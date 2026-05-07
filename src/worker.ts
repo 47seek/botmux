@@ -694,12 +694,24 @@ function maybeFollowQuietRotation(): void {
   }
 
   // Path 2: non-Linux fallback (or /proc unavailable). Directory-mtime
-  // heuristic with three guards. Less robust than fd lookup; sibling
-  // panes could in principle race the conditions, but the QUIET windows
-  // make it unlikely in practice.
+  // heuristic with three guards plus a trust-set filter on candidates.
+  //
+  // Without the trust-set filter, an actively-written sibling Claude pane
+  // in the same project dir always wins the mtime race; pid resolver then
+  // pulls the watcher back to our own (idle) jsonl on the next tick,
+  // re-arming the same condition. Result: 1 Hz path-flap that pegs CPU
+  // for as long as the sibling keeps writing (observed: 8 days, 6896
+  // switches on a single worker). Only candidates whose sid lives in
+  // `bridgeKnownSessionIds` (populated from initial attach, pid resolver
+  // hits, fd probes) are eligible — sibling sids are rejected.
   const now = Date.now();
   if (now - currentStat.mtimeMs < QUIET_ROTATION_MS) return;
-  const latest = findLatestJsonl(bridgeJsonlDir);
+  const latest = findLatestJsonl(bridgeJsonlDir, {
+    acceptCandidate: (path) => {
+      const sid = sessionIdFromJsonlPath(path);
+      return SESSION_ID_FILENAME_RE.test(sid) && bridgeKnownSessionIds.has(sid);
+    },
+  });
   if (!latest || latest === bridgeJsonlPath) return;
   const latestStat = statSafe(latest);
   if (!latestStat) return;

@@ -301,14 +301,21 @@ export function normaliseForFingerprint(s: string): string {
 
 /**
  * Find the most recently-modified `.jsonl` file in a Claude Code project
- * directory. Helper kept for diagnostics and tests. The adopt-bridge
- * watcher does NOT use mtime to follow session switches — see
- * `findJsonlContainingFingerprint` for the safer fingerprint-based variant
- * that ignores unrelated panes writing in the same project directory.
+ * directory.
  *
- * Returns null when the directory doesn't exist or has no jsonl files.
+ * `acceptCandidate` lets callers narrow the candidate set — the bridge's
+ * quiet-mtime fallback passes a trust-set predicate so a sibling Claude
+ * pane writing in the same project dir cannot hijack the watcher.
+ * Without it any actively-written sibling jsonl wins the mtime race and
+ * the bridge enters a flap loop with the pid resolver pulling it back.
+ *
+ * Returns null when the directory doesn't exist, has no jsonl files, or
+ * every candidate was rejected by `acceptCandidate`.
  */
-export function findLatestJsonl(dir: string): string | null {
+export function findLatestJsonl(
+  dir: string,
+  opts?: { acceptCandidate?: (path: string) => boolean },
+): string | null {
   if (!existsSync(dir)) return null;
   let entries: string[];
   try {
@@ -316,11 +323,13 @@ export function findLatestJsonl(dir: string): string | null {
   } catch {
     return null;
   }
+  const accept = opts?.acceptCandidate;
   let latestPath: string | null = null;
   let latestMtime = -Infinity;
   for (const name of entries) {
     if (!name.endsWith('.jsonl')) continue;
     const full = join(dir, name);
+    if (accept && !accept(full)) continue;
     try {
       const st = statSync(full);
       if (!st.isFile()) continue;

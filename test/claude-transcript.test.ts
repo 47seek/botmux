@@ -9,7 +9,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync, writeFileSync, appendFileSync, openSync, writeSync, closeSync, ftruncateSync, utimesSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, basename } from 'node:path';
 import {
   drainTranscript,
   pickAssistantTextEvents,
@@ -221,6 +221,23 @@ describe('findLatestJsonl', () => {
     writeFileSync(txt, '');
     utimesSync(txt, 5_000_000, 5_000_000);
     expect(findLatestJsonl(projectDir)).toBe(join(projectDir, 'session.jsonl'));
+  });
+
+  it('skips candidates rejected by acceptCandidate (sibling-pane hijack guard)', () => {
+    const ours = writeJsonl('ours.jsonl', 1_000_000);
+    const sibling = writeJsonl('sibling.jsonl', 5_000_000);
+    const trustSet = new Set([basename(ours, '.jsonl')]);
+    const accept = (p: string) => trustSet.has(basename(p, '.jsonl'));
+    // Without the predicate, sibling wins the mtime race.
+    expect(findLatestJsonl(projectDir)).toBe(sibling);
+    // With the predicate, the sibling is rejected and we stay on `ours`.
+    expect(findLatestJsonl(projectDir, { acceptCandidate: accept })).toBe(ours);
+  });
+
+  it('returns null when acceptCandidate rejects every jsonl', () => {
+    writeJsonl('a.jsonl', 1_000_000);
+    writeJsonl('b.jsonl', 2_000_000);
+    expect(findLatestJsonl(projectDir, { acceptCandidate: () => false })).toBeNull();
   });
 });
 
