@@ -344,6 +344,18 @@ const TMUX_PASSTHROUGH_VARS = [
   'LARK_APP_SECRET',
   '__OWNER_OPEN_ID',
   'SESSION_DATA_DIR',
+  // Proxy settings: tmux new-session runs commands with the tmux server's
+  // environment, which can be older/different from the botmux worker env.
+  // Pass these explicitly so CLI agents (Codex, Gemini, etc.) inherit the
+  // same network proxy config that botmux was started with.
+  'HTTP_PROXY',
+  'HTTPS_PROXY',
+  'http_proxy',
+  'https_proxy',
+  'ALL_PROXY',
+  'all_proxy',
+  'NO_PROXY',
+  'no_proxy',
   // Claude Code 的 root/sudo 逃生舱：worker.ts 检测到 root 时会注入 IS_SANDBOX=1，
   // tmux 不透传这个变量的话，--dangerously-skip-permissions 会被拦截立即退出。
   'IS_SANDBOX',
