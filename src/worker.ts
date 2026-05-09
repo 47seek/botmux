@@ -2158,8 +2158,12 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
         // poller. Reuses codexAdoptPendingPid since the timer dispatches
         // by cliId at probe time (see codexBridgeStartTimer).
         codexAdoptPendingPid = cfg.adoptCliPid;
-        codexBridgeStartTimer();
       }
+      // Always run the bridge poller for CoCo adopt — events.jsonl is created
+      // lazily on first event, so fs.watch typically ENOENTs at attach time.
+      // The 1s timer covers ingest + emit even when the watcher never armed,
+      // and is idempotent (no-op if already started).
+      codexBridgeStartTimer();
     }
 
     // Idle detection. In bridge mode we use the adopted CLI's real

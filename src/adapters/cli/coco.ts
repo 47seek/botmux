@@ -37,7 +37,12 @@ export function createCocoAdapter(pathOverride?: string): CliAdapter {
     },
 
     completionPattern: undefined,
-    readyPattern: /⏵⏵/,   // status bar indicator — present when CoCo's TUI is rendered
+    // `⏵⏵` only shows when CoCo runs with --yolo (bypass permissions). Adopted
+    // CoCo processes started by the user manually usually don't have that flag,
+    // so the status bar shows just the model badge `⬡ <model>` instead. Match
+    // either — without this, idle detection never fires for adopt mode and the
+    // transcript bridge never drains.
+    readyPattern: /⏵⏵|⬡/,
     systemHints: BOTMUX_SHELL_HINTS,
     altScreen: false,
   };
