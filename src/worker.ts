@@ -2868,6 +2868,15 @@ process.on('message', async (raw: unknown) => {
             }
           } else if ('sendText' in backend && 'sendSpecialKeys' in backend) {
             (backend as any).sendText(content);
+            // Beat between text and Enter so the adopted CLI's input layer
+            // has time to register the typed chars before submit. Without
+            // this, Ink-based TUIs (CoCo, Claude Code) flag the rapid
+            // input+Enter as paste continuation and treat the trailing
+            // Enter as a soft-newline, leaving the message stranded in the
+            // input box. 200ms mirrors the per-adapter writeInput delay
+            // that fresh-spawn mode goes through and matches the slash-
+            // command (raw_input) fix.
+            await new Promise(r => setTimeout(r, 200));
             (backend as any).sendSpecialKeys('Enter');
           } else {
             backend.write(content + '\r');
