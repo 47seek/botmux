@@ -52,6 +52,7 @@ import {
   buildNewTopicPrompt,
   buildFollowUpContent,
   buildBridgeInputContent,
+  buildReforkPrompt,
   getAvailableBots,
   restoreActiveSessions,
   executeScheduledTask,
@@ -778,7 +779,23 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     ds.streamCardId = undefined;
     ds.streamCardNonce = undefined;
     persistStreamCardState(ds);
-    forkWorker(ds, parsed.content, ds.hasHistory);
+    // Wrap the user message in the same `<user_message>` / `<session_id>` /
+    // `<botmux_reminder>` envelope as live-worker turns. Without this, the
+    // initial prompt that worker queues for the freshly-spawned CLI is the
+    // raw user text — the CLI sees no botmux routing context and stops calling
+    // `botmux send`, posting answers to its own terminal instead. Hits resume
+    // (after /close) and daemon-restart paths; both go through this branch
+    // because worker=null at that point.
+    const dsBotCfgForFork = getBot(ds.larkAppId).config;
+    const selfBot = getBot(ds.larkAppId);
+    const wrappedPrompt = buildReforkPrompt(ds, parsed.content, {
+      attachments,
+      mentions: parsed.mentions,
+      cliId: dsBotCfgForFork.cliId,
+      cliPathOverride: dsBotCfgForFork.cliPathOverride,
+      selfMention: { name: selfBot.botName, openId: selfBot.botOpenId },
+    });
+    forkWorker(ds, wrappedPrompt, ds.hasHistory);
   }
 }
 

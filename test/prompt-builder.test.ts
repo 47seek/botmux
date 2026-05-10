@@ -56,7 +56,8 @@ vi.mock('../src/core/worker-pool.js', () => ({
 
 // ─── Imports ──────────────────────────────────────────────────────────────
 
-import { buildNewTopicPrompt, buildFollowUpContent } from '../src/core/session-manager.js';
+import { buildNewTopicPrompt, buildFollowUpContent, buildReforkPrompt } from '../src/core/session-manager.js';
+import type { DaemonSession } from '../src/core/types.js';
 
 // ─── Tests ────────────────────────────────────────────────────────────────
 
@@ -176,5 +177,86 @@ describe('buildFollowUpContent', () => {
     });
     expect(content).not.toContain('<session_id>');
     expect(content).toContain('path="/tmp/img.jpg"');
+  });
+});
+
+// ─── buildReforkPrompt — wraps re-fork branch (resume / daemon-restart) ─────
+
+describe('buildReforkPrompt', () => {
+  const SESSION_ID = 'refork-session-id';
+
+  function makeDs(overrides: Partial<DaemonSession> = {}): DaemonSession {
+    return {
+      session: {
+        sessionId: SESSION_ID,
+        chatId: 'oc_chat',
+        rootMessageId: 'om_root',
+        title: 'topic',
+        status: 'active',
+        createdAt: '2026-01-01T00:00:00.000Z',
+      } as any,
+      worker: null,
+      workerPort: null,
+      workerToken: null,
+      larkAppId: 'app_test',
+      chatId: 'oc_chat',
+      chatType: 'group',
+      scope: 'thread',
+      spawnedAt: 0,
+      cliVersion: '1.0.0',
+      lastMessageAt: 0,
+      hasHistory: true,
+      ...overrides,
+    } as DaemonSession;
+  }
+
+  it('wraps non-adopt re-fork prompt in <user_message> + <botmux_reminder>', () => {
+    const ds = makeDs();
+    const out = buildReforkPrompt(ds, '继续聊', { cliId: 'codex' });
+    expect(out).toContain('<user_message>');
+    expect(out).toContain('继续聊');
+    expect(out).toContain('</user_message>');
+    expect(out).toContain('<botmux_reminder>');
+    expect(out).toContain('botmux send');
+  });
+
+  it('embeds <session_id> for CLIs without injectsSessionContext (codex)', () => {
+    const ds = makeDs();
+    const out = buildReforkPrompt(ds, 'hello', { cliId: 'codex' });
+    expect(out).toContain(`<session_id>${SESSION_ID}</session_id>`);
+  });
+
+  it('omits <session_id> for claude-code (injectsSessionContext=true) but keeps reminder', () => {
+    const ds = makeDs();
+    const out = buildReforkPrompt(ds, 'hello', { cliId: 'claude-code' });
+    expect(out).not.toContain('<session_id>');
+    expect(out).toContain('<user_message>');
+    expect(out).toContain('<botmux_reminder>');
+  });
+
+  it('forwards attachments and mentions to the wrapper', () => {
+    const ds = makeDs();
+    const out = buildReforkPrompt(ds, '看图', {
+      cliId: 'codex',
+      attachments: [{ type: 'image', path: '/tmp/x.jpg', name: 'x.jpg' }],
+      mentions: [{ key: '@_user_1', name: 'Alice', openId: 'ou_alice' }],
+    });
+    expect(out).toContain('path="/tmp/x.jpg"');
+    expect(out).toContain('name="Alice"');
+    expect(out).toContain('open_id="ou_alice"');
+  });
+
+  it('uses bridge content (no botmux tags) when ds.adoptedFrom is set', () => {
+    const ds = makeDs({
+      adoptedFrom: { tmuxTarget: 'foo:0.0', originalCliPid: 1, cwd: '/tmp' },
+    });
+    const out = buildReforkPrompt(ds, 'hello', {
+      cliId: 'claude-code',
+      selfMention: { name: 'Claude', openId: 'ou_bot' },
+    });
+    expect(out).not.toContain('<user_message>');
+    expect(out).not.toContain('<botmux_reminder>');
+    expect(out).not.toContain('<session_id>');
+    expect(out).toContain('hello');
   });
 });

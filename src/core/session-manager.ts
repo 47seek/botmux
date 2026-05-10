@@ -369,6 +369,48 @@ export function buildBridgeInputContent(
 const STREAM_CARD_SENTINEL = '__posting__';
 
 /**
+ * Build the prompt that gets piped into a freshly-spawned CLI when an existing
+ * (non-bridge) session re-forks its worker. Hits the `worker=null` re-fork
+ * branch in handleThreadReply: resume after /close, daemon-restart + new
+ * message, and any other path that lands a new turn without a live worker.
+ *
+ * Without wrapping, the worker would queue the user's raw text as the initial
+ * prompt — the CLI sees no `<user_message>` / `<botmux_reminder>` envelope
+ * and answers in its own terminal instead of calling `botmux send`.  This
+ * helper centralises the wrap so both daemon.ts and tests agree on the shape.
+ *
+ * Adopt-bridge sessions go through `buildBridgeInputContent` instead — see
+ * the buildBridgeInputContent docstring for why bridge prompts intentionally
+ * skip botmux routing tags.
+ */
+export function buildReforkPrompt(
+  ds: DaemonSession,
+  content: string,
+  opts?: {
+    attachments?: LarkAttachment[];
+    mentions?: LarkMention[];
+    cliId?: CliId;
+    cliPathOverride?: string;
+    selfMention?: { name?: string | null; openId?: string | null };
+  },
+): string {
+  if (ds.adoptedFrom) {
+    return buildBridgeInputContent(content, {
+      attachments: opts?.attachments,
+      mentions: opts?.mentions,
+      selfMention: opts?.selfMention,
+    });
+  }
+  return buildFollowUpContent(content, ds.session.sessionId, {
+    attachments: opts?.attachments,
+    mentions: opts?.mentions,
+    isAdoptMode: false,
+    cliId: opts?.cliId,
+    cliPathOverride: opts?.cliPathOverride,
+  });
+}
+
+/**
  * Copy current streaming-card fields from `ds` into the persisted Session and save.
  * Lets the existing card be PATCHed on next screen_update after a daemon restart,
  * instead of a fresh card being POSTed.
