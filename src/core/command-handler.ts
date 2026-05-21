@@ -36,7 +36,7 @@ export const DAEMON_COMMANDS = new Set(['/close', '/restart', '/status', '/help'
  * bypassing the normal prompt-wrapping and bracketed-paste path so the CLI's
  * own slash-command parser sees them.
  */
-export const PASSTHROUGH_COMMANDS = new Set(['/compact', '/model', '/clear', '/plugin', '/usage']);
+export const PASSTHROUGH_COMMANDS = new Set(['/compact', '/model', '/clear', '/plugin', '/usage', '/code-review', '/security-review', '/review']);
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -679,7 +679,7 @@ export async function handleCommand(
           t('help.status', undefined, loc),
           '',
           t('help.heading_passthrough', { cliName }, loc),
-          '/compact /model /clear /plugin /usage',
+          '/compact /model /clear /plugin /usage /code-review /security-review /review',
           '',
           t('help.heading_schedule', undefined, loc),
           t('help.schedule_create', undefined, loc),

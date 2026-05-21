@@ -314,7 +314,7 @@ Send these straight into a topic — the daemon intercepts them (no clash with t
 
 | Command | Description |
 |---------|-------------|
-| `/compact` `/model` `/clear` `/plugin` `/usage` | Sent verbatim to the underlying CLI for its own built-in slash commands (e.g. Claude Code's `/compact`) |
+| `/compact` `/model` `/clear` `/plugin` `/usage` `/code-review` `/security-review` `/review` | Sent verbatim to the underlying CLI for its own built-in slash commands (e.g. Claude Code's `/compact`) |
 
 **⏰ Scheduled tasks** (syntax & examples in [§ Scheduled Task Management](#scheduled-task-management))
 
