@@ -1003,4 +1003,45 @@ describe('coco writeInput submission confirmation', () => {
     const result = await adapter.writeInput(pty, 'hello');
     expect(result).toBeUndefined();
   });
+
+  it('confirms submit when baseByte lands mid-line (non-atomic history append)', async () => {
+    // CoCo/Trae 0.120.32 appends history.jsonl non-atomically, so the file size
+    // captured as baseByte can fall in the MIDDLE of the JSONL line that ends up
+    // carrying our marker. Reading straight from baseByte yields a mid-line
+    // fragment that fails JSON.parse, so the old scanner skipped the marker line
+    // and false-warned even though CoCo received and replied. The fix backs up
+    // to the line boundary before parsing.
+    resetCocoHistory();
+    appendCocoHistory('an older complete record');
+    const prompt = '<user_message>\n@CoCo midline test\n</user_message>';
+    // Simulate CoCo having written only the HEAD of this submit's line (no
+    // trailing newline yet) at the moment the adapter samples baseByte.
+    const partialHead = '{"content":"\\u003cuser_message\\u003e\\n@CoCo midline test';
+    appendFileSync(COCO_HISTORY_PATH, partialHead);
+    // baseByte is now mid-line, inside the marker line.
+
+    let completedOnce = false;
+    const pty: PtyHandle = {
+      write: vi.fn(),
+      sendText: vi.fn(),
+      sendSpecialKeys: vi.fn((key: string) => {
+        if (key !== 'Enter' || completedOnce) return;
+        completedOnce = true;
+        // CoCo finishes the rest of the SAME line + newline.
+        appendFileSync(
+          COCO_HISTORY_PATH,
+          '\\n\\u003c/user_message\\u003e","mode":"user","timestamp":"2026-05-21T09:00:00Z"}\n',
+        );
+      }),
+      pasteText: vi.fn(),
+    };
+
+    const adapter = createCocoAdapter('/bin/coco');
+    const result = await adapter.writeInput(pty, prompt);
+
+    // Confirmed → no warning, and no spurious retry Enters.
+    expect(result).toBeUndefined();
+    const enterCalls = (pty.sendSpecialKeys as any).mock.calls.filter((c: string[]) => c[0] === 'Enter').length;
+    expect(enterCalls).toBe(1);
+  });
 });

@@ -27,31 +27,68 @@ function currentFileSize(path: string): number {
  *  with JSON.parse — substring match on the raw bytes is unreliable here
  *  because CoCo's Go marshaller HTML-escapes `<`, `>`, `&` into `<`,
  *  `>`, `&`, which our string-form prefix won't match. Decoding
- *  the field and comparing JS strings sidesteps all of that. */
+ *  the field and comparing JS strings sidesteps all of that.
+ *
+ *  `fromByte` is captured as the file size at submit time, but CoCo/Trae
+ *  0.120.32 appends to history.jsonl NON-ATOMICALLY, so that baseline can land
+ *  in the MIDDLE of a JSONL line — including the very line that ends up
+ *  carrying our marker. Reading straight from `fromByte` would yield a mid-line
+ *  fragment (`...sender type=\"user\"...`) that fails JSON.parse, so the marker
+ *  line gets skipped and we falsely report "not submitted" — the user sees a
+ *  spurious submit-failure warning even though CoCo received and replied.
+ *
+ *  Fix: back up to the start of the line that contains `fromByte` and parse
+ *  whole lines, but only accept lines whose END is past `fromByte` (newly
+ *  written / spanning the baseline) so a stale earlier record that happens to
+ *  share the prefix can't produce a false positive. */
 function historyDeltaContains(path: string, fromByte: number, prefix: string): boolean {
   if (!existsSync(path)) return false;
   let size: number;
   try { size = statSync(path).size; } catch { return false; }
   if (size <= fromByte) return false;
-  const len = size - fromByte;
+
+  // Read from a little before `fromByte` so the line straddling the baseline is
+  // captured whole. A single chat-prompt JSONL line stays far under 64 KiB.
+  const LOOKBACK = 64 * 1024;
+  const readStart = Math.max(0, fromByte - LOOKBACK);
+  const len = size - readStart;
   const buf = Buffer.alloc(len);
   const fd = openSync(path, 'r');
   try {
-    readSync(fd, buf, 0, len, fromByte);
+    readSync(fd, buf, 0, len, readStart);
   } finally {
     closeSync(fd);
   }
-  const delta = buf.toString('utf8');
-  for (const line of delta.split('\n')) {
-    if (!line || !line.includes('"mode":"user"')) continue;
-    try {
-      const parsed = JSON.parse(line);
-      if (typeof parsed.content === 'string' && parsed.content.startsWith(prefix)) {
-        return true;
+
+  // Walk complete lines, tracking each line's absolute end offset in the file.
+  let lineStart = 0;
+  if (readStart > 0) {
+    // We may have started mid-line; the bytes before the first newline belong
+    // to a line whose head we can't see — skip that partial fragment.
+    const firstNl = buf.indexOf(0x0a);
+    if (firstNl === -1) return false;
+    lineStart = firstNl + 1;
+  }
+  while (lineStart < buf.length) {
+    const nl = buf.indexOf(0x0a, lineStart);
+    const lineEnd = nl === -1 ? buf.length : nl;
+    const absLineEnd = readStart + lineEnd;
+    // Only lines that extend past the baseline are this submit's; skip the rest.
+    if (absLineEnd > fromByte) {
+      const line = buf.toString('utf8', lineStart, lineEnd);
+      if (line.includes('"mode":"user"')) {
+        try {
+          const parsed = JSON.parse(line);
+          if (typeof parsed.content === 'string' && parsed.content.startsWith(prefix)) {
+            return true;
+          }
+        } catch {
+          // Truncated tail / non-JSON line — keep scanning the rest.
+        }
       }
-    } catch {
-      // Truncated tail / non-JSON line — keep scanning the rest.
     }
+    if (nl === -1) break;
+    lineStart = nl + 1;
   }
   return false;
 }
