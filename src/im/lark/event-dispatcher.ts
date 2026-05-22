@@ -506,8 +506,10 @@ export function canTalk(larkAppId: string, chatId: string | undefined, senderOpe
 }
 
 export function canOperate(larkAppId: string, _chatId: string | undefined, senderOpenId: string | undefined): boolean {
-  const allowedUsers = getBot(larkAppId).resolvedAllowedUsers;
-  if (allowedUsers.length === 0) return true;
+  const bot = getBot(larkAppId);
+  const allowedUsers = bot.resolvedAllowedUsers;
+  const hasAllowlist = allowedUsers.length > 0 || (bot.config.allowedChatGroups?.length ?? 0) > 0;
+  if (!hasAllowlist) return true;
   return !!senderOpenId && allowedUsers.includes(senderOpenId);
 }
 

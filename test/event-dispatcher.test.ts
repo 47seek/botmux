@@ -541,6 +541,17 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     expect(canOperate(MY_APP_ID, 'oc_any', 'ou_admin')).toBe(true);
   });
 
+  it('does not allow sensitive operations when only allowedChatGroups is configured', () => {
+    mockGetBot.mockReturnValue({
+      config: { larkAppId: MY_APP_ID, larkAppSecret: 'secret', cliId: 'claude-code', allowedChatGroups: ['oc_team'] },
+      botOpenId: MY_OPEN_ID,
+      resolvedAllowedUsers: [],
+      resolvedAllowedChatGroupUsers: [USER_OPEN_ID],
+    });
+
+    expect(canOperate(MY_APP_ID, 'oc_any', USER_OPEN_ID)).toBe(false);
+  });
+
   it('allows known botmux peers to @mention in non-oncall chats even when allowedUsers is restricted', async () => {
     // Regression: bot-to-bot handoff in the same group used canTalk(), whose
     // non-oncall branch only checked human allowedUsers. A peer bot's app-
