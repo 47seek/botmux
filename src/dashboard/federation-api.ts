@@ -20,8 +20,28 @@ import {
 } from '../services/federation-store.js';
 import { buildFederatedRoster } from '../services/federation-roster.js';
 import { findMembershipByDelegationToken } from '../services/federation-membership-store.js';
+import { buildTeamRoster } from '../services/team-roster.js';
 
 const MAX_BOTS = 200;
+const MAX_OWNERS = 100;
+
+/** Short-TTL idempotency cache for delegate-group: a hub may retry the SAME
+ *  request (timeout/lost response) — replaying must return the first result, not
+ *  create a duplicate group. Keyed by delegationToken+requestId. In-memory is
+ *  enough (single dashboard process; the dedup window is seconds–minutes). */
+const DELEGATE_IDEM_TTL_MS = 10 * 60 * 1000;
+const delegateIdem = new Map<string, { expiresAt: number; result: unknown }>();
+function idemGet(key: string): unknown | null {
+  const e = delegateIdem.get(key);
+  if (!e) return null;
+  if (Date.now() > e.expiresAt) { delegateIdem.delete(key); return null; }
+  return e.result;
+}
+function idemSet(key: string, result: unknown): void {
+  const now = Date.now();
+  for (const [k, v] of delegateIdem) if (v.expiresAt <= now) delegateIdem.delete(k); // opportunistic prune
+  delegateIdem.set(key, { expiresAt: now + DELEGATE_IDEM_TTL_MS, result });
+}
 
 /** Federation bearer token: prefer the header (keeps the long-lived syncToken out
  *  of URLs / access logs); fall back to ?syncToken= for short-term hub compat. */
@@ -159,11 +179,22 @@ export async function handleFederationApi(
     try { body = await readBody(req); } catch { jsonRes(res, 400, { ok: false, error: 'bad_json' }); return true; }
     const token = federationToken(req, url) || String(body?.delegationToken ?? '').trim();
     if (!findMembershipByDelegationToken(dataDir, token)) { jsonRes(res, 403, { ok: false, error: 'unknown_token' }); return true; }
-    const larkAppIds: string[] = Array.isArray(body?.larkAppIds) ? body.larkAppIds.filter((x: any) => typeof x === 'string') : [];
-    const ownerUnionIds: string[] = Array.isArray(body?.ownerUnionIds) ? body.ownerUnionIds.filter((x: any) => typeof x === 'string') : [];
+    // Dedup + cap inputs (pre-auth command endpoint — keep blast radius small).
+    const larkAppIds: string[] = Array.from(new Set((Array.isArray(body?.larkAppIds) ? body.larkAppIds : []).filter((x: any) => typeof x === 'string')));
+    const ownerUnionIds: string[] = Array.from(new Set((Array.isArray(body?.ownerUnionIds) ? body.ownerUnionIds : []).filter((x: any) => typeof x === 'string')));
     const name = (String(body?.name ?? '').trim()) || '协作群';
     if (larkAppIds.length === 0) { jsonRes(res, 400, { ok: false, error: 'no_bots_selected' }); return true; }
+    if (larkAppIds.length > MAX_BOTS || ownerUnionIds.length > MAX_OWNERS) { jsonRes(res, 400, { ok: false, error: 'too_many' }); return true; }
+    // Guardrail: the delegation must involve at least one of OUR local bots
+    // (otherwise it's unrelated to this deployment — refuse to act as creator).
+    const localIds = new Set(buildTeamRoster(dataDir).bots.map(b => b.larkAppId));
+    if (!larkAppIds.some(id => localIds.has(id))) { jsonRes(res, 400, { ok: false, error: 'no_local_bot' }); return true; }
+    // Idempotency: replays of the same {token, requestId} return the first result.
+    const requestId = String(body?.requestId ?? '').trim();
+    const idemKey = requestId ? `${token}:${requestId}` : '';
+    if (idemKey) { const cached = idemGet(idemKey); if (cached) { jsonRes(res, 200, cached); return true; } }
     const r = await deps.createTeamGroup({ name, larkAppIds, ownerUnionIds });
+    if (idemKey && r.ok) idemSet(idemKey, r);
     jsonRes(res, r.ok ? 200 : 502, r);
     return true;
   }

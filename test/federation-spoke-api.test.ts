@@ -132,6 +132,23 @@ describe('handleFederationSpokeApi', () => {
     expect(fetcher).toHaveBeenCalled();
   });
 
+  it('federated-group: delegate timeout → stops (no duplicate group), does not try next deployment', async () => {
+    writeBots([{ larkAppId: 'cli_local', botOpenId: null, botName: '本地', cliId: 'claude' }]);
+    registerDeployment(dataDir, DEFAULT_TEAM_ID, { deploymentId: 'dep_a', name: 'A', bots: [{ larkAppId: 'cli_remote', botName: 'R', cliId: 'codex' }], callbackUrl: 'http://a:7891', delegationToken: 'TA' });
+    registerDeployment(dataDir, DEFAULT_TEAM_ID, { deploymentId: 'dep_b', name: 'B', bots: [{ larkAppId: 'cli_remote', botName: 'R', cliId: 'codex' }], callbackUrl: 'http://b:7891', delegationToken: 'TB' });
+    const createTeamGroup = vi.fn(async () => ({ ok: false, error: 'no_online_daemon' }));
+    // first delegate call times out — must NOT fall through to the second deployment
+    const fetcher = vi.fn(async () => { const e: any = new Error('aborted'); e.name = 'AbortError'; throw e; });
+    const res = makeRes();
+    await handleFederationSpokeApi(
+      makeReq('POST', '/api/team/federated-group', { name: 'x', larkAppIds: ['cli_local', 'cli_remote'] }),
+      res, new URL('http://x/api/team/federated-group'), { dataDir, createTeamGroup: createTeamGroup as any, fetcher: fetcher as any },
+    );
+    expect(res.statusCode).toBe(504);
+    expect(json(res).error).toBe('delegation_timeout');
+    expect(fetcher).toHaveBeenCalledTimes(1); // stopped after timeout, did not try dep_b
+  });
+
   it('join-remote: posts local bots to the hub and stores the membership', async () => {
     writeBots([{ larkAppId: 'cli_me1', botOpenId: null, botName: '我的Bot', cliId: 'claude' }]);
     let captured: any = null;

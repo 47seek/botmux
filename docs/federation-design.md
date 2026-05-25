@@ -118,6 +118,10 @@ Hub 的团队花名册 = 本地 bot（[[team-roster]]，按 bots.json 顺序）+
 - 优先用**本地**在线 bot 建群；
 - 本地无在线 creator（`no_online_daemon`）→ **委托**给一个「拥有所选 bot、且可达」的联邦部署：hub→spoke `POST {callbackUrl}/api/federation/delegate-group`，对方用自己的在线 bot 建群、加全部 app_id + owners，回 chatId/shareLink（结果带 `delegatedTo`）。都不行 → `no_creator_available`。
 - **互信凭证**：spoke join 时给 hub `callbackUrl`（自己 dashboard 地址）+ `delegationToken`（spoke 生成）；hub 存 FederatedDeployment、spoke 存 RemoteMembership。delegate 调用带 `Authorization: Bearer <delegationToken>`，spoke 用 `findMembershipByDelegationToken` 校验「确是我 join 过的 hub」（团队内互信）。
+- **命令通道护栏**（delegate-group 是有副作用的 pre-auth 端点）：
+  - **幂等**：hub 每次 federated-group 生成一个 `requestId` 传给每个 delegate；spoke 按 `delegationToken+requestId` 短 TTL 缓存结果，重放/重试返回同一结果，不重复建群。
+  - hub **超时不试下一个**：delegate 超时＝对方可能已建群（响应丢失），hub 停止、回 `delegation_timeout`，不再委托别的部署（否则重复群）；仅在「拿到响应的明确失败」或「连接被拒（从未到达）」时才试下一个。
+  - spoke 侧 delegate 校验：必须含 ≥1 个**本部署本地 bot**（否则与本部署无关→`no_local_bot`）；`larkAppIds`/`ownerUnionIds` 去重 + 上限（200/100，超出 400）。
 
 ### owner 一并拉群（按 union_id）
 拉群把**所选 bot 的 owner（人）**也拉进群：聚合花名册带 owner（本地查 bot-owner-store、远端由联邦同步的 `ownerUnionId/ownerName`）；建群后用 **union_id**（租户稳定、跨 app 通用，避开 open_id app-scope）加 owners（`addUsersToChatByUnionId`，`member_id_type=union_id`），加不上的回 `invalidOwnerUnionIds`。

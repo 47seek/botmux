@@ -12,7 +12,7 @@
  * See docs/federation-design.md.
  */
 import type { IncomingMessage, ServerResponse } from 'node:http';
-import { randomBytes } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import { config } from '../config.js';
 import { jsonRes } from './workflow-api.js';
 import { buildTeamRoster } from '../services/team-roster.js';
@@ -160,6 +160,10 @@ export async function handleFederationSpokeApi(
     // selected bot and is reachable (hub→spoke); it creates with its own bot.
     if (r.error === 'no_online_daemon') {
       const selected = new Set(larkAppIds);
+      // One requestId for this 拉群 → each delegate is idempotent on the spoke,
+      // so a retry/replay returns the same group instead of creating a duplicate.
+      const requestId = randomUUID();
+      let lastErr = 'no_creator_available';
       for (const dep of listFederatedDeployments(dataDir, DEFAULT_TEAM_ID)) {
         if (!dep.callbackUrl || !dep.delegationToken) continue;
         if (!dep.bots.some(b => selected.has(b.larkAppId))) continue;
@@ -167,13 +171,19 @@ export async function handleFederationSpokeApi(
           const dr = await fetchWithTimeout(fetcher, `${dep.callbackUrl}/api/federation/delegate-group`, {
             method: 'POST',
             headers: { 'content-type': 'application/json', authorization: `Bearer ${dep.delegationToken}` },
-            body: JSON.stringify({ name, larkAppIds, ownerUnionIds }),
+            body: JSON.stringify({ name, larkAppIds, ownerUnionIds, requestId }),
           });
           const dj = await dr.json().catch(() => ({} as any));
           if (dr.ok && dj?.ok && dj.chatId) { jsonRes(res, 200, { ...dj, delegatedTo: dep.name }); return true; }
-        } catch { /* try next deployment */ }
+          lastErr = dj?.error || `hub_${dr.status}`; // got a response → definite failure, safe to try next
+        } catch (e) {
+          // Timeout: the spoke MAY have created the group (response lost). Do NOT
+          // try another deployment — that would risk a duplicate. Stop here.
+          if (e instanceof HubTimeout) { jsonRes(res, 504, { ok: false, error: 'delegation_timeout', delegatedTo: dep.name }); return true; }
+          lastErr = 'hub_unreachable'; // never connected → safe to try next
+        }
       }
-      jsonRes(res, 502, { ok: false, error: 'no_creator_available' });
+      jsonRes(res, 502, { ok: false, error: lastErr });
       return true;
     }
     jsonRes(res, 502, r);

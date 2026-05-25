@@ -139,18 +139,29 @@ describe('handleFederationApi', () => {
     expect(res.statusCode).toBe(403);
   });
 
-  it('delegate-group: valid delegationToken → creates via injected createTeamGroup; bad token 403; no dep 501', async () => {
-    // this deployment joined a hub and issued delegationToken 'DTOK' to it
+  it('delegate-group: valid token → creates via createTeamGroup; idempotent on requestId; guardrails', async () => {
+    writeBots([{ larkAppId: 'cli_a', botOpenId: null, botName: 'A', cliId: 'claude' }]); // our local bot
     addMembership(dataDir, { hubUrl: 'http://hub:7891', teamId: 'default', teamName: 'T', syncToken: 'st', deploymentId: 'dep_me', delegationToken: 'DTOK' });
-    let captured: any = null;
-    const createTeamGroup = vi.fn(async (args: any) => { captured = args; return { ok: true, chatId: 'oc_deleg', shareLink: 'https://x', invalidBotIds: [] }; });
-    // valid token in Authorization header
+    let calls = 0; let captured: any = null;
+    const createTeamGroup = vi.fn(async (args: any) => { calls++; captured = args; return { ok: true, chatId: 'oc_deleg', shareLink: 'https://x', invalidBotIds: [] }; });
+    // valid token + involves our local bot cli_a → creates
     let res = makeRes();
-    await callWithGroup(makeReq('POST', '/api/federation/delegate-group', { name: 'g', larkAppIds: ['cli_a', 'cli_b'], ownerUnionIds: ['on_1'] }, bearer('DTOK')), res, '/api/federation/delegate-group', createTeamGroup);
+    await callWithGroup(makeReq('POST', '/api/federation/delegate-group', { name: 'g', larkAppIds: ['cli_a', 'cli_b'], ownerUnionIds: ['on_1'], requestId: 'req1' }, bearer('DTOK')), res, '/api/federation/delegate-group', createTeamGroup);
     expect(res.statusCode).toBe(200);
     expect(json(res).chatId).toBe('oc_deleg');
     expect(captured).toMatchObject({ name: 'g', larkAppIds: ['cli_a', 'cli_b'], ownerUnionIds: ['on_1'] });
-    // unknown token → 403, not delegated
+    // replay same requestId → cached, createTeamGroup NOT called again (no dup group)
+    res = makeRes();
+    await callWithGroup(makeReq('POST', '/api/federation/delegate-group', { larkAppIds: ['cli_a'], requestId: 'req1' }, bearer('DTOK')), res, '/api/federation/delegate-group', createTeamGroup);
+    expect(res.statusCode).toBe(200);
+    expect(json(res).chatId).toBe('oc_deleg');
+    expect(calls).toBe(1); // idempotent
+    // guardrail: no local bot in selection → 400 no_local_bot
+    res = makeRes();
+    await callWithGroup(makeReq('POST', '/api/federation/delegate-group', { larkAppIds: ['cli_remote_only'], requestId: 'r2' }, bearer('DTOK')), res, '/api/federation/delegate-group', createTeamGroup);
+    expect(res.statusCode).toBe(400);
+    expect(json(res).error).toBe('no_local_bot');
+    // unknown token → 403
     res = makeRes();
     await callWithGroup(makeReq('POST', '/api/federation/delegate-group', { larkAppIds: ['cli_a'] }, bearer('NOPE')), res, '/api/federation/delegate-group', createTeamGroup);
     expect(res.statusCode).toBe(403);
