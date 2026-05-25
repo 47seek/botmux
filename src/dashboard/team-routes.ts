@@ -27,6 +27,14 @@ import { handleConnectorApi } from './connector-api.js';
 import { listTriggerLogs, summarizeTriggerLogs, type TriggerLogListOptions } from '../services/trigger-log-store.js';
 import { TEAM_PAGE_HTML } from './team-page.js';
 
+/** /api/team/* paths that are DASHBOARD-TOKEN authed (federation), so this
+ *  bmx_session route must let them fall through to the post-gate handler. Keep
+ *  in sync with handleFederationSpokeApi's path set. */
+const FEDERATION_DASHBOARD_PATHS = new Set([
+  '/api/team/local', '/api/team/local-invite', '/api/team/rename-deployment',
+  '/api/team/join-remote', '/api/team/remote-roster', '/api/team/sync-remote', '/api/team/leave-remote',
+]);
+
 const MAX_ROLE_BYTES = 4 * 1024;
 /** Guardrails against accidental/scripted bloat of teams.json (team内互信，非安全边界). */
 const MAX_TEAMS = 100;
@@ -102,6 +110,11 @@ export async function handleTeamRoute(
 ): Promise<boolean> {
   const path = url.pathname;
   if (path !== '/team' && path !== '/api/team' && !path.startsWith('/api/pairing/') && !path.startsWith('/api/team/')) return false;
+  // Federation endpoints live under /api/team/* too, but are DASHBOARD-TOKEN
+  // authed (handled by handleFederationSpokeApi AFTER the token gate). This
+  // bmx_session route is mounted BEFORE that gate, so it must NOT swallow them
+  // (it would 401 without a session / 404 with one). Let them fall through.
+  if (FEDERATION_DASHBOARD_PATHS.has(path)) return false;
 
   const dataDir = deps.dataDir ?? config.session.dataDir;
   const method = req.method ?? 'GET';

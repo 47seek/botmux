@@ -113,6 +113,25 @@ describe('handleTeamRoute', () => {
     expect(res._body).not.toContain('rf-ment');
   });
 
+  it('lets federation dashboard-token paths fall through (handled=false, not 401/404)', async () => {
+    // These /api/team/* paths are dashboard-token authed (handleFederationSpokeApi,
+    // after the token gate). This bmx_session route is mounted BEFORE that gate, so
+    // it must return false for them — otherwise they 401 (no session) / 404 (session).
+    for (const p of [
+      '/api/team/local', '/api/team/local-invite', '/api/team/rename-deployment',
+      '/api/team/join-remote', '/api/team/remote-roster', '/api/team/sync-remote', '/api/team/leave-remote',
+    ]) {
+      const res = makeRes();
+      // even WITHOUT a session, these must not be handled here
+      expect(await call(makeReq('GET', p), res, p)).toBe(false);
+      expect(res.statusCode).toBe(0); // never wrote a response
+    }
+    // a real bmx_session team path is still handled here (e.g. roster → 401 w/o session)
+    const res = makeRes();
+    expect(await call(makeReq('GET', '/api/team/roster'), res, '/api/team/roster')).toBe(true);
+    expect(res.statusCode).toBe(401);
+  });
+
   it('team APIs require a session (401 without bmx_session)', async () => {
     const res = makeRes();
     await call(makeReq('GET', '/api/team/roster'), res, '/api/team/roster');
