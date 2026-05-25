@@ -15,12 +15,22 @@ import { jsonRes } from './workflow-api.js';
 import { consumeInvite } from '../services/invite-store.js';
 import { getTeam } from '../services/team-store.js';
 import {
-  registerDeployment, syncDeployment, getDeploymentByToken,
+  registerDeployment, syncDeployment, getDeploymentByToken, removeDeploymentByToken,
   type FederatedBot,
 } from '../services/federation-store.js';
 import { buildFederatedRoster } from '../services/federation-roster.js';
 
 const MAX_BOTS = 200;
+
+/** Federation bearer token: prefer the header (keeps the long-lived syncToken out
+ *  of URLs / access logs); fall back to ?syncToken= for short-term hub compat. */
+function federationToken(req: IncomingMessage, url: URL): string {
+  const auth = req.headers['authorization'];
+  if (typeof auth === 'string' && auth.startsWith('Bearer ')) return auth.slice(7).trim();
+  const x = req.headers['x-botmux-federation-token'];
+  if (typeof x === 'string' && x) return x.trim();
+  return (url.searchParams.get('syncToken') ?? '').trim();
+}
 
 async function readBody(req: IncomingMessage, maxBytes = 256 * 1024): Promise<any> {
   const chunks: Buffer[] = [];
@@ -80,12 +90,28 @@ export async function handleFederationApi(
     if (!inv.ok) { jsonRes(res, 403, { ok: false, error: `invite_${inv.reason}` }); return true; }
     const team = getTeam(dataDir, inv.teamId);
     if (!team) { jsonRes(res, 403, { ok: false, error: 'invite_team_deleted' }); return true; }
-    const { syncToken } = registerDeployment(dataDir, inv.teamId, {
+    const reg = registerDeployment(dataDir, inv.teamId, {
       deploymentId: dep.deploymentId,
       name: typeof dep.name === 'string' && dep.name ? dep.name : dep.deploymentId,
       bots: sanitizeBots(dep.bots),
     });
-    jsonRes(res, 200, { ok: true, teamId: inv.teamId, teamName: team.name, syncToken });
+    // deploymentId is public (shows in roster) — never hand back an existing
+    // deployment's long-lived token. A duplicate must re-bind via an explicit
+    // reset proving the old token (future), not by re-joining with an invite.
+    if (!reg.created) { jsonRes(res, 409, { ok: false, error: 'deployment_already_joined' }); return true; }
+    jsonRes(res, 200, { ok: true, teamId: inv.teamId, teamName: team.name, syncToken: reg.syncToken });
+    return true;
+  }
+
+  // Spoke-initiated leave/revoke: drop this deployment from its team (authed by
+  // its own syncToken). Idempotent — unknown token is treated as already gone.
+  if (path === '/api/federation/leave' && method === 'POST') {
+    let body: any;
+    try { body = await readBody(req); } catch { jsonRes(res, 400, { ok: false, error: 'bad_json' }); return true; }
+    const syncToken = String(body?.syncToken ?? '').trim() || federationToken(req, url);
+    if (!syncToken) { jsonRes(res, 401, { ok: false, error: 'token_required' }); return true; }
+    removeDeploymentByToken(dataDir, syncToken);
+    jsonRes(res, 200, { ok: true });
     return true;
   }
 
@@ -103,8 +129,7 @@ export async function handleFederationApi(
 
   // Spoke pulls the aggregated cross-deployment roster for its team.
   if (path === '/api/federation/roster' && method === 'GET') {
-    const syncToken = (url.searchParams.get('syncToken') ?? '').trim();
-    const found = getDeploymentByToken(dataDir, syncToken);
+    const found = getDeploymentByToken(dataDir, federationToken(req, url));
     if (!found) { jsonRes(res, 403, { ok: false, error: 'unknown_token' }); return true; }
     jsonRes(res, 200, { ok: true, ...buildFederatedRoster(dataDir, found.teamId) });
     return true;

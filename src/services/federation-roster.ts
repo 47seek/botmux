@@ -11,13 +11,19 @@ import { listFederatedDeployments } from './federation-store.js';
 import { getDeploymentIdentity } from './deployment-identity.js';
 import { getTeam, getDefaultTeam, DEFAULT_TEAM_ID } from './team-store.js';
 
+/** A federated deployment is considered stale (likely offline) if it hasn't
+ *  synced within this window — its bots are flagged so the UI can de-emphasize them. */
+export const FEDERATION_STALE_MS = 5 * 60 * 1000;
+
 export interface AggregatedRosterBot {
   larkAppId: string;
   name: string;
   cliId: string;
   capability: string | null;
   hasTeamRole: boolean;
-  deployment: { id: string; name: string; local: boolean };
+  /** Tenant-stable bot id (kept now so P2 拉群 by union_id needs no schema change). */
+  botUnionId?: string;
+  deployment: { id: string; name: string; local: boolean; stale: boolean };
 }
 
 export interface AggregatedDeployment {
@@ -26,6 +32,8 @@ export interface AggregatedDeployment {
   local: boolean;
   botCount: number;
   lastSeenAt?: number;
+  /** true when a remote deployment hasn't synced within FEDERATION_STALE_MS. */
+  stale: boolean;
 }
 
 export interface AggregatedRoster {
@@ -35,13 +43,13 @@ export interface AggregatedRoster {
 }
 
 /** Hub's local bots + all member deployments' bots, tagged + grouped by deployment. */
-export function buildFederatedRoster(dataDir: string, teamId: string = DEFAULT_TEAM_ID, configOrder?: string[]): AggregatedRoster {
+export function buildFederatedRoster(dataDir: string, teamId: string = DEFAULT_TEAM_ID, configOrder?: string[], now: number = Date.now()): AggregatedRoster {
   const team = getTeam(dataDir, teamId) ?? getDefaultTeam(dataDir);
   const localId = getDeploymentIdentity(dataDir);
   const local = buildTeamRoster(dataDir, teamId, configOrder);
 
   const deployments: AggregatedDeployment[] = [
-    { id: localId.deploymentId, name: localId.name, local: true, botCount: local.bots.length },
+    { id: localId.deploymentId, name: localId.name, local: true, botCount: local.bots.length, stale: false },
   ];
   const bots: AggregatedRosterBot[] = local.bots.map(b => ({
     larkAppId: b.larkAppId,
@@ -49,11 +57,12 @@ export function buildFederatedRoster(dataDir: string, teamId: string = DEFAULT_T
     cliId: b.cliId,
     capability: b.capability,
     hasTeamRole: b.hasTeamRole,
-    deployment: { id: localId.deploymentId, name: localId.name, local: true },
+    deployment: { id: localId.deploymentId, name: localId.name, local: true, stale: false },
   }));
 
   for (const dep of listFederatedDeployments(dataDir, teamId)) {
-    deployments.push({ id: dep.deploymentId, name: dep.name, local: false, botCount: dep.bots.length, lastSeenAt: dep.lastSeenAt });
+    const stale = now - dep.lastSeenAt > FEDERATION_STALE_MS;
+    deployments.push({ id: dep.deploymentId, name: dep.name, local: false, botCount: dep.bots.length, lastSeenAt: dep.lastSeenAt, stale });
     for (const b of dep.bots) {
       bots.push({
         larkAppId: b.larkAppId,
@@ -61,7 +70,8 @@ export function buildFederatedRoster(dataDir: string, teamId: string = DEFAULT_T
         cliId: b.cliId,
         capability: b.capability ?? null,
         hasTeamRole: !!b.hasTeamRole,
-        deployment: { id: dep.deploymentId, name: dep.name, local: false },
+        botUnionId: b.botUnionId,
+        deployment: { id: dep.deploymentId, name: dep.name, local: false, stale },
       });
     }
   }

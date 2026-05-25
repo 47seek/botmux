@@ -67,25 +67,24 @@ export interface RegisterInput {
 }
 
 /**
- * Register (or refresh) a remote deployment under a team. Idempotent by
- * deploymentId: re-registering keeps the same syncToken and refreshes bots/name.
- * Returns the (possibly existing) syncToken.
+ * Register a NEW remote deployment under a team and issue a fresh syncToken.
+ *
+ * NOT idempotent on purpose: `deploymentId` is public (it appears in the roster),
+ * so re-registering an existing id must NOT hand back its long-lived syncToken —
+ * otherwise anyone with an invite could claim another deployment's token by
+ * guessing its id. A duplicate returns `{ created: false }` with NO token; the
+ * caller surfaces `deployment_already_joined`. Ongoing bot refresh is via
+ * `syncDeployment` (syncToken), not this. Re-binding/rotation is a future
+ * explicit reset proving the old syncToken.
  */
-export function registerDeployment(dataDir: string, teamId: string, input: RegisterInput, now: number = Date.now()): { syncToken: string } {
+export function registerDeployment(dataDir: string, teamId: string, input: RegisterInput, now: number = Date.now()): { syncToken: string; created: boolean } {
   const data = readFile(dataDir);
   const list = data.teams[teamId] ?? (data.teams[teamId] = []);
-  const existing = list.find(d => d.deploymentId === input.deploymentId);
-  if (existing) {
-    existing.name = input.name || existing.name;
-    existing.bots = input.bots;
-    existing.lastSeenAt = now;
-    writeFileAtomic(dataDir, data);
-    return { syncToken: existing.syncToken };
-  }
+  if (list.some(d => d.deploymentId === input.deploymentId)) return { syncToken: '', created: false };
   const syncToken = randomBytes(24).toString('base64url');
   list.push({ deploymentId: input.deploymentId, name: input.name, syncToken, bots: input.bots, joinedAt: now, lastSeenAt: now });
   writeFileAtomic(dataDir, data);
-  return { syncToken };
+  return { syncToken, created: true };
 }
 
 /** Resolve a syncToken to its {teamId, deployment}, or null. */
@@ -129,6 +128,17 @@ export function removeDeployment(dataDir: string, teamId: string, deploymentId: 
   if (data.teams[teamId].length === before) return false;
   writeFileAtomic(dataDir, data);
   return true;
+}
+
+/** Remove the deployment owning a syncToken (spoke-initiated leave/revoke). Returns true if removed. */
+export function removeDeploymentByToken(dataDir: string, syncToken: string): boolean {
+  if (!syncToken) return false;
+  const data = readFile(dataDir);
+  for (const list of Object.values(data.teams)) {
+    const idx = list.findIndex(d => d.syncToken === syncToken);
+    if (idx >= 0) { list.splice(idx, 1); writeFileAtomic(dataDir, data); return true; }
+  }
+  return false;
 }
 
 /** Drop all federation records for a team (e.g. when the team is deleted). */

@@ -93,15 +93,28 @@ describe('handleFederationSpokeApi', () => {
     expect(json(res).error).toBe('code_required');
   });
 
-  it('remote-roster: aggregates each joined hub\'s roster; leave-remote forgets it', async () => {
+  it('join-remote: hub timeout → 504 hub_timeout', async () => {
+    writeBots([]);
+    const timeoutFetcher = vi.fn(async () => { const e: any = new Error('aborted'); e.name = 'AbortError'; throw e; });
+    const res = makeRes();
+    await handleFederationSpokeApi(
+      makeReq('POST', '/api/team/join-remote', { hubUrl: 'http://hub:7891', inviteCode: 'INV' }),
+      res, new URL('http://x/api/team/join-remote'), { dataDir, fetcher: timeoutFetcher as any },
+    );
+    expect(res.statusCode).toBe(504);
+    expect(json(res).error).toBe('hub_timeout');
+  });
+
+  it('remote-roster: sends token in header (not URL); leave-remote revokes at hub + forgets locally', async () => {
     writeBots([]);
     // join one hub
     const joinFetcher = vi.fn(async () => jsonResp(200, { ok: true, teamId: 'default', teamName: 'T', syncToken: 'TOK' }));
     await handleFederationSpokeApi(makeReq('POST', '/api/team/join-remote', { hubUrl: 'http://hub:7891', inviteCode: 'INV' }), makeRes(), new URL('http://x/api/team/join-remote'), { dataDir, fetcher: joinFetcher as any });
 
-    // remote-roster pulls the hub roster
-    const rosterFetcher = vi.fn(async (u: any) => {
-      expect(String(u)).toContain('/api/federation/roster?syncToken=TOK');
+    // remote-roster pulls the hub roster — token in Authorization header, NOT the URL
+    const rosterFetcher = vi.fn(async (u: any, init: any) => {
+      expect(String(u)).toBe('http://hub:7891/api/federation/roster'); // no ?syncToken=
+      expect(init.headers.authorization).toBe('Bearer TOK');
       return jsonResp(200, { ok: true, team: { id: 'default', name: 'T', memberCount: 1 }, deployments: [], bots: [{ larkAppId: 'cli_x', name: 'X' }] });
     });
     let res = makeRes();
@@ -109,10 +122,17 @@ describe('handleFederationSpokeApi', () => {
     expect(res.statusCode).toBe(200);
     expect(json(res).memberships[0].roster.bots[0].larkAppId).toBe('cli_x');
 
-    // leave-remote forgets it
+    // leave-remote calls the hub's /leave (with the token) then forgets locally
+    const leaveFetcher = vi.fn(async (u: any, init: any) => {
+      expect(String(u)).toBe('http://hub:7891/api/federation/leave');
+      expect(init.headers.authorization).toBe('Bearer TOK');
+      return jsonResp(200, { ok: true });
+    });
     res = makeRes();
-    await handleFederationSpokeApi(makeReq('POST', '/api/team/leave-remote', { hubUrl: 'http://hub:7891', teamId: 'default' }), res, new URL('http://x/api/team/leave-remote'), { dataDir });
+    await handleFederationSpokeApi(makeReq('POST', '/api/team/leave-remote', { hubUrl: 'http://hub:7891', teamId: 'default' }), res, new URL('http://x/api/team/leave-remote'), { dataDir, fetcher: leaveFetcher as any });
     expect(res.statusCode).toBe(200);
+    expect(json(res).hubRevoked).toBe(true);
+    expect(leaveFetcher).toHaveBeenCalled();
     expect(listMemberships(dataDir).length).toBe(0);
   });
 });

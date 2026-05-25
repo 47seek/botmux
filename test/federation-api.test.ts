@@ -22,11 +22,12 @@ let dataDir: string;
 beforeEach(() => { dataDir = mkdtempSync(join(tmpdir(), 'botmux-fedapi-')); state.dataDir = dataDir; });
 
 function writeBots(entries: any[]) { writeFileSync(join(dataDir, 'bots-info.json'), JSON.stringify(entries)); }
-function makeReq(method: string, path: string, body?: unknown): any {
-  const req: any = { method, url: path, headers: {} };
+function makeReq(method: string, path: string, body?: unknown, headers: Record<string, string> = {}): any {
+  const req: any = { method, url: path, headers };
   req[Symbol.asyncIterator] = async function* () { if (body !== undefined) yield Buffer.from(JSON.stringify(body)); };
   return req;
 }
+const bearer = (t: string) => ({ authorization: `Bearer ${t}` });
 function makeRes(): any {
   const res: any = { statusCode: 0, _headers: {}, _body: '' };
   res.setHeader = (k: string, v: any) => { res._headers[k.toLowerCase()] = v; };
@@ -85,11 +86,39 @@ describe('handleFederationApi', () => {
     await call(makeReq('POST', '/api/federation/sync', { syncToken, bots: [{ larkAppId: 'cli_b1', botName: 'B1', cliId: 'codex' }, { larkAppId: 'cli_b2', botName: 'B2', cliId: 'gemini' }] }), res, '/api/federation/sync');
     expect(res.statusCode).toBe(200);
 
-    // roster reflects hub local + B's two bots
+    // roster reflects hub local + B's two bots (token in Authorization header)
+    res = makeRes();
+    await call(makeReq('GET', '/api/federation/roster', undefined, bearer(syncToken)), res, '/api/federation/roster');
+    expect(res.statusCode).toBe(200);
+    expect(json(res).bots.map((b: any) => b.larkAppId).sort()).toEqual(['cli_b1', 'cli_b2', 'cli_hub']);
+
+    // a second deployment can't re-bind by re-joining with the same id → 409
+    const { code: code2 } = createInvite(dataDir, DEFAULT_TEAM_ID, 'on_owner');
+    res = makeRes();
+    await call(makeReq('POST', '/api/federation/join', { inviteCode: code2, deployment: { deploymentId: 'dep_b', name: 'B', bots: [] } }), res, '/api/federation/join');
+    expect(res.statusCode).toBe(409);
+    expect(json(res).error).toBe('deployment_already_joined');
+
+    // leave (authed by syncToken) drops the deployment; roster then 403s
+    res = makeRes();
+    await call(makeReq('POST', '/api/federation/leave', { syncToken }), res, '/api/federation/leave');
+    expect(res.statusCode).toBe(200);
+    res = makeRes();
+    await call(makeReq('GET', '/api/federation/roster', undefined, bearer(syncToken)), res, '/api/federation/roster');
+    expect(res.statusCode).toBe(403);
+  });
+
+  it('roster still accepts ?syncToken= as a short-term compat fallback', async () => {
+    writeBots([]);
+    ensureDefaultTeam(dataDir);
+    addMember(dataDir, DEFAULT_TEAM_ID, { unionId: 'on_owner' });
+    const { code } = createInvite(dataDir, DEFAULT_TEAM_ID, 'on_owner');
+    let res = makeRes();
+    await call(makeReq('POST', '/api/federation/join', { inviteCode: code, deployment: { deploymentId: 'dep_c', name: 'C', bots: [] } }), res, '/api/federation/join');
+    const { syncToken } = json(res);
     res = makeRes();
     await call(makeReq('GET', '/api/federation/roster?syncToken=' + syncToken), res, '/api/federation/roster?syncToken=' + syncToken);
     expect(res.statusCode).toBe(200);
-    expect(json(res).bots.map((b: any) => b.larkAppId).sort()).toEqual(['cli_b1', 'cli_b2', 'cli_hub']);
   });
 
   it('join rejects a bad invite code (403)', async () => {

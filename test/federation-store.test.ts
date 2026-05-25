@@ -8,7 +8,7 @@ import { join } from 'node:path';
 import { describe, it, expect, beforeEach } from 'vitest';
 import { getDeploymentIdentity, setDeploymentName } from '../src/services/deployment-identity.js';
 import {
-  registerDeployment, syncDeployment, getDeploymentByToken,
+  registerDeployment, syncDeployment, getDeploymentByToken, removeDeploymentByToken,
   listFederatedDeployments, removeDeployment, removeTeamFederation,
 } from '../src/services/federation-store.js';
 import { addMembership, listMemberships, removeMembership } from '../src/services/federation-membership-store.js';
@@ -38,7 +38,8 @@ describe('deployment-identity', () => {
 
 describe('federation-store (hub)', () => {
   it('registers a deployment, issues a syncToken, resolves it back', () => {
-    const { syncToken } = registerDeployment(dataDir, 'default', { deploymentId: 'dep_x', name: 'X', bots: [bot('cli_a')] });
+    const { syncToken, created } = registerDeployment(dataDir, 'default', { deploymentId: 'dep_x', name: 'X', bots: [bot('cli_a')] });
+    expect(created).toBe(true);
     expect(syncToken.length).toBeGreaterThan(20);
     const r = getDeploymentByToken(dataDir, syncToken);
     expect(r?.teamId).toBe('default');
@@ -46,14 +47,22 @@ describe('federation-store (hub)', () => {
     expect(listFederatedDeployments(dataDir, 'default').map(d => d.deploymentId)).toEqual(['dep_x']);
   });
 
-  it('re-registering the same deployment keeps the token and refreshes bots', () => {
+  it('re-registering an existing deploymentId is refused with NO token (no hijack)', () => {
     const first = registerDeployment(dataDir, 'default', { deploymentId: 'dep_x', name: 'X', bots: [bot('cli_a')] });
-    const second = registerDeployment(dataDir, 'default', { deploymentId: 'dep_x', name: 'X2', bots: [bot('cli_a'), bot('cli_b')] });
-    expect(second.syncToken).toBe(first.syncToken); // no token churn
+    const second = registerDeployment(dataDir, 'default', { deploymentId: 'dep_x', name: 'X2', bots: [bot('cli_b')] });
+    expect(second.created).toBe(false);
+    expect(second.syncToken).toBe(''); // never hand back the existing token
     const list = listFederatedDeployments(dataDir, 'default');
-    expect(list.length).toBe(1);
-    expect(list[0].name).toBe('X2');
-    expect(list[0].bots.length).toBe(2);
+    expect(list.length).toBe(1);            // not duplicated
+    expect(list[0].syncToken).toBe(first.syncToken); // unchanged
+    expect(list[0].name).toBe('X');         // not overwritten by the rejected re-register
+  });
+
+  it('removeDeploymentByToken drops the owning deployment; unknown token is false', () => {
+    const { syncToken } = registerDeployment(dataDir, 'default', { deploymentId: 'dep_x', name: 'X', bots: [] });
+    expect(removeDeploymentByToken(dataDir, 'nope')).toBe(false);
+    expect(removeDeploymentByToken(dataDir, syncToken)).toBe(true);
+    expect(listFederatedDeployments(dataDir, 'default')).toEqual([]);
   });
 
   it('syncDeployment updates bots + heartbeat by token; unknown token is false', () => {
