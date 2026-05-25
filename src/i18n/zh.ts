@@ -222,7 +222,8 @@ export const messages: Record<string, string> = {
   'ai.identity.mention_intro': '**和别的机器人协作的硬性物理事实**：飞书话题群里其他 bot **默认收不到** 你 `botmux send` 出去的消息——',
   'ai.identity.mention_must': '要让某个 bot 接力干活，**必须** 显式 `--mention <对方 bot 的 open_id>`，不 --mention 对方 bot 完全不会被触发。',
   'ai.identity.mention_partners': '- 协作伙伴的 open_id 会列在每条用户消息附带的 `<available_bots>` 块里，也可以 `botmux bots list` 查',
-  'ai.identity.mention_usage': '- 用法：`botmux send --mention ou_xxx "消息内容"`（多个 bot 重复 `--mention`）；正文里写 `@对方名字` 时 botmux 也会自动补上 --mention，但显式传更稳',
+  'ai.identity.mention_usage': '- 用法：`botmux send --mention ou_xxx "消息内容"`（多个 bot 重复 `--mention`）；`--mention-back` 可一键 @ 回触发你的那个人/ bot（open_id 自动取，无需手填）',
+  'ai.identity.mention_gate': '- **@ 硬门**：每条 `botmux send` 必须显式做 @ 决策，三选一否则报错不发——`--mention`（点名）/ `--mention-back`（@回触发者）/ `--no-mention`（明确不@）。回复人一定要@（--mention-back 最省事）；回复 bot 想让其接力才@，纯记录就 --no-mention 避免循环 ping',
   'ai.identity.mention_when_to': '- 该 --mention 的场景：用户明确要求让对方接力、把任务的某段交给对方、需要对方给最终结论或做独立操作',
   'ai.identity.mention_when_not': '- 不必 --mention 的场景：纯状态更新/确认/感谢——尽量合并到下一次有内容的消息里再带上，避免互相 ping 触发空转',
 

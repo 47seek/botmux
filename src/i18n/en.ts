@@ -219,7 +219,8 @@ export const messages: Record<string, string> = {
   'ai.identity.mention_intro': '**Hard fact about cross-bot collaboration**: in a Lark topic group, other bots **do NOT receive** the messages you send via `botmux send` by default —',
   'ai.identity.mention_must': 'To hand work off to another bot, you **MUST** explicitly pass `--mention <other-bot-open-id>`. Without `--mention`, the other bot is not triggered at all.',
   'ai.identity.mention_partners': '- Collaborator `open_id`s are listed in the `<available_bots>` block attached to every user message. You can also run `botmux bots list`.',
-  'ai.identity.mention_usage': '- Usage: `botmux send --mention ou_xxx "message"` (repeat `--mention` for multiple bots). When you write `@name` in the body, botmux also auto-injects `--mention`, but passing it explicitly is safer.',
+  'ai.identity.mention_usage': '- Usage: `botmux send --mention ou_xxx "message"` (repeat `--mention` for multiple bots). `--mention-back` @s back whoever (person or bot) triggered this turn — open_id is pulled from the session, no need to type it.',
+  'ai.identity.mention_gate': '- **@ hard-gate**: every `botmux send` MUST make an explicit @ decision or it errors out — one of `--mention` (name someone) / `--mention-back` (@ the triggerer) / `--no-mention` (explicitly none). Always @ a human you reply to (--mention-back is easiest); @ a bot only when you want it to act, otherwise --no-mention to avoid ping loops.',
   'ai.identity.mention_when_to': '- When to `--mention`: the user explicitly asks for the handoff, you\'re passing a sub-task to the other bot, or you need them to give the final result / take an independent action.',
   'ai.identity.mention_when_not': '- When NOT to `--mention`: pure status updates / acknowledgements / thanks — fold them into the next message that has real content, to avoid mutual ping-spam.',
 

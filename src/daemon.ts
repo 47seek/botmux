@@ -1995,10 +1995,16 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
   if (ds) {
     markSessionActivity(ds);
     const callerOpenId = parsed.senderId || data?.sender?.sender_id?.open_id;
+    // quoteTargetId changes every inbound message (always a new message_id), so
+    // — unlike lastCallerOpenId — persist unconditionally. Powers `botmux send`'s
+    // default chat-scope quote chain + --mention-back.
+    ds.session.quoteTargetId = parsed.messageId;
+    ds.session.quoteTargetSenderOpenId = callerOpenId;
+    ds.session.quoteTargetSenderIsBot = isForeignBot;
     if (callerOpenId && ds.session.lastCallerOpenId !== callerOpenId) {
       ds.session.lastCallerOpenId = callerOpenId;
-      sessionStore.updateSession(ds.session);
     }
+    sessionStore.updateSession(ds.session);
   }
 
   // If waiting for repo selection, buffer the message and remind user
@@ -2058,6 +2064,9 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     session.larkAppId = larkAppId;
     session.ownerOpenId = ownerOpenId;
     session.lastCallerOpenId = senderOId;
+    session.quoteTargetId = parsed.messageId;
+    session.quoteTargetSenderOpenId = senderOId;
+    session.quoteTargetSenderIsBot = isForeignBot;
     session.lastMessageAt = new Date(now).toISOString();
     session.scope = scope;
     sessionStore.updateSession(session);
