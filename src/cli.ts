@@ -2827,7 +2827,10 @@ async function cmdSend(rest: string[]): Promise<void> {
 
     const explicitKnownBotMention = hasKnownBotMention(text, mentions, botEntries, crossRef, appId);
     const knownBotOpenIds = knownBotOpenIdsFromCrossRef(crossRef, botEntries, appId);
-    const footerAddressing = sendTopLevel
+    // --no-mention 显式不 @ 任何人 → 连 footer 的"发送给/cc"寻址 <at> 也清空，
+    // 否则 footer 仍会 @ 人，与 --no-mention 语义和"未@任何人"输出自相矛盾
+    // （Codex review P2）。--top-level 同样无特定收件人。
+    const footerAddressing = (sendTopLevel || noMention)
       ? { sendTo: undefined as string | undefined, cc: [] as string[] }
       : buildFooterAddressing(s, {
           isOncall: !!oncallEntry,

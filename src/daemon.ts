@@ -1690,6 +1690,14 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   const now = Date.now();
   session.larkAppId = larkAppId;
   session.ownerOpenId = senderOpenId;
+  session.lastCallerOpenId = senderOpenId;
+  // First turn of a brand-new topic: seed quoteTarget* so the very first
+  // `botmux send` can --mention-back / 引用 the triggering message (chat scope).
+  // Without this the first reply hits hasQuoteTargetSender=false (exit 2) and
+  // chat-scope首条不引用. Use the event's sender open_id (correct app scope).
+  session.quoteTargetId = parsed.messageId;
+  session.quoteTargetSenderOpenId = senderOpenId;
+  session.quoteTargetSenderIsBot = parsed.senderType === 'app' || parsed.senderType === 'bot';
   session.lastMessageAt = new Date(now).toISOString();
   session.scope = scope;
   sessionStore.updateSession(session);
