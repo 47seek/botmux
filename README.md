@@ -169,7 +169,8 @@ CLI 进入 botmux 会话时自动获得 `~/.botmux/bin` 在 PATH 中，以及一
 ## 前置要求
 
 - **Node.js** >= 20
-- **AI 编程 CLI** 已安装并完成认证（`claude`、`codex`、`cursor-agent`、`gemini`、`opencode`、`mtr` 或 `agy`（Antigravity）在 PATH 中）
+- **AI 编程 CLI** 已安装并完成认证（`claude`、`codex`、`coco`、`cursor-agent`、`gemini`、`opencode`、`mtr`、`hermes` 或 `agy`（Antigravity）在 PATH 中）
+  - **CoCo 最低版本 `0.120.32`**：type-ahead（会话忙时即可发新消息，由 CoCo 自己的消息队列接住）依赖 0.120.32+ 的行为；更早版本忙时输入可能丢失或串行，请升级后再用
 - **tmux** >= 3.x（可选，安装后自动启用会话常驻）
 - **CJK 字体**（用于截图渲染中文/emoji）：
   - macOS 自带 PingFang/Hiragino，无需配置
@@ -302,6 +303,7 @@ botmux autostart enable
 |------|------|
 | `/repo` | 显示项目选择卡片（交互式下拉 + 文本列表） |
 | `/repo <N>` | 切换到上次扫描的第 N 个项目 |
+| `/repo <路径\|项目名>` | 跳过选择卡片，直接指定路径（相对/绝对）或 workingDir 下的一级项目名 |
 | `/skip` | 跳过仓库选择卡片，直接用默认目录开启会话 |
 | `/cd <路径>` | 切换工作目录并重启 CLI 进程 |
 | `/status` | 查看会话信息（运行时间、终端地址等） |
@@ -547,13 +549,14 @@ botmux setup
 | `larkAppId` | 是 | 飞书应用 App ID |
 | `larkAppSecret` | 是 | 飞书应用 App Secret |
 | `name` | 否 | `botmux status` 中的进程名后缀；例如 `claude-main` 会显示为 `botmux-claude-main`，留空默认 `botmux-<序号>` |
-| `cliId` | 否 | CLI 适配器，默认 `claude-code`（可选：`aiden`、`coco`、`codex`、`cursor`、`gemini`、`opencode`、`antigravity`、`mtr`） |
+| `cliId` | 否 | CLI 适配器，默认 `claude-code`（可选：`aiden`、`coco`、`codex`、`cursor`、`gemini`、`opencode`、`antigravity`、`mtr`、`hermes`） |
 | `cliPathOverride` | 否 | CLI 入口的绝对路径，用于套 wrapper / router；典型场景：ccr、claude-w、aiden-x-claude 等自定义入口 |
 | `backendType` | 否 | 会话后端：`pty` 或 `tmux`（默认自动检测） |
 | `workingDir` | 否 | 默认工作目录，支持逗号分隔多个目录。新话题的 repo 选择卡片会**从该目录自身向下**递归查找 git 仓库（最多 3 层），不再向上扫父目录：指向仓库集合根目录（如 `~/projects`）即列出其下所有仓库，指向单个仓库则只列该仓库（及其 linked worktrees） |
 | `defaultWorkingDir` | 否 | 单仓库默认目录：新话题在无 oncall 绑定 / 无同群兄弟 session 时直接进入该目录，跳过 repo 选择卡片。`/cd <path>` 仍可临时切换；下一个新话题回到该默认值。**与 `defaultOncall` 的区别**：不写 `oncallChats`、不修改 `canTalk`/`canOperate` 权限模型 |
 | `allowedUsers` | 否 | 允许的用户列表（**完整邮箱**如 `alice@example.com`，或 open_id `ou_xxx`）。邮箱前缀无法解析、会被丢弃。配置了 `allowedChatGroups` 时此项必须至少有一个条目作为 owner |
 | `allowedChatGroups` | 否 | 可对话群列表（飞书 `chat_id`，如 `oc_xxx`）。**在这些群里**任何成员都能与机器人对话（按消息所在群判断，新人进群即生效、退群即失权，无需重启）；仅授对话权（`canTalk`），敏感操作仍由 `allowedUsers` 控制。等价于 owner 在该群发 `/grant`（不带 @）。 |
+| `globalGrants` | 否 | 全局可对话名单（`open_id` 列表，如 `ou_xxx`；人或 bot 均可）。名单内的对象可在**任意群**与机器人对话；仅授对话权（`canTalk`），敏感操作仍由 `allowedUsers` 控制。通常由 owner 在授权卡上点「全局授权对话」写入，也可在此手动配置。 |
 | `oncallChats` | 否 | oncall 绑定（`/oncall bind` 写入），形如 `[{ "chatId": "oc_xxx", "workingDir": "~/projects/foo" }]`，群内任何成员可 @ 提问 |
 
 **配置优先级：** `BOTS_CONFIG` 环境变量 → `~/.botmux/bots.json`

@@ -117,6 +117,23 @@ export class CodexBridgeQueue {
           }
           if (!tooOld && fingerprintOk) {
             next.started = true;
+            // Anchor the bridge-fallback suppression window to when the turn
+            // ACTUALLY started processing (the transcript user event's
+            // timestamp), not when the worker marked it. With type-ahead the
+            // worker marks turn N+1 immediately after turn N (both at flush
+            // time), but CoCo only writes turn N+1's user event when it
+            // dequeues it — i.e. after turn N's assistant_final. Without this
+            // override the [markTimeMs, nextTurn.markTimeMs) windows are all
+            // bunched at flush time, so turn N's own `botmux send` (which
+            // lands seconds later, after the model replies) falls OUTSIDE its
+            // own window and the fallback isn't suppressed → duplicate emit.
+            // `max` (not bare assignment) keeps the lower bound from ever
+            // moving backwards: a dequeue event can only be at or after the
+            // mark, and the -5s tooOld tolerance must not be able to widen the
+            // window into a previous turn's sends. Mirrors what Claude's
+            // BridgeTurnQueue.handleTurnStart does with eventTimeMs.
+            if (next.markTimeMs === undefined) next.markTimeMs = ev.timestampMs;
+            else next.markTimeMs = Math.max(next.markTimeMs, ev.timestampMs);
             this.collecting = next;
             consumedNext = true;
           }

@@ -86,7 +86,7 @@ const writeToken = randomBytes(16).toString('hex');
 
 let sessionId = '';
 let lastInitConfig: Extract<DaemonToWorker, { type: 'init' }> | null = null;
-const CLI_DISPLAY_NAMES: Record<string, string> = { 'claude-code': 'Claude', aiden: 'Aiden', coco: 'CoCo', codex: 'Codex', cursor: 'Cursor', gemini: 'Gemini', opencode: 'OpenCode', antigravity: 'Antigravity', mtr: 'MTR' };
+const CLI_DISPLAY_NAMES: Record<string, string> = { 'claude-code': 'Claude', aiden: 'Aiden', coco: 'CoCo', codex: 'Codex', cursor: 'Cursor', gemini: 'Gemini', opencode: 'OpenCode', antigravity: 'Antigravity', mtr: 'MTR', hermes: 'Hermes' };
 function cliName(): string { return CLI_DISPLAY_NAMES[lastInitConfig?.cliId ?? ''] ?? 'CLI'; }
 let isPromptReady = false;
 /** Mutex for async flushPending — prevents concurrent flush loops. */
@@ -302,6 +302,11 @@ function formatHeadlessLocalTurnContent(assistantText: string): string | null {
 // needed. Append-only over a shared file (instead of a per-turn marker) is
 // type-ahead safe: type-ahead'd turns each have their own [markTimeMs,
 // nextTurn.markTimeMs) window, and a stray send only fills its own bucket.
+// This relies on each turn's markTimeMs reflecting when it ACTUALLY started
+// processing, not when the worker marked it — the structured queue overrides
+// markTimeMs to the dequeue-time transcript event (CodexBridgeQueue.ingest)
+// and emitReadyCodexTurns only treats a STARTED next turn as a boundary, so
+// the early back-to-back marks type-ahead produces don't collapse the windows.
 function bridgeMarkerPath(): string | undefined {
   if (!process.env.SESSION_DATA_DIR || !sessionId) return undefined;
   return join(process.env.SESSION_DATA_DIR, 'turn-sends', `${sessionId}.jsonl`);
@@ -1503,7 +1508,17 @@ function emitReadyCodexTurns(): void {
   // should reach the thread. Skip marker IO entirely.
   const markers = adoptMode ? [] : readSendMarkers();
   const remaining = codexBridgeQueue.peek();
-  const nextPendingMarkTimeMs = remaining.length > 0 ? remaining[0].markTimeMs : undefined;
+  // Only a STARTED pending turn can bound the last ready turn's send window.
+  // An unstarted turn hasn't been dequeued yet (its user event hasn't landed),
+  // so it has produced no sends to leak backwards — and under type-ahead its
+  // markTimeMs is still the early flush-time mark, which would prematurely
+  // (often invalidly, lower>upper) close the ready turn's window and let its
+  // own send escape suppression → duplicate. A started-but-not-final turn
+  // (model mid-tool-use for N+1) keeps its real overridden markTimeMs as the
+  // boundary, preserving the original leak guard.
+  const nextPendingMarkTimeMs = remaining.length > 0 && remaining[0].started
+    ? remaining[0].markTimeMs
+    : undefined;
   for (let i = 0; i < ready.length; i++) {
     const turn = ready[i];
     if (!turn.finalText) continue;
@@ -2251,10 +2266,23 @@ async function flushPending(): Promise<void> {
   // Lark message. Now that the queue handles queued_command identically to
   // role:user (and overrides markTimeMs to the dequeue-time event timestamp
   // so the gate window is correct), Claude bridge can run with type-ahead
-  // again. Codex bridge stays serial because its queue hasn't been upgraded.
+  // again.
+  //
+  // CoCo (0.120.32+) also tolerates type-ahead, but for a different reason
+  // than Claude: it parks a submit-while-busy message in its own TUI queue
+  // ("↑ Press up to edit queued messages") and only writes the user event to
+  // events.jsonl when it DEQUEUES and starts processing it — i.e. AFTER the
+  // previous turn's assistant_final. So the transcript stays strictly
+  // interleaved (user1 → asst1 → user2 → asst2) and CodexBridgeQueue's
+  // single-`collecting` attribution stays correct without the queued_command
+  // upgrade Claude needed. (The submit log history.jsonl, which the adapter's
+  // writeInput verification polls, IS written at submit time even for a queued
+  // message, so verification doesn't spuriously fail either.) Only the Codex
+  // rollout bridge stays serial — its queue hasn't been validated for the
+  // back-to-back user_message ordering that type-ahead can produce there.
   const claudeBridgeActive = !!bridgeJsonlPath && !lastInitConfig?.adoptMode;
   const codexBridgeActive = codexBridgeFallbackActive();
-  const typeAheadAllowed = cliAdapter.supportsTypeAhead && !codexBridgeActive;
+  const typeAheadAllowed = cliAdapter.supportsTypeAhead && !structuredBridgeIsCodex();
   if (!isPromptReady && !typeAheadAllowed) return;
 
   isFlushing = true;
@@ -2321,16 +2349,18 @@ async function flushPending(): Promise<void> {
       if (result && result.submitted === false && backend) {
         scheduleSubmitFailureNotify(msg, result.recheck, '会话 JSONL', bridgeTurnId, result.failureReason, turnSeq);
       }
-      // Codex bridge: stop after one writeInput per idle cycle. Codex's
-      // bridge queue doesn't yet attribute queued_command-equivalents, so
-      // type-ahead'd submits would have their assistant text dropped or
+      // Codex rollout bridge: stop after one writeInput per idle cycle.
+      // Codex's bridge queue doesn't yet attribute queued_command-equivalents,
+      // so type-ahead'd submits would have their assistant text dropped or
       // mis-attributed. We resume on the next idle, by which point Codex
       // has finished and the next message can be a normal user_message
-      // submit. Claude bridge no longer takes this break — its
+      // submit. Claude bridge and CoCo no longer take this break — Claude's
       // BridgeTurnQueue handles `attachment(queued_command)` events
-      // identically to `role:user`, so type-ahead'd turns are correctly
-      // attributed and no longer need the serial-per-idle guard.
-      if (codexBridgeActive && pendingMessages.length > 0) break;
+      // identically to `role:user`, and CoCo parks queued submits in its own
+      // TUI queue (writing the events.jsonl user event only at dequeue time),
+      // so both keep the transcript interleaved and attribute correctly. We
+      // WANT CoCo to drain all pending here so they land in its TUI queue.
+      if (structuredBridgeIsCodex() && pendingMessages.length > 0) break;
     }
   } finally {
     isFlushing = false;
@@ -2353,12 +2383,12 @@ function sendToPty(content: string): void {
     // Tear down the prompt card so the user doesn't see stale options.
     send({ type: 'tui_prompt_resolved', selectedText: 'user-override' });
   }
-  // See flushPending: only Codex bridge still serialises type-ahead.
-  // Claude bridge now attributes `attachment(queued_command)` events
-  // identically to `role:user`, so type-ahead'd submits land in the right
-  // turn and we no longer need to gate the entry path on claudeBridgeActive.
-  const codexBridgeActive = codexBridgeFallbackActive();
-  const typeAheadAllowed = cliAdapter.supportsTypeAhead && !codexBridgeActive;
+  // See flushPending: only the Codex rollout bridge still serialises
+  // type-ahead. Claude attributes `attachment(queued_command)` events
+  // identically to `role:user`, and CoCo parks queued submits in its own TUI
+  // queue, so both land type-ahead'd submits in the right turn — only Codex
+  // needs the entry path gated.
+  const typeAheadAllowed = cliAdapter.supportsTypeAhead && !structuredBridgeIsCodex();
   if (isPromptReady || isFlushing || typeAheadAllowed) {
     log(`Writing to PTY: "${content.substring(0, 80)}"`);
     flushPending();  // fire-and-forget async; no-op if already flushing

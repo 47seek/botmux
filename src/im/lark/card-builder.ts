@@ -15,6 +15,7 @@ const cliDisplayNames: Record<CliId, string> = {
   'opencode': 'OpenCode',
   'antigravity': 'Antigravity',
   'mtr': 'MTR',
+  'hermes': 'Hermes',
 };
 
 export function getCliDisplayName(cliId: CliId): string {
@@ -209,6 +210,7 @@ export function buildStreamingCard(
   showTakeover?: boolean,
   locale?: Locale,
   usageLimit?: CliUsageLimitState,
+  writableTerminalUrl?: string,
 ): string {
   const effectiveCliId = cliId ?? 'claude-code';
   const cliName = getCliDisplayName(effectiveCliId);
@@ -324,6 +326,17 @@ export function buildStreamingCard(
     });
   }
   elements.push({ tag: 'action', actions: headerActions });
+
+  // ── Writable terminal link (opt-in) ─────────────────────────────────────
+  // When the bot enables `writableTerminalLinkInCard`, embed the token-bearing
+  // link right in the card so anyone here can open a writable terminal without
+  // the get-write-link → DM round-trip. The link is intentionally group-visible.
+  if (writableTerminalUrl) {
+    elements.push({
+      tag: 'markdown',
+      content: t('card.writable_terminal_link', { url: writableTerminalUrl }, locale),
+    });
+  }
 
   // ── Quick-action keys (only when the screenshot is visible — in text mode
   //    there's no visible cursor/input, so these keys would fire blindly) ──
@@ -450,19 +463,22 @@ export function buildGrantCard(o: GrantCardOpts, locale?: Locale): string {
     ? t('card.grant.body_request', { name: escapeMd(o.requesterName), owner: o.ownerOpenId }, locale)
     : t('card.grant.body_owner', { name: escapeMd(o.requesterName), owner: o.ownerOpenId }, locale);
   const v = { target_open_id: o.requesterOpenId, chat_id: o.chatId, nonce: o.nonce };
+  // 「全局授权对话」只在 owner 主动发卡时出现：owner 一眼明确要给全局；request 模式（成员
+  // 自助申请）只提供「本群」，避免成员把自己申请到全局。两个授权按钮都是 talk-only。
+  const grantButtons: any[] = [
+    { tag: 'button', type: 'primary', text: { tag: 'plain_text', content: t('card.grant.btn_chat', undefined, locale) }, value: { action: 'grant_chat', ...v } },
+  ];
+  if (o.mode === 'owner') {
+    grantButtons.push({ tag: 'button', type: 'default', text: { tag: 'plain_text', content: t('card.grant.btn_global', undefined, locale) }, value: { action: 'grant_global', ...v } });
+  }
+  grantButtons.push({ tag: 'button', type: 'danger', text: { tag: 'plain_text', content: t('card.grant.btn_deny', undefined, locale) }, value: { action: 'grant_deny', ...v } });
   const card = {
     config: { wide_screen_mode: true },
     header: { template: 'orange', title: { tag: 'plain_text', content: t('card.grant.title', undefined, locale) } },
     elements: [
       { tag: 'div', text: { tag: 'lark_md', content: body } },
       { tag: 'hr' },
-      {
-        tag: 'action',
-        actions: [
-          { tag: 'button', type: 'primary', text: { tag: 'plain_text', content: t('card.grant.btn_chat', undefined, locale) }, value: { action: 'grant_chat', ...v } },
-          { tag: 'button', type: 'danger', text: { tag: 'plain_text', content: t('card.grant.btn_deny', undefined, locale) }, value: { action: 'grant_deny', ...v } },
-        ],
-      },
+      { tag: 'action', actions: grantButtons },
       { tag: 'note', elements: [{ tag: 'lark_md', content: t('card.grant.note', undefined, locale) }] },
     ],
   };
