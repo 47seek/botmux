@@ -54,6 +54,7 @@ import {
   buildFooterAddressing,
   hasKnownBotMention,
   knownBotOpenIdsFromCrossRef,
+  orderedFooterRecipients,
   type BotMentionEntry,
 } from './utils/bot-routing.js';
 import { isLocale, setDefaultLocale, SUPPORTED_LOCALES, type Locale } from './i18n/index.js';
@@ -2830,22 +2831,13 @@ async function cmdSend(rest: string[]): Promise<void> {
     // --no-mention 显式不 @ 任何人 → 连 footer 的"发送给/cc"寻址 <at> 也清空，
     // 否则 footer 仍会 @ 人，与 --no-mention 语义和"未@任何人"输出自相矛盾
     // （Codex review P2）。--top-level 同样无特定收件人。
-    const footerAddressingRaw = (sendTopLevel || noMention)
+    const footerAddressing = (sendTopLevel || noMention)
       ? { sendTo: undefined as string | undefined, cc: [] as string[] }
       : buildFooterAddressing(s, {
           isOncall: !!oncallEntry,
           hasExplicitBotMention: explicitKnownBotMention,
           knownBotOpenIds,
         });
-    // De-dupe vs body @: if someone is already @'d in the body (典型是
-    // --mention-back @ 了触发者，而 footer 的"发送给"又指向同一个 owner/caller)，
-    // 从 footer 去掉，避免一条消息里出现两个相同的 @。
-    const bodyMentionIds = new Set(mentions.map(m => m.open_id));
-    const footerAddressing = {
-      sendTo: footerAddressingRaw.sendTo && !bodyMentionIds.has(footerAddressingRaw.sendTo)
-        ? footerAddressingRaw.sendTo : undefined,
-      cc: footerAddressingRaw.cc.filter(id => !bodyMentionIds.has(id)),
-    };
 
     // Decide: interactive card (renders markdown) vs. post (plain text).
     // Explicit --card / --text wins; otherwise auto-detect markdown syntax.
@@ -2880,9 +2872,9 @@ async function cmdSend(rest: string[]): Promise<void> {
           return `<at id=${openId}></at>`;
         });
       }
-      const trailingAts: string[] = [];
-      for (const m of mentions) if (!usedIds.has(m.open_id)) trailingAts.push(`<at id=${m.open_id}></at>`);
-      if (trailingAts.length > 0) md = md ? `${md}\n\n${trailingAts.join(' ')}` : trailingAts.join(' ');
+      // Non-inlined mentions are no longer dangled as a trailing @ block at the
+      // body bottom — they're consolidated onto the footer `发送给：` line below
+      // (human addressee first, then explicit targets). See orderedFooterRecipients.
 
       // Inline images into the markdown via ![](img_key). If caller used an
       // `![alt](img:N)` placeholder, substitute by 0-based index; any remaining
@@ -2911,12 +2903,17 @@ async function cmdSend(rest: string[]): Promise<void> {
       // the session owner). Bot recipients are filtered out so footer chrome
       // cannot accidentally wake a sibling bot.
       const footerParts = ['[botmux](https://github.com/deepcoldy/botmux)'];
-      // Top-level publish has no specific recipient — drop "发送给/cc" addressing
-      // so the message doesn't @ the session owner who isn't even in the target chat.
-      const addressing = footerAddressing;
-      if (addressing.sendTo) footerParts.push(`发送给：<at id=${addressing.sendTo}></at>`);
-      if (addressing.cc.length > 0) {
-        footerParts.push(`cc：${addressing.cc.map(id => `<at id=${id}></at>`).join(' ')}`);
+      // All real mentions land on one footer line: human addressee first, then
+      // explicit @ targets (incl. handoff bots), then cc. Ids already inlined in
+      // the body prose are skipped. Top-level publish keeps sendTo empty.
+      const footerRecipients = orderedFooterRecipients({
+        sendTo: footerAddressing.sendTo,
+        mentionIds: mentions.map(m => m.open_id),
+        cc: footerAddressing.cc,
+        inlinedIds: usedIds,
+      });
+      if (footerRecipients.length > 0) {
+        footerParts.push(`发送给：${footerRecipients.map(id => `<at id=${id}></at>`).join(' ')}`);
       }
       elements.push({ tag: 'hr' });
       elements.push({
@@ -2950,28 +2947,24 @@ async function cmdSend(rest: string[]): Promise<void> {
 
       for (const key of imageKeys) postContent.push([{ tag: 'img', image_key: key }]);
 
-      if (mentions.length > 0) {
-        const usedIds = new Set<string>();
-        for (const para of postContent) for (const n of para) if (n.tag === 'at') usedIds.add(n.user_id);
-        const unused = mentions.filter(m => !usedIds.has(m.open_id));
-        if (unused.length > 0) {
-          if (postContent.length === 0) postContent.push([]);
-          for (const m of unused) postContent[postContent.length - 1].push({ tag: 'at', user_id: m.open_id });
-        }
-      }
-
-      // Footer: mirror the card layout — a blank paragraph separates the body
-      // from the addressing line(s). Top-level publish has no specific
-      // recipient; bot recipients are filtered out by footerAddressing.
-      const addressing = footerAddressing;
-      if (addressing.sendTo || addressing.cc.length > 0) {
+      // Footer: mirror the card layout — all real mentions go on one
+      // `发送给：` line (human addressee first, then explicit targets, then cc),
+      // separated from the body by a blank paragraph. Ids already inlined in the
+      // body prose are skipped. Top-level publish keeps sendTo empty.
+      const inlinedIds = new Set<string>();
+      for (const para of postContent) for (const n of para) if (n.tag === 'at') inlinedIds.add(n.user_id);
+      const footerRecipients = orderedFooterRecipients({
+        sendTo: footerAddressing.sendTo,
+        mentionIds: mentions.map(m => m.open_id),
+        cc: footerAddressing.cc,
+        inlinedIds,
+      });
+      if (footerRecipients.length > 0) {
         if (postContent.length > 0) postContent.push([{ tag: 'text', text: '' }]);
-        if (addressing.sendTo) {
-          postContent.push([{ tag: 'text', text: '发送给：' }, { tag: 'at', user_id: addressing.sendTo }]);
-        }
-        if (addressing.cc.length > 0) {
-          postContent.push([{ tag: 'text', text: 'cc：' }, ...addressing.cc.map(id => ({ tag: 'at', user_id: id }))]);
-        }
+        postContent.push([
+          { tag: 'text', text: '发送给：' },
+          ...footerRecipients.map(id => ({ tag: 'at', user_id: id })),
+        ]);
       }
 
       const postJson = JSON.stringify({ zh_cn: { title: '', content: postContent } });
