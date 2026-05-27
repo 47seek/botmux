@@ -1,7 +1,8 @@
 // Team (federation) page: manage this deployment's team membership across
-// deployments — show my bots + federated bots (search / filter / collapse /
-// edit capability+role for LOCAL bots), mint invite codes (Hub), join other
-// deployments' teams by invite (Spoke), and 拉群. All dashboard-token authed.
+// deployments. Unified "我的团队" view — each team (the one I host + ones I
+// joined) is one collapsible block: deployments → bots, with a single 拉群
+// control per team. Edit capability/role for MY bots; mint invite codes (Hub),
+// join others' teams by invite (Spoke). All dashboard-token authed.
 // See docs/federation-design.md.
 import { escapeHtml } from './ui.js';
 
@@ -15,6 +16,20 @@ interface LocalResp {
   suggestedHubUrl: string; deployments: RosterDeployment[]; bots: RosterBot[];
 }
 
+/** One team block in the unified view: the team I host (kind=local) or a team I
+ *  joined (kind=remote). Both render identically (deployments → bots + 拉群). */
+interface Team {
+  kind: 'local' | 'remote';
+  key: string;            // 'local' or `${hubUrl}::${teamId}`
+  label: string;          // '我托管的团队' or the remote team name
+  sub: string;            // hubUrl (remote) — shown muted next to the label
+  ok: boolean;            // remote connectivity (always true for local)
+  error?: string;
+  hubUrl?: string; teamId?: string; // remote only
+  deployments: RosterDeployment[];
+  bots: RosterBot[];
+}
+
 async function jget(u: string) { const r = await fetch(u); return { status: r.status, body: await r.json().catch(() => ({})) }; }
 async function jpost(u: string, b?: unknown) {
   const r = await fetch(u, { method: 'POST', headers: { 'content-type': 'application/json' }, body: b ? JSON.stringify(b) : undefined });
@@ -25,15 +40,16 @@ async function jput(u: string, b: unknown) {
   return { status: r.status, body: await r.json().catch(() => ({})) };
 }
 
-// Roster state. picked (for 拉群) is pruned when bots become hidden (filter /
-// collapse) so a hidden row is never submitted. collapsed = deployment ids.
-let rosterBots: RosterBot[] = [];
-let rosterDeployments: RosterDeployment[] = [];
-let myDeploymentId = ''; // this deployment's id — used to decide which remote-roster bots are MINE (editable)
-const picked = new Set<string>();
-const collapsed = new Set<string>();
+let localTeam: Team | null = null;   // the team THIS deployment hosts
+let remoteTeams: Team[] = [];        // teams this deployment joined
+let myDeploymentId = '';             // this deployment's id → which bots are MINE (editable)
+const pickedByTeam = new Map<string, Set<string>>(); // team.key → picked larkAppIds (for 拉群)
+const collapsedTeams = new Set<string>();            // collapsed team.keys
 
 function $(id: string): HTMLElement { return document.getElementById(id)!; }
+function allTeams(): Team[] { return [...(localTeam ? [localTeam] : []), ...remoteTeams]; }
+function pickedSet(key: string): Set<string> { let s = pickedByTeam.get(key); if (!s) { s = new Set(); pickedByTeam.set(key, s); } return s; }
+function teamByKey(key: string): Team | undefined { return allTeams().find(t => t.key === key); }
 
 function pageHtml(): string {
   return `<section class="page">
@@ -70,27 +86,17 @@ function pageHtml(): string {
   <div id="tf-join-out" style="display:none;margin-top:6px"></div>
 </div>
 
-<div class="card" style="margin-bottom:16px">
-  <h2 style="margin-top:0">团队花名册 <span class="muted" id="tf-roster-meta" style="font-size:13px"></span></h2>
-  <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px;font-size:13px">
+<div class="card">
+  <h2 style="margin-top:0">我的团队 <span class="muted" id="tf-count" style="font-size:13px"></span>
+    <button id="tf-sync" class="ghost" style="float:right;font-size:13px">同步</button></h2>
+  <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px;font-size:13px">
     <input id="tf-search" placeholder="搜索 名称/能力/CLI…" style="padding:5px 9px;min-width:180px">
     <select id="tf-cli" style="padding:5px"><option value="">全部 CLI</option></select>
     <label><input type="checkbox" id="tf-fcap"> 有能力标签</label>
     <label><input type="checkbox" id="tf-frole"> 有团队角色</label>
-    <span class="muted" id="tf-count"></span>
   </div>
-  <div id="tf-roster">加载中…</div>
-  <div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
-    <input id="tf-grp-name" placeholder="群名（如：跨团队排障）" style="min-width:200px">
-    <button id="tf-grp" class="primary">把勾选的机器人拉一个群</button>
-    <span class="muted" style="font-size:13px">勾选机器人（可跨部署）→ 拉到一个飞书群（含 owner）</span>
-  </div>
-  <div id="tf-grp-out" style="display:none;margin-top:8px"></div>
-</div>
-
-<div class="card">
-  <h2 style="margin-top:0">我加入的远端团队 <button id="tf-sync" class="ghost" style="float:right;font-size:13px">同步</button></h2>
-  <div id="tf-remote">加载中…</div>
+  <p class="muted" style="font-size:13px;margin:0 0 4px">「我托管的团队」是别人加入你后形成的；下面是你加入的别人的团队。每个团队里勾选机器人即可单独拉群（自动带上各自负责人）。</p>
+  <div id="tf-teams">加载中…</div>
 </div>
 
 <div id="tf-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.5);align-items:center;justify-content:center;z-index:50">
@@ -115,162 +121,120 @@ function botMatch(b: RosterBot): boolean {
   return true;
 }
 
-function renderRoster(): void {
-  const el = $('tf-roster');
-  const filtered = rosterBots.filter(botMatch);
-  // prune picks that are now hidden (filtered out OR in a collapsed group)
-  const visible = new Set(filtered.filter(b => !collapsed.has(b.deployment.id)).map(b => b.larkAppId));
-  [...picked].forEach(a => { if (!visible.has(a)) picked.delete(a); });
-
-  if (!rosterBots.length) { el.innerHTML = '<p class="muted">还没有机器人。</p>'; $('tf-count').textContent = ''; return; }
-  const ordered = [...rosterDeployments].sort((a, b) => (a.local === b.local ? 0 : a.local ? -1 : 1));
-  let html = '';
+/** Render one team's deployments → bots + a single 拉群 control. */
+function renderTeamBody(t: Team, filtered: RosterBot[]): string {
+  const ordered = [...t.deployments].sort((a, b) => (a.local === b.local ? 0 : a.local ? -1 : 1));
+  let h = '';
   for (const dep of ordered) {
     const depBots = filtered.filter(x => x.deployment.id === dep.id);
     if (!depBots.length) continue;
-    const isCol = collapsed.has(dep.id);
-    const tag = dep.local ? '本部署' : (dep.stale ? '远端·离线？' : '远端');
-    html += `<div class="tf-grp" data-dep="${escapeHtml(dep.id)}" style="cursor:pointer;margin:10px 0 4px;padding:4px 6px;background:var(--bg-soft,#f6f7f9);border-radius:6px">`
-      + `<b>${isCol ? '▸' : '▾'} ${escapeHtml(dep.name)}</b> <span class="muted" style="font-size:12px">（${tag}）· ${depBots.length} 个</span></div>`;
-    if (isCol) continue;
-    html += '<table style="width:100%;border-collapse:collapse;font-size:14px"><tbody>';
+    const mine = dep.id === myDeploymentId; // MY bots are editable wherever shown
+    const tag = mine ? '本部署' : (dep.stale ? '远端·离线？' : '远端');
+    h += `<div style="margin:10px 0 2px"><b>${escapeHtml(dep.name)}</b> <span class="muted" style="font-size:12px">（${tag}）· ${depBots.length} 个</span></div>`;
+    h += '<table style="width:100%;border-collapse:collapse;font-size:14px"><tbody>';
     for (const b of depBots) {
       const app = escapeHtml(b.larkAppId);
-      const ck = picked.has(b.larkAppId) ? ' checked' : '';
+      const ck = pickedSet(t.key).has(b.larkAppId) ? ' checked' : '';
       const dim = b.deployment.stale ? 'opacity:.55' : '';
-      // local bots: editable capability + role; federated: read-only text
-      const capCell = b.deployment.local
+      const capCell = mine
         ? `<input class="tf-cap" data-app="${app}" value="${escapeHtml(b.capability || '')}" placeholder="能力标签…" style="width:92%;padding:3px 6px">`
         : (b.capability ? escapeHtml(b.capability) : '<span class="muted">—</span>');
-      const roleCell = b.deployment.local
+      const roleCell = mine
         ? `<button class="tf-role" data-app="${app}" data-name="${escapeHtml(b.name)}">${b.hasTeamRole ? '已设·改' : '设置'}</button>`
         : (b.hasTeamRole ? '有角色' : '<span class="muted">—</span>');
-      html += `<tr style="${dim}"><td style="padding:4px 8px"><input type="checkbox" class="tf-pick" data-app="${app}"${ck}></td>`
+      h += `<tr style="${dim}"><td style="padding:4px 8px"><input type="checkbox" class="tf-pick" data-tk="${escapeHtml(t.key)}" data-app="${app}"${ck}></td>`
         + `<td style="padding:4px 8px">${escapeHtml(b.name)}</td><td style="padding:4px 8px" class="muted">${escapeHtml(b.cliId)}</td>`
         + `<td style="padding:4px 8px">${capCell}</td><td style="padding:4px 8px">${roleCell}</td></tr>`;
     }
-    html += '</tbody></table>';
+    h += '</tbody></table>';
   }
-  el.innerHTML = html || '<p class="muted">没有符合条件的机器人。</p>';
-  $('tf-count').textContent = `共 ${filtered.length} / ${rosterBots.length} 个 · 已选 ${picked.size}`;
+  if (!h) h = '<p class="muted" style="margin:8px 0 0">没有符合条件的机器人。</p>';
+  h += `<div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">`
+    + `<input class="tf-gname" data-tk="${escapeHtml(t.key)}" placeholder="群名（如：跨团队排障）" style="min-width:200px">`
+    + `<button class="tf-grp primary" data-tk="${escapeHtml(t.key)}">把勾选的机器人拉一个群</button>`
+    + `<span class="muted" style="font-size:13px">勾选机器人 → 拉到一个飞书群（自动含 owner）</span>`
+    + `<span class="tf-gout" data-tk="${escapeHtml(t.key)}" style="font-size:13px;display:block;flex-basis:100%"></span></div>`;
+  return h;
+}
 
-  el.querySelectorAll<HTMLElement>('.tf-grp').forEach(g => {
-    g.onclick = () => { const id = g.dataset.dep!; if (collapsed.has(id)) collapsed.delete(id); else collapsed.add(id); renderRoster(); };
+function renderTeams(): void {
+  const el = $('tf-teams');
+  const teams = allTeams();
+  if (!teams.length) { el.innerHTML = '<p class="muted">还没有团队。生成邀请码让别人加入你，或用上方「加入别人的团队」。</p>'; $('tf-count').textContent = ''; return; }
+  let html = ''; let shown = 0, total = 0;
+  for (const t of teams) {
+    const filtered = t.bots.filter(botMatch);
+    shown += filtered.length; total += t.bots.length;
+    const visible = new Set(filtered.map(b => b.larkAppId)); // prune picks now hidden by filter
+    [...pickedSet(t.key)].forEach(a => { if (!visible.has(a)) pickedSet(t.key).delete(a); });
+    const col = collapsedTeams.has(t.key);
+    const conn = t.kind === 'remote'
+      ? (t.ok ? ' <span class="ok" style="font-size:12px">已连接</span>' : ` <span class="err" style="font-size:12px">连接失败：${escapeHtml(t.error || '')}</span>`)
+      : '';
+    const leave = t.kind === 'remote'
+      ? `<button class="tf-leave ghost" data-hub="${escapeHtml(t.hubUrl!)}" data-team="${escapeHtml(t.teamId!)}" style="font-size:12px">退出</button>` : '';
+    html += `<div class="card" style="margin:0 0 12px;padding:12px 14px;background:var(--bg-soft,#f6f7f9)">`
+      + `<div class="tf-team-h" data-tk="${escapeHtml(t.key)}" style="cursor:pointer;display:flex;align-items:center;gap:8px;flex-wrap:wrap">`
+      + `<b style="font-size:15px">${col ? '▸' : '▾'} ${escapeHtml(t.label)}</b>`
+      + (t.sub ? ` <span class="muted" style="font-size:12px">${escapeHtml(t.sub)}</span>` : '')
+      + conn
+      + ` <span class="muted" style="font-size:12px">· ${t.deployments.length} 个部署 · ${t.bots.length} 个机器人</span>`
+      + `<span style="margin-left:auto">${leave}</span></div>`;
+    if (!col) {
+      html += (t.kind === 'remote' && !t.ok)
+        ? '<p class="muted" style="margin:8px 0 0">无法获取该团队花名册。</p>'
+        : renderTeamBody(t, filtered);
+    }
+    html += '</div>';
+  }
+  el.innerHTML = html;
+  $('tf-count').textContent = `· 共 ${shown} / ${total} 个机器人`;
+  wireTeams();
+}
+
+function wireTeams(): void {
+  const el = $('tf-teams');
+  el.querySelectorAll<HTMLElement>('.tf-team-h').forEach(h => {
+    h.onclick = () => { const k = h.dataset.tk!; if (collapsedTeams.has(k)) collapsedTeams.delete(k); else collapsedTeams.add(k); renderTeams(); };
   });
   el.querySelectorAll<HTMLInputElement>('.tf-pick').forEach(cb => {
-    cb.onchange = () => { if (cb.checked) picked.add(cb.dataset.app!); else picked.delete(cb.dataset.app!); $('tf-count').textContent = `共 ${filtered.length} / ${rosterBots.length} 个 · 已选 ${picked.size}`; };
+    cb.onchange = () => { const s = pickedSet(cb.dataset.tk!); if (cb.checked) s.add(cb.dataset.app!); else s.delete(cb.dataset.app!); };
   });
   el.querySelectorAll<HTMLInputElement>('.tf-cap').forEach(inp => {
     inp.onchange = async () => {
       const app = inp.dataset.app!, val = inp.value;
       await jput('/api/team/local-bots/' + encodeURIComponent(app) + '/capability', { capability: val });
-      const bot = rosterBots.find(b => b.larkAppId === app); if (bot) bot.capability = val.trim() || null;
+      allTeams().forEach(t => { const bb = t.bots.find(b => b.larkAppId === app); if (bb) bb.capability = val.trim() || null; });
     };
   });
   el.querySelectorAll<HTMLButtonElement>('.tf-role').forEach(btn => { btn.onclick = () => openRoleModal(btn.dataset.app!, btn.dataset.name || ''); });
-}
-
-async function openRoleModal(app: string, name: string): Promise<void> {
-  const r = await jget('/api/team/local-bots/' + encodeURIComponent(app) + '/role');
-  $('tf-modal-title').textContent = '团队角色 · ' + name;
-  ($('tf-modal-text') as HTMLTextAreaElement).value = (r.body as any)?.role || '';
-  $('tf-modal').dataset.app = app;
-  $('tf-modal').style.display = 'flex';
-}
-
-async function loadLocal(): Promise<void> {
-  const r = await jget('/api/team/local');
-  const b = r.body as LocalResp;
-  if (!b?.ok) { $('tf-roster').innerHTML = '<p class="muted">加载失败。</p>'; return; }
-  $('tf-dep-name').textContent = b.deployment.name;
-  myDeploymentId = b.deployment.deploymentId;
-  $('tf-owner').textContent = b.deployment.ownerName || (b.deployment.ownerUnionId ? '已绑定' : '未绑定');
-  ($('tf-roster') as HTMLElement).dataset.hub = b.suggestedHubUrl;
-  rosterBots = b.bots || [];
-  rosterDeployments = b.deployments || [];
-  const remoteCount = rosterDeployments.filter(d => !d.local).length;
-  $('tf-roster-meta').textContent = `· ${rosterBots.length} 个机器人 / ${rosterDeployments.length} 个部署${remoteCount ? `（含 ${remoteCount} 个远端）` : ''}`;
-  const clis = Array.from(new Set(rosterBots.map(x => x.cliId).filter(Boolean))).sort();
-  ($('tf-cli') as HTMLSelectElement).innerHTML = '<option value="">全部 CLI</option>' + clis.map(c => `<option value="${escapeHtml(c)}">${escapeHtml(c)}</option>`).join('');
-  renderRoster();
-}
-
-// Per-remote-team 拉群 selection (keyed by `${hubUrl}::${teamId}`).
-const remotePicked = new Map<string, Set<string>>();
-
-async function loadRemote(): Promise<void> {
-  const r = await jget('/api/team/remote-roster');
-  const list = (r.body as any)?.memberships || [];
-  const el = $('tf-remote');
-  if (!list.length) { el.innerHTML = '<p class="muted">还没加入任何远端团队。用上方「加入别人的团队」粘对方的 Hub 地址 + 邀请码。</p>'; return; }
-  el.innerHTML = list.map((m: any) => {
-    const key = `${m.hubUrl}::${m.teamId}`;
-    const head = `<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
-      <b>${escapeHtml(m.teamName || m.teamId)}</b>
-      <span class="muted" style="font-size:12px">${escapeHtml(m.hubUrl)}</span>
-      ${m.ok ? '<span class="ok">已连接</span>' : `<span class="err">连接失败：${escapeHtml(m.error || '')}</span>`}
-      <button class="ghost tf-leave" data-hub="${escapeHtml(m.hubUrl)}" data-team="${escapeHtml(m.teamId)}" style="margin-left:auto;font-size:12px">退出</button>
-    </div>`;
-    if (!m.ok || !m.roster) return `<div style="padding:10px 0;border-bottom:1px solid var(--border,#eee)">${head}</div>`;
-    const deployments = (m.roster.deployments || []).slice().sort((a: any, b: any) => (a.local === b.local ? 0 : a.local ? -1 : 1));
-    const bots = m.roster.bots || [];
-    let tbl = '';
-    for (const dep of deployments) {
-      const depBots = bots.filter((x: any) => x.deployment.id === dep.id);
-      if (!depBots.length) continue;
-      // mine = this deployment's bots (editable); NOT the hub-local `local` flag
-      const mine = dep.id === myDeploymentId;
-      tbl += `<div style="margin:8px 0 2px"><b>${escapeHtml(dep.name)}</b> <span class="muted" style="font-size:12px">${mine ? '本部署' : (dep.stale ? '离线？' : '远端')} · ${depBots.length} 个</span></div>`;
-      tbl += '<table style="width:100%;border-collapse:collapse;font-size:14px"><tbody>';
-      for (const bt of depBots) {
-        const app = escapeHtml(bt.larkAppId);
-        const cap = bt.capability ? escapeHtml(bt.capability) : '<span class="muted">—</span>';
-        const role = bt.hasTeamRole ? '有角色' : '<span class="muted">—</span>';
-        tbl += `<tr style="${bt.deployment.stale ? 'opacity:.55' : ''}"><td style="padding:3px 8px"><input type="checkbox" class="tf-rpick" data-key="${escapeHtml(key)}" data-app="${app}"></td>`
-          + `<td style="padding:3px 8px">${escapeHtml(bt.name)}</td><td style="padding:3px 8px" class="muted">${escapeHtml(bt.cliId || '')}</td>`
-          + `<td style="padding:3px 8px">${cap}</td><td style="padding:3px 8px">${mine ? `<button class="tf-rrole" data-app="${app}" data-name="${escapeHtml(bt.name)}">${bt.hasTeamRole ? '已设·改' : '设置'}</button>` : role}</td></tr>`;
-      }
-      tbl += '</tbody></table>';
-    }
-    return `<div style="padding:10px 0;border-bottom:1px solid var(--border,#eee)">${head}${tbl}
-      <div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
-        <input class="tf-rgname" data-key="${escapeHtml(key)}" placeholder="群名" style="min-width:160px">
-        <button class="tf-rgrp primary" data-hub="${escapeHtml(m.hubUrl)}" data-team="${escapeHtml(m.teamId)}" data-key="${escapeHtml(key)}">把勾选的拉一个群</button>
-        <span class="muted tf-rgout" data-key="${escapeHtml(key)}" style="font-size:13px"></span>
-      </div></div>`;
-  }).join('');
-
   el.querySelectorAll<HTMLButtonElement>('.tf-leave').forEach(btn => {
-    btn.onclick = async () => {
+    btn.onclick = async (e) => {
+      e.stopPropagation(); // don't also toggle the team's collapse
       if (!confirm('退出该远端团队？将通知对方 Hub 移除你的部署。')) return;
       await jpost('/api/team/leave-remote', { hubUrl: btn.dataset.hub, teamId: btn.dataset.team });
-      remotePicked.delete(`${btn.dataset.hub}::${btn.dataset.team}`);
+      pickedByTeam.delete(`${btn.dataset.hub}::${btn.dataset.team}`);
       loadRemote();
     };
   });
-  el.querySelectorAll<HTMLInputElement>('.tf-rpick').forEach(cb => {
-    cb.onchange = () => {
-      const k = cb.dataset.key!; const set = remotePicked.get(k) ?? new Set<string>(); remotePicked.set(k, set);
-      if (cb.checked) set.add(cb.dataset.app!); else set.delete(cb.dataset.app!);
-    };
-  });
-  el.querySelectorAll<HTMLButtonElement>('.tf-rrole').forEach(btn => { btn.onclick = () => openRoleModal(btn.dataset.app!, btn.dataset.name || ''); });
-  el.querySelectorAll<HTMLButtonElement>('.tf-rgrp').forEach(btn => {
+  el.querySelectorAll<HTMLButtonElement>('.tf-grp').forEach(btn => {
     btn.onclick = async () => {
-      const k = btn.dataset.key!;
-      const apps = [...(remotePicked.get(k) ?? [])];
-      const out = el.querySelector<HTMLElement>(`.tf-rgout[data-key="${CSS.escape(k)}"]`)!;
-      if (!apps.length) { out.innerHTML = '<span class="err">请先勾选机器人</span>'; return; }
-      const name = (el.querySelector<HTMLInputElement>(`.tf-rgname[data-key="${CSS.escape(k)}"]`)?.value || '').trim() || '协作群';
+      const k = btn.dataset.tk!; const t = teamByKey(k); if (!t) return;
+      const apps = [...pickedSet(k)];
+      const out = el.querySelector<HTMLElement>(`.tf-gout[data-tk="${CSS.escape(k)}"]`)!;
+      if (!apps.length) { out.innerHTML = '<span class="err">请先勾选至少一个机器人</span>'; return; }
+      const name = (el.querySelector<HTMLInputElement>(`.tf-gname[data-tk="${CSS.escape(k)}"]`)?.value || '').trim() || '协作群';
       out.innerHTML = '<span class="muted">建群中…</span>';
-      const r2 = await jpost('/api/team/remote-group', { hubUrl: btn.dataset.hub, teamId: btn.dataset.team, name, larkAppIds: apps });
-      renderGroupResult(out, r2.body as any, r2.status);
-      if ((r2.body as any)?.ok) { remotePicked.delete(k); }
+      const r = t.kind === 'local'
+        ? await jpost('/api/team/federated-group', { name, larkAppIds: apps })
+        : await jpost('/api/team/remote-group', { hubUrl: t.hubUrl, teamId: t.teamId, name, larkAppIds: apps });
+      renderGroupResult(out, r.body as any, r.status);
+      if ((r.body as any)?.ok) { pickedSet(k).clear(); if (t.kind === 'local') loadLocal(); }
     };
   });
 }
 
-/** Shared 拉群-result renderer (local + remote). */
+/** Shared 拉群-result renderer. */
 function renderGroupResult(out: HTMLElement, b: any, status: number): void {
   if (b?.ok && b.chatId) {
     const link = b.shareLink || ('https://applink.feishu.cn/client/chat/open?openChatId=' + encodeURIComponent(b.chatId));
@@ -288,11 +252,51 @@ function renderGroupResult(out: HTMLElement, b: any, status: number): void {
   }
 }
 
+async function openRoleModal(app: string, name: string): Promise<void> {
+  const r = await jget('/api/team/local-bots/' + encodeURIComponent(app) + '/role');
+  $('tf-modal-title').textContent = '团队角色 · ' + name;
+  ($('tf-modal-text') as HTMLTextAreaElement).value = (r.body as any)?.role || '';
+  $('tf-modal').dataset.app = app;
+  $('tf-modal').style.display = 'flex';
+}
+
+function refreshCliOptions(): void {
+  const clis = Array.from(new Set(allTeams().flatMap(t => t.bots.map(x => x.cliId)).filter(Boolean))).sort();
+  const sel = $('tf-cli') as HTMLSelectElement; const cur = sel.value;
+  sel.innerHTML = '<option value="">全部 CLI</option>' + clis.map(c => `<option value="${escapeHtml(c)}">${escapeHtml(c)}</option>`).join('');
+  sel.value = cur;
+}
+
+async function loadLocal(): Promise<void> {
+  const r = await jget('/api/team/local');
+  const b = r.body as LocalResp;
+  if (!b?.ok) { localTeam = null; renderTeams(); return; }
+  $('tf-dep-name').textContent = b.deployment.name;
+  myDeploymentId = b.deployment.deploymentId;
+  $('tf-owner').textContent = b.deployment.ownerName || (b.deployment.ownerUnionId ? '已绑定' : '未绑定');
+  ($('tf-teams') as HTMLElement).dataset.hub = b.suggestedHubUrl; // for invite-code display
+  localTeam = { kind: 'local', key: 'local', label: '我托管的团队', sub: '', ok: true, deployments: b.deployments || [], bots: b.bots || [] };
+  refreshCliOptions();
+  renderTeams();
+}
+
+async function loadRemote(): Promise<void> {
+  const r = await jget('/api/team/remote-roster');
+  const list = (r.body as any)?.memberships || [];
+  remoteTeams = list.map((m: any) => ({
+    kind: 'remote' as const, key: `${m.hubUrl}::${m.teamId}`, label: m.teamName || m.teamId, sub: m.hubUrl,
+    ok: !!m.ok, error: m.error, hubUrl: m.hubUrl, teamId: m.teamId,
+    deployments: m.roster?.deployments || [], bots: m.roster?.bots || [],
+  }));
+  refreshCliOptions();
+  renderTeams();
+}
+
 export function renderTeamFederationPage(root: HTMLElement): void {
   root.innerHTML = pageHtml();
-  picked.clear(); collapsed.clear();
+  pickedByTeam.clear(); collapsedTeams.clear();
 
-  ['tf-search', 'tf-cli', 'tf-fcap', 'tf-frole'].forEach(id => { const el = $(id); el.oninput = renderRoster; el.onchange = renderRoster; });
+  ['tf-search', 'tf-cli', 'tf-fcap', 'tf-frole'].forEach(id => { const el = $(id); el.oninput = renderTeams; el.onchange = renderTeams; });
 
   $('tf-modal-cancel').onclick = () => { $('tf-modal').style.display = 'none'; };
   $('tf-modal-save').onclick = async () => {
@@ -307,7 +311,7 @@ export function renderTeamFederationPage(root: HTMLElement): void {
     const out = $('tf-invite-out');
     out.style.display = '';
     if ((r.body as any)?.code) {
-      const hub = ($('tf-roster') as HTMLElement).dataset.hub || '';
+      const hub = ($('tf-teams') as HTMLElement).dataset.hub || '';
       const code = (r.body as any).code;
       out.innerHTML = `<p class="muted" style="font-size:13px">把下面两项发给<b>别的部署</b>的人，让 ta 在自己 dashboard「团队」页里填（24 小时内、单次有效）：</p>
         <p>Hub 地址：<code>${escapeHtml(hub)}</code></p>
@@ -335,18 +339,6 @@ export function renderTeamFederationPage(root: HTMLElement): void {
   };
 
   $('tf-sync').onclick = async () => { await jpost('/api/team/sync-remote'); loadRemote(); };
-
-  $('tf-grp').onclick = async () => {
-    const apps = [...picked];
-    const out = $('tf-grp-out');
-    out.style.display = '';
-    if (!apps.length) { out.innerHTML = '<span class="err">请先勾选至少一个机器人。</span>'; return; }
-    const name = ($('tf-grp-name') as HTMLInputElement).value.trim() || '协作群';
-    out.innerHTML = '<span class="muted">建群中…</span>';
-    const r = await jpost('/api/team/federated-group', { name, larkAppIds: apps });
-    renderGroupResult(out, r.body as any, r.status);
-    if ((r.body as any)?.ok) loadLocal();
-  };
 
   // Bind this deployment's Feishu identity WITHOUT /pair: resolve allowedUsers
   // via the bots' own credentials. One candidate → bind; several → pick.
