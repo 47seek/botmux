@@ -12,10 +12,10 @@ import * as scheduler from './scheduler.js';
 import { scanProjects, scanMultipleProjects, describeProjectDir } from '../services/project-scanner.js';
 import { buildRepoSelectCard, buildAdoptSelectCard, buildSessionClosedCard, getCliDisplayName } from '../im/lark/card-builder.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
-import { deleteMessage, sendMessage, listChatBotMembers, resolveUserUnionId } from '../im/lark/client.js';
+import { deleteMessage, sendMessage, listChatBotMembers, resolveUserUnionId, getChatModeStrict } from '../im/lark/client.js';
 import { claimPairing } from '../services/pairing-store.js';
 import { logger } from '../utils/logger.js';
-import { killWorker, forkWorker, forkAdoptWorker, getCurrentCliVersion, postFreshStreamingCard } from './worker-pool.js';
+import { killWorker, forkWorker, forkAdoptWorker, getCurrentCliVersion, postFreshStreamingCard, postPrivateSnapshotCard, resolvePrivateCardAudience } from './worker-pool.js';
 import { expandHome, getSessionWorkingDir, getProjectScanDir, getProjectScanDirs, rememberLastCliInput } from './session-manager.js';
 import { validateWorkingDir } from './working-dir.js';
 import { discoverAdoptableSessions, validateAdoptTarget, type AdoptableSession } from './session-discovery.js';
@@ -31,7 +31,7 @@ import { t, localeForBot, type Locale } from '../i18n/index.js';
 
 // ─── Exported constants ──────────────────────────────────────────────────────
 
-export const DAEMON_COMMANDS = new Set(['/close', '/restart', '/status', '/help', '/cd', '/repo', '/skip', '/schedule', '/role', '/pair', '/login', '/adopt', '/oncall', '/group', '/g', '/card']);
+export const DAEMON_COMMANDS = new Set(['/close', '/restart', '/status', '/help', '/cd', '/repo', '/schedule', '/role', '/pair', '/login', '/adopt', '/oncall', '/group', '/g', '/card']);
 
 /**
  * Slash commands that are forwarded verbatim to the underlying CLI (e.g.
@@ -572,6 +572,40 @@ export async function handleCommand(
       case '/repo': {
         const repoArg = message.content.replace(/^\/repo\s*/, '').trim();
 
+        // First-spawn fork: consume the buffered prompt/attachments and start the
+        // CLI in whatever workingDir is currently set on the session. Shared by
+        // `commitRepoSelection` (a repo was named) and the bare-`/repo` launch
+        // (use the default workingDir) — both only run while `pendingRepo`.
+        const forkPendingCli = async (replyText: string) => {
+          const selfBot = getBot(ds!.larkAppId);
+          const botCfg = selfBot.config;
+          ds!.pendingRepo = false;
+          const { buildNewTopicPrompt, getAvailableBots } = await import('./session-manager.js');
+          const pendingPrompt = ds!.pendingPrompt ?? '';
+          const prompt = buildNewTopicPrompt(
+            pendingPrompt,
+            ds!.session.sessionId,
+            botCfg.cliId,
+            botCfg.cliPathOverride,
+            ds!.pendingAttachments,
+            ds!.pendingMentions,
+            await getAvailableBots(ds!.larkAppId, ds!.chatId),
+            ds!.pendingFollowUps,
+            { name: selfBot.botName, openId: selfBot.botOpenId },
+            loc,
+            ds!.pendingSender,
+            { larkAppId, chatId: ds!.chatId },
+          );
+          rememberLastCliInput(ds!, pendingPrompt, prompt);
+          ds!.pendingPrompt = undefined;
+          ds!.pendingAttachments = undefined;
+          ds!.pendingMentions = undefined;
+          ds!.pendingSender = undefined;
+          ds!.pendingFollowUps = undefined;
+          forkWorker(ds!, prompt);
+          await sessionReply(rootId, replyText);
+        };
+
         // Shared commit path for an already-resolved repo: update the session's
         // working dir, then either fork into the pending CLI (first spawn) or
         // close + recreate the session (mid-session switch). Used by both the
@@ -582,33 +616,7 @@ export async function handleCommand(
           sessionStore.updateSession(ds!.session);
 
           if (ds!.pendingRepo) {
-            const selfBot = getBot(ds!.larkAppId);
-            const botCfg = selfBot.config;
-            ds!.pendingRepo = false;
-            const { buildNewTopicPrompt, getAvailableBots } = await import('./session-manager.js');
-            const pendingPrompt = ds!.pendingPrompt ?? '';
-            const prompt = buildNewTopicPrompt(
-              pendingPrompt,
-              ds!.session.sessionId,
-              botCfg.cliId,
-              botCfg.cliPathOverride,
-              ds!.pendingAttachments,
-              ds!.pendingMentions,
-              await getAvailableBots(ds!.larkAppId, ds!.chatId),
-              ds!.pendingFollowUps,
-              { name: selfBot.botName, openId: selfBot.botOpenId },
-              loc,
-              ds!.pendingSender,
-              { larkAppId, chatId: ds!.chatId },
-            );
-            rememberLastCliInput(ds!, pendingPrompt, prompt);
-            ds!.pendingPrompt = undefined;
-            ds!.pendingAttachments = undefined;
-            ds!.pendingMentions = undefined;
-            ds!.pendingSender = undefined;
-            ds!.pendingFollowUps = undefined;
-            forkWorker(ds!, prompt);
-            await sessionReply(rootId, t('cmd.repo.selected_in_pending', { name: displayName }, loc));
+            await forkPendingCli(t('cmd.repo.selected_in_pending', { name: displayName }, loc));
           } else {
             killWorker(ds!);
             sessionStore.closeSession(ds!.session.sessionId);
@@ -659,6 +667,30 @@ export async function handleCommand(
           break;
         }
 
+        // Bare `/repo` while a repo card is pending → launch right away in the
+        // default workingDir. This is the text-command twin of the card's
+        // "start directly" button (and replaces the old `/skip` command).
+        // Mid-session bare `/repo` (no pending) still falls through to the card.
+        if (!repoArg && ds?.pendingRepo) {
+          // Validate the configured workingDir before spawning — `forkWorker`
+          // doesn't, so a dead cwd would otherwise spawn-and-fail silently. Same
+          // guard the card path runs below. On failure we keep the pending state
+          // so the user can recover with `/repo <valid-path>` (no card here).
+          const invalidDirs = invalidConfiguredWorkingDirs(ds, ds.larkAppId ?? larkAppId);
+          if (invalidDirs.length > 0) {
+            await sessionReply(rootId, t('cmd.repo.working_dir_not_exist', { dirs: invalidDirs.map(d => `\`${d}\``).join(', ') }, loc));
+            break;
+          }
+          const cwd = getSessionWorkingDir(ds);
+          await forkPendingCli(t('cmd.skip.opened', { cwd }, loc));
+          if (ds.repoCardMessageId) {
+            deleteMessage(ds.larkAppId, ds.repoCardMessageId);
+            ds.repoCardMessageId = undefined;
+          }
+          logger.info(`[${logTag}] Bare /repo while pending → launch in workingDir ${cwd}`);
+          break;
+        }
+
         if (ds?.worker && !ds.worker.killed) {
           await sessionReply(rootId, t('cmd.repo.warning_running', undefined, loc));
         }
@@ -685,47 +717,6 @@ export async function handleCommand(
         const repoCardMsgId = await sessionReply(rootId, cardJson, 'interactive');
         if (ds) ds.repoCardMessageId = repoCardMsgId;
         logger.info(`[${logTag}] Sent repo card with ${projects.length} project(s)`);
-        break;
-      }
-
-      case '/skip': {
-        if (ds?.pendingRepo) {
-          const selfBot = getBot(ds.larkAppId);
-          const botCfg = selfBot.config;
-          ds.pendingRepo = false;
-          const { buildNewTopicPrompt, getAvailableBots } = await import('./session-manager.js');
-          const pendingPrompt = ds.pendingPrompt ?? '';
-          const prompt = buildNewTopicPrompt(
-            pendingPrompt,
-            ds.session.sessionId,
-            botCfg.cliId,
-            botCfg.cliPathOverride,
-            ds.pendingAttachments,
-            ds.pendingMentions,
-            await getAvailableBots(ds.larkAppId, ds.chatId),
-            ds.pendingFollowUps,
-            { name: selfBot.botName, openId: selfBot.botOpenId },
-            loc,
-            ds.pendingSender,
-            { larkAppId, chatId: ds.chatId },
-          );
-          rememberLastCliInput(ds, pendingPrompt, prompt);
-          ds.pendingPrompt = undefined;
-          ds.pendingAttachments = undefined;
-          ds.pendingMentions = undefined;
-          ds.pendingSender = undefined;
-          ds.pendingFollowUps = undefined;
-          forkWorker(ds, prompt);
-          const cwd = getSessionWorkingDir(ds);
-          await sessionReply(rootId, t('cmd.skip.opened', { cwd }, loc));
-          if (ds.repoCardMessageId) {
-            deleteMessage(ds.larkAppId, ds.repoCardMessageId);
-            ds.repoCardMessageId = undefined;
-          }
-          logger.info(`[${logTag}] Skip repo via /skip, spawning CLI in ${cwd}`);
-        } else {
-          await sessionReply(rootId, t('cmd.skip.no_pending', undefined, loc));
-        }
         break;
       }
 
@@ -1109,6 +1100,40 @@ export async function handleCommand(
       case '/card': {
         if (!ds) {
           await sessionReply(rootId, t('cmd.no_active_session', undefined, loc));
+          break;
+        }
+        // Private mode (`privateCard`): send a one-shot snapshot only to the
+        // explicit talk-grant audience via the ephemeral API, instead of the
+        // group-visible live card. Ephemeral cards only work in plain `group`
+        // chats and can't be patched — so no live updates, and we fail closed
+        // (never fall back to a group-visible card) since not leaking is the
+        // entire point of this mode.
+        if (getBot(ds.larkAppId).config.privateCard) {
+          // Strict gate: only a *confirmed* plain group is safe — getChatModeStrict
+          // returns 'unknown' on API error instead of guessing 'group', so we fail
+          // closed (no leak) when we can't verify the chat type.
+          const mode = await getChatModeStrict(ds.larkAppId, ds.chatId);
+          if (mode !== 'group') {
+            await sessionReply(rootId, t('cmd.card.private_not_group', undefined, loc));
+            break;
+          }
+          const audience = resolvePrivateCardAudience(ds);
+          if (audience.length === 0) {
+            await sessionReply(rootId, t('cmd.card.private_no_audience', undefined, loc));
+            break;
+          }
+          const r = await postPrivateSnapshotCard(ds, audience);
+          if (r.notReady) {
+            await sessionReply(rootId, t('cmd.card.private_not_ready', undefined, loc));
+          } else if (r.sent === 0) {
+            // Total failure — surface a non-sensitive error (no terminal content,
+            // no open_id list). Most likely cause: missing send permission / bot
+            // not in chat / topic-thread chat.
+            await sessionReply(rootId, t('cmd.card.private_failed', undefined, loc));
+          } else if (r.sent < r.total) {
+            // Partial — report counts only, never the audience identities.
+            await sessionReply(rootId, t('cmd.card.private_partial', { sent: r.sent, total: r.total }, loc));
+          }
           break;
         }
         // Manual summon. Force the live card on for the rest of this session —

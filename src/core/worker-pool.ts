@@ -14,8 +14,8 @@ import { randomBytes } from 'node:crypto';
 import { config } from '../config.js';
 import * as sessionStore from '../services/session-store.js';
 import { persistStreamCardState } from './session-manager.js';
-import { updateMessage, deleteMessage, MessageWithdrawnError } from '../im/lark/client.js';
-import { buildStreamingCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, getCliDisplayName } from '../im/lark/card-builder.js';
+import { updateMessage, deleteMessage, sendEphemeralCard, MessageWithdrawnError } from '../im/lark/client.js';
+import { buildStreamingCard, buildPrivateSnapshotCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, getCliDisplayName } from '../im/lark/card-builder.js';
 import { loadFrozenCards, saveFrozenCards } from '../services/frozen-card-store.js';
 import { logger } from '../utils/logger.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
@@ -411,6 +411,64 @@ export async function postFreshStreamingCard(
     logger.warn(`[${tag(ds)}] /card POST failed: ${err}`);
     return false;
   }
+}
+
+/**
+ * Audience for a private `/card`: the bot's `allowedUsers` (the canOperate set —
+ * owner & co-owners), deduped, `ou_` only. Talk-only grants (`globalGrants` /
+ * `chatGrants`) and a bare triggerer are intentionally NOT included: the private
+ * card is owner-only. A grant-authorized user who runs `/card` therefore does
+ * not receive a card (matches the "授权人不发" rule). Empty when the bot has no
+ * `allowedUsers` (fully-open mode → no owner to send to).
+ */
+export function resolvePrivateCardAudience(ds: DaemonSession): string[] {
+  const bot = getBot(ds.larkAppId);
+  const set = new Set<string>();
+  for (const u of bot.resolvedAllowedUsers) if (u.startsWith('ou_')) set.add(u);
+  return [...set];
+}
+
+/**
+ * Private `/card`: build a one-shot snapshot of the current terminal and send it
+ * as an ephemeral (visible-to-one) card to each open_id in `audience`, one API
+ * call each (concurrency-capped). Never posts a group-visible card and never
+ * patches — privacy is the whole point, so there is deliberately no fallback.
+ * Returns per-recipient counts so the caller can report progress without leaking
+ * the audience list into the chat.
+ */
+export async function postPrivateSnapshotCard(
+  ds: DaemonSession,
+  audience: string[],
+): Promise<{ sent: number; total: number; notReady: boolean }> {
+  const port = ds.workerPort ?? ds.session.webPort;
+  if (!port) return { sent: 0, total: audience.length, notReady: true };
+
+  const botCfg = getBot(ds.larkAppId).config;
+  const effectiveCliId = sessionCliId(ds, botCfg);
+  const readUrl = terminalReadUrl(port);
+  const title = ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId);
+  const status = ds.lastScreenStatus ?? 'idle';
+  const cardJson = buildPrivateSnapshotCard(
+    readUrl, title, status, effectiveCliId, ds.currentImageKey, ds.lastScreenContent ?? '',
+    ds.session.sessionId, sessionAnchorId(ds), localeForBot(ds.larkAppId), cardUsageLimit(ds),
+  );
+
+  let sent = 0;
+  // Cap concurrency: Feishu per-chat ~40 QPS, ephemeral total 50/s.
+  const CONCURRENCY = 5;
+  for (let i = 0; i < audience.length; i += CONCURRENCY) {
+    const batch = audience.slice(i, i + CONCURRENCY);
+    await Promise.all(batch.map(async (openId) => {
+      try {
+        await sendEphemeralCard(ds.larkAppId, ds.chatId, openId, cardJson);
+        sent++;
+      } catch (err) {
+        logger.warn(`[${tag(ds)}] private /card ephemeral send to ${openId.substring(0, 8)}… failed: ${err}`);
+      }
+    }));
+  }
+  logger.info(`[${tag(ds)}] private /card: ephemeral sent ${sent}/${audience.length}`);
+  return { sent, total: audience.length, notReady: false };
 }
 
 // ─── Card PATCH serialization queue ─────────────────────────────────────────
@@ -837,6 +895,7 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
     workingDir: cwd,
     cliId: botCfg.cliId,
     cliPathOverride: botCfg.cliPathOverride,
+    model: botCfg.model,
     backendType: botCfg.backendType ?? config.daemon.backendType,
     prompt,
     resume,
@@ -1583,6 +1642,7 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
     workingDir: adopted.cwd,
     cliId: adoptedCliId,
     cliSessionId: isStructuredBridge ? adopted.sessionId : undefined,
+    model: botCfg.model,
     backendType: 'tmux',
     prompt: '',
     resume: false,

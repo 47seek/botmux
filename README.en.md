@@ -62,7 +62,7 @@ Compared to OpenClaw-style approaches built on Agent SDKs:
 ## Prerequisites
 
 - **Node.js** >= 20
-- **AI coding CLI** installed and authenticated (`claude`, `codex`, `coco`, `cursor-agent`, `gemini`, `opencode`, `mtr`, `hermes`, or `agy` (Antigravity) in PATH)
+- **AI coding CLI / local agent app** installed and authenticated (`claude`, `codex`, `coco`, `cursor-agent`, `gemini`, `opencode`, `hermes`, or `agy` (Antigravity) in PATH)
   - **CoCo requires `0.120.32+`**: type-ahead (sending a new message while a turn is still running, parked in CoCo's own message queue) relies on 0.120.32+ behavior; earlier versions may drop or serialize input while busy — upgrade before use
 - **tmux** >= 3.x (optional — auto-enabled when installed for persistent CLI sessions)
 - **CJK fonts** (only needed for screenshot rendering of Chinese text / emoji):
@@ -307,10 +307,9 @@ Send these straight into a topic — the daemon intercepts them (no clash with t
 
 | Command | Description |
 |---------|-------------|
-| `/repo` | Show project selector card (interactive dropdown + text list) |
+| `/repo` | While a repo is pending selection, launch in the default workingDir; mid-session, show the project selector card (interactive dropdown + text list) |
 | `/repo <N>` | Switch to Nth project from last scan |
 | `/repo <path\|name>` | Skip the selector card; pass a path (relative/absolute) or a first-level project name under workingDir |
-| `/skip` | Skip the repo selector card, start the session in the default dir |
 | `/cd <path>` | Change working directory and restart the CLI process |
 | `/status` | Show session info (uptime, terminal URL, etc.) |
 | `/restart` | Restart CLI process (keeps the session context) |
@@ -416,7 +415,7 @@ Configure bots via `~/.botmux/bots.json`. Run `botmux setup` to create it intera
 botmux setup
 ```
 
-When `~/.botmux/bots.json` already exists, `botmux setup` can add a bot, reconfigure from scratch, edit an existing bot, or delete a bot config. The edit/delete flow accepts the process name shown by `botmux status` (e.g. `botmux-1` or a custom `botmux-claude-main`) or the `larkAppId`; empty input keeps the current value, and `-` clears optional fields such as `name`, `backendType`, `workingDir`, and `allowedUsers`. Changing `larkAppId` asks for confirmation because historical session/chat state under the old app ID is not migrated automatically. Deleting a bot only removes one local `bots.json` entry; it does not delete the Lark app, historical messages, or local session data. Run `botmux restart` for changes to take effect.
+When `~/.botmux/bots.json` already exists, `botmux setup` can add a bot, reconfigure from scratch, edit an existing bot, or delete a bot config. The edit/delete flow accepts the process name shown by `botmux status` (e.g. `botmux-1` or a custom `botmux-claude-main`) or the `larkAppId`; empty input keeps the current value, and `-` clears optional fields such as `name`, `model`, `backendType`, `workingDir`, and `allowedUsers`. Changing `larkAppId` asks for confirmation because historical session/chat state under the old app ID is not migrated automatically. Deleting a bot only removes one local `bots.json` entry; it does not delete the Lark app, historical messages, or local session data. Run `botmux restart` for changes to take effect.
 
 **bots.json format:**
 
@@ -427,6 +426,7 @@ When `~/.botmux/bots.json` already exists, `botmux setup` can add a bot, reconfi
     "larkAppSecret": "secret_1",
     "name": "claude-main",
     "cliId": "claude-code",
+    "model": "sonnet",
     "workingDir": "~/projects",
     "allowedUsers": ["alice@company.com"],
     "allowedChatGroups": ["oc_xxx_team"]
@@ -435,6 +435,7 @@ When `~/.botmux/bots.json` already exists, `botmux setup` can add a bot, reconfi
     "larkAppId": "cli_xxx_bot2",
     "larkAppSecret": "secret_2",
     "cliId": "codex",
+    "model": "gpt-5-codex",
     "workingDir": "~/work"
   }
 ]
@@ -445,7 +446,8 @@ When `~/.botmux/bots.json` already exists, `botmux setup` can add a bot, reconfi
 | `larkAppId` | Yes | Lark app ID |
 | `larkAppSecret` | Yes | Lark app secret |
 | `name` | No | Process name suffix shown by `botmux status`; e.g. `claude-main` appears as `botmux-claude-main`, defaults to `botmux-<index>` |
-| `cliId` | No | CLI adapter, defaults to `claude-code` (options: `aiden`, `coco`, `codex`, `codex-app`, `cursor`, `gemini`, `opencode`, `antigravity`, `mtr`, `hermes`) |
+| `cliId` | No | CLI adapter, defaults to `claude-code` (options: `aiden`, `coco`, `codex`, `codex-app`, `cursor`, `gemini`, `opencode`, `antigravity`, `hermes`) |
+| `model` | No | Model name used when spawning the CLI. Currently honored by: `claude-code`, `codex`, `coco`, `cursor`, `gemini`, `opencode`; other adapters ignore the field. Leave empty to use the CLI default. `botmux setup` proposes per-CLI candidates plus a free-form Other option. |
 | `cliPathOverride` | No | Absolute path to the CLI entry, for wrappers / routers; typical use: `ccr`, `claude-w`, `aiden-x-claude`, etc. |
 | `backendType` | No | Session backend: `pty` or `tmux` (auto-detected by default) |
 | `workingDir` | No | Default working directory, supports comma-separated. The new-topic repo-select card scans for git repos **from this directory downward** (recursive, up to 3 levels), no longer climbing to the parent: point it at a repos root (e.g. `~/projects`) to list every repo beneath it, or at a single repo to list just that repo (and its linked worktrees) |

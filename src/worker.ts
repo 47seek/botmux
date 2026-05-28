@@ -87,7 +87,7 @@ const writeToken = randomBytes(16).toString('hex');
 
 let sessionId = '';
 let lastInitConfig: Extract<DaemonToWorker, { type: 'init' }> | null = null;
-const CLI_DISPLAY_NAMES: Record<string, string> = { 'claude-code': 'Claude', aiden: 'Aiden', coco: 'CoCo', codex: 'Codex', 'codex-app': 'Codex App', cursor: 'Cursor', gemini: 'Gemini', opencode: 'OpenCode', antigravity: 'Antigravity', mtr: 'MTR', hermes: 'Hermes' };
+const CLI_DISPLAY_NAMES: Record<string, string> = { 'claude-code': 'Claude', aiden: 'Aiden', coco: 'CoCo', codex: 'Codex', 'codex-app': 'Codex App', cursor: 'Cursor', gemini: 'Gemini', opencode: 'OpenCode', antigravity: 'Antigravity', mtr: 'MTR', hermes: 'Hermes', mira: 'Mira' };
 function cliName(): string { return CLI_DISPLAY_NAMES[lastInitConfig?.cliId ?? ''] ?? 'CLI'; }
 let isPromptReady = false;
 /** Mutex for async flushPending — prevents concurrent flush loops. */
@@ -2122,6 +2122,7 @@ let trustHandled = false;
 // not pollute the visible terminal. Strip them before xterm rendering and
 // translate them back into worker IPC.
 const CODEX_APP_OSC_PREFIX = '\x1b]777;botmux:';
+const APP_RUNNER_OSC_CLI_IDS = new Set(['codex-app', 'mira']);
 let codexAppOscPending = '';
 
 function decodeCodexAppPayload(payload: string): any | undefined {
@@ -2152,11 +2153,11 @@ function handleCodexAppMarker(body: string): void {
         m.sentAtMs >= startedAtMs && m.sentAtMs <= completedAtMs + 5_000,
       );
       if (sentByModel) {
-        log('Codex App final_output suppressed (model already called botmux send)');
+        log(`${cliName()} final_output suppressed (model already called botmux send)`);
         return;
       }
     }
-    const turnId = typeof payload.turnId === 'string' ? payload.turnId : `codex-app-${Date.now()}`;
+    const turnId = typeof payload.turnId === 'string' ? payload.turnId : `${lastInitConfig?.cliId ?? 'app'}-${Date.now()}`;
     send({
       type: 'final_output',
       content: payload.content,
@@ -2167,7 +2168,7 @@ function handleCodexAppMarker(body: string): void {
 }
 
 function splitCodexAppControl(data: string): string {
-  if (lastInitConfig?.cliId !== 'codex-app' && codexAppOscPending.length === 0) return data;
+  if (!APP_RUNNER_OSC_CLI_IDS.has(lastInitConfig?.cliId ?? '') && codexAppOscPending.length === 0) return data;
   const input = codexAppOscPending + data;
   codexAppOscPending = '';
 
@@ -2772,6 +2773,7 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     botName: cfg.botName,
     botOpenId: cfg.botOpenId,
     locale: cfg.locale,
+    model: cfg.model,
   });
 
   // Extra args from env (CLI_DISABLE_DEFAULT_ARGS is removed — adapters own their defaults)
@@ -2788,6 +2790,17 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   if (injectClaudeSandbox) {
     log('Detected root user — injecting IS_SANDBOX=1 for Claude Code');
   }
+
+  // Claude Code 2.1.x：`--resume` 一个「空闲 >70min 且累计 >10 万 token」的会话会弹
+  // 交互式菜单（Resume from summary / full / Don't ask again），botmux 无法导航 →
+  // 进程卡死（issue #62）。把 token 阈值顶到极大让触发门永远命中 `tokens < threshold`
+  // 而 return null → 菜单不弹、按 full session 原样续（走 summary 会触发 /compact，
+  // 破坏 bridge 的会话连续性追踪）。用户显式设了就尊重。注意：该 key 必须同时进
+  // BOTMUX_INJECTED_ENV_KEYS 白名单，否则 tmux backend 不会把它透传进 pane。
+  const claudeResumeTokenThreshold =
+    cfg.cliId === 'claude-code'
+      ? process.env.CLAUDE_CODE_RESUME_TOKEN_THRESHOLD ?? '2147483647'
+      : undefined;
 
   // Predict reattach vs fresh so the log line tells the truth. When a bmx-*
   // tmux session is still alive, TmuxBackend.spawn ignores the bin/args and
@@ -2816,6 +2829,7 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
       BOTMUX_LARK_APP_ID: cfg.larkAppId,
       BOTMUX_ROOT_MESSAGE_ID: cfg.rootMessageId,
       ...(injectClaudeSandbox ? { IS_SANDBOX: '1' } : {}),
+      ...(claudeResumeTokenThreshold ? { CLAUDE_CODE_RESUME_TOKEN_THRESHOLD: claudeResumeTokenThreshold } : {}),
     } as unknown as Record<string, string>,
   });
 
