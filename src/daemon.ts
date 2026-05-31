@@ -2277,9 +2277,48 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
         sessionReply(anchor, tr('daemon.cmd_allowed_users_only', { cmd }, localeForBot(larkAppId)), 'text', larkAppId);
         return;
       }
+      // First message of a fresh thread carrying a session-needing daemon command
+      // — e.g. another bot dispatched `/repo <path>` into a brand-new thread.
+      // Without a session, handleCommand gets ds=undefined and `/repo` (and other
+      // session commands) fall through to the repo-select card. Create the session
+      // first, mirroring handleNewTopic's first-message `/repo` pendingRepo setup.
+      // Session-less commands (/group /g) don't need one.
+      if (!existingDs && threadChatId && !SESSIONLESS_DAEMON_COMMANDS.has(cmd)) {
+        const session = sessionStore.createSession(threadChatId, anchor, cmdContent.substring(0, 50), ctxChatType);
+        const now = Date.now();
+        session.larkAppId = larkAppId;
+        session.ownerOpenId = threadSenderOpenId;
+        session.ownerUnionId = data?.sender?.sender_id?.union_id;
+        session.lastCallerOpenId = threadSenderOpenId;
+        session.lastMessageAt = new Date(now).toISOString();
+        session.scope = scope;
+        let cmdPending: Partial<DaemonSession> | undefined;
+        if (cmd === '/repo') {
+          const { pinnedWorkingDir } = await resolvePinnedWorkingDir({ scope, anchor, chatId: threadChatId, chatType: ctxChatType, larkAppId });
+          if (pinnedWorkingDir) session.workingDir = pinnedWorkingDir;
+          cmdPending = { pendingRepo: true, pendingPrompt: '', workingDir: pinnedWorkingDir };
+        }
+        sessionStore.updateSession(session);
+        activeSessions.set(sessionKey(anchor, larkAppId), {
+          session,
+          worker: null,
+          workerPort: null,
+          workerToken: null,
+          larkAppId,
+          chatId: threadChatId,
+          chatType: ctxChatType,
+          scope,
+          spawnedAt: Date.parse(session.createdAt) || now,
+          cliVersion: cliVersionCache.get(getBot(larkAppId).config.cliId)?.version ?? 'unknown',
+          lastMessageAt: now,
+          hasHistory: false,
+          ownerOpenId: threadSenderOpenId,
+          ...cmdPending,
+        });
+      }
       // Pass mention-stripped content so /command argument parsing works.
       // chatId lets session-less handlers (e.g. /group) reach the chat roster.
-      handleCommand(cmd, anchor, { ...parsed, content: commandContent, chatId: threadChatId }, commandDeps, larkAppId);
+      await handleCommand(cmd, anchor, { ...parsed, content: commandContent, chatId: threadChatId }, commandDeps, larkAppId);
       return;
     }
   }

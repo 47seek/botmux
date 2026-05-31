@@ -13,7 +13,7 @@ import { describe, it, expect } from 'vitest';
 import {
   parseDispatchBotSpec,
   buildDispatchMessages,
-  buildRepoPrimeContent,
+  buildRepoPrimeText,
 } from '../src/core/dispatch.js';
 
 describe('parseDispatchBotSpec', () => {
@@ -84,40 +84,35 @@ describe('buildDispatchMessages', () => {
   });
 });
 
-describe('buildRepoPrimeContent', () => {
+describe('buildRepoPrimeText', () => {
   const bots = [
     { openId: 'ou_a', name: 'Alice', role: 'coder' },
     { openId: 'ou_b', name: 'Bob', role: 'reviewer' },
   ];
 
-  it('@-mentions every bot so the prime triggers each session', () => {
-    const r = buildRepoPrimeContent({ path: '/root/iserver/botmux', bots });
+  // The prime must be a TEXT message (with inline <at> tags), exactly like a
+  // human typing "@bot /repo <path>". A structured `post` loses the path in the
+  // live event (renderPostNode path); text goes through resolveMentions cleanly.
+  it('@-mentions every bot via <at> tags so the text prime triggers each session', () => {
+    const r = buildRepoPrimeText({ path: '/root/iserver/botmux', bots });
     expect(r.mentionedOpenIds).toEqual(['ou_a', 'ou_b']);
-    const ats = r.content.flat().filter(n => n.tag === 'at').map(n => (n as { user_id: string }).user_id);
-    expect(ats).toEqual(['ou_a', 'ou_b']);
+    expect(r.text).toContain('<at user_id="ou_a">');
+    expect(r.text).toContain('<at user_id="ou_b">');
   });
 
-  it('emits a `/repo <path>` command after the mentions (so it parses as the first command)', () => {
-    const r = buildRepoPrimeContent({ path: '/root/iserver/botmux', bots });
-    const joined = r.content
-      .flat()
-      .filter(n => n.tag === 'text')
-      .map(n => (n as { text: string }).text)
-      .join('');
-    expect(joined).toContain('/repo /root/iserver/botmux');
-    // The /repo text node must come after the at-nodes so that, post
-    // mention-strip, the receiving daemon sees "/repo <path>" as the command.
-    const flat = r.content.flat();
-    const lastAt = flat.map(n => n.tag).lastIndexOf('at');
-    const repoIdx = flat.findIndex(n => n.tag === 'text' && (n as { text: string }).text.includes('/repo '));
-    expect(repoIdx).toBeGreaterThan(lastAt);
+  it('emits `/repo <path>` after the mentions (parses like a human-typed @bot /repo)', () => {
+    const r = buildRepoPrimeText({ path: '/root/iserver/botmux', bots });
+    expect(r.text).toContain('/repo /root/iserver/botmux');
+    // /repo must come after the last <at> so that, post mention-strip, the
+    // receiving daemon sees "/repo <path>" as the command.
+    expect(r.text.indexOf('/repo')).toBeGreaterThan(r.text.lastIndexOf('</at>'));
   });
 
   it('throws on an empty path', () => {
-    expect(() => buildRepoPrimeContent({ path: '   ', bots })).toThrow();
+    expect(() => buildRepoPrimeText({ path: '   ', bots })).toThrow();
   });
 
   it('throws when no bots are given', () => {
-    expect(() => buildRepoPrimeContent({ path: '/x', bots: [] })).toThrow();
+    expect(() => buildRepoPrimeText({ path: '/x', bots: [] })).toThrow();
   });
 });

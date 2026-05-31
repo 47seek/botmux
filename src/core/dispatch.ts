@@ -106,29 +106,27 @@ export function buildDispatchMessages(input: {
 
 /**
  * Build the "repo prime" message: a `/repo <path>` command @-mentioning the
- * target bots. Sent as the first message into a freshly-seeded thread, it makes
- * each sub-bot's daemon resolve the working dir and spawn its CLI **idle** (no
- * repo-selection card, no manual "直接开始" click) — i.e. standby. A follow-up
- * brief then becomes each session's first prompt. `/repo` is an existing botmux
- * command, so this works against any current daemon (no receiving-side change).
+ * target bots, sent as a **plain text message** — exactly like a human typing
+ * "@bot /repo <path>". Sent as the first message into a freshly-seeded thread,
+ * it makes each sub-bot's daemon resolve the working dir and spawn its CLI
+ * **idle** (no repo-selection card, no manual "直接开始" click) — i.e. standby.
  *
- * The `/repo <path>` text node is placed *after* the @-nodes so that, once the
- * receiving daemon strips leading mentions, it sees `/repo <path>` as the command.
+ * Why text (not a structured `post`): the receiving daemon parses a text
+ * message's @ via `resolveMentions` (the same clean path a human @ goes
+ * through), whereas a `post`'s at/text nodes go through `renderPostNode`, which
+ * drops the `/repo` argument in the live event — see the dispatch debugging
+ * notes. `/repo` is an existing botmux command, so this needs no receiving-side
+ * change. The `<at>` tags come first so that, once the receiving daemon strips
+ * leading mentions, it sees `/repo <path>` as the command.
  */
-export function buildRepoPrimeContent(input: {
+export function buildRepoPrimeText(input: {
   path: string;
   bots: DispatchBot[];
-}): { content: PostParagraph[]; mentionedOpenIds: string[] } {
+}): { text: string; mentionedOpenIds: string[] } {
   const path = input.path.trim();
   if (!path) throw new Error('repo prime requires a path');
   if (input.bots.length === 0) throw new Error('repo prime requires at least one bot');
 
-  const para: PostNode[] = [];
-  for (const b of input.bots) {
-    para.push({ tag: 'at', user_id: b.openId });
-    para.push({ tag: 'text', text: ' ' });
-  }
-  para.push({ tag: 'text', text: `/repo ${path}` });
-
-  return { content: [para], mentionedOpenIds: input.bots.map(b => b.openId) };
+  const ats = input.bots.map(b => `<at user_id="${b.openId}"></at>`).join(' ');
+  return { text: `${ats} /repo ${path}`, mentionedOpenIds: input.bots.map(b => b.openId) };
 }

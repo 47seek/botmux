@@ -26,7 +26,7 @@ import { createInterface } from 'node:readline';
 import { createRequire } from 'node:module';
 import { createHmac, randomBytes } from 'node:crypto';
 import { validateWorkingDir } from './core/working-dir.js';
-import { parseDispatchBotSpec, buildDispatchMessages, buildRepoPrimeContent } from './core/dispatch.js';
+import { parseDispatchBotSpec, buildDispatchMessages, buildRepoPrimeText } from './core/dispatch.js';
 import { enableAutostart, disableAutostart, autostartStatus, refreshAutostart } from './autostart.js';
 import { tmuxEnv } from './setup/ensure-tmux.js';
 import { writeBotsJsonAtomic as writeBotsAtomic } from './setup/bots-store.js';
@@ -3316,14 +3316,15 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     // 1. Seed (thread root) — top-level header; gives the thread something to hang off.
     const seedId = await sendMessage(appId, targetChatId, built.seedText, 'text');
 
-    // 2. Optional repo prime — `/repo <path>` so each sub-bot spawns idle in that
-    //    dir (no repo-selection card). `/repo` is an existing botmux command, so
-    //    this needs no change on the receiving bot's daemon.
+    // 2. Optional repo prime — a plain TEXT message "@bot /repo <path>" (like a
+    //    human types) so each sub-bot spawns idle in that dir (no repo-select
+    //    card). Text goes through resolveMentions cleanly; a structured post
+    //    drops the /repo arg in the live event. `/repo` is an existing command,
+    //    so this needs no change on the receiving bot's daemon.
     let primeId: string | undefined;
     if (repo) {
-      const prime = buildRepoPrimeContent({ path: repo, bots });
-      const primeJson = JSON.stringify({ zh_cn: { title: '', content: prime.content } });
-      primeId = await replyMessage(appId, seedId, primeJson, 'post', true);
+      const prime = buildRepoPrimeText({ path: repo, bots });
+      primeId = await replyMessage(appId, seedId, prime.text, 'text', true);
     }
 
     // 3. Brief kickoff — reply_in_thread @-ing the bots so each spawns its own
