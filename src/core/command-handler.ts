@@ -848,15 +848,17 @@ export async function handleCommand(
           break;
         }
         const botCliId = ds ? getBot(ds.larkAppId).config.cliId : undefined;
-        const backendType = ds
-          ? (getBot(ds.larkAppId).config.backendType ?? config.daemon.backendType)
-          : config.daemon.backendType;
-        const useZellij = backendType === 'zellij';
 
-        // Discover via the backend the bot actually runs.
-        const sessions: Array<AdoptableSession | ZellijAdoptableSession> = useZellij
-          ? discoverAdoptableZellijSessions(botCliId)
-          : discoverAdoptableSessions(botCliId);
+        // Discover BOTH tmux AND zellij sessions, regardless of the bot's own
+        // backend — a normal tmux bot should still be able to adopt a CLI the
+        // user is running inside zellij (and vice-versa). The adopt itself
+        // picks the right observe backend from the chosen target.
+        // discoverAdoptableZellijSessions returns [] when zellij isn't
+        // installed, so this is safe on tmux-only hosts.
+        const sessions: Array<AdoptableSession | ZellijAdoptableSession> = [
+          ...discoverAdoptableSessions(botCliId),
+          ...discoverAdoptableZellijSessions(botCliId),
+        ];
 
         if (sessions.length === 0) {
           await sessionReply(rootId, t('cmd.adopt.no_sessions', undefined, loc));
@@ -865,14 +867,14 @@ export async function handleCommand(
 
         const directTarget = adoptArgs;
         if (directTarget) {
-          // zellij direct target: "session:paneId" or "session/paneId"; tmux:
-          // the "session:window.pane" tmux address.
-          const target = useZellij
-            ? (sessions as ZellijAdoptableSession[]).find(s => {
-                const sep = directTarget.replace('/', ':');
-                return `${s.zellijSession}:${s.zellijPaneId}` === sep;
-              })
-            : (sessions as AdoptableSession[]).find(s => s.tmuxTarget === directTarget);
+          // Match a tmux address ("session:window.pane") OR a zellij target
+          // ("session:paneId" / "session/paneId") against the merged list.
+          const zellijNorm = directTarget.replace('/', ':');
+          const target = sessions.find(s =>
+            'zellijPaneId' in s
+              ? `${s.zellijSession}:${s.zellijPaneId}` === zellijNorm
+              : s.tmuxTarget === directTarget,
+          );
           if (!target) {
             await sessionReply(rootId, t('cmd.adopt.pane_not_found', { pane: directTarget }, loc));
             break;
