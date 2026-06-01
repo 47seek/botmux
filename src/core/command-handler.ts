@@ -11,7 +11,7 @@ import * as sessionStore from '../services/session-store.js';
 import * as scheduleStore from '../services/schedule-store.js';
 import * as scheduler from './scheduler.js';
 import { scanProjects, scanMultipleProjects, describeProjectDir } from '../services/project-scanner.js';
-import { buildRepoSelectCard, buildAdoptSelectCard, buildSessionClosedCard, getCliDisplayName } from '../im/lark/card-builder.js';
+import { buildRepoSelectCard, buildAdoptSelectCard, buildCodexAppThreadSelectCard, buildSessionClosedCard, getCliDisplayName } from '../im/lark/card-builder.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import { deleteMessage, sendMessage, listChatBotMembers, resolveUserUnionId, getChatModeStrict } from '../im/lark/client.js';
 import { claimPairing } from '../services/pairing-store.js';
@@ -20,6 +20,7 @@ import { killWorker, forkWorker, forkAdoptWorker, getCurrentCliVersion, postFres
 import { expandHome, getSessionWorkingDir, getProjectScanDir, getProjectScanDirs, rememberLastCliInput } from './session-manager.js';
 import { validateWorkingDir } from './working-dir.js';
 import { discoverAdoptableSessions, validateAdoptTarget, type AdoptableSession } from './session-discovery.js';
+import { listCodexAppThreads, type CodexAppThreadSummary } from '../services/codex-app-threads.js';
 import { generateAuthUrl, getTokenStatus } from '../utils/user-token.js';
 import { bindOncall, unbindOncall, getOncallStatus } from '../services/oncall-store.js';
 import { invalidWorkingDirs } from '../utils/working-dir.js';
@@ -229,6 +230,11 @@ function formatUptime(ms: number): string {
   if (m < 60) return `${m}m${s % 60}s`;
   const h = Math.floor(m / 60);
   return `${h}h${m % 60}m`;
+}
+
+function codexAppThreadTitle(thread: CodexAppThreadSummary): string {
+  const raw = (thread.name || thread.preview || thread.threadId).replace(/\s+/g, ' ').trim();
+  return raw.length > 80 ? raw.slice(0, 79) + '…' : raw;
 }
 
 function invalidConfiguredWorkingDirs(ds: DaemonSession | undefined, larkAppId: string | undefined): string[] {
@@ -845,7 +851,17 @@ export async function handleCommand(
           await sessionReply(rootId, t('cmd.adopt.already_adopted', { label, pane: adopted.tmuxTarget }, loc));
           break;
         }
-        const botCliId = ds ? getBot(ds.larkAppId).config.cliId : undefined;
+        const botCfgForAdopt = ds ? getBot(ds.larkAppId).config : (larkAppId ? getBot(larkAppId).config : undefined);
+        if (botCfgForAdopt?.cliId === 'codex-app') {
+          if (!ds) {
+            await sessionReply(rootId, t('cmd.no_active_session', undefined, loc));
+            break;
+          }
+          await handleCodexAppAdoptCommand(adoptArgs, rootId, ds, deps, larkAppId);
+          break;
+        }
+
+        const botCliId = botCfgForAdopt?.cliId;
         const sessions = discoverAdoptableSessions(botCliId);
 
         if (sessions.length === 0) {
@@ -1696,7 +1712,79 @@ export async function handleCommand(
   }
 }
 
+async function handleCodexAppAdoptCommand(
+  args: string,
+  rootId: string,
+  ds: DaemonSession,
+  deps: CommandHandlerDeps,
+  larkAppId?: string,
+): Promise<void> {
+  const sessionReply = (rid: string, content: string, msgType?: string) =>
+    deps.sessionReply(rid, content, msgType, larkAppId);
+  const loc: Locale = localeForBot(ds.larkAppId ?? larkAppId);
+  const botCfg = getBot(ds.larkAppId).config;
+
+  let threads: CodexAppThreadSummary[];
+  try {
+    threads = await listCodexAppThreads({
+      codexBin: botCfg.cliPathOverride,
+      cwd: getSessionWorkingDir(ds),
+      limit: 50,
+    });
+  } catch (err: any) {
+    await sessionReply(rootId, t('cmd.codex_app_adopt.list_failed', { error: err?.message ?? String(err) }, loc));
+    return;
+  }
+
+  if (threads.length === 0) {
+    await sessionReply(rootId, t('cmd.codex_app_adopt.no_threads', undefined, loc));
+    return;
+  }
+
+  if (args) {
+    const target = threads.find(t => t.threadId === args || t.threadId.startsWith(args));
+    if (!target) {
+      await sessionReply(rootId, t('cmd.codex_app_adopt.thread_not_found', { threadId: args }, loc));
+      return;
+    }
+    await startCodexAppThreadSession(target, ds, deps, larkAppId);
+    return;
+  }
+
+  const cardJson = buildCodexAppThreadSelectCard(threads, rootId, loc);
+  await sessionReply(rootId, cardJson, 'interactive');
+}
+
 // ─── Adopt session helper ────────────────────────────────────────────────────
+
+export async function startCodexAppThreadSession(
+  thread: CodexAppThreadSummary,
+  ds: DaemonSession,
+  deps: CommandHandlerDeps,
+  larkAppId?: string,
+): Promise<void> {
+  const sessionReply = (rid: string, content: string, msgType?: string) =>
+    deps.sessionReply(rid, content, msgType, larkAppId);
+  const loc: Locale = localeForBot(ds.larkAppId ?? larkAppId);
+  const title = codexAppThreadTitle(thread);
+
+  ds.adoptedFrom = undefined;
+  ds.workingDir = thread.cwd;
+  ds.hasHistory = true;
+  ds.currentTurnTitle = undefined;
+  ds.lastScreenContent = undefined;
+  ds.lastScreenStatus = undefined;
+
+  ds.session.workingDir = thread.cwd;
+  ds.session.title = `Codex App: ${title}`;
+  ds.session.cliId = 'codex-app';
+  ds.session.cliSessionId = thread.threadId;
+  ds.session.adoptedFrom = undefined;
+  sessionStore.updateSession(ds.session);
+
+  forkWorker(ds, '', true);
+  await sessionReply(sessionAnchorId(ds), t('cmd.codex_app_adopt.success', { title }, loc));
+}
 
 export async function startAdoptSession(
   target: AdoptableSession,
