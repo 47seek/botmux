@@ -127,6 +127,35 @@ function findAllClisUnder(
   return found.filter(m => !found.some(n => n.pid !== m.pid && n.cliId === m.cliId && isAncestor(m.pid, n.pid)));
 }
 
+/** comm values that are never a pane process — transient scan/client tooling
+ *  that `ps`-based discovery and `zellij action` calls spawn under the server. */
+const TRANSIENT_COMMS = new Set(['zellij', 'ps', 'pgrep', 'sh-from-ps', '']);
+
+/**
+ * Persistent pane-shell children of a zellij server, robust against the
+ * transient processes that briefly parent to the server during discovery.
+ *
+ * Two failure modes are filtered: (1) `getChildPids` snapshots the whole `ps`
+ * table, so any `ps`/`zellij`-client process alive at that instant with
+ * ppid==server leaks in (comm denylist removes these); (2) anything else
+ * transient — caught by taking TWO snapshots and intersecting, since a
+ * short-lived process is gone by the second read while real pane shells persist.
+ * Without this the children count flaps vs the terminal count → the count guard
+ * intermittently refuses → discovery returns nothing on the unlucky call → the
+ * card shows panes but the click's re-discovery finds none → "目标 CLI 会话已退出".
+ */
+function paneShellChildren(serverPid: number): number[] {
+  const snap = (): Set<number> => new Set(
+    getChildPids(serverPid).filter(pid => {
+      const c = readComm(pid) ?? '';
+      return c.length > 0 && !TRANSIENT_COMMS.has(c);
+    }),
+  );
+  const first = snap();
+  const second = snap();
+  return [...first].filter(pid => second.has(pid)).sort((a, b) => a - b);
+}
+
 /** Run a read-only `zellij --session S action …`, returning stdout or null. */
 function zellijRead(session: string, args: string[]): string | null {
   try {
@@ -207,9 +236,12 @@ export function discoverAdoptableZellijSessions(filterCliId?: CliId): ZellijAdop
     // panes/tabs run the SAME cli from the SAME dir (e.g. multiple `codex` in
     // ~): a cwd match is then ambiguous and silently drops them all (the bug
     // 申晗 hit). Counts must match or the alignment is unreliable → refuse.
-    const children = getChildPids(serverPid).sort((a, b) => a - b);
+    // paneShellChildren filters the transient ps/zellij-client processes that
+    // briefly parent to the server during discovery (see its doc) — only
+    // persistent pane shells/commands remain, so the count guard is stable.
+    const children = paneShellChildren(serverPid);
     if (children.length !== terminals.length) {
-      logger.debug(`[zellij-adopt] ${session}: server children(${children.length}) != terminals(${terminals.length}) — can't align, refusing`);
+      logger.debug(`[zellij-adopt] ${session}: pane processes(${children.length}) != terminals(${terminals.length}) — can't align, refusing`);
       continue;
     }
 
