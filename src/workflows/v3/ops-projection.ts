@@ -1,0 +1,202 @@
+/**
+ * v3 dashboard projection: a run dir (journal.ndjson + dag.json) → a read-only
+ * `RunView` the dashboard renders as a DAG graph with per-node live/replay
+ * terminals.
+ *
+ * Mirrors `src/workflows/ops-projection.ts` (the v0.2 read-only projection):
+ * runId allowlist + path-inside-dir defense before touching the filesystem,
+ * and defensive reads (missing/partial files degrade gracefully, never throw)
+ * so a half-written run still renders.
+ *
+ * Node status comes from `materialize(journal)` (the canonical fold); live
+ * terminal info comes from the `nodeSessionReady` event (written mid-run, kept
+ * even if the node later fails); edges/goal come from the persisted dag.json.
+ */
+import { readFileSync, existsSync, readdirSync } from 'node:fs';
+import { join, resolve, sep } from 'node:path';
+import { homedir } from 'node:os';
+import { readJournal } from './journal.js';
+import { materialize, type V3RunStatus } from './state.js';
+import type { V3NodeStatus } from './orchestrator.js';
+
+/** Same allowlist shape as v0.2 ops-projection — validate BEFORE path-joining a
+ *  caller-supplied runId, so it can't escape runsDir via traversal. */
+const RUN_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+export function isValidRunId(runId: string): boolean {
+  return RUN_ID_RE.test(runId);
+}
+
+/** Default run root, aligned with cli-run.ts / grill-state.ts. */
+export function defaultRunsDir(): string {
+  return join(homedir(), '.botmux', 'v3-runs');
+}
+
+export interface WebTerminalView {
+  sessionId: string;
+  webPort?: number;
+  // NO `token` — the dashboard view is READ-ONLY; the write token is never
+  // exposed through the read API (codex security review 2026-06-02).  A live
+  // view connects read-only to `http://<host>:<webPort>/`.
+  /** `live` while the node's work worker is in flight; `closed` once the node
+   *  reached a terminal verdict (then replay via the pty-log endpoint). */
+  status: 'live' | 'closed';
+}
+
+export interface RunNodeView {
+  id: string;
+  status: V3NodeStatus;
+  /** Upstream node ids (graph edges) — from the persisted dag.json. */
+  depends: string[];
+  goal?: string;
+  attemptId?: string;
+  /** Present once the node's worker reported `nodeSessionReady`. */
+  webTerminal?: WebTerminalView;
+  /** Whether a raw PTY log exists for replay.  The absolute path is NOT exposed
+   *  to the frontend (codex review) — a replay endpoint locates it server-side
+   *  via `ptyLogPathFor(runsDir, runId, nodeId)`. */
+  hasPtyLog: boolean;
+  /** Present once the node succeeded. */
+  manifestPath?: string;
+}
+
+export interface RunView {
+  runId: string;
+  runStatus: V3RunStatus;
+  failedNodeId?: string;
+  nodes: RunNodeView[];
+}
+
+interface DagNodeLite {
+  id: string;
+  depends: string[];
+  goal?: string;
+}
+
+function readDagNodes(runDir: string): DagNodeLite[] {
+  const p = join(runDir, 'dag.json');
+  if (!existsSync(p)) return [];
+  try {
+    const dag = JSON.parse(readFileSync(p, 'utf-8')) as { nodes?: unknown };
+    if (!dag || !Array.isArray(dag.nodes)) return [];
+    return dag.nodes.map((raw): DagNodeLite => {
+      const n = raw as { id?: unknown; depends?: unknown; goal?: unknown };
+      return {
+        id: String(n.id),
+        depends: Array.isArray(n.depends) ? n.depends.map(String) : [],
+        goal: typeof n.goal === 'string' ? n.goal : undefined,
+      };
+    });
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Project an already-resolved run dir into a `RunView`.  Read-only + defensive:
+ * a missing journal / dag still yields a (possibly sparse) view rather than
+ * throwing — the dashboard polls this while a run is mid-flight.
+ */
+export function projectRun(runId: string, runDir: string): RunView {
+  const journalPath = join(runDir, 'journal.ndjson');
+  const events = existsSync(journalPath) ? readJournal(journalPath) : [];
+  const snap = materialize(events);
+  const dagNodes = readDagNodes(runDir);
+
+  const sessions = new Map<string, { sessionId: string; webPort?: number; ptyLogPath?: string }>();
+  const manifests = new Map<string, string>();
+  for (const e of events) {
+    if (e.type === 'nodeSessionReady') {
+      sessions.set(e.nodeId, { ...e.sessionInfo, ptyLogPath: e.ptyLogPath });
+    } else if (e.type === 'nodeSucceeded') {
+      manifests.set(e.nodeId, e.manifestPath);
+    }
+  }
+
+  // Prefer the dag's node order (covers not-yet-dispatched nodes); fall back to
+  // whatever the journal has seen if dag.json is missing.
+  const ids = dagNodes.length ? dagNodes.map((n) => n.id) : [...snap.nodes.keys()];
+  const dagById = new Map(dagNodes.map((n) => [n.id, n]));
+
+  const nodes: RunNodeView[] = ids.map((id) => {
+    const status = (snap.nodes.get(id)?.status ?? 'pending') as V3NodeStatus;
+    const sess = sessions.get(id);
+    const view: RunNodeView = {
+      id,
+      status,
+      depends: dagById.get(id)?.depends ?? [],
+      goal: dagById.get(id)?.goal,
+      attemptId: snap.attempts.get(id),
+      hasPtyLog: Boolean(sess?.ptyLogPath),
+      manifestPath: manifests.get(id),
+    };
+    if (sess) {
+      view.webTerminal = {
+        sessionId: sess.sessionId,
+        webPort: sess.webPort,
+        status: status === 'running' ? 'live' : 'closed',
+      };
+    }
+    return view;
+  });
+
+  return { runId, runStatus: snap.runStatus, failedNodeId: snap.failedNodeId, nodes };
+}
+
+/**
+ * Validate a caller-supplied `runId`, resolve it under `runsDir` (re-checking
+ * the join stays inside runsDir — defense in depth), and project.  Returns
+ * `undefined` for an invalid id / traversal attempt / missing run.
+ */
+export function projectRunById(runsDir: string, runId: string): RunView | undefined {
+  if (!isValidRunId(runId)) return undefined;
+  const root = resolve(runsDir);
+  const runDir = resolve(root, runId);
+  if (runDir !== root && !runDir.startsWith(root + sep)) return undefined;
+  if (!existsSync(runDir)) return undefined;
+  return projectRun(runId, runDir);
+}
+
+/**
+ * Server-side resolver for a node's raw PTY log path (for the replay endpoint).
+ * The absolute path is NEVER in the public RunView — callers locate it here by
+ * runId/nodeId, and it's re-validated to be inside the run dir (defense in
+ * depth) before any read.  Returns undefined for invalid id / traversal / no log.
+ */
+export function ptyLogPathFor(runsDir: string, runId: string, nodeId: string): string | undefined {
+  if (!isValidRunId(runId)) return undefined;
+  const root = resolve(runsDir);
+  const runDir = resolve(root, runId);
+  if (runDir !== root && !runDir.startsWith(root + sep)) return undefined;
+  const journalPath = join(runDir, 'journal.ndjson');
+  if (!existsSync(journalPath)) return undefined;
+
+  let recorded: string | undefined;
+  for (const e of readJournal(journalPath)) {
+    if (e.type === 'nodeSessionReady' && e.nodeId === nodeId && e.ptyLogPath) recorded = e.ptyLogPath;
+  }
+  if (!recorded) return undefined;
+
+  const abs = resolve(recorded);
+  if (abs !== runDir && !abs.startsWith(runDir + sep)) return undefined;
+  return existsSync(abs) ? abs : undefined;
+}
+
+export interface RunSummary {
+  runId: string;
+  runStatus: V3RunStatus;
+  nodeCount: number;
+}
+
+/** List runs under `runsDir` (dirs that have a journal.ndjson), newest-first by
+ *  name (runIds carry a `<slug>-<yymmdd-hhmm>` stamp so name sort ≈ time sort). */
+export function listRuns(runsDir: string): RunSummary[] {
+  if (!existsSync(runsDir)) return [];
+  const out: RunSummary[] = [];
+  for (const entry of readdirSync(runsDir, { withFileTypes: true })) {
+    if (!entry.isDirectory() || !isValidRunId(entry.name)) continue;
+    if (!existsSync(join(runsDir, entry.name, 'journal.ndjson'))) continue;
+    const view = projectRun(entry.name, join(runsDir, entry.name));
+    out.push({ runId: view.runId, runStatus: view.runStatus, nodeCount: view.nodes.length });
+  }
+  return out.sort((a, b) => b.runId.localeCompare(a.runId));
+}

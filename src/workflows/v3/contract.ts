@@ -187,6 +187,11 @@ export interface RunNodeRequest {
   env: Record<string, string>;
   timeoutMs: number;
   cancelSignal?: AbortSignal;
+  /** Called as soon as the worker web terminal is ready, before the node
+   *  reaches terminal.  Runtime uses this to append `nodeSessionReady` so the
+   *  dashboard can attach to an in-flight node instead of waiting for
+   *  RunNodeResult at completion. */
+  onSessionReady?: (info: WorkerSessionInfo & { ptyLogPath?: string }) => void | Promise<void>;
   /** Defaults to `${attemptDir}/stdout.log` when omitted. */
   stdoutPath?: string;
   /** Defaults to `${attemptDir}/stderr.log` when omitted. */
@@ -240,3 +245,56 @@ export type ValidateManifest = (
   manifestPath: string,
   outputDir: string,
 ) => Promise<ManifestValidationResult>;
+
+// ─── Spec (grill 产物 → architect 输入) ──────────────────────────────────────
+
+export const SPEC_SCHEMA_VERSION = 1;
+
+/**
+ * One prospective node in the requirement-decomposition sketch.  grill writes
+ * these (the WHAT); architect turns them into formal dag.json nodes (the HOW).
+ *
+ * `input_needs` is FREE TEXT ("需要 research 阶段产出的竞品事实"), NOT a list of
+ * upstream sketchIds — grill must not draw edges; architect parses `input_needs`
+ * into the dag's `depends`. (codex review 2026-06-02.)  `risk_gate` → dag.json
+ * humanGate on the corresponding node.
+ */
+export interface SpecNodeSketch {
+  sketchId: string;
+  goal: string;
+  input_needs: string[];
+  expected_outputs: string[];
+  acceptance: string;
+  risk_gate: boolean;
+  unknowns: string[];
+}
+
+/**
+ * The canonical, machine-readable spec.  `workflow spec-finalize` parses the
+ * fenced ```json block out of spec.md, validates it, and materializes this as
+ * `spec.json` (parse/validate failure blocks handoff — codex review 2026-06-02).
+ * architect reads `spec.json` for STRUCTURE; `spec.md` is narrative context only.
+ *
+ * Node sketch ships as fenced JSON (not YAML) — dependency-free, mirrors v0.2's
+ * JSON workflow definitions, and an LLM emits valid JSON reliably.
+ */
+export interface Spec {
+  schemaVersion: number;
+  runId: string;
+  title: string;
+  /** grill 收敛后的清晰需求陈述. */
+  requirement: string;
+  /** 整体验收标准（人读叙事在 spec.md，这里给 architect 的结构化副本）. */
+  acceptance?: string;
+  /** 明确不做的. */
+  nonGoals?: string[];
+  nodes: SpecNodeSketch[];
+}
+
+// ─── Architect seam ─────────────────────────────────────────────────────────
+// `runArchitect(...)` + its `RunArchitectInput`/`RunArchitectResult` live in
+// `architect.ts` (codex owns the architect goal-worker).  The host controller
+// imports them from there directly — they are NOT redefined here (one-directional
+// host→architect call, not a bidirectional injection contract like RunNode).
+// The host still runs loadDag/validateDag on the returned dagPath; it does NOT
+// trust architect's self-claim of validity. (seam agreed w/ codex 2026-06-02.)

@@ -75,6 +75,7 @@ async function runNodeImpl(
 ): Promise<RunNodeResult> {
   const secret = await deps.resolveLarkAppSecret(req.botSnapshot.larkAppId);
   const manifestPath = req.env[GOAL_ENV.MANIFEST_PATH] ?? join(req.attemptDir, 'manifest.json');
+  const ptyLogPath = join(req.attemptDir, 'pty.log');
   if (!secret) return { status: 'fail', manifestPath };
 
   await mkdir(dirname(stdoutPath(req)), { recursive: true });
@@ -90,6 +91,7 @@ async function runNodeImpl(
       ...req.env,
       [GOAL_ENV.V3_MARKER]: '1',
       BOTMUX_WORKFLOW: '1',
+      BOTMUX_WORKFLOW_PTY_LOG_PATH: ptyLogPath,
       BOTMUX_WORKFLOW_RUN_ID: req.runId,
       BOTMUX_WORKFLOW_NODE_ID: req.node.id,
     },
@@ -126,6 +128,7 @@ async function runNodeImpl(
     let cancelRequested = false;
     let initSent = false;
     let goalSent = false;
+    let sessionReadyNotified = false;
 
     const hardDeadline = setTimeout(() => {
       finish('fail', 'timeout');
@@ -137,6 +140,19 @@ async function runNodeImpl(
         ...(webPort !== undefined ? { webPort } : {}),
         ...(token ? { token } : {}),
       };
+    }
+
+    function notifySessionReady(): void {
+      if (sessionReadyNotified || webPort === undefined) return;
+      sessionReadyNotified = true;
+      try {
+        void req.onSessionReady?.({
+          ...sessionInfo(),
+          ptyLogPath,
+        });
+      } catch (err) {
+        void appendLine(stderrPath(req), `[v3] onSessionReady callback failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
     }
 
     function cleanup(signal: NodeJS.Signals = 'SIGTERM'): void {
@@ -224,6 +240,7 @@ async function runNodeImpl(
         case 'ready':
           webPort = event.port;
           token = event.token;
+          notifySessionReady();
           try {
             sendInit();
           } catch {

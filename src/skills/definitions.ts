@@ -1042,6 +1042,117 @@ botmux dispatch --title "<子项目标题>" --bot "<coder_open_id>:名字:coder"
 - 失败别硬重试同一招 ≥3 次；上报用户。
 `;
 
+const WORKFLOW_V3_SKILL = `---
+name: botmux-workflow
+description: 把一个「模糊的、一次性的、需要拆成多步的目标」交给系统：先 grill 把需求问清楚 → 自动编排成 DAG 流程 → 跑完。触发场景：用户给一个复合/探索性任务且没指定具体步骤，如"帮我调研X出报告"、"把这事拆成几步自动跑完"、"做个 workflow 处理…"、"帮我把 A/B/C 串起来自动做"。区别：跑已存好的固定流程模板用 \`/workflow run <id>\`（不是本 skill）；设计可复用模板用 botmux-workflow-create；本 skill 是一次性即兴 workflow。简单单步请求/普通问答/改代码不要触发；进入前先跟用户确认一句。
+---
+
+# botmux-workflow — v3 即兴 workflow（grill → 编排 → 跑）
+
+把用户一句模糊的复合目标，通过「拷问澄清 → 自动编排 DAG → 人确认 → 自动执行」一条龙做完。整个过程在当前飞书话题里**一问一答**进行（用 botmux send 跟用户对话）。
+
+## 何时用 / 不用
+- ✅ 用户有一个**一次性、需要拆成多步**的目标，但没给出具体步骤（"调研三家竞品出对比报告"、"把日志拉下来分析再生成图表"）。
+- ❌ 跑**已存好的固定模板** → 让用户用 \`/workflow run <id>\`。
+- ❌ **设计可复用模板** → botmux-workflow-create。
+- ❌ 单步请求 / 普通问答 / 改代码 → 别触发，正常回答。
+
+## 0. 先确认（防误触发）
+真正进入 grill 前先发一句确认：
+
+> 我理解你想让我做一整套 workflow：先问你几个问题把需求弄清楚，再自动编排成流程跑完。对吗？
+
+用户确认了再往下。（用户已经很明确要做 workflow 时可省略此步。）
+
+## 1. 建 run
+\`\`\`bash
+botmux workflow new "<把用户目标浓缩成一句话>"
+\`\`\`
+记下返回的 \`runId\`（和 \`specPath\`）——后面**每个**命令都要带这个 runId。
+
+## 2. Grill：一次只问一个问题
+遵循 grill-me 方法：
+- **一次一个问题**，每个都给出你的**推荐默认答案**（不是开放式"你想怎样"）。
+- 沿决策树走，先父决策再子决策。
+- 能从代码/文件查到的**别问，直接查**。
+- 目标：能为**每个**预想节点凑齐五件套 \`goal / input_needs / expected_outputs / acceptance / risk_gate\`，否则继续问。
+- **逃生阀**：用户随时可说"够了 / 用默认 / 别问了"——立即收尾，用推荐默认填满缺口，把没定的写进该节点 \`unknowns\`。
+- 别把用户问烦：五件套是上限不是下限，能合并的问题合并。
+
+## 3. 写 spec.md
+往第 1 步返回的 \`specPath\` 写文件 = 人读叙事 + **唯一一个** fenced json 块（机器读的 canonical Spec）。
+
+人读部分：\`## 需求\` / \`## 决策树\`（决策点+结论+拒绝的备选）/ \`## 验收标准\` / \`## 非目标\`。
+
+机器读部分（**只放一个** json 代码块，schema 如下）：
+\`\`\`json
+{
+  "schemaVersion": 1,
+  "runId": "<第1步的 runId>",
+  "title": "<一句话标题>",
+  "requirement": "<收敛后的清晰需求>",
+  "acceptance": "<整体验收标准>",
+  "nonGoals": ["<明确不做的>"],
+  "nodes": [
+    {
+      "sketchId": "research",
+      "goal": "调研 X/Y/Z 的定价与功能，写成 facts.md",
+      "input_needs": [],
+      "expected_outputs": ["facts.md"],
+      "acceptance": "每家含定价档+功能矩阵",
+      "risk_gate": false,
+      "unknowns": []
+    },
+    {
+      "sketchId": "report",
+      "goal": "基于调研产物写竞品分析报告 report.md",
+      "input_needs": ["research 阶段产出的竞品事实"],
+      "expected_outputs": ["report.md"],
+      "acceptance": "含结论与建议",
+      "risk_gate": true,
+      "unknowns": []
+    }
+  ]
+}
+\`\`\`
+**字段铁律**：
+- \`input_needs\` 是**自由文本**描述"这步需要什么信息/产物"，**绝不要写成上游 sketchId 列表**——画依赖边是 architect 的活，不是你的。
+- \`risk_gate: true\` = 这步执行期要人工审批（如对外发送）。
+- \`unknowns\` 放没跟用户定死、用了默认的点。
+
+## 4. 校验 spec
+\`\`\`bash
+botmux workflow spec-finalize <runId>
+\`\`\`
+成功 → 下一步。失败（命令打印 problems）→ 按 problems 修 spec.md 的 json 块再跑。**校验不过不能往下走。**
+
+## 5. Gate-1：确认需求
+给用户简明摘要（做哪几步、各自产出、验收、不做什么），问：
+
+> 这是我理解的需求和拆解，对吗？确认我就编排成可执行流程。
+
+用户确认 → \`botmux workflow approve-spec <runId>\`；要改 → 回第 2/3 步改 spec 再 finalize。
+
+## 6. 编排 DAG
+\`\`\`bash
+botmux workflow architect <runId>
+\`\`\`
+系统自动把 spec 编译成 dag.json 并**由 host 校验**。成功 → 命令打印 \`dagPath\`/\`notesPath\`，进下一步。失败（退回 spec_approved + 打印 problems）→ 说明 spec 还有问题，按 problems 回第 2/3 步修 spec，重新 approve-spec + architect。
+
+## 7. Gate-2：确认流程
+读 architect 产出的 dag.json + architect-notes.md（用第 6 步打印的路径），给用户讲清楚流程：有哪些节点、依赖顺序、哪些节点执行期会停下等人批。问：
+
+> 编排好的流程是这样，对吗？确认就开跑。
+
+用户确认 → \`botmux workflow approve-dag <runId>\`，然后开跑 \`botmux v3 run <dagPath>\`（带当前 bot）。要改 → 回去修 spec 重新编排。
+
+## 关键纪律
+- 全程飞书一问一答，用 botmux send 对话。
+- \`runId\` 是贯穿全程的钥匙，每个命令都带对。
+- 三道确认别省：进入前确认 + Gate-1 需求 + Gate-2 流程。
+- 任何 \`botmux workflow\` 命令报错，把人话版原因告诉用户，别闷头重试。
+`;
+
 export const ASK_SKILL_NAME = 'botmux-ask';
 
 export const BUILTIN_SKILLS: SkillDef[] = [
@@ -1052,6 +1163,7 @@ export const BUILTIN_SKILLS: SkillDef[] = [
   { name: 'botmux-bots', content: BOTS_SKILL },
   { name: 'botmux-handoff', content: HANDOFF_SKILL },
   { name: 'botmux-workflow-create', content: WORKFLOW_CREATE_SKILL },
+  { name: 'botmux-workflow', content: WORKFLOW_V3_SKILL },
   { name: 'botmux-orchestrate', content: ORCHESTRATE_SKILL },
 ];
 

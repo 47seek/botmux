@@ -37,6 +37,13 @@ export type V3ErrorClass =
 export type V3Event =
   | { type: 'runStarted'; runId: string }
   | { type: 'nodeDispatched'; nodeId: string; attemptId: string }
+  // Written when the node's worker web terminal is ready (mid-run) so the
+  // dashboard can attach to an in-flight node's LIVE terminal instead of waiting
+  // for completion.  Kept even if the node later fails (terminal info survives).
+  // NOTE: deliberately NO web-terminal `token` here — it's a WRITE token, and
+  // read-only "watch the subagent" doesn't need it; persisting it would turn
+  // write access into a durable artifact (codex security review 2026-06-02).
+  | { type: 'nodeSessionReady'; nodeId: string; attemptId: string; sessionInfo: { sessionId: string; webPort?: number }; ptyLogPath?: string }
   | { type: 'nodeSucceeded'; nodeId: string; attemptId: string; manifestPath: string }
   | { type: 'nodeFailed'; nodeId: string; attemptId: string; errorClass: V3ErrorClass; message?: string }
   | { type: 'gateDispatched'; nodeId: string; waitId: string }

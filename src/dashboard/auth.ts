@@ -151,12 +151,19 @@ export function decideDashboardAuth(opts: {
     method === 'GET' &&
     pathname.startsWith('/api/workflows/') &&
     !pathname.endsWith('/terminal-log/raw');
+  // v3 read-only API is link-shareable like the v0.2 one, EXCEPT the per-node
+  // raw PTY stream (`…/pty-log`) which — same rationale as terminal-log/raw —
+  // can leak secrets that scrolled the terminal, so it stays behind cookie auth.
+  const isV3ReadOnly =
+    method === 'GET' &&
+    pathname.startsWith('/api/v3/') &&
+    !pathname.endsWith('/pty-log');
   const isStaticShell =
     method === 'GET' && (pathname === '/' || pathname.startsWith('/assets/'));
 
   const authed = !!presentedToken && presentedToken === activeToken;
 
-  if (!authed && !isWorkflowReadOnly && !isStaticShell) {
+  if (!authed && !isWorkflowReadOnly && !isV3ReadOnly && !isStaticShell) {
     return { kind: 'deny401' };
   }
 

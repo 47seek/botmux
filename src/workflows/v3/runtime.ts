@@ -179,6 +179,11 @@ export async function runWorkflow(
     JSON.stringify(Object.fromEntries(botSnapshots), null, 2),
   );
 
+  // Persist the dag into the runDir so the dashboard projection can read the
+  // node graph (depends → edges) and a resume is self-describing.  Deterministic
+  // (same runId ⇒ same dag), so re-writing on resume is harmless.
+  writeFileSync(join(runDir, 'dag.json'), JSON.stringify(dag, null, 2));
+
   // First run only: stamp runStarted (idempotent on resume).
   if (readJournal(journalPath).length === 0) {
     appendEvent(journalPath, { type: 'runStarted', runId: dag.runId });
@@ -310,6 +315,20 @@ export async function runWorkflow(
       env,
       timeoutMs: (node.timeoutSec ?? DEFAULT_NODE_TIMEOUT_SEC) * 1000,
       cancelSignal: opts.cancelSignal,
+      // Worker terminal is ready mid-run → stamp nodeSessionReady so the
+      // dashboard can attach to the LIVE terminal.  Sync appendEvent (no await
+      // on the pool's fire-and-forget ready path — codex note).
+      onSessionReady: (info) => {
+        // Drop the write `token` — never persist it (codex security review):
+        // the dashboard view is read-only and doesn't need write access.
+        appendEvent(journalPath, {
+          type: 'nodeSessionReady',
+          nodeId: node.id,
+          attemptId,
+          sessionInfo: { sessionId: info.sessionId, webPort: info.webPort },
+          ptyLogPath: info.ptyLogPath,
+        });
+      },
     };
 
     const p = deps

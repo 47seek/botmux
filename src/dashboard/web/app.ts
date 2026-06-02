@@ -10,6 +10,7 @@ import { renderTeamFederationPage, renderTeamManagePage } from './team-federatio
 import { renderConnectorsPage } from './connectors.js';
 import { renderWorkflowsPage } from './workflows.js';
 import { renderWorkflowCatalogPage } from './workflow-catalog.js';
+import { renderV3RunsPage } from './v3.js';
 import { wireBotOnboardingButton } from './bot-onboarding.js';
 import { t, ui } from './ui.js';
 import type { DashboardLocale } from './i18n.js';
@@ -71,7 +72,8 @@ function route() {
     hash.startsWith('#/workflows-catalog')
   ) {
     pageDispose = renderWorkflowCatalogPage(root);
-  } else if (hash.startsWith('#/workflows')) pageDispose = renderWorkflowsPage(root);
+  } else if (hash.startsWith('#/v3')) pageDispose = renderV3RunsPage(root);
+  else if (hash.startsWith('#/workflows')) pageDispose = renderWorkflowsPage(root);
   else if (hash.startsWith('#/groups')) renderGroupsPage(root);
   else if (hash.startsWith('#/bot-defaults')) renderBotDefaultsPage(root);
   else if (hash.startsWith('#/connectors')) renderConnectorsPage(root);
