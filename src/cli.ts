@@ -41,6 +41,7 @@ import {
   resolveCliId,
   assertOwnerWhenChatGroups,
   findInvalidAllowedUserEntries,
+  formatBotConfigTableRows,
   hasOwnerEntry,
   type BotConfigEditInput,
 } from './setup/bot-config-editor.js';
@@ -708,6 +709,9 @@ async function promptBotConfig(rl: ReturnType<typeof createInterface>): Promise<
     bot.allowedUsers = await promptRequiredOwner(rl);
   }
 
+  const appName = await refreshBotAppName(bot);
+  if (appName) console.log(`App Name: ${appName}\n`);
+
   if (!ensureBotWorkingDirsExist(bot, '默认工作目录')) return null;
 
   return normalizeBotConfig(bot);
@@ -728,19 +732,89 @@ function formatOptionalValue(v: unknown): string {
  * parseBotSelection 不再接受裸数字, 避免又冒出 "序号到底是几" 的歧义.
  */
 function formatBotConfigTable(bots: any[]): string {
-  if (bots.length === 0) return '';
-  const headers = ['进程名', 'App ID', 'CLI'];
-  const rows = bots.map((b, i) => [
-    botProcessName(b, i, PM2_NAME),
-    String(b?.larkAppId ?? ''),
-    String(b?.cliId ?? 'claude-code'),
-  ]);
-  const widths = headers.map((h, c) =>
-    Math.max(displayWidth(h), ...rows.map(r => displayWidth(r[c]))),
+  const appNames = loadKnownBotAppNames();
+  return formatBotConfigTableRows(bots.map((b, i) => ({
+    processName: botProcessName(b, i, PM2_NAME),
+    appName: knownBotAppName(b, appNames),
+    appId: String(b?.larkAppId ?? ''),
+    cliId: String(b?.cliId ?? 'claude-code'),
+  })));
+}
+
+type BotInfoEntryForSetup = { larkAppId?: string; botName?: string | null; appName?: string | null };
+
+function loadKnownBotAppNames(): Map<string, string> {
+  const map = new Map<string, string>();
+
+  const ingest = (entries: unknown): void => {
+    if (!Array.isArray(entries)) return;
+    for (const entry of entries as BotInfoEntryForSetup[]) {
+      const appId = typeof entry?.larkAppId === 'string' ? entry.larkAppId : '';
+      const name = typeof entry?.botName === 'string'
+        ? entry.botName.trim()
+        : typeof entry?.appName === 'string'
+          ? entry.appName.trim()
+          : '';
+      if (appId && name) map.set(appId, name);
+    }
+  };
+
+  // Populated by running daemons after /bot/v3/info; available even when setup
+  // is offline and avoids a network call in the common restart/edit path.
+  try { ingest(JSON.parse(readFileSync(join(DATA_DIR, 'bots-info.json'), 'utf-8'))); } catch { /* ignore */ }
+  // Cache written by setup's own best-effort lookup, so the name can show even
+  // before the first daemon start.
+  try { ingest(JSON.parse(readFileSync(join(CONFIG_DIR, 'bots-app-names.json'), 'utf-8'))); } catch { /* ignore */ }
+
+  return map;
+}
+
+function knownBotAppName(bot: any, appNames = loadKnownBotAppNames()): string | undefined {
+  const configured = typeof bot?.appName === 'string' ? bot.appName.trim() : '';
+  if (configured) return configured;
+  const appId = typeof bot?.larkAppId === 'string' ? bot.larkAppId : '';
+  return appId ? appNames.get(appId) : undefined;
+}
+
+function cacheBotAppName(appId: string, appName: string): void {
+  const cleanName = appName.trim();
+  if (!appId || !cleanName) return;
+  const path = join(CONFIG_DIR, 'bots-app-names.json');
+  const map = new Map<string, BotInfoEntryForSetup>();
+  try {
+    const entries = JSON.parse(readFileSync(path, 'utf-8'));
+    if (Array.isArray(entries)) {
+      for (const entry of entries as BotInfoEntryForSetup[]) {
+        if (typeof entry?.larkAppId === 'string') map.set(entry.larkAppId, entry);
+      }
+    }
+  } catch { /* ignore */ }
+  map.set(appId, { larkAppId: appId, appName: cleanName, botName: cleanName });
+  writeFileSync(path, JSON.stringify([...map.values()], null, 2) + '\n', { mode: 0o600 });
+}
+
+async function refreshBotAppName(bot: any): Promise<string | undefined> {
+  const appId = typeof bot?.larkAppId === 'string' ? bot.larkAppId : '';
+  const secret = typeof bot?.larkAppSecret === 'string' ? bot.larkAppSecret : '';
+  if (!appId || !secret) return undefined;
+  try {
+    const { fetchBotAppName } = await import('./setup/verify-permissions.js');
+    const info = await fetchBotAppName(appId, secret, botBrand(bot), { budgetMs: 5_000 });
+    if (info.ok) {
+      cacheBotAppName(appId, info.appName);
+      return info.appName;
+    }
+  } catch { /* best effort only */ }
+  return undefined;
+}
+
+async function refreshMissingBotAppNames(bots: any[]): Promise<void> {
+  const known = loadKnownBotAppNames();
+  await Promise.all(
+    bots
+      .filter((bot) => !knownBotAppName(bot, known))
+      .map((bot) => refreshBotAppName(bot)),
   );
-  const render = (cells: string[]) =>
-    '  ' + cells.map((cell, i) => padEndDisplay(cell, widths[i])).join('  ');
-  return [render(headers), ...rows.map(render)].join('\n');
 }
 
 async function promptEditBotConfig(
@@ -909,6 +983,7 @@ async function cmdSetup(): Promise<void> {
   if (hasBots) {
     // --- Multi-bot mode (bots.json exists) ---
     const bots = loadBotsJson();
+    await refreshMissingBotAppNames(bots);
     console.log(`已配置 ${bots.length} 个机器人：\n`);
     console.log(formatBotConfigTable(bots));
     console.log('');
@@ -977,6 +1052,7 @@ async function cmdSetup(): Promise<void> {
           return;
         }
         console.log('✅ 凭证有效\n');
+        await refreshBotAppName(edited);
       }
       rl.close();
 
