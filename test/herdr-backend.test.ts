@@ -557,4 +557,52 @@ describe('HerdrBackend callbacks', () => {
     // kill() tears down the live cohort.
     for (const w of nextCohort) expect(w.child.killed).toBe(true);
   });
+
+  it('status watcher: instant non-zero exit on a vanished agent emits onExit and does NOT re-arm (storm guard)', () => {
+    // Regression for the re-arm storm: on herdr v0.6.6 a `herdr wait
+    // agent-status` against a dead pane returns code 1 IMMEDIATELY. The old
+    // code re-armed synchronously on any non-0 code → a tight spawn loop that
+    // starved the poll timer and the session hung. The fix: an instant
+    // non-zero return triggers a liveness check; a vanished agent (empty
+    // `agent list`) emits onExit instead of re-arming.
+    const waitChildren: Array<{ status: string; child: FakeChild }> = [];
+    mockedSpawn.mockImplementation(((_cmd: any, args: any) => {
+      const child = makeFakeChild();
+      const argv = args as string[];
+      if (argv.includes('wait') && argv.includes('agent-status')) {
+        const statusIdx = argv.indexOf('--status');
+        waitChildren.push({ status: argv[statusIdx + 1]!, child });
+      }
+      return child;
+    }) as any);
+
+    // Agent present at spawn, then GONE (empty list) once it has exited.
+    let agentGone = false;
+    setHerdrResponses([
+      { match: a => a[0] === 'session' && a[1] === 'list', reply: () => EXISTING_SESSION_REPLY },
+      { match: a => a.includes('agent') && a.includes('get'), reply: () => AGENT_GET_REPLY('1-1') },
+      { match: a => a.includes('agent') && a.includes('list'), reply: () => agentGone ? JSON.stringify({ result: { agents: [] } }) : AGENT_LIST_REPLY('1-1') },
+      { match: a => a.includes('read') && (a.includes('agent') || a.includes('pane')), reply: () => PANE_READ_REPLY('x') },
+    ]);
+
+    const be = new HerdrBackend(SESSION, { isReattach: true });
+    const exits: Array<[number | null, string | null]> = [];
+    be.onExit((code, signal) => exits.push([code, signal]));
+    be.spawn('claude', [], { cwd: '/work', cols: 80, rows: 24, env: {} });
+
+    const cohort = waitChildren.slice();
+    expect(cohort.length).toBe(3);
+
+    // The agent has now exited; the next `wait` returns code 1 instantly.
+    agentGone = true;
+    cohort.find(w => w.status === 'done')!.child.emit('exit', 1, null);
+
+    // onExit fired (storm guard saw the empty agent list)...
+    expect(exits.length).toBe(1);
+    // ...and NO fresh cohort was armed synchronously (the bug spun new ones).
+    const nextCohort = waitChildren.slice(cohort.length);
+    expect(nextCohort.length).toBe(0);
+
+    be.kill();
+  });
 });

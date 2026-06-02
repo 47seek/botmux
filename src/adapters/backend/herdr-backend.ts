@@ -82,6 +82,19 @@ function extractAgents(raw: any): any[] {
   return Array.isArray(agents) ? agents : [];
 }
 
+// Whether a matched `agent list` row represents an exited CLI. Verified against
+// herdr v0.6.6: a live agent carries `agent_status` ('unknown' | 'working' |
+// 'idle' | 'blocked' | 'done'); once the underlying process exits, herdr drops
+// the row entirely (so absence — handled by the caller — is the primary exit
+// signal). We still defensively treat an explicit terminal marker as exited so
+// a future herdr that keeps a tombstone row (e.g. agent_status:'exited' or a
+// running:false / status fields) doesn't hang the session.
+function agentRowExited(agent: any): boolean {
+  return agent?.agent_status === 'exited'
+    || agent?.status === 'exited'
+    || agent?.running === false;
+}
+
 function extractReadText(raw: any): string {
   return typeof raw?.result?.read?.text === 'string' ? raw.result.read.text : '';
 }
@@ -353,15 +366,15 @@ export class HerdrBackend implements SessionBackend {
       return;
     }
     this.agentProbeFailures = 0;
-    // herdr v0.6.6+ keeps exited agents in `agent list` with running:false /
-    // status:"exited" instead of dropping them, so name-presence alone isn't
-    // a liveness signal — we'd never see the CLI exit, the worker would
-    // never emit `claude_exit`, and the session would hang. Match against
-    // BOTH the historical "row vanished" case AND the new sentinel fields.
+    // Exit detection. Verified against herdr v0.6.6: when the CLI process exits,
+    // herdr DROPS the agent row from `agent list` (it does NOT keep a
+    // running:false tombstone). So the primary signal is "our agent is no
+    // longer in the list". We also treat an explicit terminal marker as exited
+    // (agentRowExited) to stay robust if a future herdr keeps a tombstone row —
+    // otherwise name-presence alone would never report the exit and the worker
+    // would never emit `claude_exit`, hanging the session.
     const matchingAgent = agents.find(agent => agent?.name === this.agentName || agent?.pane_id === this.paneId);
-    const agentExited = matchingAgent
-      ? matchingAgent.running === false || matchingAgent.status === 'exited'
-      : true;
+    const agentExited = matchingAgent ? agentRowExited(matchingAgent) : true;
     if (this.started && agentExited) {
       const exitCode = typeof matchingAgent?.exit_code === 'number' ? matchingAgent.exit_code : 0;
       this.handleExit(exitCode, null);
@@ -408,6 +421,7 @@ export class HerdrBackend implements SessionBackend {
     if (!paneTarget) return;
     this.stopStatusWatcher();
     const cohort: ChildProcess[] = [];
+    const armedAt = Date.now();
     for (const status of SETTLED_STATUSES) {
       const child = spawn('herdr', [
         '--session', this.sessionName,
@@ -428,26 +442,48 @@ export class HerdrBackend implements SessionBackend {
         // First exit in this cohort — tear down siblings, then read+re-arm.
         this.stopStatusWatcher();
         this.readAndEmitDelta();
-        // exit code 0 → reached the watched status; 1 → timed out (no
-        // transition within the window — agent likely still working).
-        // Anything else suggests target vanished; verify before re-arming.
-        if (code !== 0 && code !== 1) {
-          const agents = this.listAgents();
-          if (agents !== null) {
-            const matching = agents.find(a => a?.pane_id === this.paneId || a?.name === this.agentName);
-            // Treat the v0.6.6+ tombstone (running:false / status:exited) the
-            // same as a vanished row — otherwise the watcher would re-arm
-            // forever against a dead agent.
-            const exited = matching
-              ? matching.running === false || matching.status === 'exited'
-              : true;
-            if (exited) {
-              const exitCode = typeof matching?.exit_code === 'number' ? matching.exit_code : 0;
-              this.handleExit(exitCode, null);
-              return;
+
+        // Storm guard. code 0 = the watched status was genuinely reached (a
+        // real transition, which can legitimately happen instantly) → re-arm
+        // immediately, the normal hot path. The danger is a NON-ZERO instant
+        // return: when the agent's pane has gone away (the CLI exited), `herdr
+        // wait agent-status` returns code 1 within MILLISECONDS rather than
+        // after the 30s timeout. The old code re-armed on every non-0 code
+        // synchronously, so a dead pane spun a tight spawn loop (thousands of
+        // `herdr wait` children/sec) that starved the 500ms poll timer → the
+        // session never reported its exit and hung. So for a non-zero code we
+        // first distinguish "real long timeout" (child lived a meaningful
+        // fraction of the window — agent still working, re-arm normally) from
+        // "instant return" (pane likely gone — check liveness; only re-arm via
+        // a deferred timer, never synchronously, so poll() can run and we can't
+        // spin). Verified on v0.6.6: the exited agent's row disappears from
+        // `agent list`.
+        if (code !== 0) {
+          const elapsed = Date.now() - armedAt;
+          const returnedInstantly = elapsed < STATUS_WAIT_TIMEOUT_MS / 2;
+          if (returnedInstantly) {
+            const agents = this.listAgents();
+            if (agents !== null) {
+              const matching = agents.find(a => a?.pane_id === this.paneId || a?.name === this.agentName);
+              const exited = matching ? agentRowExited(matching) : true;
+              if (exited) {
+                const exitCode = typeof matching?.exit_code === 'number' ? matching.exit_code : 0;
+                this.handleExit(exitCode, null);
+                return;
+              }
             }
+            // Agent still alive but the wait returned instantly (transient
+            // herdr hiccup). Re-arm on a later tick, never synchronously, so we
+            // can't spin: the deferred timer yields the loop to poll(). unref
+            // so we never hold the event loop open.
+            if (this.exited) return;
+            const t = setTimeout(() => { if (!this.exited) this.startStatusWatcher(); }, POLL_INTERVAL_MS);
+            t.unref?.();
+            return;
           }
         }
+        // Normal path: a genuine status transition (code 0) or a real
+        // long-timeout (code 1 after ~30s of working) — re-arm immediately.
         this.startStatusWatcher();
       });
       child.on('error', () => {
