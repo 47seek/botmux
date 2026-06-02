@@ -23,7 +23,7 @@ import { findCodexRolloutByPid } from '../services/codex-transcript.js';
 import { findCocoSessionByPid } from '../services/coco-transcript.js';
 import { findServerPid } from '../adapters/backend/zellij-backend.js';
 import {
-  listLiveSessions, parseDumpLayoutLeafPanes, parseListPanesJson,
+  listLiveSessions, parseListPanesJson,
 } from './zellij-session-discovery.js';
 import { zellijEnv } from '../setup/ensure-zellij.js';
 import { logger } from '../utils/logger.js';
@@ -189,56 +189,48 @@ export function discoverAdoptableZellijSessions(filterCliId?: CliId): ZellijAdop
   for (const session of listLiveSessions()) {
     if (session.startsWith('bmx-')) continue;
 
-    const layoutOut = zellijRead(session, ['dump-layout']);
     const panesOut = zellijRead(session, ['list-panes', '--json']);
-    if (!layoutOut || !panesOut) continue;
-
-    // Positional join: ALL leaf terminal panes (command + bare shell) in
-    // dump-layout document order vs non-plugin/non-floating terminals in
-    // list-panes sorted by id. Counts MUST match or the alignment is
-    // untrustworthy — refuse the whole session rather than bind the wrong pane.
-    const leaves = parseDumpLayoutLeafPanes(layoutOut);
+    if (!panesOut) continue;
     const terminals = parseListPanesJson(panesOut)
       .filter(p => !p.isPlugin && !p.isFloating)
       .sort((a, b) => paneNum(a.paneId) - paneNum(b.paneId));
-    if (leaves.length === 0 || leaves.length !== terminals.length) {
-      if (leaves.length !== terminals.length) {
-        logger.debug(`[zellij-adopt] ${session}: leaf(${leaves.length})/terminal(${terminals.length}) count mismatch — refusing adopt`);
-      }
-      continue;
-    }
+    if (terminals.length === 0) continue;
 
     const serverPid = findServerPid(session);
     if (!serverPid) continue;
-    const clis = findAllClisUnder(serverPid, 4, filterCliId);
 
-    for (let i = 0; i < leaves.length; i++) {
-      const leaf = leaves[i]!;
-      const term = terminals[i]!;
-      if (!leaf.command) continue; // bare shell pane — not adoptable
+    // Bind each pane to its OWN process subtree. The zellij server forks one
+    // shell per terminal pane, so its direct children sorted by pid (= process
+    // creation order) align positionally with the terminals sorted by id (=
+    // pane creation order) — both strictly monotonic. This gives each pane its
+    // specific CLI pid WITHOUT a cwd match, which is essential when several
+    // panes/tabs run the SAME cli from the SAME dir (e.g. multiple `codex` in
+    // ~): a cwd match is then ambiguous and silently drops them all (the bug
+    // 申晗 hit). Counts must match or the alignment is unreliable → refuse.
+    const children = getChildPids(serverPid).sort((a, b) => a - b);
+    if (children.length !== terminals.length) {
+      logger.debug(`[zellij-adopt] ${session}: server children(${children.length}) != terminals(${terminals.length}) — can't align, refusing`);
+      continue;
+    }
 
-      // The cliId comes from the actual PROCESS (cliIdForProc handles
-      // node-wrapped CLIs where dump-layout's command is just "node"); we only
-      // need leaf.command to know the pane is running something. Bind by cwd:
-      // each running pane's cwd should match exactly one process-tree CLI of
-      // the (already filtered) cliId. `clis` is pre-filtered by filterCliId.
-      const paneCwd = canonPath(leaf.cwd);
-      const matches = clis.filter(c => c.cwd && c.cwd === paneCwd);
-      // Refuse ambiguous (>1) or unresolved (0) — never adopt the wrong pane.
-      if (matches.length !== 1) continue;
-      const cli = matches[0]!;
+    for (let i = 0; i < terminals.length; i++) {
+      // findAllClisUnder collapses the node-wrapper chain to the native CLI;
+      // a bare shell pane yields none and is skipped.
+      const clis = findAllClisUnder(children[i]!, 4, filterCliId);
+      if (clis.length === 0) continue;
+      const cli = clis[0]!;
 
-      const dims = paneDimensions(session, term.paneId);
+      const dims = paneDimensions(session, terminals[i]!.paneId);
       if (!dims) continue;
 
       const { sessionId, startedAt } = resolveSessionId(cli.cliId, cli.pid);
       results.push({
         zellijSession: session,
-        zellijPaneId: term.paneId,
+        zellijPaneId: terminals[i]!.paneId,
         cliPid: cli.pid,
         cliId: cli.cliId,
         sessionId,
-        cwd: cli.cwd ?? leaf.cwd ?? '',
+        cwd: cli.cwd ?? '',
         startedAt,
         paneCols: dims.cols,
         paneRows: dims.rows,
