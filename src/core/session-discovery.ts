@@ -2,7 +2,7 @@
  * Session Discovery — scans tmux panes for running CLI processes that can be adopted.
  *
  * Discovers non-botmux tmux sessions running known CLI binaries (Claude Code,
- * Codex, Aiden, CoCo, Gemini, OpenCode, MTR, Hermes) and collects metadata needed to adopt them.
+ * Codex, Aiden, CoCo, Cursor, Gemini, OpenCode, MTR, Hermes) and collects metadata needed to adopt them.
  */
 import { execFileSync, execSync } from 'node:child_process';
 import { readdirSync, readFileSync, readlinkSync, realpathSync } from 'node:fs';
@@ -43,6 +43,7 @@ const CLI_COMM_MAP: Record<string, CliId> = {
   codex: 'codex',
   aiden: 'aiden',
   coco: 'coco',
+  'cursor-agent': 'cursor',
   // CoCo 的别名 traecli：某些发行版（如 trae）安装的可执行实际叫
   // `traecli`，tmux pane_current_command 仍显示 "coco" 是因为进程标题被
   // 改写过；macOS 下 `ps -o comm=` 拿到的是真实 argv[0]，因此这里需要
@@ -57,6 +58,10 @@ const CLI_COMM_MAP: Record<string, CliId> = {
 export function cliIdForComm(comm: string, filterCliId?: CliId): CliId | undefined {
   const normalizedComm = comm.startsWith('.') ? comm.slice(1) : comm;
   const direct = CLI_COMM_MAP[comm] ?? CLI_COMM_MAP[normalizedComm];
+  // Cursor's agent binary may be installed as the generic name `agent`. Only
+  // accept that alias when a Cursor bot is explicitly asking, otherwise a broad
+  // /adopt scan could mistake unrelated agent processes for Cursor sessions.
+  if (filterCliId === 'cursor' && normalizedComm === 'agent') return 'cursor';
   // MTR is an OpenCode fork and some installs still expose the underlying
   // native process as "opencode". When an MTR bot asks to adopt, treat that
   // process as MTR so the bot's filter does not hide its own sessions.
@@ -305,9 +310,9 @@ function extractHerdrAgents(raw: any): any[] {
   return Array.isArray(agents) ? agents : [];
 }
 
-function herdrAgentCliId(agent: any): CliId | undefined {
+function herdrAgentCliId(agent: any, filterCliId?: CliId): CliId | undefined {
   const name = typeof agent?.agent === 'string' ? basename(agent.agent) : '';
-  return name in CLI_COMM_MAP ? CLI_COMM_MAP[name]! : undefined;
+  return name ? cliIdForComm(name, filterCliId) : undefined;
 }
 
 function discoverHerdrAdoptableSessions(filterCliId?: CliId): AdoptableSession[] {
@@ -321,7 +326,7 @@ function discoverHerdrAdoptableSessions(filterCliId?: CliId): AdoptableSession[]
     const sessionName = session.name as string;
     const rawAgents = herdrJson(['--session', sessionName, 'agent', 'list']);
     for (const agent of extractHerdrAgents(rawAgents)) {
-      const cliId = herdrAgentCliId(agent);
+      const cliId = herdrAgentCliId(agent, filterCliId);
       if (!cliId) continue;
       if (filterCliId && cliId !== filterCliId) continue;
       const cwd = typeof agent?.cwd === 'string' ? agent.cwd : undefined;

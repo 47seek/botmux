@@ -226,6 +226,41 @@ describe('discoverAdoptableSessions', () => {
     expect(results[1]!.paneRows).toBe(50);
   });
 
+  it('should discover cursor-agent processes as Cursor sessions', () => {
+    setupMocks({
+      paneLines: 'cursor:0.0 1000\n',
+      commMap: { 1000: 'zsh', 1001: 'cursor-agent' },
+      childMap: { 1000: [1001] },
+      cwdMap: { 1001: '/workspace/cursor' },
+      dimsMap: { 'cursor:0.0': '160 50' },
+    });
+
+    const results = discoverAdoptableSessions();
+
+    expect(results).toHaveLength(1);
+    expect(results[0]!.cliId).toBe('cursor');
+    expect(results[0]!.cliPid).toBe(1001);
+    expect(results[0]!.cwd).toBe('/workspace/cursor');
+  });
+
+  it('should treat generic agent as Cursor only for Cursor-filtered adoption', () => {
+    setupMocks({
+      paneLines: 'cursor:0.0 1000\n',
+      commMap: { 1000: 'zsh', 1001: 'agent' },
+      childMap: { 1000: [1001] },
+      cwdMap: { 1001: '/workspace/cursor' },
+      dimsMap: { 'cursor:0.0': '160 50' },
+    });
+
+    expect(discoverAdoptableSessions()).toHaveLength(0);
+
+    const results = discoverAdoptableSessions('cursor');
+    expect(results).toHaveLength(1);
+    expect(results[0]!.cliId).toBe('cursor');
+    expect(results[0]!.cliPid).toBe(1001);
+    expect(results[0]!.cwd).toBe('/workspace/cursor');
+  });
+
   it('should skip bmx-* prefixed sessions', () => {
     setupMocks({
       paneLines: 'bmx-abc12345:0.0 1000\nmysession:0.0 2000\n',
