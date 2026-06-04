@@ -33,6 +33,7 @@ import { findTraexRolloutBySessionId, findTraexRolloutByPid } from './services/t
 import { cocoEventsPathForSession, drainCocoEvents, findCocoSessionByPid } from './services/coco-transcript.js';
 import { currentHermesStateOffset, drainHermesStateDb } from './services/hermes-transcript.js';
 import { currentMtrSessionOffset, drainMtrSession, findLatestMtrSessionByDirectory, findMtrSessionById, type MtrTranscriptSource } from './services/mtr-transcript.js';
+import { drainCursorTranscript, findCursorTranscriptByChatId, findCursorTranscriptByPid } from './services/cursor-transcript.js';
 import { baselineJsonlCursor } from './services/jsonl-cursor.js';
 import { dirname } from 'node:path';
 import { createServer as createHttpServer, type IncomingMessage } from 'node:http';
@@ -1401,7 +1402,14 @@ function drainPathInto(path: string, fromOffset: number): { offset: number; tail
 function codexBridgeFallbackActive(): boolean {
   // True for transcript-backed CLIs whose final output can be harvested
   // when the model forgets to call `botmux send`.
-  return lastInitConfig?.cliId === 'codex' || lastInitConfig?.cliId === 'traex' || lastInitConfig?.cliId === 'coco' || lastInitConfig?.cliId === 'hermes' || lastInitConfig?.cliId === 'mtr';
+  const id = lastInitConfig?.cliId;
+  if (id === 'codex' || id === 'traex' || id === 'coco' || id === 'hermes' || id === 'mtr') return true;
+  // Cursor only harvests its transcript in adopt mode: a botmux-spawned
+  // cursor session carries the botmux skill and replies via `botmux send`,
+  // and we never resolve a transcript path for it — so leave that flow
+  // (screen capture + botmux send) untouched and scope the bridge to adopt.
+  if (id === 'cursor') return lastInitConfig?.adoptMode === true;
+  return false;
 }
 
 // Both Codex and TRAE share the same rollout JSONL layout (response_item
@@ -1418,8 +1426,13 @@ function structuredBridgeIsMtr(): boolean {
   return lastInitConfig?.cliId === 'mtr';
 }
 
+function structuredBridgeIsCursor(): boolean {
+  return lastInitConfig?.cliId === 'cursor';
+}
+
 function structuredBridgeIngestPath(path: string, offset: number) {
   if (structuredBridgeIsCodex()) return drainCodexRollout(path, offset);
+  if (structuredBridgeIsCursor()) return drainCursorTranscript(path, offset);
   if (structuredBridgeIsHermes()) {
     const result = drainHermesStateDb(offset);
     return { events: result.events, newOffset: result.newOffset, pendingTail: '' };
@@ -1462,6 +1475,29 @@ function codexBridgeStartTimer(): void {
           }
         }
         mtrBridgeIngest();
+        if (isPromptReady) emitReadyCodexTurns();
+        return;
+      }
+      if (structuredBridgeIsCursor()) {
+        // Late-attach: the transcript usually exists at adopt time (the
+        // session is already running), so cursorBridgeAttach in setup wins.
+        // This covers the rare race where pid→chatId resolved but the JSONL
+        // hadn't been created yet. Resolution order: chatId (cliSessionId) →
+        // path; then adopt pid → store.db fd → chatId → path.
+        if (!codexBridgeRolloutPath) {
+          let path = codexBridgePendingSessionId
+            ? findCursorTranscriptByChatId(codexBridgePendingSessionId)
+            : undefined;
+          if (!path && codexAdoptPendingPid) {
+            path = findCursorTranscriptByPid(codexAdoptPendingPid)?.path;
+          }
+          if (path) {
+            codexBridgePendingSessionId = undefined;
+            codexAdoptPendingPid = undefined;
+            cursorBridgeAttach(path);
+          }
+        }
+        codexBridgeIngest();
         if (isPromptReady) emitReadyCodexTurns();
         return;
       }
@@ -1645,6 +1681,24 @@ function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'fre
   codexBridgeStartTimer();
 }
 
+/** Attach the Cursor adopt bridge. Cursor's JSONL has no per-event
+ *  timestamp, so split-live's timestamp cutoff can't separate pre-adopt
+ *  history from live turns. Instead we baseline by byte offset (history is
+ *  behind the offset and never re-ingested) and surface the last completed
+ *  turn as the "📜 /adopt 前最后一轮" preamble from a one-shot full drain
+ *  before baselining past it. */
+function cursorBridgeAttach(path: string): void {
+  if (existsSync(path)) {
+    try {
+      const full = drainCursorTranscript(path, 0);
+      maybeEmitCodexAdoptPreamble(full.events);
+    } catch (err: any) {
+      log(`Cursor bridge preamble drain failed: ${err.message}`);
+    }
+  }
+  codexBridgeAttach(path, 'baseline-existing');
+}
+
 /** Called from flushPending after writeInput first returns a cliSessionId.
  *  Tries to locate the rollout file immediately; if it's not on disk yet,
  *  remembers the sid so the 1s poller can keep retrying. */
@@ -1655,6 +1709,19 @@ function codexBridgeNotifyCliSessionId(cliSessionId: string): void {
     if (source) {
       codexBridgePendingSessionId = undefined;
       mtrBridgeAttach(source, 'fresh-empty');
+    } else {
+      codexBridgePendingSessionId = cliSessionId;
+      codexBridgeStartTimer();
+    }
+    return;
+  }
+  if (structuredBridgeIsCursor()) {
+    // Cursor's cliSessionId is the chatId — the same UUID naming the
+    // agent-transcript JSONL, so it resolves the path directly.
+    const cursorPath = findCursorTranscriptByChatId(cliSessionId);
+    if (cursorPath) {
+      codexBridgePendingSessionId = undefined;
+      cursorBridgeAttach(cursorPath);
     } else {
       codexBridgePendingSessionId = cliSessionId;
       codexBridgeStartTimer();
@@ -2885,6 +2952,27 @@ function setupAdoptTranscriptBridges(cfg: Extract<DaemonToWorker, { type: 'init'
       codexBridgePendingSessionId = undefined;
       mtrBridgeAttach(source, 'split-live');
     } else {
+      codexBridgeStartTimer();
+    }
+  } else if (cfg.cliId === 'cursor') {
+    const adoptStartMs = Date.now();
+    codexAdoptStartMs = adoptStartMs;
+    codexBridgeQueue.setLocalTurns(true, adoptStartMs);
+    // Resolve the transcript: cliSessionId (= Cursor chatId) when discovery
+    // captured it, else the adopt pid via its open store.db fd. Cursor lacks
+    // per-event timestamps, so cursorBridgeAttach baselines by byte offset
+    // rather than the timestamp-cutoff split-live the other CLIs use.
+    let path: string | undefined;
+    if (cfg.cliSessionId) path = findCursorTranscriptByChatId(cfg.cliSessionId);
+    if (!path && cfg.adoptCliPid) {
+      const probed = findCursorTranscriptByPid(cfg.adoptCliPid);
+      if (probed) path = probed.path;
+    }
+    if (path) {
+      cursorBridgeAttach(path);
+    } else {
+      if (cfg.cliSessionId) codexBridgePendingSessionId = cfg.cliSessionId;
+      codexAdoptPendingPid = cfg.adoptCliPid;
       codexBridgeStartTimer();
     }
   }
