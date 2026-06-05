@@ -192,6 +192,39 @@ describe('webhook token mode', () => {
     });
     expect(res.status).toBe(401);
   });
+
+  it('passes the connector instruction onto the dispatched trigger (top-level, not in envelope)', async () => {
+    const captured: any[] = [];
+    const proxyToDaemon = vi.fn(async (_appId: string, _path: string, init: RequestInit) => {
+      captured.push(JSON.parse(String(init.body)));
+      return { status: 200, text: async () => JSON.stringify({ ok: true, action: 'delivered', target: { kind: 'turn', chatId: 'oc_fixed' } }) };
+    }) as any;
+    await startWebhookServer({ proxyToDaemon });
+    const { createWebhookSecret } = await import('../src/services/webhook-key.js');
+    const { upsertConnector } = await import('../src/services/connector-store.js');
+    const secret = createWebhookSecret('tok_plain_value');
+    upsertConnector({
+      id: 'conn_instr',
+      name: 'Instr',
+      enabled: true,
+      verify: { type: 'token', secretRef: secret.ref, signatureHeader: 'x-botmux-signature', timestampHeader: 'x-botmux-timestamp', nonceHeader: 'x-botmux-nonce', toleranceSeconds: 300 },
+      target: { mode: 'fixed', kind: 'turn', botId: 'app1', chatId: 'oc_fixed' },
+      promptEnvelope: { sourceName: 'instr', headerAllowlist: [], includeRawText: false, maxBodyBytes: 1024, instruction: 'Summarize and notify oncall.' },
+      loggingPolicy: { storePayload: false, storeHeaders: false, retentionDays: 14 },
+      lifecycleExtractors: null,
+      createdAt: '2026-06-06T00:00:00.000Z',
+      updatedAt: '2026-06-06T00:00:00.000Z',
+    });
+    const res = await fetch(`${baseUrl}/webhook/conn_instr/tok_plain_value`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{}',
+    });
+    expect(res.status).toBe(200);
+    expect(captured).toHaveLength(1);
+    expect(captured[0].instruction).toBe('Summarize and notify oncall.');
+    expect(captured[0].envelope.instruction).toBeUndefined();
+  });
 });
 
 describe('webhook new-group lifecycle', () => {

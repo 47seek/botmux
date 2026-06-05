@@ -365,6 +365,7 @@ export async function handleWebhookRoute(
         payload: parsed.payload,
         ...(connector.promptEnvelope.includeRawText ? { rawText: parsed.rawText } : {}),
       },
+      ...(connector.promptEnvelope.instruction ? { instruction: connector.promptEnvelope.instruction } : {}),
       options: { dedupKey, status },
     };
 
@@ -407,6 +408,7 @@ export async function handleWebhookRoute(
       payload: parsed.payload,
       ...(connector.promptEnvelope.includeRawText ? { rawText: parsed.rawText } : {}),
     },
+    ...(connector.promptEnvelope.instruction ? { instruction: connector.promptEnvelope.instruction } : {}),
     options: {},
   };
 

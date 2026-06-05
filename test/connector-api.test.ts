@@ -84,6 +84,27 @@ describe('connector-api write routes', () => {
     expect(created.webhookUrl).toContain(`/webhook/${created.connector.id}/${created.secret}`);
   });
 
+  it('round-trips a trusted promptEnvelope.instruction and clears it on empty', async () => {
+    const created = await json(await fetch(`${baseUrl}/api/connectors`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        name: 'Alert handler',
+        target: { mode: 'fixed', kind: 'turn', botId: 'app1', chatId: 'oc_1' },
+        promptEnvelope: { sourceName: 'alerts', instruction: '  总结告警并 @ oncall  ' },
+      }),
+    }));
+    expect(created.connector.promptEnvelope.instruction).toBe('总结告警并 @ oncall');
+
+    const id = created.connector.id;
+    const cleared = await json(await fetch(`${baseUrl}/api/connectors/${encodeURIComponent(id)}`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ promptEnvelope: { sourceName: 'alerts', instruction: '' } }),
+    }));
+    expect(cleared.connector.promptEnvelope.instruction).toBeUndefined();
+  });
+
   it('keeps HMAC mode when explicitly requested and omits the token from the URL', async () => {
     const created = await json(await fetch(`${baseUrl}/api/connectors`, {
       method: 'POST',

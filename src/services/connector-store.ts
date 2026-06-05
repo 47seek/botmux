@@ -35,6 +35,9 @@ export interface ConnectorDefinition {
     headerAllowlist: string[];
     includeRawText: boolean;
     maxBodyBytes: number;
+    // Trusted task ("what should the bot do with this event"); injected above the
+    // untrusted event data when a turn fires. Empty/absent = no extra instruction.
+    instruction?: string;
   };
   loggingPolicy: {
     storePayload: boolean;

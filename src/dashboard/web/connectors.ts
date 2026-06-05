@@ -8,7 +8,7 @@ interface Connector {
   id: string; name: string; enabled: boolean;
   verify?: { type: 'token' | 'hmac-sha256' };
   target: { mode: 'dynamic' | 'fixed' | 'new-group'; kind: 'turn' | 'workflow'; botId: string; chatId?: string; allowChats?: string[]; workflowId?: string };
-  promptEnvelope: { sourceName: string };
+  promptEnvelope: { sourceName: string; instruction?: string };
 }
 interface BotOpt { larkAppId: string; botName: string; }
 interface GroupOpt { chatId: string; name: string; bots: string[] }
@@ -66,6 +66,8 @@ function pageHtml(): string {
     </div>
     <label class="cn-life" style="display:none">去重字段</label><input class="cn-life" id="cn-dedup" style="display:none" placeholder="如 payload.alert.id">
     <label class="cn-life" style="display:none">状态字段</label><input class="cn-life" id="cn-status" style="display:none" placeholder="如 payload.status">
+    <label style="align-self:start">处理指令<span class="muted" style="font-weight:400">（可选）</span></label>
+    <textarea id="cn-instruction" rows="3" placeholder="事件触发时让机器人做什么。如：总结这条告警的严重程度，@相关 oncall，给出排查建议。留空 = 只把事件原样交给模型自由发挥。" style="width:100%;box-sizing:border-box;font-family:inherit;font-size:13px"></textarea>
     <label>校验方式</label>
     <select id="cn-verify">
       <option value="token">令牌（简单：密钥放进 URL，一条 curl 就能触发）</option>
@@ -150,7 +152,7 @@ function renderList(connectors: Connector[]): void {
       <div style="margin-top:6px;font-size:13px;display:flex;align-items:center;gap:8px;flex-wrap:wrap">
         <span class="muted">Webhook URL：</span><code style="font-size:12px;word-break:break-all">${escapeHtml(url)}${isToken ? '/&lt;令牌&gt;' : ''}</code>
         <button class="cn-copy ghost" data-url="${escapeHtml(url)}" style="font-size:12px">复制</button>
-      </div>${isToken ? '<div class="muted" style="font-size:12px;margin-top:4px">令牌模式：调用时在 URL 末尾追加 <code>/&lt;令牌&gt;</code>（令牌仅创建/轮换时显示一次）。</div>' : ''}${c.target.mode === 'dynamic' ? '<div class="muted" style="font-size:12px;margin-top:4px">动态模式：请求需带目标群 —— <code>?chatId=&lt;群ID&gt;</code> 或头 <code>x-botmux-chat-id</code> 或 body <code>{"chatId":"…"}</code>。</div>' : ''}</div>`;
+      </div>${isToken ? '<div class="muted" style="font-size:12px;margin-top:4px">令牌模式：调用时在 URL 末尾追加 <code>/&lt;令牌&gt;</code>（令牌仅创建/轮换时显示一次）。</div>' : ''}${c.target.mode === 'dynamic' ? '<div class="muted" style="font-size:12px;margin-top:4px">动态模式：请求需带目标群 —— <code>?chatId=&lt;群ID&gt;</code> 或头 <code>x-botmux-chat-id</code> 或 body <code>{"chatId":"…"}</code>。</div>' : ''}${c.promptEnvelope?.instruction ? `<div class="muted" style="font-size:12px;margin-top:4px">处理指令：${escapeHtml(c.promptEnvelope.instruction)}</div>` : ''}</div>`;
   }).join('');
 
   el.querySelectorAll<HTMLButtonElement>('.cn-copy').forEach(b => { b.onclick = () => { navigator.clipboard?.writeText(b.dataset.url!); b.textContent = '已复制'; setTimeout(() => b.textContent = '复制', 1200); }; });
@@ -206,6 +208,8 @@ export function renderConnectorsPage(root: HTMLElement): void {
       target: { kind, mode, botId },
       promptEnvelope: { sourceName: name },
     };
+    const instruction = val('cn-instruction');
+    if (instruction) body.promptEnvelope.instruction = instruction;
     if (kind === 'workflow') { if (!val('cn-wf')) { out.innerHTML = '<span class="err">请填工作流 ID</span>'; return; } body.target.workflowId = val('cn-wf'); }
     if (mode === 'fixed') {
       const manualVisible = ($('cn-chat') as HTMLInputElement).style.display !== 'none';
@@ -253,7 +257,7 @@ export function renderConnectorsPage(root: HTMLElement): void {
         <p style="margin:4px 0;font-size:13px"><span class="muted">Webhook URL：</span><code style="word-break:break-all">${escapeHtml(url)}</code></p>
         ${sec ? `<p style="margin:4px 0;font-size:13px"><span class="muted">${isToken ? '访问令牌' : '签名密钥'}（只显示这一次，请保存）：</span><code>${escapeHtml(sec)}</code></p>` : ''}
         ${usage}</div>`;
-      (['cn-name', 'cn-wf', 'cn-chat', 'cn-dedup', 'cn-status', 'cn-secret'] as const).forEach(id => { ($(id) as HTMLInputElement).value = ''; });
+      (['cn-name', 'cn-wf', 'cn-chat', 'cn-dedup', 'cn-status', 'cn-secret', 'cn-instruction'] as const).forEach(id => { ($(id) as HTMLInputElement).value = ''; });
       ($('cn-allow-sel') as HTMLSelectElement).selectedIndex = -1;
       load();
     } else {

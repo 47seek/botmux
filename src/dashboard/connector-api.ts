@@ -169,6 +169,11 @@ function normalizeConnectorInput(
         : prior?.promptEnvelope.headerAllowlist ?? [],
       includeRawText: bool(promptEnvelope.includeRawText, prior?.promptEnvelope.includeRawText ?? false),
       maxBodyBytes: positiveInt(promptEnvelope.maxBodyBytes, prior?.promptEnvelope.maxBodyBytes ?? 256 * 1024, 1, 10 * 1024 * 1024),
+      // A provided string sets/clears the trusted instruction (empty = clear);
+      // when the field is absent entirely, keep whatever the prior had.
+      ...(typeof promptEnvelope.instruction === 'string'
+        ? (promptEnvelope.instruction.trim() ? { instruction: promptEnvelope.instruction.trim().slice(0, 8000) } : {})
+        : prior?.promptEnvelope.instruction ? { instruction: prior.promptEnvelope.instruction } : {}),
     },
     loggingPolicy: {
       storePayload: bool(loggingPolicy.storePayload, prior?.loggingPolicy.storePayload ?? false),
