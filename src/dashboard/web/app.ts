@@ -18,9 +18,23 @@ import type { ThemeMode } from './preferences.js';
 
 const root = document.getElementById('root')!;
 
+// Resolved once at bootstrap from GET /api/settings:
+//   - `isAuthed`        → gates the management nav + route guards
+//   - `publicReadOnly`  → decides whether a read 401 is a hard lockout (token
+//                          rotated → blocking overlay) or just a read-only
+//                          visitor touching a token-gated page (soft toast).
+// Defaults keep the authed / legacy UX if the probe fails.
+let isAuthed = true;
+let publicReadOnly = false;
+
+// Management pages are token-gated end-to-end (no public GET) — a read-only
+// visitor must not reach them. `data-route` values from index.html's nav.
+const MANAGE_ROUTES = ['roles', 'bot-defaults', 'team', 'connectors'];
+
 // ── Auth-expiry overlay ──────────────────────────────────────────────────────
-// Any 401 from an API call means the dashboard token was rotated (a new access
-// link was generated). Show a blocking overlay so the user knows to switch tabs.
+// Shown only when the dashboard token was rotated WHILE public read-only is off
+// (a real hard lockout). Under public read-only a 401 is a soft toast instead
+// (see patchedFetch) — so this no longer fires for read-only visitors.
 let _expiredShown = false;
 export function showAuthExpiredOverlay(): void {
   if (_expiredShown) return;
@@ -36,12 +50,18 @@ export function showAuthExpiredOverlay(): void {
     'box-shadow:0 12px 40px rgba(0,0,0,.35)">' +
     '<h2 style="margin:0 0 14px;font-size:19px">访问链接已失效</h2>' +
     '<p style="margin:0 0 24px;line-height:1.7;color:var(--muted,#8f959e);font-size:14px">' +
-    '当前链接/访问已失效，请使用最新授权链接重新进入。<br>最好关闭当前页。</p>' +
-    '<button onclick="window.close()" ' +
+    '当前链接/访问已失效，请使用最新授权链接重新进入（运行 botmux dashboard 获取）。</p>' +
+    '<button id="auth-expired-dismiss" type="button" ' +
     'style="padding:8px 22px;background:var(--accent,#3370ff);color:#fff;border:none;' +
-    'border-radius:8px;cursor:pointer;font-size:14px">关闭此页</button>' +
+    'border-radius:8px;cursor:pointer;font-size:14px">知道了</button>' +
     '</div>';
   document.body.appendChild(el);
+  // `window.close()` can't close a tab the user opened, so the old inline
+  // onclick was a dead button (overlay got stuck). Dismiss the overlay instead,
+  // and let it reappear on the next genuine 401.
+  const dismiss = () => { el.remove(); _expiredShown = false; };
+  el.querySelector<HTMLButtonElement>('#auth-expired-dismiss')?.addEventListener('click', dismiss);
+  el.addEventListener('click', (e) => { if (e.target === el) dismiss(); });
 }
 
 // ── Read-only toast (write attempt without a valid token) ───────────────────
@@ -78,7 +98,12 @@ window.fetch = async function patchedFetch(
   const res = await _origFetch(...args);
   if (res.status === 401) {
     const method = (args[1]?.method ?? 'GET').toUpperCase();
-    if (method === 'GET' || method === 'HEAD') showAuthExpiredOverlay();
+    const isRead = method === 'GET' || method === 'HEAD';
+    // A read 401 is a hard lockout (token rotated → blocking overlay) ONLY when
+    // public read-only is off. Under public read-only a read 401 just means a
+    // tokenless visitor touched a token-gated page → soft toast, never the
+    // stuck overlay. Writes are always a soft "needs the active token".
+    if (isRead && !publicReadOnly) showAuthExpiredOverlay();
     else showReadOnlyToast();
   }
   return res;
@@ -121,13 +146,67 @@ store.on(paintAttentionStrip);
 // bot 友好名异步解析回来后刷一次 strip（页面级重绘由各 mount 自己处理）
 void loadNameMaps().then(paintAttentionStrip);
 
+// Resolve the read-only/authed state from /api/settings (authed reflects the
+// cookie; publicReadOnly is the global toggle). Errors keep the authed default
+// so a transient probe failure never hides nav from a real token holder.
+async function loadAuthState(): Promise<void> {
+  try {
+    const r = await fetch('/api/settings');
+    if (r.ok) {
+      const j = await r.json();
+      isAuthed = !!j.authed;
+      publicReadOnly = !!(j.settings && j.settings.publicReadOnly);
+    }
+  } catch { /* keep defaults */ }
+}
+
+// Read-only visitors can't use the management pages (all token-gated), so hide
+// their nav entries + the add-bot action instead of luring them into a 401.
+function applyAuthVisibility(): void {
+  for (const r of MANAGE_ROUTES) {
+    const a = document.querySelector<HTMLElement>(`.sidebar-nav a[data-route="${r}"]`);
+    if (a) a.style.display = isAuthed ? '' : 'none';
+  }
+  const addBot = document.getElementById('add-bot-btn');
+  if (addBot) addBot.style.display = isAuthed ? '' : 'none';
+}
+
+function renderAuthRequiredPage(host: HTMLElement): void {
+  host.innerHTML =
+    '<section class="auth-required" style="max-width:520px;margin:64px auto;text-align:center;' +
+    'background:var(--card,#fff);border-radius:14px;padding:40px 36px;box-shadow:0 8px 28px rgba(0,0,0,.12)">' +
+    '<h2 style="margin:0 0 12px;font-size:20px">此页需要授权链接</h2>' +
+    '<p style="margin:0 0 24px;line-height:1.7;color:var(--muted,#8f959e);font-size:14px">' +
+    '你当前是只读访问，管理页（角色 / Bot 配置 / 团队 / 接入点）需要授权链接。' +
+    '运行 <code>botmux dashboard</code> 获取最新链接后即可管理。</p>' +
+    '<a href="#/" style="display:inline-block;padding:8px 22px;background:var(--accent,#3370ff);' +
+    'color:#fff;border-radius:8px;text-decoration:none;font-size:14px">返回总览</a>' +
+    '</section>';
+}
+
 // Pages that own a polling loop / cleanup return a disposer; we run it
 // on the next route switch so timers don't leak across navigations.
 let pageDispose: (() => void) | null = null;
 
+function highlightNav(hash: string): void {
+  for (const a of document.querySelectorAll<HTMLAnchorElement>('.sidebar-nav a')) {
+    const href = a.getAttribute('href') ?? '#/';
+    a.classList.toggle('active', href === (hash || '#/'));
+  }
+}
+
 function route() {
   if (pageDispose) { pageDispose(); pageDispose = null; }
   const hash = location.hash || '#/';
+
+  // Read-only hard-guard: a tokenless visitor hitting a management route gets a
+  // friendly notice instead of a page that fires a 401 (which used to pop a
+  // stuck "link expired" overlay).
+  if (!isAuthed && MANAGE_ROUTES.some(r => hash.startsWith('#/' + r))) {
+    renderAuthRequiredPage(root);
+    highlightNav(hash);
+    return;
+  }
   // Catalog is a sub-route under Workflows now (`#/workflows/catalog[/<id>]`)
   // so the top nav has a single "Workflows (beta)" entry.  Legacy
   // `#/workflows-catalog[*]` URLs are kept working for any external links
@@ -149,11 +228,7 @@ function route() {
   else if (hash.startsWith('#/sessions')) renderSessionsPage(root);
   else void renderOverviewPage(root);
 
-  // active nav highlighting
-  for (const a of document.querySelectorAll<HTMLAnchorElement>('.sidebar-nav a')) {
-    const href = a.getAttribute('href') ?? '#/';
-    a.classList.toggle('active', href === (hash || '#/'));
-  }
+  highlightNav(hash);
 }
 
 const statusEl = document.getElementById('status');
@@ -198,6 +273,10 @@ void (async () => {
   });
   paintChrome();
   paintAttentionStrip();
+  // Resolve authed/publicReadOnly BEFORE first render so the management nav is
+  // hidden and route guards are active for read-only visitors from frame one.
+  await loadAuthState();
+  applyAuthVisibility();
   try {
     await bootstrap();
   } catch (err) {
