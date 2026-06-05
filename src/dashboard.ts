@@ -19,6 +19,7 @@ import { planGroupCreator } from './dashboard/team-group.js';
 import { handleWorkflowApi, jsonRes } from './dashboard/workflow-api.js';
 import { handleDashboardTriggerApi } from './dashboard/trigger-api.js';
 import { handleConnectorApi } from './dashboard/connector-api.js';
+import { redactGroupsForPublic, redactSchedulesForPublic } from './dashboard/public-redact.js';
 import { handleWebhookRoute } from './dashboard/webhook-routes.js';
 import { handleFederationApi } from './dashboard/federation-api.js';
 import { handleFederationSpokeApi, syncAllMemberships } from './dashboard/federation-spoke-api.js';
@@ -437,12 +438,13 @@ const server = createServer(async (req, res) => {
       return jsonRes(res, 200, { sessions: aggregator.getSessions() });
     }
     if (req.method === 'GET' && url.pathname === '/api/schedules') {
-      // Public-read carve-out: the task prompt is CONTENT (business
-      // instructions), not status — strip it for anonymous visitors. The
-      // schedules page only renders name/timing, so nothing degrades.
+      // Public-read carve-out: the row carries CONTENT (prompt = business
+      // instructions) and a bound `workingDir` (repo/customer path) — strip
+      // both for anonymous visitors. The schedules page only renders
+      // name/timing/status, so nothing degrades.
       const schedules = authed
         ? aggregator.getSchedules()
-        : aggregator.getSchedules().map(({ prompt: _prompt, ...rest }) => rest);
+        : redactSchedulesForPublic(aggregator.getSchedules());
       return jsonRes(res, 200, { schedules });
     }
     if (req.method === 'GET' && url.pathname === '/api/settings') {
@@ -622,8 +624,13 @@ const server = createServer(async (req, res) => {
           return (a.name ?? a.chatId).localeCompare(b.name ?? b.chatId);
         })
         .map(({ _firstSeenAt, ...rest }) => rest);
+      // Public-read carve-out: oncall bindings carry workingDir (repo/customer
+      // paths). The read-only board only needs chat/bot names; the oncall
+      // editor that consumes oncallChat is authed-only. Strip for anon so the
+      // bound dirs don't leak via /api/groups (mirrors the /api/schedules
+      // prompt strip + keeps /api/bots oncall removal honest).
       return jsonRes(res, 200, {
-        chats: sorted,
+        chats: authed ? sorted : redactGroupsForPublic(sorted),
         bots: onlineBots.map(b => ({ larkAppId: b.larkAppId, botName: b.botName })),
       });
     }
@@ -1023,15 +1030,16 @@ const server = createServer(async (req, res) => {
       res.write('retry: 5000\n\n');
       const off = aggregator.on(ev => {
         // Mirror the GET /api/schedules carve-out: schedule events carry the
-        // full task object — strip the prompt for anonymous SSE listeners,
-        // or the REST-side scrub would be trivially bypassed by `/events`.
+        // full task object — strip the prompt AND workingDir for anonymous SSE
+        // listeners, or the REST-side scrub would be trivially bypassed by
+        // `/events`.
         let body = ev.body;
         if (!authed && (ev.type === 'schedule.created' || ev.type === 'schedule.updated')) {
           const b = body as { schedule?: Record<string, unknown>; patch?: Record<string, unknown>; id?: string };
           body = {
             ...b,
-            ...(b.schedule ? { schedule: { ...b.schedule, prompt: undefined } } : {}),
-            ...(b.patch ? { patch: { ...b.patch, prompt: undefined } } : {}),
+            ...(b.schedule ? { schedule: { ...b.schedule, prompt: undefined, workingDir: undefined } } : {}),
+            ...(b.patch ? { patch: { ...b.patch, prompt: undefined, workingDir: undefined } } : {}),
           } as typeof ev.body;
         }
         res.write(`event: ${ev.type}\ndata: ${JSON.stringify({ larkAppId: ev.larkAppId, body })}\n\n`);
