@@ -297,15 +297,18 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
     </section>`;
   }
 
-  // 会话模式：私聊（p2pMode）+ 普通群（regularGroupReplyInThread）两个默认会话方式
+  // 会话模式：私聊（p2pMode）+ 普通群（regularGroupReplyMode）两个默认会话方式
   // 放在同一板块，各自一个下拉、一改即保存。
-  //   • p2pMode          → PUT /api/bots/:appId/p2p-mode（走 applyConfigField，与 /botconfig 同路径）
-  //   • 普通群默认模式    → PUT /api/bots/:appId/card-prefs 的 regularGroupReplyInThread 布尔
-  //                        （chat = false / new-topic = true，默认 chat）
-  // 普通群第三态 topic_alias 仍是 per-chat 的 /reply-mode 高级项，不在此 per-bot 默认里。
+  //   • p2pMode             → PUT /api/bots/:appId/p2p-mode（走 applyConfigField，与 /botconfig 同路径）
+  //   • 普通群默认模式 mode  → PUT /api/bots/:appId/card-prefs 的 regularGroupReplyMode
+  //                           （chat | new-topic | shared，默认 chat）
+  // per-chat 的 /reply-mode 可覆盖此 per-bot 默认。
   function renderSessionModeSection(b: any): string {
     const p2p: string = b.p2pMode === 'chat' ? 'chat' : 'thread';
-    const regular: string = b.regularGroupReplyInThread === true ? 'new-topic' : 'chat';
+    const regular: string = (b.regularGroupReplyMode === 'new-topic' || b.regularGroupReplyMode === 'shared')
+      ? b.regularGroupReplyMode : 'chat';
+    const opt = (v: string, label: string) =>
+      `<option value="${v}" ${regular === v ? 'selected' : ''}>${escapeHtml(label)}</option>`;
     return `<section class="bd-section">
       <h3 class="bd-section-title">${t('botDefaults.sectionSessionMode')}</h3>
       <div class="bd-row">
@@ -325,8 +328,9 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
         <label>
           <span>${t('botDefaults.regularGroupMode')}</span>
           <select data-input="regularGroupMode">
-            <option value="chat" ${regular === 'new-topic' ? '' : 'selected'}>${escapeHtml(t('botDefaults.regularGroupModeChat'))}</option>
-            <option value="new-topic" ${regular === 'new-topic' ? 'selected' : ''}>${escapeHtml(t('botDefaults.regularGroupModeNewTopic'))}</option>
+            ${opt('chat', t('botDefaults.regularGroupModeChat'))}
+            ${opt('new-topic', t('botDefaults.regularGroupModeNewTopic'))}
+            ${opt('shared', t('botDefaults.regularGroupModeShared'))}
           </select>
         </label>
         <small class="bd-help">${t('botDefaults.regularGroupModeHelp')}</small>
@@ -561,7 +565,7 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
               cached.autoStartOnGroupJoin = body.autoStartOnGroupJoin;
               cached.autoStartOnGroupJoinPrompt = body.autoStartOnGroupJoinPrompt;
               cached.autoStartOnNewTopic = body.autoStartOnNewTopic;
-              cached.regularGroupReplyInThread = body.regularGroupReplyInThread;
+              cached.regularGroupReplyMode = body.regularGroupReplyMode;
             }
           } else {
             statusEl.textContent = `✗ ${body.error ?? r.status}`;
@@ -653,15 +657,15 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
         });
       }
 
-      // ── 普通群默认会话模式 regularGroupReplyInThread select ─────────────────
-      // chat = 整群一个连续会话（默认）；new-topic = 每条顶层 @ 开独立话题。
-      // 复用 card-prefs 路径（与旧复选框同字段，只是 UI 改成下拉）。
+      // ── 普通群默认会话模式 regularGroupReplyMode select ─────────────────────
+      // chat = 整群一个连续会话（默认）；new-topic = 每条顶层 @ 开独立话题；
+      // shared = 话题模式但复用同一个 session。走 card-prefs 路径。
       const regularGroupModeSel = card.querySelector<HTMLSelectElement>('select[data-input=regularGroupMode]');
       const regularGroupStatusEl = card.querySelector<HTMLSpanElement>('[data-regular-group-status]');
       if (regularGroupModeSel) {
         regularGroupModeSel.addEventListener('change', () => {
           putCardPref(
-            { regularGroupReplyInThread: regularGroupModeSel.value === 'new-topic' },
+            { regularGroupReplyMode: regularGroupModeSel.value },
             regularGroupModeSel,
             regularGroupStatusEl,
           );

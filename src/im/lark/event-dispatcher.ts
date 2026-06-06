@@ -901,7 +901,7 @@ export interface RoutingContext {
    *  thread-scope (an existing rootMessageId, or this messageId when
    *  it's the seed of a brand-new thread). */
   anchor: string;
-  /** Chat-scope topic-alias reply target for this turn, if any. */
+  /** Chat-scope shared-topic reply target for this turn, if any. */
   replyRootId?: string;
   larkAppId: string;
 }
@@ -1010,7 +1010,7 @@ export function maybeApplyForceTopicOverride(
   return true;
 }
 
-async function maybeApplyTopicAliasSeed(input: {
+async function maybeApplySharedTopicSeed(input: {
   larkAppId: string;
   chatId: string;
   chatType: 'group' | 'p2p';
@@ -1023,7 +1023,7 @@ async function maybeApplyTopicAliasSeed(input: {
   const { larkAppId, chatId, chatType, message, senderOpenId, messageId, routing, forceTopicApplied } = input;
   if (forceTopicApplied) return undefined;
   if (chatType !== 'group') return undefined;
-  if (resolveRegularGroupMode(larkAppId, chatId) !== 'topic_alias') return undefined;
+  if (resolveRegularGroupMode(larkAppId, chatId) !== 'shared') return undefined;
   if (!isBotMentioned(larkAppId, message, senderOpenId)) return undefined;
   const freshMode = routing.scope === 'thread'
     ? await getChatMode(larkAppId, chatId, { forceRefresh: true })
@@ -1031,7 +1031,7 @@ async function maybeApplyTopicAliasSeed(input: {
   if (freshMode !== 'group') return undefined;
   routing.scope = 'chat';
   routing.anchor = chatId;
-  logger.info(`[reply-mode] topic_alias turn msg=${messageId.substring(0, 12)} routes through chat=${chatId.substring(0, 12)}`);
+  logger.info(`[reply-mode] shared turn msg=${messageId.substring(0, 12)} routes through chat=${chatId.substring(0, 12)}`);
   return messageId;
 }
 
@@ -1042,10 +1042,11 @@ async function maybeApplyTopicAliasSeed(input: {
  *                               top-level message starts a fresh topic; a
  *                               reply inside an existing thread carries
  *                               root_id+thread_id and threads into its session)
- *   - 普通群 + no real thread  → per-bot default:
- *                               regularGroupReplyInThread=true uses
- *                               thread-scope anchored at message_id; otherwise
- *                               chat-scope anchored at chat_id.
+ *   - 普通群 + no real thread  → resolved regular-group mode:
+ *                               new-topic uses thread-scope anchored at
+ *                               message_id; chat / shared stay chat-scope
+ *                               anchored at chat_id (shared folds into a topic
+ *                               post-routing, see maybeApplySharedTopicSeed).
  *
  *  Why we gate on thread_id (not root_id alone): Lark 客户端的引用气泡 / 快速
  *  回复 UI 有时会给"用户视角的顶层消息"塞 root_id 但**不会**塞 thread_id。
@@ -1063,10 +1064,10 @@ type RoutingDecision = {
 };
 
 function regularGroupRouting(larkAppId: string, messageId: string, chatId: string): RoutingDecision {
-  // tri-state: only `new-topic` forks a fresh thread-scope session. `topic_alias`
-  // stays chat-scope here (the alias fold happens post-routing, see
-  // maybeApplyTopicAliasSeed); `chat` is the flat default. resolveRegularGroupMode
-  // is the single decision point so new-topic and topic_alias never both fire.
+  // tri-state: only `new-topic` forks a fresh thread-scope session. `shared`
+  // stays chat-scope here (the topic fold happens post-routing, see
+  // maybeApplySharedTopicSeed); `chat` is the flat default. resolveRegularGroupMode
+  // is the single decision point so new-topic and shared never both fire.
   if (resolveRegularGroupMode(larkAppId, chatId) === 'new-topic') {
     return { scope: 'thread', anchor: messageId, source: 'regular-group-thread' };
   }
@@ -1207,21 +1208,21 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
           const ctx = { scope: decision.scope, anchor: decision.anchor };
           // Honor `/t` / `/topic` from bot senders too, aligning with the human
           // path so an explicit `@bot /t …` handoff seeds a fresh topic instead of
-          // sticking to chat-scope. Applied BEFORE the gate (and the topic_alias
+          // sticking to chat-scope. Applied BEFORE the gate (and the shared-topic
           // fold) so vetting keys on the FINAL routing: `/t` rewrites ctx to a
           // brand-new {thread, messageId} anchor. forceTopicApplied also suppresses
-          // the topic_alias fold below — a `/t` seed wins over alias, same
+          // the shared-topic fold below — a `/t` seed wins over shared, same
           // precedence as the human path.
           const forcedTopic = maybeApplyForceTopicOverride(ctx, message, messageId);
           if (forcedTopic) {
             logger.info(`[/t] Force-topic override (bot sender): msg=${messageId.substring(0, 12)} → thread-scope, anchor=msg`);
           }
-          const replyRootId = await maybeApplyTopicAliasSeed({
+          const replyRootId = await maybeApplySharedTopicSeed({
             larkAppId, chatId, chatType, message, senderOpenId, messageId, routing: ctx, forceTopicApplied: forcedTopic,
           });
           // Regular-group foreign-bot @mention: gate to vetted botmux peers
           // (registered in our bot-openids cross-ref). Fires for legacy chat-scope
-          // routing, the regularGroupReplyInThread/new-topic send-shape
+          // routing, the new-topic send-shape
           // (decision.source === 'regular-group-thread'), AND a `/t` force-topic
           // seed (forcedTopic) — so random Lark bots cannot silently spawn sessions
           // in 普通群, whether this bot replies in threads or a stranger bot @s us
@@ -1370,7 +1371,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         }
 
         // 主动开工 — 场景②: capture only genuine topic-group seeds NOW, before
-        // `/t` or the regularGroupReplyInThread preference can create the same
+        // `/t` or the regular-group new-topic mode can create the same
         // {thread, anchor=messageId} shape in a regular group. autoStartOnNewTopic
         // is deliberately limited to 话题群.
         const autoTopicSeedScope = routingSource === 'topic-chat' ? routing.scope : 'chat';
@@ -1386,7 +1387,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
 
         let ownsSession = handlers.isSessionOwner?.(routing.anchor, larkAppId) ?? false;
 
-        const seedReplyRootId = await maybeApplyTopicAliasSeed({
+        const seedReplyRootId = await maybeApplySharedTopicSeed({
           larkAppId, chatId, chatType, message, senderOpenId, messageId, routing, forceTopicApplied,
         });
         if (seedReplyRootId) {
@@ -1436,7 +1437,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
           let stats: { userCount: number; botCount: number } | null = null;
           if (ownsSession && !replyRootId) stats = await getGroupStats(larkAppId, chatId);
           // replyRootId means this turn has already been explicitly addressed
-          // to the bot by topic_alias logic (possibly from inside an existing
+          // to the bot by shared-topic logic (possibly from inside an existing
           // Lark thread). Do not re-run the generic group @ gate, which would
           // reject multi-bot thread replies simply because `routing.scope` was
           // folded back to chat-scope.

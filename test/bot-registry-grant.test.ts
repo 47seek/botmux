@@ -5,9 +5,9 @@ describe('bot-registry grant additions', () => {
   it('parseBotConfigsFromText preserves & filters chatReplyModes (tri-state)', () => {
     const cfgs = parseBotConfigsFromText(JSON.stringify([{
       larkAppId: 'rm1', larkAppSecret: 's',
-      chatReplyModes: { oc_1: 'topic_alias', oc_2: 'chat', oc_4: 'new-topic', oc_3: 'bad', '': 'topic_alias' },
+      chatReplyModes: { oc_1: 'shared', oc_2: 'chat', oc_4: 'new-topic', oc_3: 'bad', '': 'shared' },
     }]));
-    expect(cfgs[0].chatReplyModes).toEqual({ oc_1: 'topic_alias', oc_2: 'chat', oc_4: 'new-topic' });
+    expect(cfgs[0].chatReplyModes).toEqual({ oc_1: 'shared', oc_2: 'chat', oc_4: 'new-topic' });
   });
 
   it('parseBotConfigsFromText leaves chatReplyModes undefined when absent/all-invalid', () => {
@@ -107,13 +107,15 @@ describe('bot-registry grant additions', () => {
     expect(parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'rc3', larkAppSecret: 's' }]))[0].restrictGrantCommands).toBeUndefined();
   });
 
-  it('parses regularGroupReplyInThread only as strict boolean true (else undefined)', () => {
-    expect(parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'rg1', larkAppSecret: 's', regularGroupReplyInThread: true }]))[0].regularGroupReplyInThread).toBe(true);
-    for (const bad of [false, 'true', 1, undefined]) {
-      const c = parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'rg2', larkAppSecret: 's', regularGroupReplyInThread: bad }]));
-      expect(c[0].regularGroupReplyInThread).toBeUndefined();
+  it('parses regularGroupReplyMode: keeps new-topic|shared, drops chat/invalid/absent to undefined', () => {
+    expect(parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'rg1', larkAppSecret: 's', regularGroupReplyMode: 'new-topic' }]))[0].regularGroupReplyMode).toBe('new-topic');
+    expect(parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'rg1b', larkAppSecret: 's', regularGroupReplyMode: 'shared' }]))[0].regularGroupReplyMode).toBe('shared');
+    // 'chat' is the default → normalized to undefined so bots.json stays clean.
+    for (const bad of ['chat', 'bad', true, 1, undefined]) {
+      const c = parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'rg2', larkAppSecret: 's', regularGroupReplyMode: bad }]));
+      expect(c[0].regularGroupReplyMode).toBeUndefined();
     }
-    expect(parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'rg3', larkAppSecret: 's' }]))[0].regularGroupReplyInThread).toBeUndefined();
+    expect(parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'rg3', larkAppSecret: 's' }]))[0].regularGroupReplyMode).toBeUndefined();
   });
 
   it('parses p2pMode only as literal chat (else undefined = thread default)', () => {

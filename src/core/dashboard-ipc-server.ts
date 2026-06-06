@@ -11,6 +11,7 @@ import * as brandStore from '../services/brand-store.js';
 import * as cardPrefsStore from '../services/card-prefs-store.js';
 import * as grantPrefsStore from '../services/grant-prefs-store.js';
 import { findConfigField, applyConfigField } from '../services/bot-config-store.js';
+import { normalizeChatReplyMode, type ChatReplyMode } from '../services/chat-reply-mode-store.js';
 import * as chatFirstSeenStore from '../services/chat-first-seen-store.js';
 import * as scheduler from './scheduler.js';
 import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry, transferSession } from './worker-pool.js';
@@ -622,7 +623,7 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     autoStartOnGroupJoin: cardPrefs.autoStartOnGroupJoin,
     autoStartOnGroupJoinPrompt: cardPrefs.autoStartOnGroupJoinPrompt,
     autoStartOnNewTopic: cardPrefs.autoStartOnNewTopic,
-    regularGroupReplyInThread: cardPrefs.regularGroupReplyInThread,
+    regularGroupReplyMode: cardPrefs.regularGroupReplyMode,
     restrictGrantCommands: grantPrefs.restrictGrantCommands,
     messageQuotaDefaultLimit: grantPrefs.messageQuotaDefaultLimit,
     p2pMode,
@@ -636,7 +637,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
   let body: {
     disableStreamingCard?: unknown; writableTerminalLinkInCard?: unknown; privateCard?: unknown;
     autoStartOnGroupJoin?: unknown; autoStartOnGroupJoinPrompt?: unknown; autoStartOnNewTopic?: unknown;
-    regularGroupReplyInThread?: unknown;
+    regularGroupReplyMode?: unknown;
   };
   try { body = await readJsonBody(req); }
   catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
@@ -644,7 +645,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
   const patch: {
     disableStreamingCard?: boolean; writableTerminalLinkInCard?: boolean; privateCard?: boolean;
     autoStartOnGroupJoin?: boolean; autoStartOnGroupJoinPrompt?: string; autoStartOnNewTopic?: boolean;
-    regularGroupReplyInThread?: boolean;
+    regularGroupReplyMode?: ChatReplyMode;
   } = {};
   if (typeof body.disableStreamingCard === 'boolean') patch.disableStreamingCard = body.disableStreamingCard;
   if (typeof body.writableTerminalLinkInCard === 'boolean') patch.writableTerminalLinkInCard = body.writableTerminalLinkInCard;
@@ -652,7 +653,10 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
   if (typeof body.autoStartOnGroupJoin === 'boolean') patch.autoStartOnGroupJoin = body.autoStartOnGroupJoin;
   if (typeof body.autoStartOnGroupJoinPrompt === 'string') patch.autoStartOnGroupJoinPrompt = body.autoStartOnGroupJoinPrompt;
   if (typeof body.autoStartOnNewTopic === 'boolean') patch.autoStartOnNewTopic = body.autoStartOnNewTopic;
-  if (typeof body.regularGroupReplyInThread === 'boolean') patch.regularGroupReplyInThread = body.regularGroupReplyInThread;
+  if (typeof body.regularGroupReplyMode === 'string') {
+    const m = normalizeChatReplyMode(body.regularGroupReplyMode);
+    if (m) patch.regularGroupReplyMode = m;
+  }
   if (Object.keys(patch).length === 0) return jsonRes(res, 400, { ok: false, error: 'no_valid_fields' });
 
   const r = await cardPrefsStore.updateBotCardPrefs(cachedLarkAppId, patch);

@@ -112,9 +112,9 @@ function setupBotState(opts?: {
   globalGrants?: string[];
   allowedUsers?: string[];
   restrictGrantCommands?: boolean;
-  regularGroupReplyInThread?: boolean;
+  regularGroupReplyMode?: 'chat' | 'new-topic' | 'shared';
   autoStartOnNewTopic?: boolean;
-  chatReplyModes?: Record<string, 'chat' | 'new-topic' | 'topic_alias'>;
+  chatReplyModes?: Record<string, 'chat' | 'new-topic' | 'shared'>;
   p2pMode?: 'thread' | 'chat';
 }) {
   mockGetBot.mockReturnValue({
@@ -125,7 +125,7 @@ function setupBotState(opts?: {
       chatGrants: opts?.chatGrants,
       globalGrants: opts?.globalGrants,
       restrictGrantCommands: opts?.restrictGrantCommands,
-      regularGroupReplyInThread: opts?.regularGroupReplyInThread,
+      regularGroupReplyMode: opts?.regularGroupReplyMode,
       autoStartOnNewTopic: opts?.autoStartOnNewTopic,
       chatReplyModes: opts?.chatReplyModes,
       p2pMode: opts?.p2pMode,
@@ -525,7 +525,7 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     // 它必须排在 vetting gate 之后。否则随机第三方 bot 发 `@bot /t …` 会让闸门
     // 的 `ctx.scope === 'chat' || source === 'regular-group-thread'` 两条件全 false
     // → 绕过 vetting → 静默 spawn 一个 thread-scope 会话。这条用例锁死「不能绕」。
-    mockGetChatMode.mockResolvedValueOnce('group');  // 普通群, regularGroupReplyInThread off → source=regular-group-chat
+    mockGetChatMode.mockResolvedValueOnce('group');  // 普通群, regularGroupReplyMode unset(chat) → source=regular-group-chat
     mockReadFileSync.mockReturnValue('{}');  // empty cross-ref → unknown peer
     const event = makeBotMessageEvent({
       senderOpenId: OTHER_BOT_OPEN_ID,
@@ -1177,8 +1177,8 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     expect(handlers.handleThreadReply).not.toHaveBeenCalled();
   });
 
-  it('topic_alias top-level @ routes through chat session with replyRootId=current message', async () => {
-    setupBotState({ chatReplyModes: { 'chat-reply-mode': 'topic_alias' }, allowedUsers: [USER_OPEN_ID] });
+  it('shared top-level @ routes through chat session with replyRootId=current message', async () => {
+    setupBotState({ chatReplyModes: { 'chat-reply-mode': 'shared' }, allowedUsers: [USER_OPEN_ID] });
     mockGetChatMode.mockResolvedValue('group');
     const event = makeUserMessageEvent({
       senderOpenId: USER_OPEN_ID,
@@ -1202,8 +1202,8 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
   });
 
-  it('topic_alias thread-contained @ starts a fresh alias on the current message id', async () => {
-    setupBotState({ chatReplyModes: { 'chat-reply-mode': 'topic_alias' }, allowedUsers: [USER_OPEN_ID] });
+  it('shared thread-contained @ starts a fresh alias on the current message id', async () => {
+    setupBotState({ chatReplyModes: { 'chat-reply-mode': 'shared' }, allowedUsers: [USER_OPEN_ID] });
     mockGetChatMode.mockResolvedValue('group');
     const event = makeUserMessageEvent({
       senderOpenId: USER_OPEN_ID,
@@ -1229,8 +1229,8 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
   });
 
-  it('topic_alias explicit @ inside an existing alias thread starts a new alias on current message', async () => {
-    setupBotState({ chatReplyModes: { 'chat-reply-mode': 'topic_alias' }, allowedUsers: [USER_OPEN_ID] });
+  it('shared explicit @ inside an existing alias thread starts a new alias on current message', async () => {
+    setupBotState({ chatReplyModes: { 'chat-reply-mode': 'shared' }, allowedUsers: [USER_OPEN_ID] });
     mockGetChatMode.mockResolvedValue('group');
     handlers.resolveReplyThreadAlias.mockReturnValue({ chatId: 'chat-reply-mode', sessionId: 'sess-chat' });
     handlers.isSessionOwner.mockImplementation((anchor: string) => anchor === 'chat-reply-mode');
@@ -1256,8 +1256,8 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
   });
 
-  it('topic_alias bot-sent post inside a thread starts a fresh alias on current message', async () => {
-    setupBotState({ chatReplyModes: { 'chat-reply-mode': 'topic_alias' } });
+  it('shared bot-sent post inside a thread starts a fresh alias on current message', async () => {
+    setupBotState({ chatReplyModes: { 'chat-reply-mode': 'shared' } });
     mockGetChatMode.mockResolvedValue('group');
     mockReadFileSync.mockReturnValue(JSON.stringify({ BotB: OTHER_BOT_OPEN_ID }));
     handlers.isSessionOwner.mockImplementation((anchor: string) => anchor === 'chat-reply-mode');
@@ -1290,7 +1290,7 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
   });
 
-  it('topic_alias follow-up thread reply folds back to chat session alias', async () => {
+  it('shared follow-up thread reply folds back to chat session alias', async () => {
     setupBotState({ allowedUsers: [USER_OPEN_ID] });
     mockGetChatMode.mockResolvedValue('group');
     handlers.resolveReplyThreadAlias.mockReturnValue({ chatId: 'chat-reply-mode', sessionId: 'sess-chat' });
@@ -1322,7 +1322,7 @@ describe('im.message.receive_v1 — regular group thread replies preference', ()
 
   beforeEach(() => {
     capturedHandlers = {};
-    setupBotState({ regularGroupReplyInThread: true });
+    setupBotState({ regularGroupReplyMode: 'new-topic' });
     handlers = makeHandlers();
     mockFindOncallChat.mockReturnValue(undefined);
     mockGetChatMode.mockResolvedValue('group');
@@ -1375,7 +1375,7 @@ describe('im.message.receive_v1 — regular group thread replies preference', ()
   });
 });
 
-describe('im.message.receive_v1 — regular group reply mode (tri-state: chat | new-topic | topic_alias)', () => {
+describe('im.message.receive_v1 — regular group reply mode (tri-state: chat | new-topic | shared)', () => {
   let handlers: ReturnType<typeof makeHandlers>;
 
   beforeEach(() => {
@@ -1413,10 +1413,10 @@ describe('im.message.receive_v1 — regular group reply mode (tri-state: chat | 
     expect(handlers.handleThreadReply).not.toHaveBeenCalled();
   });
 
-  it('per-chat topic_alias overrides a per-bot new-topic default — single mode, no competition', async () => {
-    // Per-bot default would fork a new topic; the per-chat topic_alias override
+  it('per-chat shared overrides a per-bot new-topic default — single mode, no competition', async () => {
+    // Per-bot default would fork a new topic; the per-chat shared override
     // must win and keep this turn on the chat-scope session (alias into thread).
-    setupBotState({ regularGroupReplyInThread: true, chatReplyModes: { 'chat-tri-alias': 'topic_alias' }, allowedUsers: [USER_OPEN_ID] });
+    setupBotState({ regularGroupReplyMode: 'new-topic', chatReplyModes: { 'chat-tri-alias': 'shared' }, allowedUsers: [USER_OPEN_ID] });
     handlers.isSessionOwner.mockImplementation((anchor: string) => anchor === 'chat-tri-alias');
     const event = makeUserMessageEvent({
       senderOpenId: USER_OPEN_ID,
@@ -1440,7 +1440,7 @@ describe('im.message.receive_v1 — regular group reply mode (tri-state: chat | 
   });
 
   it('per-chat chat opts out of a per-bot new-topic default — flat chat-scope, not a new topic', async () => {
-    setupBotState({ regularGroupReplyInThread: true, chatReplyModes: { 'chat-tri-flat': 'chat' }, allowedUsers: [USER_OPEN_ID] });
+    setupBotState({ regularGroupReplyMode: 'new-topic', chatReplyModes: { 'chat-tri-flat': 'chat' }, allowedUsers: [USER_OPEN_ID] });
     handlers.isSessionOwner.mockReturnValue(false);
     const event = makeUserMessageEvent({
       senderOpenId: USER_OPEN_ID,
@@ -1657,7 +1657,7 @@ describe('im.message.receive_v1 — stale topic detection (topic → group conve
   });
 
   it('keeps thread-scope on topic-cache flip-back when regular group thread replies are enabled', async () => {
-    setupBotState({ regularGroupReplyInThread: true });
+    setupBotState({ regularGroupReplyMode: 'new-topic' });
     mockGetChatMode.mockImplementation(async (_appId: string, _chatId: string, options?: { forceRefresh?: boolean }) => {
       return options?.forceRefresh ? 'group' : 'topic';
     });
@@ -1995,14 +1995,14 @@ describe('im.message.receive_v1 — /t force-topic override', () => {
 describe('im.message.receive_v1 — 主动开工 场景② (autoStartOnNewTopic)', () => {
   let handlers: ReturnType<typeof makeHandlers>;
 
-  function setupAutoTopicBot(enabled: boolean, regularGroupReplyInThread = false) {
+  function setupAutoTopicBot(enabled: boolean, regularGroupNewTopic = false) {
     mockGetBot.mockReturnValue({
       config: {
         larkAppId: MY_APP_ID,
         larkAppSecret: 'secret',
         cliId: 'claude-code',
         autoStartOnNewTopic: enabled,
-        regularGroupReplyInThread: regularGroupReplyInThread || undefined,
+        regularGroupReplyMode: regularGroupNewTopic ? 'new-topic' : undefined,
       },
       botOpenId: MY_OPEN_ID,
       // A non-empty allowlist that does NOT include the sender → canTalk(sender)

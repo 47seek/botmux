@@ -871,7 +871,9 @@ const server = createServer(async (req, res) => {
             autoStartOnGroupJoin: j.autoStartOnGroupJoin === true,
             autoStartOnGroupJoinPrompt: typeof j.autoStartOnGroupJoinPrompt === 'string' ? j.autoStartOnGroupJoinPrompt : '',
             autoStartOnNewTopic: j.autoStartOnNewTopic === true,
-            regularGroupReplyInThread: j.regularGroupReplyInThread === true,
+            regularGroupReplyMode: (j.regularGroupReplyMode === 'new-topic' || j.regularGroupReplyMode === 'shared')
+              ? j.regularGroupReplyMode
+              : 'chat',
             restrictGrantCommands: j.restrictGrantCommands === true,
             messageQuotaDefaultLimit: typeof j.messageQuotaDefaultLimit === 'number' ? j.messageQuotaDefaultLimit : null,
             p2pMode: j.p2pMode === 'chat' ? 'chat' : 'thread',

@@ -11,11 +11,12 @@
  *   • privateCard               — `/card` sends a private ephemeral snapshot
  *                                  (visible to the talk-grant audience) instead
  *                                  of the group-visible live card
- *   • regularGroupReplyInThread — top-level @mentions in regular groups open
- *                                  focused thread replies under the trigger
+ *   • regularGroupReplyMode     — per-bot DEFAULT session mode for regular
+ *                                  groups: chat | new-topic | shared (see
+ *                                  chat-reply-mode-store). Default 'chat'.
  */
 import { rmwBotEntry } from './config-store.js';
-import { getBot } from '../bot-registry.js';
+import { getBot, type ChatReplyMode } from '../bot-registry.js';
 import { logger } from '../utils/logger.js';
 
 export interface BotCardPrefs {
@@ -28,8 +29,8 @@ export interface BotCardPrefs {
   autoStartOnGroupJoinPrompt: string;
   /** 主动开工 — 场景②: auto-start on every new topic in a topic group. */
   autoStartOnNewTopic: boolean;
-  /** In regular groups, reply to top-level @mentions by opening a thread. */
-  regularGroupReplyInThread: boolean;
+  /** Per-bot DEFAULT regular-group session mode (chat | new-topic | shared). */
+  regularGroupReplyMode: ChatReplyMode;
 }
 
 /** Current card prefs for a bot (booleans default false, prompt defaults '' when unset). */
@@ -43,7 +44,7 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
       autoStartOnGroupJoin: c.autoStartOnGroupJoin === true,
       autoStartOnGroupJoinPrompt: typeof c.autoStartOnGroupJoinPrompt === 'string' ? c.autoStartOnGroupJoinPrompt : '',
       autoStartOnNewTopic: c.autoStartOnNewTopic === true,
-      regularGroupReplyInThread: c.regularGroupReplyInThread === true,
+      regularGroupReplyMode: c.regularGroupReplyMode ?? 'chat',
     };
   } catch {
     return {
@@ -53,7 +54,7 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
       autoStartOnGroupJoin: false,
       autoStartOnGroupJoinPrompt: '',
       autoStartOnNewTopic: false,
-      regularGroupReplyInThread: false,
+      regularGroupReplyMode: 'chat',
     };
   }
 }
@@ -82,6 +83,13 @@ export async function updateBotCardPrefs(
     if (val.trim()) entry[key] = val;
     else delete entry[key];
   };
+  // Regular-group default mode: store only the non-default modes; 'chat' (the
+  // default) drops the key so bots.json stays tidy (absent === 'chat').
+  const applyMode = (entry: any, key: keyof BotCardPrefs, val: ChatReplyMode | undefined) => {
+    if (val === undefined) return;
+    if (val === 'new-topic' || val === 'shared') entry[key] = val;
+    else delete entry[key];
+  };
 
   const r = await rmwBotEntry<BotCardPrefs>(larkAppId, (entry) => {
     apply(entry, 'disableStreamingCard', patch.disableStreamingCard);
@@ -90,7 +98,7 @@ export async function updateBotCardPrefs(
     apply(entry, 'autoStartOnGroupJoin', patch.autoStartOnGroupJoin);
     applyStr(entry, 'autoStartOnGroupJoinPrompt', patch.autoStartOnGroupJoinPrompt);
     apply(entry, 'autoStartOnNewTopic', patch.autoStartOnNewTopic);
-    apply(entry, 'regularGroupReplyInThread', patch.regularGroupReplyInThread);
+    applyMode(entry, 'regularGroupReplyMode', patch.regularGroupReplyMode);
     return {
       write: true,
       result: {
@@ -100,7 +108,9 @@ export async function updateBotCardPrefs(
         autoStartOnGroupJoin: entry.autoStartOnGroupJoin === true,
         autoStartOnGroupJoinPrompt: typeof entry.autoStartOnGroupJoinPrompt === 'string' ? entry.autoStartOnGroupJoinPrompt : '',
         autoStartOnNewTopic: entry.autoStartOnNewTopic === true,
-        regularGroupReplyInThread: entry.regularGroupReplyInThread === true,
+        regularGroupReplyMode: (entry.regularGroupReplyMode === 'new-topic' || entry.regularGroupReplyMode === 'shared')
+          ? entry.regularGroupReplyMode
+          : 'chat',
       },
     };
   });
@@ -125,14 +135,16 @@ export async function updateBotCardPrefs(
   if (patch.autoStartOnNewTopic !== undefined) {
     bot.config.autoStartOnNewTopic = patch.autoStartOnNewTopic || undefined;
   }
-  if (patch.regularGroupReplyInThread !== undefined) {
-    bot.config.regularGroupReplyInThread = patch.regularGroupReplyInThread || undefined;
+  if (patch.regularGroupReplyMode !== undefined) {
+    bot.config.regularGroupReplyMode = (patch.regularGroupReplyMode === 'new-topic' || patch.regularGroupReplyMode === 'shared')
+      ? patch.regularGroupReplyMode
+      : undefined;
   }
   logger.info(
     `[card-prefs:${larkAppId}] disableStreamingCard=${r.result.disableStreamingCard} ` +
     `writableTerminalLinkInCard=${r.result.writableTerminalLinkInCard} privateCard=${r.result.privateCard} ` +
     `autoStartOnGroupJoin=${r.result.autoStartOnGroupJoin} autoStartOnNewTopic=${r.result.autoStartOnNewTopic} ` +
-    `regularGroupReplyInThread=${r.result.regularGroupReplyInThread} ` +
+    `regularGroupReplyMode=${r.result.regularGroupReplyMode} ` +
     `autoStartOnGroupJoinPrompt.len=${r.result.autoStartOnGroupJoinPrompt.length}`,
   );
   return { ok: true, prefs: r.result };

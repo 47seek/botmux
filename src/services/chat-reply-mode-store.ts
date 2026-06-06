@@ -3,17 +3,18 @@
  *
  * Three modes (tri-state) — unifies #116 + #131 into one knob so a chat resolves
  * to EXACTLY ONE mode and the two thread-reply mechanisms can never compete:
- *   • chat        — flat chat-scope replies in the group (legacy default).
+ *   • chat        — flat chat-scope replies in the group (default).
  *   • new-topic   — each top-level @mention opens a fresh thread-scope session
  *                   under the trigger (its own worker/cwd/context). This is the
- *                   per-bot `regularGroupReplyInThread` behavior from #116.
- *   • topic_alias — reuse the bot's existing chat-scope session/worker/cwd, but
- *                   route this turn's reply into the trigger message's thread (#131).
+ *                   per-bot fork behavior from #116.
+ *   • shared      — 话题模式但复用同一个 session: reuse the bot's existing
+ *                   chat-scope session/worker/cwd, but route this turn's reply
+ *                   into the trigger message's thread (#131).
  *
  * Resolution: per-chat override (`chatReplyModes[chatId]`) wins; otherwise fall
- * back to the per-bot default (`regularGroupReplyInThread === true` → new-topic,
- * else chat). The setting is bot-scoped: Bot A can prefer topic replies in one
- * group while Bot B or another group stays flat.
+ * back to the per-bot default (`regularGroupReplyMode`, default 'chat'). The
+ * setting is bot-scoped: Bot A can prefer topic replies in one group while Bot B
+ * or another group stays flat.
  */
 import { rmwBotEntry } from './config-store.js';
 import { getBot, type ChatReplyMode } from '../bot-registry.js';
@@ -26,19 +27,19 @@ export function normalizeChatReplyMode(raw: string | undefined): ChatReplyMode |
   if (!v || v === 'status') return undefined;
   if (v === 'chat') return 'chat';
   if (v === 'topic' || v === 'new-topic' || v === 'newtopic' || v === 'thread') return 'new-topic';
-  if (v === 'alias' || v === 'topic-alias' || v === 'topic_alias') return 'topic_alias';
+  if (v === 'shared' || v === 'share' || v === 'alias' || v === 'topic-alias' || v === 'topic_alias') return 'shared';
   return undefined;
 }
 
 /** Short command-word label for status / confirmation messages. */
-export function replyModeLabel(mode: ChatReplyMode): 'chat' | 'topic' | 'alias' {
-  return mode === 'new-topic' ? 'topic' : mode === 'topic_alias' ? 'alias' : 'chat';
+export function replyModeLabel(mode: ChatReplyMode): 'chat' | 'topic' | 'shared' {
+  return mode === 'new-topic' ? 'topic' : mode === 'shared' ? 'shared' : 'chat';
 }
 
-/** Per-bot default mode, derived from #116's `regularGroupReplyInThread` boolean. */
+/** Per-bot default regular-group mode (`regularGroupReplyMode`, default 'chat'). */
 function regularGroupDefaultMode(larkAppId: string): ChatReplyMode {
   try {
-    return getBot(larkAppId).config.regularGroupReplyInThread === true ? 'new-topic' : 'chat';
+    return getBot(larkAppId).config.regularGroupReplyMode ?? 'chat';
   } catch {
     return 'chat';
   }
@@ -47,7 +48,7 @@ function regularGroupDefaultMode(larkAppId: string): ChatReplyMode {
 /**
  * Effective regular-group reply mode for a chat — the SINGLE source of truth for
  * routing. Per-chat override first, then the per-bot default. Both the
- * `regularGroupRouting` (new-topic) and `maybeApplyTopicAliasSeed` (topic_alias)
+ * `regularGroupRouting` (new-topic) and `maybeApplySharedTopicSeed` (shared)
  * code paths read this, so they are mutually exclusive by construction.
  */
 export function resolveRegularGroupMode(larkAppId: string, chatId: string | undefined): ChatReplyMode {

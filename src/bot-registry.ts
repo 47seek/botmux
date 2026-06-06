@@ -9,7 +9,7 @@ import { isLocale, setBotLookup, type Locale } from './i18n/index.js';
 import type { VoiceConfig } from './services/voice/types.js';
 import { type Brand, sdkDomain, normalizeBrand } from './im/lark/lark-hosts.js';
 
-export type ChatReplyMode = 'chat' | 'new-topic' | 'topic_alias';
+export type ChatReplyMode = 'chat' | 'new-topic' | 'shared';
 
 export interface OncallChat {
   /** Lark chat_id (oc_xxx) the bot was pulled into. */
@@ -207,11 +207,14 @@ export interface BotConfig {
    */
   autoStartOnNewTopic?: boolean;
   /**
-   * When true, a top-level @mention in a regular Lark group opens a topic-style
-   * thread reply under that original message. Default undefined keeps legacy
-   * chat-scope regular-group behavior.
+   * Per-bot DEFAULT session mode for regular Lark groups (overridable per-chat
+   * via `/reply-mode` → `chatReplyModes`). Resolved by
+   * `chat-reply-mode-store.regularGroupDefaultMode`.
+   *   • 'chat' (or undefined) — whole group shares one flat chat-scope session
+   *   • 'new-topic'           — each top-level @mention forks its own thread-scope session
+   *   • 'shared'              — replies fold into a topic but reuse the one chat-scope session
    */
-  regularGroupReplyInThread?: boolean;
+  regularGroupReplyMode?: ChatReplyMode;
   /**
    * Per-bot voice-engine override for the voice-summary feature. Merged OVER
    * the global `voice` block in ~/.botmux/config.json (per-bot wins field by
@@ -528,14 +531,14 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     }
 
     // chatReplyModes：只保留每群显式设置，非法值丢弃。三态 chat｜new-topic｜
-    // topic_alias 都保留解析；写入路径会删除「与 per-bot 默认相同」的条目以保持
+    // shared 都保留解析；写入路径会删除「与 per-bot 默认相同」的条目以保持
     // bots.json 干净（见 chat-reply-mode-store.setChatReplyMode）。
     let chatReplyModes: { [chatId: string]: ChatReplyMode } | undefined;
     if (entry.chatReplyModes && typeof entry.chatReplyModes === 'object' && !Array.isArray(entry.chatReplyModes)) {
       const out: { [chatId: string]: ChatReplyMode } = {};
       for (const [cid, mode] of Object.entries(entry.chatReplyModes)) {
         if (typeof cid !== 'string' || !cid.trim()) continue;
-        if (mode === 'chat' || mode === 'new-topic' || mode === 'topic_alias') out[cid] = mode;
+        if (mode === 'chat' || mode === 'new-topic' || mode === 'shared') out[cid] = mode;
       }
       if (Object.keys(out).length > 0) chatReplyModes = out;
     }
@@ -671,7 +674,12 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         ? entry.autoStartOnGroupJoinPrompt
         : undefined,
       autoStartOnNewTopic: entry.autoStartOnNewTopic === true || undefined,
-      regularGroupReplyInThread: entry.regularGroupReplyInThread === true || undefined,
+      // Per-bot regular-group default mode. Only 'new-topic' | 'shared' are
+      // meaningful; 'chat' (the flat default) and anything else normalize to
+      // undefined so bots.json stays clean.
+      regularGroupReplyMode: entry.regularGroupReplyMode === 'new-topic' || entry.regularGroupReplyMode === 'shared'
+        ? entry.regularGroupReplyMode
+        : undefined,
       voice,
     });
   }
