@@ -31,7 +31,6 @@ import {
   applyConfigField, setBotAllowedUsers, getConfigSnapshot, getConfigCardData, type ConfigEffect,
 } from '../services/bot-config-store.js';
 import { resolveCliId, findInvalidAllowedUserEntries } from '../setup/bot-config-editor.js';
-import { listRelayTargets, resolveRelayTarget, buildRelayContent } from '../services/config-relay.js';
 import { publishAttentionPatch, announcePendingRepoSession } from './session-activity.js';
 import { setCardMode } from '../services/card-mode-store.js';
 import { invalidWorkingDirs } from '../utils/working-dir.js';
@@ -601,15 +600,10 @@ async function handleConfigCommand(
   const loc = localeForBot(larkAppId);
   const reply = (c: string) => deps.sessionReply(rootId, c, undefined, larkAppId);
   const senderId = message.senderId;
-  const chatId = message.chatId;
-  // 发送者是不是 bot（控制 bot 中转过来的消息）。allowedUsers 这类动信任根的操作
-  // 只允许真人，杜绝「控制 bot 中转 /botconfig set allowedUsers」式的提权。
-  const fromBot = message.senderType === 'app' || message.senderType === 'bot';
 
   // Admin 闸：严格限定 allowedUsers，**拒绝开放模式**（无 allowlist 的 bot 没有可
   // 授权的 owner，不能凭聊天改配置）。上游 canOperate 对开放模式 / 兄弟 bot 也放行，
-  // 改配置比一般 daemon 命令敏感，这里收紧到「本 bot 的 allowedUsers」。被授权的控制
-  // bot 走的也是这条——它的 open_id 在目标的 allowedUsers 里，故同样过闸。
+  // 改配置比一般 daemon 命令敏感，这里收紧到「本 bot 的 allowedUsers」。
   let bot;
   try { bot = getBot(larkAppId); } catch { await reply(t('cmd.config.no_bot', undefined, loc)); return; }
   const admins = bot.resolvedAllowedUsers;
@@ -643,72 +637,6 @@ async function handleConfigCommand(
   if (sub === 'help' || sub === '帮助') { await reply(buildConfigHelp(loc)); return; }
   if (sub === 'get' || sub === 'show' || sub === 'list' || sub === '查看') { await reply(buildConfigSnapshot(larkAppId, loc)); return; }
 
-  // ── 跨机器中转（控制 bot → 共享群 → 目标 bot 的 /botconfig）────────────────────
-  if (sub === 'targets' || sub === 'bots') {
-    if (!chatId) { await reply(t('cmd.config.relay_need_group', undefined, loc)); return; }
-    const targets = await listRelayTargets(larkAppId, chatId);
-    if (targets.length === 0) { await reply(t('cmd.config.targets_none', undefined, loc)); return; }
-    const lines = targets
-      .map(tg => `• ${tg.name}${tg.mentionable ? '' : ' ' + t('cmd.config.target_unreachable', undefined, loc)}  \`${tg.openId}\``)
-      .join('\n');
-    await reply(t('cmd.config.targets_list', { list: lines }, loc));
-    return;
-  }
-
-  if (sub === 'relay') {
-    if (!chatId) { await reply(t('cmd.config.relay_need_group', undefined, loc)); return; }
-    const targetQuery = parts[1];
-    const subcommand = parts.slice(2).join(' ').trim();
-    if (!targetQuery || !subcommand) { await reply(t('cmd.config.relay_usage', undefined, loc)); return; }
-    const res = await resolveRelayTarget(larkAppId, chatId, targetQuery);
-    if (!res.ok) {
-      if (res.reason === 'not_mentionable') { await reply(t('cmd.config.relay_unreachable', { name: res.target.name }, loc)); return; }
-      await reply(t('cmd.config.relay_not_found', { query: targetQuery, candidates: res.candidates.join(', ') || '—' }, loc));
-      return;
-    }
-    const content = buildRelayContent(res.target.openId, subcommand);
-    try {
-      await sendMessage(larkAppId, chatId, content, 'text');
-    } catch (e: any) {
-      await reply(t('cmd.config.relay_send_failed', { msg: e?.message ?? String(e) }, loc));
-      return;
-    }
-    await reply(t('cmd.config.relay_sent', { name: res.target.name, cmd: `/botconfig ${subcommand}` }, loc));
-    return;
-  }
-
-  if (sub === 'trust' || sub === 'untrust') {
-    if (fromBot) { await reply(t('cmd.config.humans_only', undefined, loc)); return; }
-    const arg = parts[1];
-    if (sub === 'trust' && (!arg || arg.toLowerCase() === 'list')) {
-      const cur = getBot(larkAppId).config.allowedUsers ?? [];
-      await reply(t('cmd.config.trust_list', { list: cur.join(', ') || '∅' }, loc));
-      return;
-    }
-    if (!arg) { await reply(t('cmd.config.trust_usage', undefined, loc)); return; }
-    if (!chatId) { await reply(t('cmd.config.relay_need_group', undefined, loc)); return; }
-    const res = await resolveRelayTarget(larkAppId, chatId, arg);
-    if (!res.ok) {
-      if (res.reason === 'not_mentionable') { await reply(t('cmd.config.relay_unreachable', { name: res.target.name }, loc)); return; }
-      await reply(t('cmd.config.relay_not_found', { query: arg, candidates: res.candidates.join(', ') || '—' }, loc));
-      return;
-    }
-    const targetOpenId = res.target.openId;
-    const curRaw = [...(getBot(larkAppId).config.allowedUsers ?? [])];
-    if (sub === 'trust') {
-      if (curRaw.includes(targetOpenId)) { await reply(t('cmd.config.trust_already', { name: res.target.name }, loc)); return; }
-      const r = await setBotAllowedUsers(larkAppId, [...curRaw, targetOpenId], senderId);
-      if (!r.ok) { await reply(t('cmd.config.write_failed', { reason: r.reason }, loc)); return; }
-      await reply(t('cmd.config.trust_ok', { name: res.target.name, id: targetOpenId }, loc));
-    } else {
-      if (!curRaw.includes(targetOpenId)) { await reply(t('cmd.config.untrust_absent', { name: res.target.name }, loc)); return; }
-      const r = await setBotAllowedUsers(larkAppId, curRaw.filter(e => e !== targetOpenId), senderId);
-      if (!r.ok) { await reply(t('cmd.config.write_failed', { reason: r.reason }, loc)); return; }
-      await reply(t('cmd.config.untrust_ok', { name: res.target.name }, loc));
-    }
-    return;
-  }
-
   if (sub === 'set' || sub === 'unset') {
     const fieldKey = parts[1];
     if (!fieldKey) { await reply(t('cmd.config.set_usage', undefined, loc)); return; }
@@ -725,7 +653,6 @@ async function handleConfigCommand(
 
     // set
     if (spec.kind === 'allowedUsers') {
-      if (fromBot) { await reply(t('cmd.config.humans_only', undefined, loc)); return; }
       await applyAllowedUsersSet(parts.slice(2), rootId, larkAppId, senderId, deps, loc);
       return;
     }
@@ -1211,8 +1138,7 @@ export async function handleCommand(
           await sessionReply(rootId, t('cmd.config.no_bot', undefined, loc));
           break;
         }
-        // chatId 既供 sessionless 中转（targets/relay/trust）用，也作 session 路径兜底。
-        await handleConfigCommand({ ...message, chatId: message.chatId ?? ds?.chatId }, rootId, appId, deps);
+        await handleConfigCommand(message, rootId, appId, deps);
         logger.info(`[${logTag}] Config command handled`);
         break;
       }
