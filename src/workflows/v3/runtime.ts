@@ -26,6 +26,7 @@ import {
   isLoopNode,
   loopInstanceId,
   type V3Dag,
+  type V3InputRef,
   type V3LoopExitWhen,
   type V3LoopNode,
   type V3Node,
@@ -788,7 +789,10 @@ export async function runWorkflow(
       id: loopInstanceId(ref.loopId, ref.iteration, ref.bodyNodeId),
       bot: bodyDef.bot ?? loopNode.bot,
       depends: bodyDef.depends.map((d) => ({ from: loopInstanceId(ref.loopId, ref.iteration, d.from) })),
-      inputs: bodyDef.inputs.map((r) => ({ from: loopInstanceId(ref.loopId, ref.iteration, r.from) })),
+      inputs: bodyDef.inputs.map((r) => ({
+        from: loopInstanceId(ref.loopId, ref.iteration, r.from),
+        ...(r.select ? { select: r.select } : {}), // P3: 实例化时保留 selector
+      })),
     };
   }
 
@@ -992,16 +996,31 @@ export async function runWorkflow(
       }
     };
 
+    // P3 selector misses collected during resolution — merged into `omitted`
+    // so the agent reads the gap as a known contract issue, not silence.
+    const selectorMisses: Array<{ from: string; reason: 'selectorMiss' }> = [];
+    const pushRef = (ref: V3InputRef): void => {
+      const filter = ref.select
+        ? (f: Manifest['files'][number]) =>
+            ref.select!.name !== undefined ? f.name === ref.select!.name : f.path === ref.select!.path
+        : undefined;
+      const before = inputs.length;
+      pushFrom(ref.from, ref.from, filter);
+      if (ref.select && inputs.length === before) {
+        selectorMisses.push({ from: ref.from, reason: 'selectorMiss' });
+      }
+    };
+
     for (const ref of node.inputs) {
       if (omittedFrom.has(ref.from)) continue; // branch not taken — surfaced via `omitted`
-      pushFrom(ref.from, ref.from);
+      pushRef(ref);
     }
 
     if (loopRef) {
       const loopNode = nodesById.get(loopRef.loopId) as V3LoopNode;
       // (a) The loop's outer inputs (e.g. `prepare`'s products) flow into
       // every body instance of every iteration.
-      for (const ref of loopNode.inputs) pushFrom(ref.from, ref.from);
+      for (const ref of loopNode.inputs) pushRef(ref);
       // (b) Declared previous-iteration feedback.
       if (loopRef.iteration > 1) {
         for (const fb of loopNode.feedback) {
@@ -1025,6 +1044,7 @@ export async function runWorkflow(
     // Dedupe by (label, path) — `feedback: ["test.result", "test.files"]`
     // legitimately overlaps on result.json; one entry is enough.
     const seen = new Set<string>();
+    const allOmitted = [...(omitted ?? []), ...selectorMisses];
     return {
       inputs: inputs.filter((i) => {
         const key = JSON.stringify([i.from, i.path]);
@@ -1032,7 +1052,7 @@ export async function runWorkflow(
         seen.add(key);
         return true;
       }),
-      ...(omitted && omitted.length > 0 ? { omitted } : {}),
+      ...(allOmitted.length > 0 ? { omitted: allOmitted } : {}),
     };
   }
 }

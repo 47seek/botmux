@@ -476,3 +476,21 @@ override?: {
 - **toolsSubset 显式延期（P2b）**：需要 init/worker/adapter 全链路加字段 +
   按 CLI 的支持矩阵（claude-code 可映射 --allowedTools，codex/seed 待查），
   validateDag 对它 fail-loud 报"deferred"而非静默忽略。
+
+## 14. P3 附录：per-file input selector
+
+`inputs` 条目支持从上游 manifest 拉**单个命名产物**（P0 时 deferred 的
+per-file selector，对位 seedclaw 命名 artifact 的 v3 原生形态——文件级、
+不引入未 journal 的共享 KV）：
+
+```jsonc
+"inputs": [{ "from": "research", "select": { "name": "report.md" } }]
+```
+
+- `select` 恰好设 `name`（manifest 逻辑名）或 `path`（manifest 相对路径）之一；
+- buildInputs 按 selector 过滤上游 manifest files；**未命中 → 不注入 +
+  `GoalInputs.omitted` 记 `reason:'selectorMiss'`**，goal 提示让 agent 把缺失
+  当已知契约缺口处理（延续 P0 反静默原则）；后续可硬化为 dispatch 前置失败；
+- loop body 实例化（instanceNodeFor）保留 selector；loop 外层 inputs 同样生效；
+- 不做共享 board/KV：跨节点暂存态若未 journal 化会破坏重放确定性（P0 收敛
+  结论），有需求等 host/transform node journal 化产物再说。

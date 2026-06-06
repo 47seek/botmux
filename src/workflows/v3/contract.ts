@@ -93,13 +93,13 @@ export interface GoalInputs {
     kind: ManifestFileKind;
     preview?: string;
   }>;
-  /** Declared inputs NOT injected because their edge resolved inactive or
-   *  their source was skipped (edge-activation design §6).  Only meaningful
-   *  on one_success / quorum nodes — telling the agent "this absence is by
-   *  design" stops it from hallucinating the missing product. */
+  /** Declared inputs NOT injected: edge resolved inactive / source skipped
+   *  (edge-activation design §6) or a P3 per-file selector matched nothing in
+   *  the upstream manifest ('selectorMiss').  Telling the agent "this absence
+   *  is known" stops it from hallucinating the missing product. */
   omitted?: Array<{
     from: string;
-    reason: 'edgeInactive' | 'sourceSkipped';
+    reason: 'edgeInactive' | 'sourceSkipped' | 'selectorMiss';
   }>;
 }
 

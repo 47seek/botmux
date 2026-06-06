@@ -70,6 +70,12 @@ export const MAX_HUMAN_GATE_OPTION_LENGTH = 32;
 export interface V3InputRef {
   /** Upstream nodeId whose manifest files become this node's inputs. */
   from: string;
+  /** P3 per-file selector: pull ONE named product instead of the whole
+   *  manifest.  Exactly one of `name` (manifest logical name) / `path`
+   *  (manifest relative path) when present.  A selector that matches nothing
+   *  at dispatch time is surfaced to the agent via `GoalInputs.omitted`
+   *  (reason 'selectorMiss') — absence reads as a contract gap, not silence. */
+  select?: { name?: string; path?: string };
 }
 
 /**
@@ -1164,10 +1170,38 @@ function normInputs(v: unknown, id: string, problems: string[]): V3InputRef[] {
   for (let j = 0; j < v.length; j++) {
     const inp = v[j];
     if (!isObject(inp) || typeof inp.from !== 'string') {
-      problems.push(`node "${id}".inputs[${j}] must be { from: <nodeId> }`);
+      problems.push(`node "${id}".inputs[${j}] must be { from: <nodeId>, select? }`);
       continue;
     }
-    out.push({ from: inp.from });
+    const extra = Object.keys(inp).filter((k) => k !== 'from' && k !== 'select');
+    if (extra.length > 0) {
+      problems.push(`node "${id}".inputs[${j}] has unsupported key(s): ${extra.join(', ')} (allowed: from, select)`);
+      continue;
+    }
+    if (inp.select === undefined) {
+      out.push({ from: inp.from });
+      continue;
+    }
+    // P3 selector: exactly one of name/path, both non-empty strings.
+    if (!isObject(inp.select)) {
+      problems.push(`node "${id}".inputs[${j}].select must be { name: <string> } or { path: <string> }`);
+      continue;
+    }
+    const selKeys = Object.keys(inp.select);
+    const badKeys = selKeys.filter((k) => k !== 'name' && k !== 'path');
+    if (badKeys.length > 0 || selKeys.length !== 1) {
+      problems.push(`node "${id}".inputs[${j}].select must set exactly ONE of name / path`);
+      continue;
+    }
+    const selVal = inp.select.name ?? inp.select.path;
+    if (typeof selVal !== 'string' || selVal.trim() === '') {
+      problems.push(`node "${id}".inputs[${j}].select.${selKeys[0]} must be a non-empty string`);
+      continue;
+    }
+    out.push({
+      from: inp.from,
+      select: inp.select.name !== undefined ? { name: selVal } : { path: selVal },
+    });
   }
   return out;
 }

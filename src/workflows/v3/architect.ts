@@ -83,6 +83,7 @@ export function buildArchitectGoal(specPath: string, specJsonPath: string): stri
     '- Use the v3 DAG schema: { runId, nodes: [{ id, type:"goal", goal, bot?, depends, inputs, timeoutSec?, humanGate?, resultSchema?, triggerRule? }] }.',
     '- Convert each spec node sketch into one goal node unless the spec explicitly says to merge or drop it.',
     '- Treat input_needs as free-text requirements, NOT as pre-authored edges. Infer depends/inputs only when the dependency is justified by the spec.',
+    '- An inputs entry may select ONE named product instead of the whole manifest: { "from": "<nodeId>", "select": { "name": "<manifest file name>" } } (or { "path": ... }). Prefer a selector when the downstream goal only needs a specific file — it keeps the worker\'s context small.',
     '- Preserve risk_gate=true as a humanGate prompt on the corresponding node.',
     '- Estimate a per-node timeoutSec from the task size — err on the GENEROUS side (completion is detected early via the manifest, so an oversized budget costs nothing): quick single-file edits ~600, typical research/writing ~1800, long research / refactor / audit tasks 3600-7200. Hard ceiling 14400 (4h). Omit it only for trivially small nodes (default is 1800).',
     '- Keep node ids path-safe: [A-Za-z0-9._-].',
