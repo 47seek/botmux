@@ -516,12 +516,24 @@ export function requestRevisitGrant(
   // A pair grant must target the blocked node as its source.
   if (pair && input.sourceNodeId !== blockedNodeId) return { kind: 'invalid', reason: 'pair-source-mismatch' };
 
-  appendEvent(journalPath, {
-    type: 'revisitBudgetGranted',
-    ...(pair ? { sourceNodeId: input.sourceNodeId, toNodeId: input.toNodeId } : {}),
-    by: input.by,
-    ...(input.reason ? { reason: input.reason } : {}),
-  });
+  // Recovery-safe grant (code review): the node can be blocked on
+  // REVISIT_BUDGET_EXHAUSTED yet have budget ALREADY ok — that's the crash
+  // window where a prior call appended `revisitBudgetGranted` but died before the
+  // retry.  Re-granting there would double the budget for one approval.  So only
+  // append the grant while the budget is STILL exhausted; otherwise just resume
+  // (retry) the half-applied grant.  Both paths are idempotent: after the retry
+  // the node is pending, so a further click is `not-budget-blocked`.
+  const stillExhausted = info.revisitTo
+    ? !revisitBudgetStatus(events, blockedNodeId, info.revisitTo).ok
+    : true; // no recorded target → can't re-check; treat as exhausted (append once)
+  if (stillExhausted) {
+    appendEvent(journalPath, {
+      type: 'revisitBudgetGranted',
+      ...(pair ? { sourceNodeId: input.sourceNodeId, toNodeId: input.toNodeId } : {}),
+      by: input.by,
+      ...(input.reason ? { reason: input.reason } : {}),
+    });
+  }
   // Resume: retry the blocked node so it re-runs and re-requests its revisit
   // within the now-extended budget (reuses requestV3Retry's idempotency/guards).
   const retry = requestV3Retry(baseDir, runId, { nodeId: blockedNodeId, expectedAttemptId: info.attemptId });

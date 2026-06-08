@@ -874,4 +874,31 @@ describe('runWorkflow — 跨节点 revisit A→B→C', () => {
       rmSync(base, { recursive: true, force: true });
     }
   });
+
+  it('回溯预算:grant 已写但 retry 未写的崩溃窗口 → 不重复加预算,只补 retry(recovery-safe)', () => {
+    const base = mkdtempSync(join(tmpdir(), 'v3-rt-grant-crash-'));
+    try {
+      const runId = 'g';
+      const jp = join(base, runId, 'journal.ndjson');
+      appendEvent(jp, { type: 'runStarted', runId });
+      appendEvent(jp, { type: 'nodeDispatched', nodeId: 'C', instanceId: 'C#002', attemptId: 'C#002/attempts/001' });
+      appendEvent(jp, { type: 'nodeRevisitRequested', nodeId: 'C', instanceId: 'C#001', attemptId: 'C#001/attempts/001', toNodeId: 'A' });
+      appendEvent(jp, {
+        type: 'nodeBlocked', nodeId: 'C', instanceId: 'C#002', attemptId: 'C#002/attempts/001',
+        errorClass: 'resultInvalid', errorCode: 'REVISIT_BUDGET_EXHAUSTED', message: 'exhausted', revisitTo: 'A',
+      });
+      appendEvent(jp, { type: 'runBlocked', blockedNodeId: 'C' });
+      // 崩溃窗口:grant 已写(预算已 ok),但 retry 还没写 —— 节点仍 blocked。
+      appendEvent(jp, { type: 'revisitBudgetGranted', sourceNodeId: 'C', toNodeId: 'A', by: 'ou_user' });
+
+      // 恢复点击:绝不能再 append 第二条 grant(否则一次准许变 +2),只补 retry。
+      const out = requestRevisitGrant(base, runId, { sourceNodeId: 'C', toNodeId: 'A', by: 'ou_user', expectedAttemptId: 'C#002/attempts/001' });
+      expect(out.kind).toBe('granted');
+      const events = readJournal(jp);
+      expect(events.filter((e) => e.type === 'revisitBudgetGranted').length).toBe(1); // 仍是 1,没翻倍
+      expect(events.find((e) => e.type === 'nodeRetryRequested')).toMatchObject({ nodeId: 'C', nextAttemptId: 'C#002/attempts/002' });
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
 });
