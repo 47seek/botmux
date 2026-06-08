@@ -37,6 +37,8 @@ import { appendEvent, readJournal, type StoredEvent, type V3ErrorClass, type V3L
 import { materialize, writeState } from './state.js';
 import { normalizeGateWaitInput, writePendingWait } from './human-gate.js';
 import {
+  ASK_HUMAN_ERROR_CODE,
+  GOAL_ASK_FILE,
   GOAL_ENV,
   MANIFEST_FILE_KINDS,
   MANIFEST_SCHEMA_VERSION,
@@ -44,6 +46,7 @@ import {
   V3_SUPPORTED_CLIS,
   isV3SupportedCli,
   type BotSnapshot,
+  type GoalAsk,
   type GoalInputs,
   type Manifest,
   type RunNode,
@@ -118,7 +121,7 @@ export function renderGoalFile(
     ...loopSection,
     '## How to complete this node',
     'You are an autonomous agent completing exactly ONE botmux v3 workflow node.',
-    'Work toward the goal above until it is done, then stop. Do not ask the user any questions.',
+    'Work toward the goal above until it is done, then stop. Do NOT ask the user with interactive tools (they are disabled in this mode). If you genuinely need a human DECISION to proceed, use the human-ask escape hatch described below (also available as the `botmux-goal-ask` skill).',
     '',
     `- Upstream inputs: the file at $${E.INPUTS_PATH} is a JSON object \`{ "inputs": [...] }\` listing upstream products, each with an absolute \`path\`. Read only the ones the goal needs (it may be empty). If an \`omitted\` array is present, those declared inputs were intentionally not produced (their workflow branch was not taken) — treat their absence as by-design, do NOT invent their content.`,
     `- Output: write ALL products under the directory at $${E.OUTPUT_DIR}. Do NOT write anything outside that directory.`,
@@ -142,6 +145,12 @@ export function renderGoalFile(
     `You are DONE only after the manifest at $${E.MANIFEST_PATH} exists and every file it references exists.`,
     'If you cannot complete the goal, write a failure manifest and stop.',
     'If you hit an authentication / authorization / interactive-confirmation wall (a login prompt, an expired token, a permission you cannot grant yourself): do NOT wait for a human and do NOT keep retrying. Immediately write a failure manifest with an \`error.code\` like "AUTH_REQUIRED" and \`error.retryable: true\`, then stop — a human will unblock and retry this node.',
+    '',
+    '## Asking a human (only when a DECISION truly needs a person)',
+    `If — and ONLY if — you cannot proceed without a human's judgement call (a choice only a person can make; NOT something you can research, infer, or decide yourself), use the runtime human-ask:`,
+    `  1. Write a JSON file to $${E.ATTEMPT_DIR}/${GOAL_ASK_FILE} of the shape \`{ "question": "<one clear question>", "options": ["<2-6 concrete choices>"] }\`.`,
+    `  2. Write a failure manifest with \`error.code: "${ASK_HUMAN_ERROR_CODE}"\`, \`error.retryable: true\`, and \`summary\` = your question, then STOP.`,
+    `A human picks one option; this node then RE-RUNS with their choice injected into $${E.INPUTS_PATH} as the \`human/answer\` input (read it and continue from there). Prefer deciding yourself — every ask pauses the whole workflow on a person.`,
     '',
   ].join('\n');
 }
@@ -173,6 +182,32 @@ export function classifyTerminal(
     case 'cancelled':
       return 'failed';
   }
+}
+
+/**
+ * Read + validate a goal worker's `ask.json` (the runtime human-ask payload).
+ * Defensive: a missing / malformed / out-of-bounds file yields `undefined`, so a
+ * broken ask degrades to a plain blocked card rather than crashing the drive —
+ * the manifest's `error.message` still carries the question text for the human.
+ * Needs ≥2 options (a choice) and caps at 6 (card sanity).  Exported for tests.
+ */
+export function readGoalAsk(askPath: string): GoalAsk | undefined {
+  if (!existsSync(askPath)) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(askPath, 'utf-8'));
+  } catch {
+    return undefined;
+  }
+  if (typeof parsed !== 'object' || parsed === null) return undefined;
+  const o = parsed as Record<string, unknown>;
+  const question = typeof o.question === 'string' ? o.question.trim() : '';
+  if (!question) return undefined;
+  const options = Array.isArray(o.options)
+    ? o.options.filter((x): x is string => typeof x === 'string' && x.trim() !== '').map((x) => x.trim())
+    : [];
+  if (options.length < 2) return undefined;
+  return { question, options: options.slice(0, 6) };
 }
 
 /**
@@ -612,7 +647,7 @@ export async function runWorkflow(
     const effSnap = mergeNodeCapability(botSnap, node.override);
 
     const inputsPath = join(attemptDir, 'inputs.json');
-    writeFileSync(inputsPath, JSON.stringify(buildInputs(node, events, loopRef, omitted), null, 2));
+    writeFileSync(inputsPath, JSON.stringify(buildInputs(node, events, attemptId, loopRef, omitted), null, 2));
 
     const manifestPath = join(attemptDir, 'manifest.json');
     const env: Record<string, string> = {
@@ -748,10 +783,26 @@ export async function runWorkflow(
           }
         }
         const kind = classifyTerminal(errorClass, { selfReportedFail, retryable });
-        appendEvent(journalPath, {
-          type: kind === 'blocked' ? 'nodeBlocked' : 'nodeFailed',
-          nodeId: node.id, attemptId, errorClass, errorCode, message,
-        });
+        if (kind === 'blocked') {
+          // Runtime human-ask: a self-reported block carrying ASK_HUMAN_ERROR_CODE
+          // means the agent wrote a question to ask.json and stopped.  Surface
+          // question + options on the blocked event so the daemon posts an ask
+          // card; a malformed ask.json degrades to a plain retry card.
+          const ask =
+            errorCode === ASK_HUMAN_ERROR_CODE
+              ? readGoalAsk(join(attemptDir, GOAL_ASK_FILE))
+              : undefined;
+          appendEvent(journalPath, {
+            type: 'nodeBlocked',
+            nodeId: node.id, attemptId, errorClass, errorCode, message,
+            ...(ask ? { ask } : {}),
+          });
+        } else {
+          appendEvent(journalPath, {
+            type: 'nodeFailed',
+            nodeId: node.id, attemptId, errorClass, errorCode, message,
+          });
+        }
       })
       .catch((err: unknown) => {
         appendEvent(journalPath, {
@@ -1010,11 +1061,30 @@ export async function runWorkflow(
   function buildInputs(
     node: V3Node,
     events: StoredEvent[],
+    attemptId: string,
     loopRef?: V3LoopRef,
     omitted?: GoalInputs['omitted'],
   ): GoalInputs {
     const inputs: GoalInputs['inputs'] = [];
     const omittedFrom = new Set((omitted ?? []).map((o) => o.from));
+
+    // Runtime human-ask answer: when THIS dispatch is the retry a human-ask was
+    // answered into, inject the persisted answer as a `human/answer` input so the
+    // agent reads the decision and resumes instead of re-asking.
+    const answeredRetry = [...events].reverse().find(
+      (e): e is StoredEvent & { type: 'nodeRetryRequested' } =>
+        e.type === 'nodeRetryRequested' && e.nodeId === node.id &&
+        e.nextAttemptId === attemptId && !!e.answer,
+    );
+    if (answeredRetry?.answer) {
+      inputs.push({
+        from: 'human',
+        name: 'answer',
+        path: answeredRetry.answer.path,
+        kind: 'json',
+        preview: answeredRetry.answer.preview,
+      });
+    }
 
     const latestSuccess = (nodeId: string) =>
       [...events]

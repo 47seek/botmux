@@ -10,9 +10,11 @@
 import { join } from 'node:path';
 import {
   V3_BLOCKED_RETRY_ACTION,
+  V3_BLOCKED_ASK_ANSWER_ACTION,
   buildV3BlockedCard,
   v3BlockedCardNonce,
   type V3BlockedActionValue,
+  type V3AskAnswerActionValue,
 } from './v3-blocked-card.js';
 import { requestV3Retry, blockedInfoFor } from '../../workflows/v3/daemon-run.js';
 import { readJournal } from '../../workflows/v3/journal.js';
@@ -24,7 +26,7 @@ import {
 import { isValidRunId } from '../../workflows/v3/ops-projection.js';
 
 export function isV3BlockedAction(action: unknown): boolean {
-  return action === V3_BLOCKED_RETRY_ACTION;
+  return action === V3_BLOCKED_RETRY_ACTION || action === V3_BLOCKED_ASK_ANSWER_ACTION;
 }
 
 export interface V3BlockedCardHandlerDeps {
@@ -43,24 +45,28 @@ export interface V3BlockedCardHandlerDeps {
  * a frozen「已重试」card, or a `{ toast }`.  Triggers `driveRun` on success.
  */
 export async function handleV3BlockedAction(
-  value: V3BlockedActionValue,
+  value: V3BlockedActionValue | V3AskAnswerActionValue,
   operatorOpenId: string | undefined,
   deps: V3BlockedCardHandlerDeps,
 ): Promise<unknown> {
+  // 同一张卡两条 action：普通重试 / human-ask 选项答题。后者额外带 selected，
+  // 走同一条 requestV3Retry 通道（带 answer），只是冻结卡渲染不同。
+  const isAsk = value.action === V3_BLOCKED_ASK_ANSWER_ACTION;
+  const verb = isAsk ? '回答' : '重试';
   const baseDir = deps.baseDir ?? defaultBaseDir();
   if (!isValidRunId(value.runId)) {
-    return { toast: { type: 'warning', content: '重试已失效（非法 run）' } };
+    return { toast: { type: 'warning', content: `${verb}已失效（非法 run）` } };
   }
   // attempt 入 nonce：重试过的节点（attempt 已前进）的旧卡 nonce 对不上 → stale。
   if (value.nonce !== v3BlockedCardNonce(value.runId, value.nodeId, value.attemptId)) {
-    return { toast: { type: 'warning', content: '重试卡已失效（nonce 不匹配）' } };
+    return { toast: { type: 'warning', content: `这张卡已失效（nonce 不匹配）` } };
   }
   const runDir = join(baseDir, value.runId);
   const grill = readGrillState(runDir);
   const binding = grill?.chatBinding;
 
   if (deps.canResolve && !deps.canResolve(binding, operatorOpenId)) {
-    return { toast: { type: 'warning', content: '你没有权限重试这个节点' } };
+    return { toast: { type: 'warning', content: `你没有权限${verb}这个节点` } };
   }
 
   const requestRetry = deps.requestRetry ?? requestV3Retry;
@@ -72,12 +78,15 @@ export async function handleV3BlockedAction(
     outcome = requestRetry(baseDir, value.runId, {
       nodeId: value.nodeId,
       expectedAttemptId: value.attemptId,
+      ...(isAsk
+        ? { answer: { selected: value.selected, by: operatorOpenId ?? 'unknown' } }
+        : {}),
     });
   } catch (err) {
     return {
       toast: {
         type: 'error',
-        content: `重试失败，请再试：${err instanceof Error ? err.message : String(err)}`,
+        content: `${verb}失败，请再试：${err instanceof Error ? err.message : String(err)}`,
       },
     };
   }
@@ -89,7 +98,7 @@ export async function handleV3BlockedAction(
         content:
           outcome.reason === 'missing' ? '该 run 不存在或已清理'
           : outcome.reason === 'stale-attempt' ? '该节点已进入新一轮 attempt，这张旧卡失效（看最新那张卡）'
-          : '该节点已不在受阻状态，重试卡失效',
+          : `该节点已不在受阻状态，${verb}卡失效`,
       },
     };
   }
@@ -97,7 +106,7 @@ export async function handleV3BlockedAction(
     // Idempotent: a prior click already reserved the retry — make sure the
     // run is actually moving (covers click → daemon crash → click after restart).
     deps.driveRun(value.runId);
-    return { toast: { type: 'info', content: '已在重试中' } };
+    return { toast: { type: 'info', content: isAsk ? '已回答，正在重跑' : '已在重试中' } };
   }
 
   // requested → drive the run (fresh replay re-dispatches with the reserved
@@ -105,14 +114,27 @@ export async function handleV3BlockedAction(
   deps.driveRun(value.runId);
   const events = readJournal(join(runDir, 'journal.ndjson'));
   const info = blockedInfoFor(events, value.nodeId);
-  const frozen = buildV3BlockedCard({
-    runId: value.runId,
-    nodeId: value.nodeId,
-    attemptId: value.attemptId,
-    errorClass: info.errorClass,
-    errorCode: info.errorCode,
-    message: info.message,
-    retried: { nextAttemptId: outcome.nextAttemptId, by: operatorOpenId },
-  });
+  const frozen = isAsk
+    ? buildV3BlockedCard({
+        runId: value.runId,
+        nodeId: value.nodeId,
+        attemptId: value.attemptId,
+        // 带上 ask 仅为在冻结卡里复现问题文案（answered 优先于 options 渲染）。
+        ask: info.ask,
+        answered: {
+          selected: (value as V3AskAnswerActionValue).selected,
+          nextAttemptId: outcome.nextAttemptId,
+          by: operatorOpenId,
+        },
+      })
+    : buildV3BlockedCard({
+        runId: value.runId,
+        nodeId: value.nodeId,
+        attemptId: value.attemptId,
+        errorClass: info.errorClass,
+        errorCode: info.errorCode,
+        message: info.message,
+        retried: { nextAttemptId: outcome.nextAttemptId, by: operatorOpenId },
+      });
   return JSON.parse(frozen);
 }

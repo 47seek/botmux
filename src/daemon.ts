@@ -1552,6 +1552,8 @@ const v3GateRunner = createV3GateRunner({
       errorClass: info.errorClass,
       errorCode: info.errorCode,
       message: info.message,
+      // human-ask 受阻 → 渲染问题 + 选项按钮卡（替代纯重试卡）。
+      ...(info.ask ? { ask: info.ask } : {}),
     });
     if (binding.rootMessageId) {
       await sessionReply(binding.rootMessageId, card, 'interactive', binding.larkAppId);

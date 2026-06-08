@@ -17,7 +17,7 @@
  */
 
 import { join } from 'node:path';
-import { existsSync, readdirSync, statSync } from 'node:fs';
+import { existsSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 
 import { loadBotConfigs, type BotConfig } from '../../bot-registry.js';
 import { isLoopNode, loadDag } from './dag.js';
@@ -50,7 +50,7 @@ import {
 import { readJournal, appendEvent, type StoredEvent, type V3ErrorClass } from './journal.js';
 import { materialize } from './state.js';
 import { isValidRunId } from './ops-projection.js';
-import type { ValidateManifest } from './contract.js';
+import { GOAL_ANSWER_FILE, type GoalAnswer, type ValidateManifest } from './contract.js';
 
 /**
  * runId → runDir with a path-traversal guard (codex review #2).  runIds reach
@@ -71,6 +71,10 @@ export interface V3BlockedInfo {
   errorClass?: V3ErrorClass;
   errorCode?: string;
   message?: string;
+  /** Present when the block is a runtime human-ask (errorCode === ASK_HUMAN):
+   *  the agent's question + options → the daemon posts an ask card (option
+   *  buttons) instead of a plain retry card. */
+  ask?: { question: string; options: string[] };
 }
 
 /** Latest `nodeBlocked` details for a node (card content).  Falls back to a
@@ -86,6 +90,7 @@ export function blockedInfoFor(events: StoredEvent[], nodeId: string): V3Blocked
         errorClass: e.errorClass,
         errorCode: e.errorCode,
         message: e.message,
+        ...(e.ask ? { ask: e.ask } : {}),
       };
     }
   }
@@ -310,7 +315,7 @@ export type V3RetryOutcome =
 export function requestV3Retry(
   baseDir: string,
   runId: string,
-  input: { nodeId?: string; expectedAttemptId?: string } = {},
+  input: { nodeId?: string; expectedAttemptId?: string; answer?: { selected: string; by: string } } = {},
 ): V3RetryOutcome {
   const runDir = safeRunDir(baseDir, runId);
   const journalPath = join(runDir, 'journal.ndjson');
@@ -357,6 +362,18 @@ export function requestV3Retry(
   }
   const nextAttemptId = nextAttemptIdFor(events, nodeId);
 
+  // Runtime human-ask answer: persist the chosen option next to the asked
+  // attempt (answer.json) and carry its path on the retry event — buildInputs
+  // injects it into the next attempt as the `human/answer` input.  Plain blocked
+  // retries pass no answer and this whole block is skipped.
+  let answer: { path: string; preview: string; by: string } | undefined;
+  if (input.answer) {
+    const answerPath = join(runDir, previousAttemptId, GOAL_ANSWER_FILE);
+    const payload: GoalAnswer = { selected: input.answer.selected, by: input.answer.by };
+    writeFileSync(answerPath, JSON.stringify(payload, null, 2));
+    answer = { path: answerPath, preview: input.answer.selected, by: input.answer.by };
+  }
+
   appendEvent(journalPath, {
     type: 'nodeRetryRequested',
     nodeId,
@@ -365,6 +382,7 @@ export function requestV3Retry(
     reason: 'blockedRetry',
     previousErrorClass: info.errorClass,
     previousErrorCode: info.errorCode,
+    ...(answer ? { answer } : {}),
   });
   return { kind: 'requested', nodeId, previousAttemptId, nextAttemptId };
 }

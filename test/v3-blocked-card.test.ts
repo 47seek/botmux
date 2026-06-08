@@ -4,7 +4,7 @@
  */
 
 import { describe, it, expect, vi } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -12,11 +12,14 @@ import {
   buildV3BlockedCard,
   v3BlockedCardNonce,
   V3_BLOCKED_RETRY_ACTION,
+  V3_BLOCKED_ASK_ANSWER_ACTION,
   type V3BlockedActionValue,
+  type V3AskAnswerActionValue,
 } from '../src/im/lark/v3-blocked-card.js';
 import { handleV3BlockedAction } from '../src/im/lark/v3-blocked-card-handler.js';
 import { birthRun, readGrillState, writeGrillState } from '../src/workflows/v3/grill-state.js';
-import { appendEvent } from '../src/workflows/v3/journal.js';
+import { appendEvent, readJournal } from '../src/workflows/v3/journal.js';
+import { ASK_HUMAN_ERROR_CODE, GOAL_ANSWER_FILE } from '../src/workflows/v3/contract.js';
 
 const INPUT = {
   runId: 'demo-run-260606-1200',
@@ -59,6 +62,47 @@ describe('buildV3BlockedCard', () => {
     const parsed = JSON.parse(card);
     const reason = parsed.elements.find((e: any) => e.tag === 'div' && e.text?.content?.includes('原因'));
     expect(reason.text.content).toContain('\\*bold\\*');
+  });
+
+  it('ask 卡：blue header + 问题 + 每个选项一个按钮（value 带 selected + ask-answer action）', () => {
+    const card = JSON.parse(buildV3BlockedCard({
+      ...INPUT,
+      ask: { question: '部署到哪个环境？', options: ['staging', 'prod'] },
+    }));
+    expect(card.header.template).toBe('blue');
+    expect(card.header.title.content).toContain('拍板');
+    // 问题文案在卡里
+    expect(JSON.stringify(card)).toContain('部署到哪个环境');
+    // 一个选项一个按钮，value 带 selected
+    const actionEl = card.elements.find(
+      (e: any) => e.tag === 'action' && e.actions[0]?.value?.action === V3_BLOCKED_ASK_ANSWER_ACTION,
+    );
+    expect(actionEl.actions).toHaveLength(2);
+    const v0 = actionEl.actions[0].value as V3AskAnswerActionValue;
+    expect(v0).toMatchObject({
+      action: V3_BLOCKED_ASK_ANSWER_ACTION,
+      runId: INPUT.runId,
+      nodeId: 'deploy',
+      attemptId: 'deploy/attempts/001',
+      selected: 'staging',
+      nonce: v3BlockedCardNonce(INPUT.runId, 'deploy', 'deploy/attempts/001'),
+    });
+    expect((actionEl.actions[1].value as V3AskAnswerActionValue).selected).toBe('prod');
+    // 没有普通重试按钮
+    expect(JSON.stringify(card)).not.toContain(V3_BLOCKED_RETRY_ACTION);
+  });
+
+  it('answered 冻结卡：green + 无选项按钮 + 显示选中项与新 attempt', () => {
+    const card = JSON.parse(buildV3BlockedCard({
+      ...INPUT,
+      ask: { question: '部署到哪个环境？', options: ['staging', 'prod'] },
+      answered: { selected: 'prod', nextAttemptId: 'deploy/attempts/002', by: 'ou_x' },
+    }));
+    expect(card.header.template).toBe('green');
+    const json = JSON.stringify(card);
+    expect(json).toContain('prod');
+    expect(json).toContain('002');
+    expect(json).not.toContain(V3_BLOCKED_ASK_ANSWER_ACTION);
   });
 });
 
@@ -128,6 +172,49 @@ describe('handleV3BlockedAction', () => {
     });
     expect(denied.toast.content).toContain('权限');
     expect(driveRun).not.toHaveBeenCalled();
+    rmSync(base, { recursive: true, force: true });
+  });
+
+  it('ask 选项点击 → 写 answer.json + nodeRetryRequested.answer + 冻结「已回答」卡 + driveRun', async () => {
+    const base = mkdtempSync(join(tmpdir(), 'v3-blocked-card-'));
+    const runId = 'ask-260606-0001';
+    const { runDir } = birthRun({
+      goal: 'g', baseDir: base, runId,
+      chatBinding: { larkAppId: 'cli_test', chatId: 'oc_chat', rootMessageId: 'om_root' },
+    });
+    const journalPath = join(runDir, 'journal.ndjson');
+    // 受阻的那个 attempt 一定跑过（它写了 ask.json），目录存在 → answer.json 能落它旁边
+    mkdirSync(join(runDir, 'deploy', 'attempts', '001'), { recursive: true });
+    appendEvent(journalPath, { type: 'runStarted', runId });
+    appendEvent(journalPath, { type: 'nodeDispatched', nodeId: 'deploy', attemptId: 'deploy/attempts/001' });
+    appendEvent(journalPath, {
+      type: 'nodeBlocked', nodeId: 'deploy', attemptId: 'deploy/attempts/001',
+      errorClass: 'manifestInvalid', errorCode: ASK_HUMAN_ERROR_CODE, message: '部署到哪个环境？',
+      ask: { question: '部署到哪个环境？', options: ['staging', 'prod'] },
+    });
+    appendEvent(journalPath, { type: 'runBlocked', blockedNodeId: 'deploy' });
+
+    const askValue: V3AskAnswerActionValue = {
+      action: V3_BLOCKED_ASK_ANSWER_ACTION,
+      runId, nodeId: 'deploy', attemptId: 'deploy/attempts/001',
+      selected: 'prod',
+      nonce: v3BlockedCardNonce(runId, 'deploy', 'deploy/attempts/001'),
+    };
+    const driveRun = vi.fn();
+    const res: any = await handleV3BlockedAction(askValue, 'ou_op', { baseDir: base, driveRun });
+
+    // 冻结绿卡，显示选中项
+    expect(driveRun).toHaveBeenCalledWith(runId);
+    expect(res.header.template).toBe('green');
+    expect(JSON.stringify(res)).toContain('prod');
+
+    // answer.json 落在受阻 attempt 旁边
+    const answer = JSON.parse(readFileSync(join(runDir, 'deploy', 'attempts', '001', GOAL_ANSWER_FILE), 'utf-8'));
+    expect(answer).toMatchObject({ selected: 'prod', by: 'ou_op' });
+
+    // 重试事件带 answer 指针
+    const retryEvt: any = readJournal(journalPath).find((e) => e.type === 'nodeRetryRequested');
+    expect(retryEvt.answer).toMatchObject({ preview: 'prod', by: 'ou_op' });
     rmSync(base, { recursive: true, force: true });
   });
 

@@ -31,7 +31,7 @@ import {
   isV3BlockedAction,
   type V3BlockedCardHandlerDeps,
 } from './v3-blocked-card-handler.js';
-import type { V3BlockedActionValue } from './v3-blocked-card.js';
+import type { V3BlockedActionValue, V3AskAnswerActionValue } from './v3-blocked-card.js';
 import {
   handleV3LoopGrantAction,
   isV3LoopGrantAction,
@@ -606,7 +606,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
   }
   if (isV3BlockedAction(value?.action)) {
     if (!deps.v3BlockedDeps) return;
-    return await handleV3BlockedAction(value as unknown as V3BlockedActionValue, operatorOpenId, deps.v3BlockedDeps);
+    return await handleV3BlockedAction(value as unknown as V3BlockedActionValue | V3AskAnswerActionValue, operatorOpenId, deps.v3BlockedDeps);
   }
   if (isV3LoopGrantAction(value?.action)) {
     if (!deps.v3LoopGrantDeps) return;

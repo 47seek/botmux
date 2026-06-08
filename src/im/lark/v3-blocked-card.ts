@@ -11,6 +11,8 @@
 import { config } from '../../config.js';
 
 export const V3_BLOCKED_RETRY_ACTION = 'v3_blocked_retry';
+/** 运行时 human-ask 选项按钮的 action（与「重试」同卡不同 namespace）。 */
+export const V3_BLOCKED_ASK_ANSWER_ACTION = 'v3_blocked_ask_answer';
 
 /** card 按钮回传的 value 形态——v3-blocked-card-handler 据此解析。 */
 export interface V3BlockedActionValue {
@@ -19,6 +21,17 @@ export interface V3BlockedActionValue {
   nodeId: string;
   /** 受阻的 attemptId —— nonce 按它推导，旧 attempt 的 stale 卡天然失效。 */
   attemptId: string;
+  nonce: string;
+}
+
+/** ask 选项按钮回传的 value —— 人选的选项 + 受阻 attempt（freshness）。 */
+export interface V3AskAnswerActionValue {
+  action: typeof V3_BLOCKED_ASK_ANSWER_ACTION;
+  runId: string;
+  nodeId: string;
+  attemptId: string;
+  /** 选中的选项文本（= GoalAsk.options 之一），落库为 answer.selected。 */
+  selected: string;
   nonce: string;
 }
 
@@ -35,6 +48,10 @@ export interface V3BlockedCardInput {
   messageMaxChars?: number;
   /** 有值 → 渲染冻结的「已重试」卡（无按钮，防 stale UI 重复提交）。 */
   retried?: { nextAttemptId: string; by?: string };
+  /** 运行时 human-ask：agent 的问题 + 选项 → 渲染选项按钮卡（替代重试按钮）。 */
+  ask?: { question: string; options: string[] };
+  /** 有值 → 渲染冻结的「已回答」卡（ask 专用，无按钮）。 */
+  answered?: { selected: string; nextAttemptId: string; by?: string };
 }
 
 const DEFAULT_MESSAGE_MAX_CHARS = 500;
@@ -53,11 +70,15 @@ export function buildV3BlockedCard(input: V3BlockedCardInput): string {
   const nonce = input.nonce ?? v3BlockedCardNonce(input.runId, input.nodeId, input.attemptId);
   const webDetailUrl = input.webDetailUrl ?? v3RunDetailUrl(input.runId);
   const msgMax = input.messageMaxChars ?? DEFAULT_MESSAGE_MAX_CHARS;
-  const retried = input.retried;
+  const { retried, ask, answered } = input;
 
-  const title = retried ? `已重试：节点 ${input.nodeId}` : `节点受阻：${input.nodeId}`;
-  // amber/orange = 受阻可恢复（区别于 gate 蓝 / 失败红）；重试后转绿。
-  const template = retried ? 'green' : 'orange';
+  // 四态共用一张卡，header 决定语气：蓝=等人拍板 / 绿=已回答·已重试 / 橙=受阻待重试。
+  let title: string;
+  let template: string;
+  if (answered) { title = `已回答：节点 ${input.nodeId}`; template = 'green'; }
+  else if (ask) { title = `需要你拍板：节点 ${input.nodeId}`; template = 'blue'; }
+  else if (retried) { title = `已重试：节点 ${input.nodeId}`; template = 'green'; }
+  else { title = `节点受阻：${input.nodeId}`; template = 'orange'; }
 
   const attemptNNN = input.attemptId.slice(input.attemptId.lastIndexOf('/') + 1);
   const elements: Array<Record<string, unknown>> = [
@@ -69,7 +90,51 @@ export function buildV3BlockedCard(input: V3BlockedCardInput): string {
       ],
     },
     { tag: 'hr' },
-    {
+  ];
+
+  if (ask || answered) {
+    // ── 运行时 human-ask：渲染问题 + 选项按钮（或冻结的「已回答」）──
+    const question = ask?.question;
+    if (question) {
+      elements.push({
+        tag: 'div',
+        text: { tag: 'lark_md', content: `**${escapeMd(truncate(question, msgMax))}**` },
+      });
+    }
+    if (answered) {
+      elements.push({ tag: 'hr' });
+      elements.push({
+        tag: 'div',
+        text: {
+          tag: 'lark_md',
+          content:
+            `✅ 已选择 → **${escapeMd(answered.selected)}**` +
+            (answered.by ? ` · by ${escapeMd(short(answered.by, 20))}` : '') +
+            ` · 重跑 ${escapeMd(answered.nextAttemptId.slice(answered.nextAttemptId.lastIndexOf('/') + 1))}`,
+        },
+      });
+    } else if (ask) {
+      // 一个选项一个按钮，选中文本回传为 answer.selected（按 attempt 入 nonce 防 stale）。
+      elements.push({
+        tag: 'action',
+        actions: ask.options.map((opt) => ({
+          tag: 'button',
+          text: { tag: 'plain_text', content: short(opt, 80) },
+          type: 'primary',
+          value: {
+            action: V3_BLOCKED_ASK_ANSWER_ACTION,
+            runId: input.runId,
+            nodeId: input.nodeId,
+            attemptId: input.attemptId,
+            selected: opt,
+            nonce,
+          } satisfies V3AskAnswerActionValue,
+        })),
+      });
+    }
+  } else {
+    // ── 普通受阻 / 已重试 ──
+    elements.push({
       tag: 'div',
       text: {
         tag: 'lark_md',
@@ -78,42 +143,41 @@ export function buildV3BlockedCard(input: V3BlockedCardInput): string {
           (input.errorCode ? ` · \`${escapeMd(input.errorCode)}\`` : '') +
           (input.message ? `\n${escapeMd(truncate(input.message, msgMax))}` : ''),
       },
-    },
-  ];
-
-  if (retried) {
-    elements.push({ tag: 'hr' });
-    elements.push({
-      tag: 'div',
-      text: {
-        tag: 'lark_md',
-        content:
-          `🔄 已重试 → ${escapeMd(retried.nextAttemptId.slice(retried.nextAttemptId.lastIndexOf('/') + 1))}` +
-          (retried.by ? ` · by ${escapeMd(short(retried.by, 20))}` : ''),
-      },
     });
-  } else {
-    elements.push({
-      tag: 'div',
-      text: { tag: 'lark_md', content: '处理掉阻塞原因（如完成鉴权）后点重试，会以新 attempt 重跑该节点。' },
-    });
-    elements.push({
-      tag: 'action',
-      actions: [
-        {
-          tag: 'button',
-          text: { tag: 'plain_text', content: '🔄 重试' },
-          type: 'primary',
-          value: {
-            action: V3_BLOCKED_RETRY_ACTION,
-            runId: input.runId,
-            nodeId: input.nodeId,
-            attemptId: input.attemptId,
-            nonce,
-          } satisfies V3BlockedActionValue,
+    if (retried) {
+      elements.push({ tag: 'hr' });
+      elements.push({
+        tag: 'div',
+        text: {
+          tag: 'lark_md',
+          content:
+            `🔄 已重试 → ${escapeMd(retried.nextAttemptId.slice(retried.nextAttemptId.lastIndexOf('/') + 1))}` +
+            (retried.by ? ` · by ${escapeMd(short(retried.by, 20))}` : ''),
         },
-      ],
-    });
+      });
+    } else {
+      elements.push({
+        tag: 'div',
+        text: { tag: 'lark_md', content: '处理掉阻塞原因（如完成鉴权）后点重试，会以新 attempt 重跑该节点。' },
+      });
+      elements.push({
+        tag: 'action',
+        actions: [
+          {
+            tag: 'button',
+            text: { tag: 'plain_text', content: '🔄 重试' },
+            type: 'primary',
+            value: {
+              action: V3_BLOCKED_RETRY_ACTION,
+              runId: input.runId,
+              nodeId: input.nodeId,
+              attemptId: input.attemptId,
+              nonce,
+            } satisfies V3BlockedActionValue,
+          },
+        ],
+      });
+    }
   }
 
   elements.push({

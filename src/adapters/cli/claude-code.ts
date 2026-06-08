@@ -5,6 +5,7 @@ import { resolveCommand } from './registry.js';
 import type { CliAdapter, CliId, PtyHandle } from './types.js';
 import { findJsonlContainingFingerprint, jsonlContainsFingerprint, normaliseForFingerprint } from '../../services/claude-transcript.js';
 import { t } from '../../i18n/index.js';
+import { GOAL_ENV } from '../../workflows/v3/contract.js';
 
 /** Resolve cwd to its canonical (symlink-free) absolute path for project-hash
  *  computation. Claude Code itself runs `process.cwd()` which the kernel returns
@@ -464,7 +465,11 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
           permissions: { defaultMode: 'bypassPermissions' },
         }));
       }
-      args.push('--disallowed-tools', 'EnterPlanMode,ExitPlanMode');
+      const disallowedTools = ['EnterPlanMode', 'ExitPlanMode'];
+      if (process.env[GOAL_ENV.V3_MARKER] === '1') {
+        disallowedTools.push('AskUserQuestion');
+      }
+      args.push('--disallowed-tools', disallowedTools.join(','));
       // Inject botmux's built-in skills as a plugin scoped to THIS session only.
       // Keeps them out of the user's global ~/.claude/skills so a standalone
       // `claude` never surfaces/mis-fires `botmux send` etc.

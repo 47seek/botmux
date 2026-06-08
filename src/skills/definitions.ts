@@ -8,6 +8,8 @@
  *   - keep frontmatter minimal — just `name` and `description` for discovery
  */
 
+import { ASK_HUMAN_ERROR_CODE, GOAL_ASK_FILE, GOAL_ENV } from '../workflows/v3/contract.js';
+
 export interface SkillDef {
   /** Filesystem-safe name — becomes the directory name under {skillsDir}/ */
   name: string;
@@ -969,6 +971,78 @@ stdout 为一行 JSON。注意：\`--json\` 覆盖所有结果类型；超时 / 
 - 默认超时 300 秒，可用 \`--timeout <seconds>\` 调整
 `;
 
+const GOAL_ASK_SKILL = `---
+name: botmux-goal-ask
+description: v3 goal-mode 节点在真正需要人类判断时使用的文件式 ask 协议。触发场景：你运行在 botmux v3 goal-mode，必须让人从 2-6 个明确选项中做一个判断，且无法自行研究或推断。不要调用原生 AskUserQuestion，也不要调用 botmux ask；写 ask.json + ASK_HUMAN failure manifest 后停止。
+---
+
+# botmux-goal-ask — v3 goal-mode 人类判断
+
+你运行在 botmux v3 goal-mode 时，不能打开原生交互问答，也不能调用 \`botmux ask\`。如果且仅如果你遇到**必须由人做判断**的选择题，使用本文件协议暂停节点。
+
+## 什么时候用
+
+- 需要产品 / 业务 / 风险决策，不能通过读取文件、运行命令、搜索资料自行判断
+- 选项已经清楚，可以给出 2-6 个具体选择
+- 没有人回答前继续执行会改变方向或造成风险
+
+## 什么时候不要用
+
+- 登录、鉴权、权限、外部确认弹窗：写普通 retryable failure manifest（如 \`AUTH_REQUIRED\`），不要 ask
+- 你可以自行推断、测试或查证的问题：直接处理，不要打断人
+- workflow 节点审批：外层 humanGate 已经处理，不要套 ask
+- 自由文本长回答：v3 MVP 只支持选项按钮；把问题改写成清晰选项
+
+## 协议
+
+1. 写 ask 文件到当前 attempt 目录：
+
+\`\`\`json
+{
+  "question": "一个清晰的问题",
+  "options": ["选项 A", "选项 B"]
+}
+\`\`\`
+
+路径必须是：
+
+\`\`\`bash
+$${GOAL_ENV.ATTEMPT_DIR}/${GOAL_ASK_FILE}
+\`\`\`
+
+2. 立刻写 failure manifest 到：
+
+\`\`\`bash
+$${GOAL_ENV.MANIFEST_PATH}
+\`\`\`
+
+manifest 的要求：
+
+\`\`\`json
+{
+  "schemaVersion": 1,
+  "status": "fail",
+  "summary": "同 ask.question 的一句话摘要",
+  "files": [],
+  "error": {
+    "code": "${ASK_HUMAN_ERROR_CODE}",
+    "message": "同 ask.question",
+    "retryable": true
+  }
+}
+\`\`\`
+
+3. 写完 manifest 后停止，不要继续执行。
+
+人类选择后，runtime 会重跑该节点，并把答案注入到：
+
+\`\`\`bash
+$${GOAL_ENV.INPUTS_PATH}
+\`\`\`
+
+输入里会有一个 \`from: "human/answer"\` 的条目，指向 answer.json。读取它，里面的 \`selected\` 就是人类选项，然后继续完成原目标。
+`;
+
 const WORKER_BUDGET_SKILL = `---
 name: botmux-worker-budget
 description: 查看或调整 botmux idle worker 自动暂停预算。触发场景：用户提到 OOM、内存占用、live worker 太多、闲置会话暂停、maxLiveWorkers、idleSuspendMs，或要求 agent 修改 worker 预算配置。必须使用 botmux worker-budget 命令，不要手写 ~/.botmux/config.json。
@@ -1191,6 +1265,7 @@ export const BUILTIN_SKILLS: SkillDef[] = [
   { name: 'botmux-handoff', content: HANDOFF_SKILL },
   { name: 'botmux-workflow-create', content: WORKFLOW_CREATE_SKILL },
   { name: 'botmux-workflow', content: WORKFLOW_V3_SKILL },
+  { name: 'botmux-goal-ask', content: GOAL_ASK_SKILL },
   { name: 'botmux-worker-budget', content: WORKER_BUDGET_SKILL },
   { name: 'botmux-orchestrate', content: ORCHESTRATE_SKILL },
 ];
