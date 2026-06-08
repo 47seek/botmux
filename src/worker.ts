@@ -69,7 +69,7 @@ import { tmuxEnv } from './setup/ensure-tmux.js';
 import { IdleDetector } from './utils/idle-detector.js';
 import { ScreenAnalyzer } from './utils/screen-analyzer.js';
 import { captureToPng } from './utils/screenshot-renderer.js';
-import { snapshotToPng, snapshotToText } from './utils/transient-snapshot.js';
+import { snapshotToPng, snapshotToText, shouldCaptureScreen, isScreenSelfDriven } from './utils/transient-snapshot.js';
 import { chooseWebTerminalSeed } from './utils/web-terminal-seed.js';
 import { parseWorkerRequestUrl } from './utils/worker-http.js';
 import { detectCliUsageLimit, usageLimitStateKey, type CliUsageLimitState } from './utils/cli-usage-limit.js';
@@ -2868,10 +2868,12 @@ function startScreenUpdates(): void {
   let lastTextSnapshotHash = '';
   let lastContent = '';
   // PTY-activity watermark of the last tick that actually captured. The screen
-  // is derived entirely from pane output, which always reaches us through
-  // onPtyData (it updates lastPtyActivityAtMs and feeds the renderer in the
-  // same place). So when this hasn't advanced, the screen is byte-identical to
-  // lastContent and a capture is pure waste.
+  // normally reaches us only through onPtyData (it updates lastPtyActivityAtMs
+  // and feeds the renderer in the same place), so when this hasn't advanced the
+  // screen is byte-identical to lastContent and a capture is pure waste.
+  // Exception: an observe backend that paused its emission poller for a live
+  // web-attach (isScreenSelfDriven) keeps changing without bumping the
+  // watermark — there we must capture every tick (see shouldCaptureScreen).
   let lastSnapshotPtyActivity = -1;
   screenUpdateTimer = setInterval(() => {
     if (awaitingFirstPrompt) return;
@@ -2886,9 +2888,15 @@ function startScreenUpdates(): void {
       // During idle (the steady state for a parked session) this skips a tmux
       // capture-pane + a throwaway xterm-headless instantiation every tick —
       // the dominant per-session background cost — while the status-transition
-      // send below still fires off the cached content.
+      // send below still fires off the cached content. The exception is a
+      // self-driven screen (observe backend with a live web-attach): the
+      // watermark can't be trusted there, so capture every tick.
       const ptyActivity = lastPtyActivityAtMs;
-      if (ptyActivity !== lastSnapshotPtyActivity) {
+      if (shouldCaptureScreen({
+        ptyActivity,
+        lastCapturedPtyActivity: lastSnapshotPtyActivity,
+        screenSelfDriven: isScreenSelfDriven(backend),
+      })) {
         lastSnapshotPtyActivity = ptyActivity;
         // Preferred path: pipe-pane backends pull a fresh viewport snapshot
         // from tmux every tick. This eliminates the accumulated-buffer drift
