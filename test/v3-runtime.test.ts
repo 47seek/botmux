@@ -697,7 +697,12 @@ describe('runWorkflow — 跨节点 revisit A→B→C', () => {
       const events = readJournal(join(outcome.runDir, 'journal.ndjson'));
 
       // C 请求了回溯到 A
-      expect(events.some((e) => e.type === 'nodeRevisitRequested' && (e as any).toNodeId === 'A')).toBe(true);
+      const rr = events.find((e) => e.type === 'nodeRevisitRequested' && (e as any).toNodeId === 'A') as any;
+      expect(rr).toBeDefined();
+      // 协议:journal 里三个 feedback 路径都是 runDir 相对(可搬迁 + 不泄漏本机绝对路径)
+      expect(isAbsolute(rr.reasonPath)).toBe(false);
+      expect(isAbsolute(rr.sourceManifestPath)).toBe(false);
+      expect(isAbsolute(rr.targetPreviousManifestPath)).toBe(false);
       // A/B/C 的 #001 实例全部被 supersede（刷新）
       expect(events.filter((e) => e.type === 'nodeInstanceSuperseded').map((e) => (e as any).instanceId).sort())
         .toEqual(['A#001', 'B#001', 'C#001']);

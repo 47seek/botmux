@@ -18,7 +18,7 @@
  */
 
 import { mkdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
-import { join, dirname } from 'node:path';
+import { join, dirname, relative, isAbsolute } from 'node:path';
 
 import {
   DEFAULT_NODE_TIMEOUT_SEC,
@@ -945,21 +945,24 @@ export async function runWorkflow(
       ? [...events0].reverse().find((e): e is StoredEvent & { type: 'nodeSucceeded' } =>
           e.type === 'nodeSucceeded' && (e.instanceId ?? e.nodeId) === targetEff)
       : undefined;
-    // Persist the reason as a file the target's fresh instance can Read.
-    let reasonPath: string | undefined;
+    // Persist the reason as a file the target's fresh instance can Read.  The
+    // journal stores runDir-RELATIVE paths (run-dir portability + no abs-path
+    // leakage into projections/cards); buildInputs resolves to absolute on read.
+    let reasonPathRel: string | undefined;
     if (request.reason) {
       const dir = join(runDir, 'revisits');
       mkdirSync(dir, { recursive: true });
-      reasonPath = join(dir, `${instanceId.replace(/[#/]/g, '-')}-reason.md`);
-      writeFileSync(reasonPath, `# Revisit reason (from ${nodeId} / ${instanceId})\n\n${request.reason}\n`);
+      const abs = join(dir, `${instanceId.replace(/[#/]/g, '-')}-reason.md`);
+      writeFileSync(abs, `# Revisit reason (from ${nodeId} / ${instanceId})\n\n${request.reason}\n`);
+      reasonPathRel = relative(runDir, abs);
     }
     appendEvent(journalPath, {
       type: 'nodeRevisitRequested',
       nodeId, instanceId, attemptId, toNodeId: request.toNodeId,
       ...(request.reason ? { reason: request.reason } : {}),
-      ...(reasonPath ? { reasonPath } : {}),
-      sourceManifestPath,
-      ...(targetSucc ? { targetPreviousManifestPath: targetSucc.manifestPath } : {}),
+      ...(reasonPathRel ? { reasonPath: reasonPathRel } : {}),
+      sourceManifestPath: relative(runDir, sourceManifestPath),
+      ...(targetSucc ? { targetPreviousManifestPath: relative(runDir, targetSucc.manifestPath) } : {}),
     });
     for (const affectedNodeId of affectedNodesFrom(request.toNodeId)) {
       const eff = snap.nodes.get(affectedNodeId)?.effectiveInstanceId;
@@ -1291,15 +1294,19 @@ export async function runWorkflow(
     // nodeRevisitRequested event (requester / target-prior), not via a
     // nodeSucceeded lookup.  Names are prefixed so the agent can tell the
     // feedback pieces apart (`revisit/source:…`, `revisit/previous:…`).
+    // Journal stores runDir-relative revisit paths; resolve to absolute for read.
+    const resolveRunPath = (p: string): string => (isAbsolute(p) ? p : join(runDir, p));
     const pushManifestByPath = (label: string, manifestPath: string | undefined, namePrefix: string): void => {
-      if (!manifestPath || !existsSync(manifestPath)) return;
+      if (!manifestPath) return;
+      const abs = resolveRunPath(manifestPath);
+      if (!existsSync(abs)) return;
       let manifest: Manifest;
       try {
-        manifest = JSON.parse(readFileSync(manifestPath, 'utf-8')) as Manifest;
+        manifest = JSON.parse(readFileSync(abs, 'utf-8')) as Manifest;
       } catch {
         return;
       }
-      const outDir = join(dirname(manifestPath), 'work');
+      const outDir = join(dirname(abs), 'work');
       for (const f of manifest.files) {
         inputs.push({
           from: label,
@@ -1342,7 +1349,7 @@ export async function runWorkflow(
         e.type === 'nodeRevisitRequested' && e.toNodeId === node.id);
     if (revisitReq) {
       if (revisitReq.reasonPath) {
-        inputs.push({ from: 'revisit', name: 'reason', path: revisitReq.reasonPath, kind: 'markdown', preview: revisitReq.reason });
+        inputs.push({ from: 'revisit', name: 'reason', path: resolveRunPath(revisitReq.reasonPath), kind: 'markdown', preview: revisitReq.reason });
       }
       pushManifestByPath('revisit', revisitReq.sourceManifestPath, 'source');
       pushManifestByPath('revisit', revisitReq.targetPreviousManifestPath, 'previous');
