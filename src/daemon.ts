@@ -104,7 +104,8 @@ import { isBotMentioned, probeBotOpenId, startLarkEventDispatcher, writeBotInfoF
 import { learnFromMentions, resolveSender, flushIdentityCacheSync } from './im/lark/identity-cache.js';
 import { normalizeBrand } from './im/lark/lark-hosts.js';
 import { renderBufferedSenderBlock } from './core/session-manager.js';
-import { markSessionActivity, announcePendingRepoSession } from './core/session-activity.js';
+import { markSessionActivity, announcePendingRepoSession, publishAttentionPatch, clearAgentAttention } from './core/session-activity.js';
+import { emitSessionLifecycleHook } from './services/session-lifecycle-hooks.js';
 import { WorkflowEventWatcher, handleWorkflowFanoutEvent } from './workflows/fanout.js';
 import type { WorkflowRuntimeContext, WorkerSpawnFn } from './workflows/runtime.js';
 import { runLoop } from './workflows/loop.js';
@@ -1746,6 +1747,40 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
   return jsonRes(res, 200, result);
 });
 
+// ─── attention IPC route (internal: set needs-you state) ─────────────────────
+//
+// NOT an agent-facing command. `botmux send --attention` posts the message
+// (direct to Lark) and then calls this to flip ds.agentAttention so the
+// dashboard needs-you column lights up with the reason. Raise-only — clearing
+// happens on the user's next reply (clearAgentAttentionForHumanInbound) or on
+// session close. No thread ping here: `send` already delivered the message.
+ipcRoute('POST', '/api/attention', async (req, res) => {
+  let raw: { sessionId?: unknown; kind?: unknown; reason?: unknown };
+  try {
+    raw = await readJsonBody(req);
+  } catch {
+    return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  }
+  const sessionId = typeof raw.sessionId === 'string' ? raw.sessionId : '';
+  if (!sessionId) return jsonRes(res, 400, { ok: false, error: 'missing_sessionId' });
+
+  let ds: DaemonSession | undefined;
+  for (const s of activeSessions.values()) {
+    if (s.session.sessionId === sessionId) { ds = s; break; }
+  }
+  if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
+
+  const reason = typeof raw.reason === 'string' ? raw.reason.replace(/\s+/g, ' ').trim().slice(0, 500) : '';
+  if (!reason) return jsonRes(res, 400, { ok: false, error: 'missing_reason' });
+  const rawKind = typeof raw.kind === 'string' ? raw.kind.trim().toLowerCase() : '';
+  const kind = ['authz', 'decision', 'blocked', 'help'].includes(rawKind) ? rawKind : 'blocked';
+
+  ds.agentAttention = { kind, reason, at: Date.now() };
+  publishAttentionPatch(ds);
+  emitSessionLifecycleHook(ds, 'session.requires_attention', { reason: 'agent_request', kind, message: reason });
+  return jsonRes(res, 200, { ok: true });
+});
+
 // ─── hooks emit 转发端点 ────────────────────────────────────────────────────
 // CLI side（botmux send 等）调用 emitHookEvent 时，把事件转发到 daemon 这条
 // 接口；daemon 在自己的长寿命事件循环里负责 spawn hook、跑 timeout、超时杀
@@ -2530,6 +2565,15 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
   const cmdContent = stripLeadingMentions(content, parsed.mentions);
   const threadSenderOpenId = parsed.senderId || data?.sender?.sender_id?.open_id;
   const threadChatId = ctxChatId ?? data?.message?.chat_id;
+  const clearAgentAttentionForHumanInbound = (): void => {
+    if (isForeignBot || isBotSenderType) return;
+    const ds = activeSessions.get(sessionKey(anchor, larkAppId));
+    if (ds) clearAgentAttention(ds);
+  };
+  // Any human-authored reply means the user has seen/touched the raised-hand
+  // blocker. Do this before command, callback, workflow, and ask-custom early
+  // returns so those paths cannot leave stale needs-you rows behind.
+  clearAgentAttentionForHumanInbound();
 
   // Intercept OAuth callback URLs (from /login flow)
   if (isCallbackUrl(content)) {
