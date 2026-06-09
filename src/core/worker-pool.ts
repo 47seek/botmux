@@ -567,6 +567,63 @@ export async function deliverWriteLinkCard(
   }
 }
 
+export interface WriteLinkOwnerDelivery {
+  ok: boolean;
+  error?: 'terminal_unavailable' | 'no_owner' | 'delivery_failed';
+  delivered: number;
+  total: number;
+  channels: Array<'ephemeral' | 'dm' | 'failed'>;
+}
+
+/**
+ * Build the write-enabled session card for `ds` and deliver it privately to the
+ * bot's owner(s) — the payload behind the `botmux term-link` CLI command.
+ *
+ * Mirrors the in-chat "🔑 获取操作链接" button flow ({@link deliverWriteLinkCard}),
+ * but fans out to the owner audience ({@link resolvePrivateCardAudience}) instead
+ * of a single click-operator: a CLI caller has no Lark identity, so "deliver to
+ * the owner(s)" is the closest equivalent of "deliver to the person who asked".
+ * Each owner gets an in-chat visible-to-you ephemeral card, auto-falling back to
+ * a private DM in topic / p2p chats. The write token therefore only ever rides
+ * these private channels — it is never returned to the CLI caller / stdout.
+ */
+export async function deliverWriteLinkCardToOwners(ds: DaemonSession): Promise<WriteLinkOwnerDelivery> {
+  const port = ds.workerPort ?? ds.session.webPort;
+  if (!port || !ds.workerToken) return { ok: false, error: 'terminal_unavailable', delivered: 0, total: 0, channels: [] };
+
+  const audience = resolvePrivateCardAudience(ds);
+  if (audience.length === 0) return { ok: false, error: 'no_owner', delivered: 0, total: 0, channels: [] };
+
+  const botCfg = getBot(ds.larkAppId).config;
+  const effectiveCliId = sessionCliId(ds, botCfg);
+  const cardJson = buildSessionCard(
+    ds.session.sessionId,
+    sessionAnchorId(ds),
+    buildTerminalUrl(ds, { write: true }),
+    ds.session.title || getCliDisplayName(effectiveCliId),
+    effectiveCliId,
+    true,             // showManageButtons — write-link card includes restart & close
+    !!ds.adoptedFrom, // adoptMode — disconnect, never close-the-CLI
+    localeForBot(ds.larkAppId),
+  );
+
+  const channels: Array<'ephemeral' | 'dm' | 'failed'> = [];
+  // Cap concurrency like postPrivateSnapshotCard (Feishu ephemeral ~50/s total).
+  const CONCURRENCY = 5;
+  for (let i = 0; i < audience.length; i += CONCURRENCY) {
+    const batch = audience.slice(i, i + CONCURRENCY);
+    channels.push(...await Promise.all(batch.map(openId => deliverWriteLinkCard(ds, openId, cardJson))));
+  }
+  const delivered = channels.filter(c => c !== 'failed').length;
+  return {
+    ok: delivered > 0,
+    error: delivered > 0 ? undefined : 'delivery_failed',
+    delivered,
+    total: audience.length,
+    channels,
+  };
+}
+
 /**
  * Deliver a status confirmation (restart / session-closed / resume) as a
  * "visible-to-the-operator-only" ephemeral message in a plain group; on failure

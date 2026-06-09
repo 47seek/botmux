@@ -2300,6 +2300,119 @@ async function cmdResume(): Promise<void> {
   process.exit(1);
 }
 
+/**
+ * `botmux term-link [session-id|prefix]` — get the writable ("可操作") terminal
+ * for an active session. The link carries a write token, so rather than print it
+ * (where it could land in logs / shell history), the daemon delivers it as a
+ * private card to the bot owner(s): an in-chat visible-to-you ephemeral card,
+ * auto-falling back to a DM in topic / p2p chats. The CLI only ever sees delivery
+ * counts — never the token. The daemon route is loopback-HMAC gated, signed here
+ * with .dashboard-secret (same scheme as `botmux dashboard`).
+ */
+async function cmdTermLink(rest: string[]): Promise<void> {
+  const target = rest[0];
+  const active = [...loadSessions().values()].filter(s => s.status === 'active');
+  if (active.length === 0) {
+    console.error('没有活跃会话。可操作终端只能对 status=active 的会话获取（botmux list 查看）。');
+    process.exit(1);
+  }
+
+  let session: SessionData;
+  if (!target) {
+    if (active.length === 1) {
+      session = active[0];
+    } else {
+      console.error('用法: botmux term-link <session-id|prefix>');
+      console.error(`  当前有 ${active.length} 个活跃会话，请指定其一：`);
+      for (const s of active) console.error(`   ${s.sessionId.substring(0, 12)}  ${s.title}`);
+      process.exit(1);
+    }
+  } else {
+    const matches = active.filter(s => s.sessionId.startsWith(target));
+    if (matches.length === 0) {
+      console.error(`❌ 未找到匹配 "${target}" 的活跃会话（resume 已关闭的会话后再试）`);
+      process.exit(1);
+    }
+    if (matches.length > 1) {
+      console.error(`❌ "${target}" 匹配了 ${matches.length} 个活跃会话，请提供更长的 ID 前缀：`);
+      for (const s of matches) console.error(`   ${s.sessionId.substring(0, 12)}  ${s.title}`);
+      process.exit(1);
+    }
+    session = matches[0];
+  }
+
+  // Multi-bot larkAppId guard (mirror of cmdResume): a legacy session without
+  // larkAppId can't be routed deterministically when >1 daemon is online.
+  if (!session.larkAppId) {
+    const online = listOnlineDaemons();
+    if (online.length > 1) {
+      console.error(`❌ 会话 ${session.sessionId.substring(0, 12)} 缺少 larkAppId，多 bot 部署下无法判定归属。`);
+      console.error(`   在线 daemon (${online.length}): ${online.map(d => d.larkAppId).join(', ')}`);
+      process.exit(1);
+    }
+    if (online.length === 0) {
+      console.error('❌ 没有在线 daemon。请先：botmux start');
+      process.exit(1);
+    }
+  }
+
+  const daemon = findDaemon(session.larkAppId);
+  if (!daemon) {
+    console.error('❌ 未找到在线 daemon。请确认 daemon 正在运行：botmux status');
+    process.exit(1);
+  }
+
+  const SECRET_PATH = join(CONFIG_DIR, '.dashboard-secret');
+  if (!existsSync(SECRET_PATH)) {
+    console.error('❌ 缺少 .dashboard-secret（daemon 未初始化）。先 `botmux restart`。');
+    process.exit(1);
+  }
+  const secret = readFileSync(SECRET_PATH, 'utf8').trim();
+  const ts = Math.floor(Date.now() / 1000).toString();
+  const nonce = randomBytes(8).toString('hex');
+  const sig = createHmac('sha256', secret).update(`${ts}:${nonce}`).digest('base64url');
+
+  let res: Response;
+  try {
+    res = await fetch(
+      `http://127.0.0.1:${daemon.ipcPort}/api/sessions/${encodeURIComponent(session.sessionId)}/write-link-card`,
+      { method: 'POST', headers: { 'X-Botmux-Cli-Ts': ts, 'X-Botmux-Cli-Nonce': nonce, 'X-Botmux-Cli-Auth': sig } },
+    );
+  } catch (err: any) {
+    console.error(`❌ 无法连接到 daemon (port=${daemon.ipcPort}): ${err?.message ?? err}`);
+    process.exit(1);
+  }
+
+  let body: any = {};
+  try { body = await res.json(); } catch { /* */ }
+  if (res.ok && body?.ok) {
+    const chans: string[] = body.channels ?? [];
+    const eph = chans.filter(c => c === 'ephemeral').length;
+    const dm = chans.filter(c => c === 'dm').length;
+    const via = [eph ? `${eph} 条群内私密卡` : '', dm ? `${dm} 条私聊 DM` : ''].filter(Boolean).join(' + ');
+    console.log(`✅ 可操作终端卡片已私密发给 owner（${body.delivered}/${body.total}${via ? '：' + via : ''}）`);
+    console.log(`   会话: ${session.sessionId.substring(0, 12)}  ${session.title}`);
+    console.log('   卡片里「打开终端」即带写 token 进入；链接只走私密通道，不进群、不回显到这里。');
+    return;
+  }
+
+  const errCode = body?.error ?? `HTTP ${res.status}`;
+  if (errCode === 'unauthorized') {
+    console.error('❌ 鉴权失败（loopback HMAC）。确认 .dashboard-secret 未变、daemon 已用同一份重启。');
+  } else if (errCode === 'session_not_active') {
+    console.error('❌ daemon 中该会话非活跃，无法获取可操作终端。');
+  } else if (errCode === 'terminal_unavailable') {
+    console.error('❌ 该会话终端尚未就绪（worker 未起或缺 token）。等会话起来再试。');
+  } else if (errCode === 'no_owner') {
+    console.error('❌ 该 bot 未配置 owner（allowedUsers 为空 / 全开放模式），没有可私密投递的对象。');
+  } else if (errCode === 'delivery_failed') {
+    console.error('❌ 卡片投递失败（ephemeral 与 DM 均失败）。查看 daemon 日志：botmux logs。');
+  } else {
+    console.error(`❌ 获取失败: ${errCode}`);
+  }
+  process.exit(1);
+}
+
 function showHelp(): void {
   console.log(`
 botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
@@ -2321,6 +2434,9 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
   delete stopped   清理所有进程已退出的僵尸会话
   resume <id>      恢复一个已关闭的会话（支持 ID 前缀匹配）— 会话标记回 active，
                    下条消息会以 --resume 重新拉起 CLI 进程
+  term-link [id]   获取活跃会话的「可操作终端」（带写 token）。不回显链接，改由
+                   daemon 把可操作卡片私密发给 owner（群内仅你可见，话题/单聊回退 DM）。
+                   单个活跃会话可省略 id
   autostart enable     注册开机自启（macOS launchd / Linux user systemd，无需 sudo）
   autostart disable    注销开机自启
   autostart status     查看自启状态
@@ -5008,6 +5124,7 @@ switch (command) {
   case 'del':
   case 'rm':      cmdDelete(); break;
   case 'resume':  await cmdResume(); break;
+  case 'term-link': await cmdTermLink(process.argv.slice(3)); break;
   case 'schedule': await cmdSchedule(process.argv[3] ?? '', process.argv.slice(4)); break;
   case 'ask': {
     // `botmux ask buttons --options ...` → sub='buttons', rest=['--options', ...]

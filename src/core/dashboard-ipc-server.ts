@@ -25,7 +25,7 @@ import { readGlobalConfig } from '../global-config.js';
 import { normalizeChatReplyMode, type ChatReplyMode } from '../services/chat-reply-mode-store.js';
 import * as chatFirstSeenStore from '../services/chat-first-seen-store.js';
 import * as scheduler from './scheduler.js';
-import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry, transferSession } from './worker-pool.js';
+import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners } from './worker-pool.js';
 import { listOnlineDaemons } from '../utils/daemon-discovery.js';
 import { getChatMode, replyMessage, sendMessage, resolveUnionIdFromOpenId } from '../im/lark/client.js';
 import { resumeSession } from './session-manager.js';
@@ -103,14 +103,15 @@ export async function readJsonBody<T = unknown>(req: IncomingMessage): Promise<T
 // Most IPC routes are loopback-trusted: the codebase's threat model treats a
 // local botmux process as already root-equivalent on the box (see the
 // migrate-to-chat route below), so close/resume/sandbox-diff carry no per-route
-// auth. The write-link route is different — it HANDS OUT a reusable
-// terminal-control credential (the worker write token), so it additionally
-// requires the caller to prove it can read ~/.botmux/.dashboard-secret. That
-// keeps a sandboxed worker, or a random local process that merely discovered the
-// ipcPort, from minting write tokens for sessions it doesn't own. The only legit
-// caller — the dashboard proxy — signs with the same secret + scheme as
-// `botmux dashboard` → /__cli/rotate. (A same-user process that can read the
-// secret is out of scope: it's already trusted.)
+// auth. The two write-link routes are different — they HAND OUT a reusable
+// terminal-control credential (the worker write token: GET /write-link returns
+// the URL, POST /write-link-card delivers it as a private Lark card), so they
+// additionally require the caller to prove it can read ~/.botmux/.dashboard-secret.
+// That keeps a sandboxed worker, or a random local process that merely discovered
+// the ipcPort, from minting write tokens for sessions it doesn't own. The legit
+// callers — the dashboard proxy and `botmux term-link` — sign with the same secret
+// + scheme as `botmux dashboard` → /__cli/rotate. (A same-user process that can
+// read the secret is out of scope: it's already trusted.)
 let injectedIpcSecret: string | null = null;
 /** Test seam: override the secret used to verify token-route HMAC. */
 export function setIpcAuthSecret(secret: string | null): void { injectedIpcSecret = secret; }
@@ -196,6 +197,27 @@ ipcRoute('GET', '/api/sessions/:sessionId/write-link', (req, res, params) => {
   const port = ds.workerPort ?? ds.session.webPort;
   if (!port || !ds.workerToken) return jsonRes(res, 409, { ok: false, error: 'terminal_unavailable' });
   jsonRes(res, 200, { ok: true, url: buildTerminalUrl(ds, { write: true }) });
+});
+
+/**
+ * Deliver the writable-terminal card privately to the bot's owner(s) — the
+ * `botmux term-link <id>` CLI command's backend. Unlike the GET route above
+ * (which returns the URL to its single authenticated caller), this POSTs the
+ * card into the owners' private Lark channels (ephemeral → DM fallback) and
+ * returns ONLY delivery counts: the write token never crosses back to the CLI /
+ * stdout. Same loopback-HMAC gate as write-link — it still hands out a control
+ * credential, just into Lark rather than into the HTTP response.
+ */
+ipcRoute('POST', '/api/sessions/:sessionId/write-link-card', async (req, res, params) => {
+  if (!tokenRouteAuthorized(req)) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
+  const ds = findActiveBySessionId(params.sessionId);
+  if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
+  const r = await deliverWriteLinkCardToOwners(ds);
+  const status = r.ok ? 200
+    : r.error === 'terminal_unavailable' ? 409
+    : r.error === 'no_owner' ? 422
+    : 502;
+  jsonRes(res, status, r);
 });
 
 // ─── Sandbox landing (owner reviews the clone's diff then applies it back) ───

@@ -123,6 +123,75 @@ describe('GET /api/sessions/:sessionId/write-link', () => {
   });
 });
 
+describe('POST /api/sessions/:sessionId/write-link-card', () => {
+  it('returns 401 without a valid loopback-HMAC signature', async () => {
+    setIpcAuthSecret(TEST_IPC_SECRET);
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/s2/write-link-card`, { method: 'POST' });
+    expect(res.status).toBe(401);
+    expect((await res.json()).error).toBe('unauthorized');
+  });
+
+  it('returns 404 session_not_active for an unknown/closed session', async () => {
+    setIpcAuthSecret(TEST_IPC_SECRET);
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/ghost/write-link-card`, {
+      method: 'POST', headers: tokenAuthHeaders(),
+    });
+    expect(res.status).toBe(404);
+    expect((await res.json()).error).toBe('session_not_active');
+  });
+
+  it('on success returns delivery counts only — never the token or URL', async () => {
+    setIpcAuthSecret(TEST_IPC_SECRET);
+    const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue({
+      session: { sessionId: 's9' }, workerPort: 4321, workerToken: 'secret-tok',
+    } as any);
+    const deliverSpy = vi.spyOn(workerPool, 'deliverWriteLinkCardToOwners').mockResolvedValue({
+      ok: true, delivered: 2, total: 2, channels: ['ephemeral', 'dm'],
+    });
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/s9/write-link-card`, {
+      method: 'POST', headers: tokenAuthHeaders(),
+    });
+    expect(res.status).toBe(200);
+    const raw = await res.text();
+    // The token rides only the private Lark channels — the HTTP response that
+    // crosses back to the CLI must carry counts, not the credential.
+    expect(raw).not.toContain('secret-tok');
+    expect(raw).not.toContain('token=');
+    const body = JSON.parse(raw);
+    expect(body).toMatchObject({ ok: true, delivered: 2, total: 2, channels: ['ephemeral', 'dm'] });
+    expect(body.url).toBeUndefined();
+    findSpy.mockRestore();
+    deliverSpy.mockRestore();
+  });
+
+  it('maps no_owner → 422 and terminal_unavailable → 409', async () => {
+    setIpcAuthSecret(TEST_IPC_SECRET);
+    const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue({ session: { sessionId: 's9' } } as any);
+    const deliverSpy = vi.spyOn(workerPool, 'deliverWriteLinkCardToOwners');
+
+    deliverSpy.mockResolvedValueOnce({ ok: false, error: 'no_owner', delivered: 0, total: 0, channels: [] });
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+    const noOwner = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/s9/write-link-card`, {
+      method: 'POST', headers: tokenAuthHeaders(),
+    });
+    expect(noOwner.status).toBe(422);
+    expect((await noOwner.json()).error).toBe('no_owner');
+
+    deliverSpy.mockResolvedValueOnce({ ok: false, error: 'terminal_unavailable', delivered: 0, total: 0, channels: [] });
+    const notReady = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/s9/write-link-card`, {
+      method: 'POST', headers: tokenAuthHeaders(),
+    });
+    expect(notReady.status).toBe(409);
+    expect((await notReady.json()).error).toBe('terminal_unavailable');
+
+    findSpy.mockRestore();
+    deliverSpy.mockRestore();
+  });
+});
+
 describe('POST /api/sessions/:sessionId/locate rate limit', () => {
   it('returns 429 on second call within window', async () => {
     handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
