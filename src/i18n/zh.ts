@@ -78,6 +78,8 @@ export const messages: Record<string, string> = {
   'card.land.body': '沙盒会话产生了 **{files}** 个文件改动（**+{ins} / -{del}**）。\n落盘目标：`{dir}`\n\n审阅下方 diff，确认后「应用到磁盘」会把这些改动 `git apply` 回真实仓库。',
   'card.land.files_header': '改动文件',
   'card.land.preview_header': 'diff 预览',
+  'card.land.truncated': '预览已截断，完整改动见下方 .patch 文件',
+  'card.land.patch_note': '已附完整 .patch 文件（可 git apply）',
   'card.land.btn_apply': '应用到磁盘',
   'card.land.btn_discard': '丢弃',
   'card.land.note': '仅 owner 可应用；改动来自隔离副本，应用前真实仓库不受影响。',

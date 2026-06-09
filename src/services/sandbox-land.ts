@@ -168,48 +168,62 @@ export function computeSandboxDiff(dataDir: string, sessionId: string, locale?: 
     return { ok: true, empty: true, patch: '', statText: '', files: 0, insertions: 0, deletions: 0 };
   }
 
-  // The real project root is recorded as the overlay's lower; for the preview we
-  // diff the upper file against the same-named real file. We don't know the real
-  // root from the upper alone, so the preview diffs upper-vs-(real sibling) only
-  // when the caller's apply target is known — here we render a kind+path summary
-  // plus a `git diff --no-index /dev/null <upperfile>` so the content is visible.
+  // Diff each upper file against the SAME-NAMED real file in the overlay lower
+  // (the recorded project root) so modified files show a true unified diff (not
+  // the whole file as "added"), then rewrite git's --no-index headers to
+  // project-relative a/<rel> b/<rel> — clean for the card AND `git apply`-able as
+  // the .patch file. New files diff vs /dev/null; deletions diff lower vs /dev/null.
+  const lower = projectLower(dataDir, sessionId);   // real project root ('' if unknown)
+  const relDiff = (oldPath: string, newPath: string, rel: string): string => {
+    let out = '';
+    try { out = spawnSync('git', ['diff', '--no-index', '--', oldPath, newPath], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 }).stdout ?? ''; }
+    catch { /* */ }
+    if (!out) return '';
+    return out.split('\n').map(line => {
+      if (line.startsWith('diff --git ')) return `diff --git a/${rel} b/${rel}`;
+      if (line.startsWith('--- ')) return line.includes('/dev/null') ? '--- /dev/null' : `--- a/${rel}`;
+      if (line.startsWith('+++ ')) return line.includes('/dev/null') ? '+++ /dev/null' : `+++ b/${rel}`;
+      return line;
+    }).join('\n');
+  };
+  const countPlus = (b: string) => b.split('\n').filter(l => l.startsWith('+') && !l.startsWith('+++')).length;
+  const countMinus = (b: string) => b.split('\n').filter(l => l.startsWith('-') && !l.startsWith('---')).length;
+
   const statLines: string[] = [];
   const patchParts: string[] = [];
-  let insertions = 0;
-  let deletions = 0;
+  let insertions = 0, deletions = 0, fileCount = 0;
   for (const c of changes) {
     if (c.kind === 'delete') {
-      statLines.push(`  D  ${c.rel}`);
-      patchParts.push(`--- a/${c.rel}\n+++ /dev/null\n(deleted by sandboxed agent)\n`);
-      deletions++;
+      const lowFile = lower ? join(lower, c.rel) : '';
+      const body = (lowFile && existsSync(lowFile))
+        ? relDiff(lowFile, '/dev/null', c.rel)
+        : `diff --git a/${c.rel} b/${c.rel}\ndeleted file\n--- a/${c.rel}\n+++ /dev/null\n`;
+      statLines.push(`D  ${c.rel}`);
+      deletions += countMinus(body) || 1;
+      patchParts.push(body); fileCount++;
       continue;
     }
     if (c.kind === 'symlink') {
-      statLines.push(`  L  ${c.rel} -> ${c.linkTarget ?? ''}`);
-      patchParts.push(`(symlink ${c.rel} -> ${c.linkTarget ?? ''})\n`);
-      continue;
+      statLines.push(`L  ${c.rel} -> ${c.linkTarget ?? ''}`);
+      patchParts.push(`# symlink ${c.rel} -> ${c.linkTarget ?? ''} (recreated on land; not in this text patch)`);
+      fileCount++; continue;
     }
     if (c.kind === 'opaque') {
-      // We can't know here whether it's a fresh dir or a wholesale replace (that
-      // depends on the target's lower, resolved at apply time) — label it neutrally.
-      statLines.push(`  R  ${c.rel}/ (directory contents replaced, if it pre-existed)`);
-      patchParts.push(`(directory contents replaced: ${c.rel}/)\n`);
+      // Replaced directory; its surviving children land as their own 'file'
+      // changes (walkUpper recursed), so no diff body here — just note it.
+      statLines.push(`R  ${c.rel}/ (directory replaced)`);
       continue;
     }
-    statLines.push(`  M  ${c.rel}`);
-    // Show the new content as a diff against an empty file (no-index, always
-    // available; the upper file is the post-edit content the agent produced).
+    // regular file: modified (exists in lower) vs new
     const upPath = join(upper, c.rel);
-    let body = '';
-    try {
-      const r = spawnSync('git', ['diff', '--no-index', '--', '/dev/null', upPath], { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 });
-      body = r.stdout ?? '';
-    } catch { /* */ }
-    if (!body) {
-      try { body = `+++ b/${c.rel}\n${readFileSync(upPath, 'utf8').split('\n').map(l => `+${l}`).join('\n')}\n`; } catch { body = `(binary or unreadable: ${c.rel})\n`; }
-    }
-    insertions += body.split('\n').filter(l => l.startsWith('+') && !l.startsWith('+++')).length;
-    patchParts.push(body);
+    const lowFile = lower ? join(lower, c.rel) : '';
+    const isMod = !!(lowFile && existsSync(lowFile));
+    const body = relDiff(isMod ? lowFile : '/dev/null', upPath, c.rel)
+      || `diff --git a/${c.rel} b/${c.rel}\n(binary or unreadable: ${c.rel})\n`;
+    statLines.push(`${isMod ? 'M' : 'A'}  ${c.rel}`);
+    insertions += countPlus(body);
+    deletions += countMinus(body);
+    patchParts.push(body); fileCount++;
   }
 
   return {
@@ -217,7 +231,7 @@ export function computeSandboxDiff(dataDir: string, sessionId: string, locale?: 
     empty: false,
     patch: patchParts.join('\n'),
     statText: statLines.join('\n'),
-    files: changes.length,
+    files: fileCount,
     insertions,
     deletions,
   };

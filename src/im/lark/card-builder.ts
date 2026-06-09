@@ -1707,15 +1707,24 @@ export interface LandCardOpts {
   files: number;
   insertions: number;
   deletions: number;
-  preview: string;   // truncated patch text
+  preview: string;        // patch text for the in-card preview (already truncated)
+  truncated?: boolean;    // preview was cut → full diff is in the attached .patch
+  patchAttached?: boolean; // a .patch file message accompanies this card
 }
 
 export function buildLandCard(o: LandCardOpts, locale?: Locale): string {
   const v = { sessionId: o.sessionId, workingDir: o.workingDir };
   const body = t('card.land.body', { files: o.files, ins: o.insertions, del: o.deletions, dir: escapeMd(o.workingDir) }, locale);
   const elements: any[] = [{ tag: 'div', text: { tag: 'lark_md', content: body } }];
-  if (o.statText) elements.push({ tag: 'div', text: { tag: 'lark_md', content: `**${t('card.land.files_header', undefined, locale)}**\n` + '```\n' + o.statText.slice(0, 1500) + '\n```' } });
-  if (o.preview) elements.push({ tag: 'div', text: { tag: 'lark_md', content: `**${t('card.land.preview_header', undefined, locale)}**\n` + '```diff\n' + o.preview + '\n```' } });
+  // Use the card v2 `markdown` element (NOT a lark_md div) for the stat + diff —
+  // it renders ``` fenced code blocks as real monospace blocks, which lark_md
+  // divs do not. Paths are already project-relative (computeSandboxDiff).
+  if (o.statText) elements.push({ tag: 'markdown', content: `**${t('card.land.files_header', undefined, locale)}**\n` + '```text\n' + o.statText.slice(0, 2000) + '\n```' });
+  if (o.preview) {
+    const note = o.truncated ? `\n\n_${t('card.land.truncated', undefined, locale)}_` : '';
+    elements.push({ tag: 'markdown', content: `**${t('card.land.preview_header', undefined, locale)}**\n` + '```diff\n' + o.preview + '\n```' + note });
+  }
+  if (o.patchAttached) elements.push({ tag: 'note', elements: [{ tag: 'lark_md', content: t('card.land.patch_note', undefined, locale) }] });
   elements.push(
     { tag: 'hr' },
     { tag: 'action', actions: [

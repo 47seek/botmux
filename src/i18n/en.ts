@@ -75,6 +75,8 @@ export const messages: Record<string, string> = {
   'card.land.body': 'The sandbox session produced **{files}** changed file(s) (**+{ins} / -{del}**).\nTarget: `{dir}`\n\nReview the diff below; "Apply to disk" will `git apply` these changes back to the real repo.',
   'card.land.files_header': 'Changed files',
   'card.land.preview_header': 'Diff preview',
+  'card.land.truncated': 'Preview truncated — full diff in the attached .patch file',
+  'card.land.patch_note': 'Full .patch attached (git apply-able)',
   'card.land.btn_apply': 'Apply to disk',
   'card.land.btn_discard': 'Discard',
   'card.land.note': 'Owner-only; changes come from an isolated clone — the real repo is untouched until you apply.',

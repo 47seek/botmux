@@ -2,7 +2,7 @@
  * Command handler — processes /slash commands from users.
  * Extracted from daemon.ts for modularity.
  */
-import { existsSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { join, resolve, basename } from 'node:path';
 import { config } from '../config.js';
 import { buildTerminalUrl } from './terminal-url.js';
@@ -14,7 +14,7 @@ import { scanProjects, scanMultipleProjects, describeProjectDir } from '../servi
 import { buildRepoSelectCard, buildAdoptSelectCard, buildCodexAppThreadSelectCard, buildSessionClosedCard, buildSlashListCard, getCliDisplayName, buildConfigCard, buildLandCard } from '../im/lark/card-builder.js';
 import { computeSandboxDiff } from '../services/sandbox-land.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
-import { deleteMessage, sendMessage, sendUserMessage, listChatBotMembers, resolveUserUnionId, getChatModeStrict } from '../im/lark/client.js';
+import { deleteMessage, sendMessage, sendUserMessage, listChatBotMembers, resolveUserUnionId, getChatModeStrict, uploadFile } from '../im/lark/client.js';
 import { chatAppLink, normalizeBrand } from '../im/lark/lark-hosts.js';
 import { claimPairing } from '../services/pairing-store.js';
 import { logger } from '../utils/logger.js';
@@ -865,11 +865,29 @@ export async function handleCommand(
         const d = computeSandboxDiff(config.session.dataDir, sid, loc);
         if (!d.ok) { await sessionReply(rootId, t('cmd.land.cannot', { error: d.error }, loc)); break; }
         if (d.empty) { await sessionReply(rootId, t('cmd.land.empty', undefined, loc)); break; }
-        const lines = d.patch.split('\n');
-        const preview = lines.slice(0, 40).join('\n') + (lines.length > 40 ? '\n…' : '');
-        const card = buildLandCard({ sessionId: sid, workingDir: wd, statText: d.statText, files: d.files, insertions: d.insertions, deletions: d.deletions, preview }, loc);
+        // In-card preview: cap by lines AND chars (Lark card size limit); the FULL
+        // diff goes to an attached .patch file (better for large changesets).
+        const MAX_LINES = 60, MAX_CHARS = 4000;
+        const allLines = d.patch.split('\n');
+        let preview = allLines.slice(0, MAX_LINES).join('\n');
+        let truncated = allLines.length > MAX_LINES;
+        if (preview.length > MAX_CHARS) { preview = preview.slice(0, MAX_CHARS); truncated = true; }
+        // Attach the full .patch (git apply-able) — sent as a file message first,
+        // then the review card below it.
+        let patchAttached = false;
+        if (larkAppId) {
+          try {
+            const patchName = `botmux-land-${sid.slice(0, 8)}.patch`;
+            const patchPath = join(config.session.dataDir, 'sandboxes', sid, patchName);
+            writeFileSync(patchPath, d.patch);
+            const fileKey = await uploadFile(larkAppId, patchPath);
+            await sendMessage(larkAppId, ds.session.chatId, JSON.stringify({ file_key: fileKey }), 'file');
+            patchAttached = true;
+          } catch (e) { logger.warn(`[${logTag}] /land patch attach failed: ${(e as Error).message}`); }
+        }
+        const card = buildLandCard({ sessionId: sid, workingDir: wd, statText: d.statText, files: d.files, insertions: d.insertions, deletions: d.deletions, preview, truncated, patchAttached }, loc);
         await sessionReply(rootId, card, 'interactive');
-        logger.info(`[${logTag}] /land: ${d.files} files (+${d.insertions}/-${d.deletions}) → review card`);
+        logger.info(`[${logTag}] /land: ${d.files} files (+${d.insertions}/-${d.deletions}) → card${patchAttached ? ' + .patch' : ''}`);
         break;
       }
 
