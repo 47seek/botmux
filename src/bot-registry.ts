@@ -65,6 +65,21 @@ export interface BotConfig {
    * such as --yolo or --dangerously-*. Missing/false preserves legacy behavior.
    */
   disableCliBypass?: boolean;
+  /**
+   * Run this bot's CLI inside a per-session file sandbox (bubblewrap, Linux):
+   * the agent sees only a clone of the project + a de-identified config dir,
+   * never the host home/secrets/other sessions. Intended for oncall bots shared
+   * with semi-trusted users. Linux-only; ignored elsewhere. Env BOTMUX_SANDBOX=1
+   * forces it on regardless (testing).
+   */
+  sandbox?: boolean;
+  /**
+   * Per-bot privacy masks for the sandbox: absolute paths blanked inside the
+   * overlay sandbox (dirs → empty tmpfs; files → empty placeholder). OPT-IN with
+   * NO defaults — the agent reads the entire real fs natively unless a path is
+   * listed here. Only meaningful when `sandbox` is true. Linux-only.
+   */
+  sandboxHidePaths?: string[];
   backendType?: BackendType;
   workingDir?: string;
   workingDirs?: string[];
@@ -651,6 +666,10 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         ? entry.model.trim()
         : undefined,
       disableCliBypass: entry.disableCliBypass === true,
+      sandbox: entry.sandbox === true,
+      sandboxHidePaths: Array.isArray(entry.sandboxHidePaths)
+        ? entry.sandboxHidePaths.filter((p: unknown): p is string => typeof p === 'string' && !!p.trim())
+        : [],
       backendType: entry.backendType,
       workingDir: workingDirs?.[0] ?? entry.workingDir,
       workingDirs,

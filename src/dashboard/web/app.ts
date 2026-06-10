@@ -12,9 +12,9 @@ import { renderSettingsPage } from './settings.js';
 import { renderWorkflowsPage } from './workflows.js';
 import { renderWorkflowCatalogPage } from './workflow-catalog.js';
 import { wireBotOnboardingButton } from './bot-onboarding.js';
-import { attentionReason, botDisplayName, escapeHtml, loadNameMaps, relTime, t, ui } from './ui.js';
+import { attentionReason, attentionWaitSince, botDisplayName, escapeHtml, loadNameMaps, relTime, t, ui } from './ui.js';
 import { initThemeMenu, paintThemeMenu } from './theme-menu.js';
-import type { DashboardLocale } from './i18n.js';
+import { normalizeDashboardLocale, type DashboardLocale } from './i18n.js';
 
 const root = document.getElementById('root')!;
 
@@ -119,7 +119,7 @@ function paintAttentionStrip(): void {
   const pending = [...store.sessions.values()]
     .map(s => ({ s, reason: attentionReason(s) }))
     .filter((x): x is { s: any; reason: string } => !!x.reason)
-    .sort((a, b) => Number(a.s.lastMessageAt ?? 0) - Number(b.s.lastMessageAt ?? 0));
+    .sort((a, b) => attentionWaitSince(a.s) - attentionWaitSince(b.s));
   if (pending.length === 0) {
     el.hidden = true;
     el.innerHTML = '';
@@ -131,7 +131,7 @@ function paintAttentionStrip(): void {
     <span class="attention-strip-ic" aria-hidden="true">!</span>
     <b>${escapeHtml(t('strip.pending', { count: pending.length }))}</b>
     <span class="attention-strip-longest">${escapeHtml(t('strip.longest', {
-      time: relTime(longest.s.lastMessageAt),
+      time: relTime(attentionWaitSince(longest.s)),
       bot: botDisplayName(longest.s),
       reason: longest.reason,
     }))}</span>
@@ -155,9 +155,33 @@ async function loadAuthState(): Promise<void> {
     if (r.ok) {
       const j = await r.json();
       isAuthed = !!j.authed;
+      // Share the cookie-auth verdict with per-row renderers (the sessions
+      // board's writable-terminal segment reads ui.authed at render time).
+      ui.authed = isAuthed;
       publicReadOnly = !!(j.settings && j.settings.publicReadOnly);
+      // The global UI locale (`botmux lang`) is the single source of truth: when
+      // set, it wins over the browser-detected / locally-stored locale so the
+      // dashboard always reflects the same language as the Feishu cards. When
+      // unset (null), keep the browser/local default ui.init() already picked.
+      const serverLocale = normalizeDashboardLocale(j.lang);
+      if (serverLocale) ui.setLocale(serverLocale);
     }
   } catch { /* keep defaults */ }
+}
+
+// Persist a language choice back to the global config so it drives `botmux lang`
+// and the Feishu cards too (the server fans the change out to every daemon
+// live). Authed-only — read-only visitors just change their local view, which
+// the server-authoritative locale overrides on their next load.
+async function persistLocale(locale: DashboardLocale): Promise<void> {
+  if (!isAuthed) return;
+  try {
+    await fetch('/api/settings', {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ lang: locale }),
+    });
+  } catch { /* best-effort; UI already switched locally */ }
 }
 
 // Read-only visitors can't use the management pages (all token-gated), so hide
@@ -178,7 +202,7 @@ function renderAuthRequiredPage(host: HTMLElement): void {
     'padding:40px 36px;box-shadow:0 8px 28px rgba(0,0,0,.12)">' +
     '<h2 style="margin:0 0 12px;font-size:20px;color:var(--fg)">此页需要授权链接</h2>' +
     '<p style="margin:0 0 24px;line-height:1.7;color:var(--muted);font-size:14px">' +
-    '你当前是只读访问，管理页（角色 / Bot 配置 / 团队 / 接入点）需要授权链接。' +
+    '你当前是只读访问，管理页（角色 / Bot 配置 / 团队 / Webhook）需要授权链接。' +
     '运行 <code>botmux dashboard</code> 获取最新链接后即可管理。</p>' +
     '<a href="#/" style="display:inline-block;padding:8px 22px;background:var(--accent);' +
     'color:var(--on-accent);border-radius:8px;text-decoration:none;font-size:14px">返回总览</a>' +
@@ -253,7 +277,11 @@ function paintChrome() {
 
 function wireChromeControls() {
   document.querySelectorAll<HTMLButtonElement>('[data-locale]').forEach(btn => {
-    btn.onclick = () => ui.setLocale(btn.dataset.locale as DashboardLocale);
+    btn.onclick = () => {
+      const locale = btn.dataset.locale as DashboardLocale;
+      ui.setLocale(locale);
+      void persistLocale(locale);
+    };
   });
   initThemeMenu();
 }

@@ -24,6 +24,12 @@ class DashboardUiState {
   themeMode: ThemeMode = 'system';
   resolvedTheme: ResolvedTheme = 'light';
   skin: SkinId = 'default';
+  // Dashboard cookie-auth state, mirrored from /api/settings by app.ts's
+  // loadAuthState(). Gates write-only affordances rendered per-row (e.g. the
+  // writable-terminal "🔑" segment in the sessions board) — read-only visitors
+  // must not see a control whose endpoint they'd 401 on. Defaults true so a
+  // transient probe failure never hides it from a real token holder.
+  authed = true;
   private listeners = new Set<UiListener>();
   private translate = createDashboardTranslator(this.locale);
   private mediaQuery: MediaQueryList | null = null;
@@ -339,8 +345,17 @@ export function stripMentionPrefix(title: unknown): string {
 /** 会话当前是否卡在等人，以及等什么（全局 strip 和工作台共用同一判定）。 */
 export function attentionReason(s: Record<string, any>): string | null {
   if (s.status === 'closed') return null;
+  if (s.agentAttention?.reason) return s.agentAttention.reason;
+  if (s.agentAttention) return t('sessions.board.signalAgent');
   if (s.pendingRepo) return t('sessions.board.signalRepo');
   if (s.tuiPromptActive) return t('sessions.board.signalPrompt');
   if (s.status === 'limited') return t('sessions.board.signalLimited');
   return null;
+}
+
+export function attentionWaitSince(s: Record<string, any>): number {
+  const ms = Number(s.agentAttention?.at ?? s.lastMessageAt ?? 0);
+  if (Number.isFinite(ms)) return ms;
+  const fallback = Number(s.lastMessageAt ?? 0);
+  return Number.isFinite(fallback) ? fallback : 0;
 }

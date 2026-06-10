@@ -20,7 +20,7 @@
  */
 import { execSync, spawnSync, spawn } from 'node:child_process';
 import { existsSync, mkdirSync, copyFileSync, readFileSync, writeFileSync, renameSync, readdirSync, readlinkSync, appendFileSync, statSync, unlinkSync } from 'node:fs';
-import { join, dirname } from 'node:path';
+import { join, dirname, basename } from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline';
@@ -52,7 +52,7 @@ import { createCliAdapterSync } from './adapters/cli/registry.js';
 import { logger } from './utils/logger.js';
 import { invalidWorkingDirs } from './utils/working-dir.js';
 import { firstPositional } from './cli/arg-utils.js';
-import { dispatchPrimaryMessage } from './cli/send-dispatch.js';
+import { dispatchPrimaryMessage, findStdinAliasAttachment, sendFileAttachments } from './cli/send-dispatch.js';
 import {
   formatBotInfoEntriesForCli,
   formatChatBotsForCli,
@@ -64,7 +64,7 @@ import {
   orderedFooterRecipients,
   type BotMentionEntry,
 } from './utils/bot-routing.js';
-import { isLocale, localeForBot, setDefaultLocale, SUPPORTED_LOCALES, type Locale } from './i18n/index.js';
+import { isLocale, localeForBot, setDefaultLocale, SUPPORTED_LOCALES, t, type Locale } from './i18n/index.js';
 import { type Brand, chatAppLink, larkHosts, normalizeBrand, sdkDomain } from './im/lark/lark-hosts.js';
 import { mergeGlobalConfig, readGlobalConfig, setGlobalLocale, globalConfigPath, type WorkerConfig } from './global-config.js';
 import { detectWorkerResources, resolveWorkerBudget } from './core/worker-budget.js';
@@ -660,7 +660,7 @@ async function promptBotConfig(rl: ReturnType<typeof createInterface>): Promise<
   }
   console.log('✅ 凭证有效（tenant_access_token 已成功获取）\n');
 
-  console.log('支持的 CLI: 1) claude-code  2) aiden  3) coco（别名 traecli）  4) codex  5) cursor  6) gemini  7) opencode  8) antigravity  9) mtr  10) hermes  11) codex-app  12) mira  13) seed  14) traex  15) pi  16) copilot');
+  console.log('支持的 CLI: 1) claude-code  2) aiden  3) coco（别名 traecli）  4) codex  5) cursor  6) gemini  7) opencode  8) antigravity  9) mtr  10) hermes  11) codex-app  12) mira  13) seed  14) traex  15) pi  16) copilot  17) oh-my-pi');
   const cliChoice = await ask(rl, 'CLI 适配器 [1]: ');
   let cliId: CliId;
   try {
@@ -762,7 +762,7 @@ async function promptEditBotConfig(
   ]);
   input.larkAppSecret = await ask(rl, `LARK_APP_SECRET [保留当前值]: `);
 
-  console.log('\n支持的 CLI: 1) claude-code  2) aiden  3) coco（别名 traecli）  4) codex  5) cursor  6) gemini  7) opencode  8) antigravity  9) mtr  10) hermes  11) codex-app  12) mira  13) seed  14) traex  15) pi  16) copilot');
+  console.log('\n支持的 CLI: 1) claude-code  2) aiden  3) coco（别名 traecli）  4) codex  5) cursor  6) gemini  7) opencode  8) antigravity  9) mtr  10) hermes  11) codex-app  12) mira  13) seed  14) traex  15) pi  16) copilot  17) oh-my-pi');
   printInputHelp('CLI 适配器', [
     '选择 botmux 需要套用哪一种 CLI 参数协议和会话恢复方式。',
     'coco 的别名 traecli 走同一适配器；二进制名是 traecli 也选 coco 即可。',
@@ -2300,6 +2300,119 @@ async function cmdResume(): Promise<void> {
   process.exit(1);
 }
 
+/**
+ * `botmux term-link [session-id|prefix]` — get the writable ("可操作") terminal
+ * for an active session. The link carries a write token, so rather than print it
+ * (where it could land in logs / shell history), the daemon delivers it as a
+ * private card to the bot owner(s): an in-chat visible-to-you ephemeral card,
+ * auto-falling back to a DM in topic / p2p chats. The CLI only ever sees delivery
+ * counts — never the token. The daemon route is loopback-HMAC gated, signed here
+ * with .dashboard-secret (same scheme as `botmux dashboard`).
+ */
+async function cmdTermLink(rest: string[]): Promise<void> {
+  const target = rest[0];
+  const active = [...loadSessions().values()].filter(s => s.status === 'active');
+  if (active.length === 0) {
+    console.error('没有活跃会话。可操作终端只能对 status=active 的会话获取（botmux list 查看）。');
+    process.exit(1);
+  }
+
+  let session: SessionData;
+  if (!target) {
+    if (active.length === 1) {
+      session = active[0];
+    } else {
+      console.error('用法: botmux term-link <session-id|prefix>');
+      console.error(`  当前有 ${active.length} 个活跃会话，请指定其一：`);
+      for (const s of active) console.error(`   ${s.sessionId.substring(0, 12)}  ${s.title}`);
+      process.exit(1);
+    }
+  } else {
+    const matches = active.filter(s => s.sessionId.startsWith(target));
+    if (matches.length === 0) {
+      console.error(`❌ 未找到匹配 "${target}" 的活跃会话（resume 已关闭的会话后再试）`);
+      process.exit(1);
+    }
+    if (matches.length > 1) {
+      console.error(`❌ "${target}" 匹配了 ${matches.length} 个活跃会话，请提供更长的 ID 前缀：`);
+      for (const s of matches) console.error(`   ${s.sessionId.substring(0, 12)}  ${s.title}`);
+      process.exit(1);
+    }
+    session = matches[0];
+  }
+
+  // Multi-bot larkAppId guard (mirror of cmdResume): a legacy session without
+  // larkAppId can't be routed deterministically when >1 daemon is online.
+  if (!session.larkAppId) {
+    const online = listOnlineDaemons();
+    if (online.length > 1) {
+      console.error(`❌ 会话 ${session.sessionId.substring(0, 12)} 缺少 larkAppId，多 bot 部署下无法判定归属。`);
+      console.error(`   在线 daemon (${online.length}): ${online.map(d => d.larkAppId).join(', ')}`);
+      process.exit(1);
+    }
+    if (online.length === 0) {
+      console.error('❌ 没有在线 daemon。请先：botmux start');
+      process.exit(1);
+    }
+  }
+
+  const daemon = findDaemon(session.larkAppId);
+  if (!daemon) {
+    console.error('❌ 未找到在线 daemon。请确认 daemon 正在运行：botmux status');
+    process.exit(1);
+  }
+
+  const SECRET_PATH = join(CONFIG_DIR, '.dashboard-secret');
+  if (!existsSync(SECRET_PATH)) {
+    console.error('❌ 缺少 .dashboard-secret（daemon 未初始化）。先 `botmux restart`。');
+    process.exit(1);
+  }
+  const secret = readFileSync(SECRET_PATH, 'utf8').trim();
+  const ts = Math.floor(Date.now() / 1000).toString();
+  const nonce = randomBytes(8).toString('hex');
+  const sig = createHmac('sha256', secret).update(`${ts}:${nonce}`).digest('base64url');
+
+  let res: Response;
+  try {
+    res = await fetch(
+      `http://127.0.0.1:${daemon.ipcPort}/api/sessions/${encodeURIComponent(session.sessionId)}/write-link-card`,
+      { method: 'POST', headers: { 'X-Botmux-Cli-Ts': ts, 'X-Botmux-Cli-Nonce': nonce, 'X-Botmux-Cli-Auth': sig } },
+    );
+  } catch (err: any) {
+    console.error(`❌ 无法连接到 daemon (port=${daemon.ipcPort}): ${err?.message ?? err}`);
+    process.exit(1);
+  }
+
+  let body: any = {};
+  try { body = await res.json(); } catch { /* */ }
+  if (res.ok && body?.ok) {
+    const chans: string[] = body.channels ?? [];
+    const eph = chans.filter(c => c === 'ephemeral').length;
+    const dm = chans.filter(c => c === 'dm').length;
+    const via = [eph ? `${eph} 条群内私密卡` : '', dm ? `${dm} 条私聊 DM` : ''].filter(Boolean).join(' + ');
+    console.log(`✅ 可操作终端卡片已私密发给 owner（${body.delivered}/${body.total}${via ? '：' + via : ''}）`);
+    console.log(`   会话: ${session.sessionId.substring(0, 12)}  ${session.title}`);
+    console.log('   卡片里「打开终端」即带写 token 进入；链接只走私密通道，不进群、不回显到这里。');
+    return;
+  }
+
+  const errCode = body?.error ?? `HTTP ${res.status}`;
+  if (errCode === 'unauthorized') {
+    console.error('❌ 鉴权失败（loopback HMAC）。确认 .dashboard-secret 未变、daemon 已用同一份重启。');
+  } else if (errCode === 'session_not_active') {
+    console.error('❌ daemon 中该会话非活跃，无法获取可操作终端。');
+  } else if (errCode === 'terminal_unavailable') {
+    console.error('❌ 该会话终端尚未就绪（worker 未起或缺 token）。等会话起来再试。');
+  } else if (errCode === 'no_owner') {
+    console.error('❌ 该 bot 未配置 owner（allowedUsers 为空 / 全开放模式），没有可私密投递的对象。');
+  } else if (errCode === 'delivery_failed') {
+    console.error('❌ 卡片投递失败（ephemeral 与 DM 均失败）。查看 daemon 日志：botmux logs。');
+  } else {
+    console.error(`❌ 获取失败: ${errCode}`);
+  }
+  process.exit(1);
+}
+
 function showHelp(): void {
   console.log(`
 botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
@@ -2321,6 +2434,9 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
   delete stopped   清理所有进程已退出的僵尸会话
   resume <id>      恢复一个已关闭的会话（支持 ID 前缀匹配）— 会话标记回 active，
                    下条消息会以 --resume 重新拉起 CLI 进程
+  term-link [id]   获取活跃会话的「可操作终端」（带写 token）。不回显链接，改由
+                   daemon 把可操作卡片私密发给 owner（群内仅你可见，话题/单聊回退 DM）。
+                   单个活跃会话可省略 id
   autostart enable     注册开机自启（macOS launchd / Linux user systemd，无需 sudo）
   autostart disable    注销开机自启
   autostart status     查看自启状态
@@ -2354,6 +2470,12 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
        --voice "<口语文字>"            合成语音气泡发出（需先 botmux voice 配置 TTS）
        --top-level                     发顶层消息（不回复进当前话题）
        --chat-id <oc_xxx>              指定目标群（默认当前话题所在群）
+       --attention[=kind]              举手：发消息的同时把本会话标进 dashboard
+                                       「需要你」列并通知你——撞到只有你能解的硬阻碍
+                                       （授权/拍板/缺权限）无法继续时用。消息正文即看板
+                                       原因。kind=authz|decision|blocked(默认)|help。
+                                       仅限回复当前会话，不能与 --top-level/--chat-id/--into
+                                       /--voice 混用；用户回复后自动撤下。
        --anyway                        跳过「@ 到活跃子 bot」护栏强发（见下）
     @ 硬门：每条回复须三选一 --mention/--mention-back/--no-mention，否则报错不发。
     按内容价值选：有实质结论要对方看/确认/决策→--mention-back(或--mention点名)；
@@ -2814,9 +2936,85 @@ import { buildCardBodyElements, brandFooterSegment } from './im/lark/md-card.js'
 import { COMPLETED_REACTION_EMOJI_TYPE, claimPendingResponseCard, isPendingResponseCardOpen, markPendingResponseCardPatchedIfCurrent, mergePendingResponseState, shouldMarkPendingAsMentionedSend, shouldPatchPendingOnExplicitSend } from './core/pending-response.js';
 import { resolveBrandLabel } from './bot-registry.js';
 import { config } from './config.js';
-import { resolveQuoteTarget, validateMentionDecision } from './services/send-policy.js';
+import { resolveQuoteTarget, validateMentionDecision, parseAttentionFlag, attentionUsageError } from './services/send-policy.js';
+
+/**
+ * Sandbox relay mode for `botmux send`. Inside a file-sandbox the CLI cannot
+ * read bots.json or reach Lark directly (creds are deliberately absent), so we
+ * hand the send to the daemon-side outbox watcher (adapters/backend/sandbox.ts
+ * startOutboxWatcher), which re-runs `send` OUTSIDE the sandbox with the
+ * worker's creds. Forward the argv verbatim (content via a file in the shared
+ * outbox), then block on the response file and mirror its result.
+ */
+async function relaySend(rest: string[], relayDir: string): Promise<void> {
+  const sid = argValue(rest, '--session-id') ?? process.env.BOTMUX_SESSION_ID;
+  if (!sid) { console.error('relay: 无法确定 session-id'); process.exit(1); }
+  // Resolve content with the same precedence as cmdSend (content-file > positional > stdin)
+  const contentFile = argValue(rest, '--content-file');
+  let content = '';
+  if (contentFile) {
+    content = existsSync(contentFile) ? readFileSync(contentFile, 'utf-8') : '';
+  } else {
+    const pos = positionals(rest, ['--card', '--text', '--top-level', '--no-quote', '--mention-back', '--no-mention', '--anyway', '--voice']);
+    content = pos.length > 0 ? pos.join(' ') : await readStdin();
+  }
+  const id = randomBytes(8).toString('hex');
+  // Structured request: the daemon-side watcher rebuilds the argv from these
+  // validated fields (it NEVER executes raw argv — see buildRelayHostArgs).
+  // Content + attachments are written into the shared outbox as plain
+  // basenames; the watcher validates they stay inside the outbox, allowlists
+  // the flags, and forces the session-id. This is what keeps creds out of the
+  // sandbox: the sandbox can't make the host read an arbitrary path.
+  const contentBase = `${id}.content`;
+  const cfile = join(relayDir, contentBase);
+  writeFileSync(cfile, content);
+
+  // Copy any --image/--file attachment into the outbox; carry only basenames.
+  const attachments: string[] = [];
+  for (const p of argValues(rest, '--image', '--images', '--file', '--files')) {
+    if (!p || !existsSync(p)) continue;
+    const base = `${id}-${randomBytes(4).toString('hex')}-${basename(p)}`;
+    try { writeFileSync(join(relayDir, base), readFileSync(p)); attachments.push(base); } catch { /* skip unreadable */ }
+  }
+
+  // Forward only presentation flags (must match the watcher's allowlist); path,
+  // routing (--chat-id/--into/--top-level) and --session-id flags are dropped —
+  // content/attachments come from the outbox and session-id is forced host-side.
+  const FLAGS_NOVAL = new Set(['--mention-back', '--no-mention', '--no-quote', '--voice']);
+  const FLAGS_VAL = new Set(['--mention', '--quote']);
+  const flags: string[] = [];
+  for (let i = 0; i < rest.length; i++) {
+    const tok = rest[i];
+    if (FLAGS_NOVAL.has(tok)) flags.push(tok);
+    else if (FLAGS_VAL.has(tok) && i + 1 < rest.length) flags.push(tok, rest[++i]);
+    // else dropped
+  }
+  writeFileSync(join(relayDir, `${id}.req.json`), JSON.stringify({ contentFile: contentBase, attachments, flags }));
+
+  const resPath = join(relayDir, `${id}.res.json`);
+  const deadlineMs = Date.now() + 120_000;
+  while (Date.now() < deadlineMs) {
+    if (existsSync(resPath)) {
+      try {
+        const res = JSON.parse(readFileSync(resPath, 'utf-8')) as { code?: number; stdout?: string; stderr?: string };
+        try { unlinkSync(resPath); } catch { /* */ }
+        try { unlinkSync(cfile); } catch { /* */ }
+        if (res.stdout) process.stdout.write(res.stdout);
+        if (res.stderr) process.stderr.write(res.stderr);
+        process.exit(res.code ?? 0);
+      } catch { /* partial write — retry next tick */ }
+    }
+    await new Promise(r => setTimeout(r, 150));
+  }
+  console.error('relay: 等待 daemon 投递超时（120s）');
+  process.exit(1);
+}
 
 async function cmdSend(rest: string[]): Promise<void> {
+  // Sandbox relay: a file-sandboxed session has no creds/bots.json, so route
+  // the send through the daemon-side outbox instead of delivering directly.
+  const relayDir = process.env.BOTMUX_SEND_RELAY;
+  if (relayDir) { await relaySend(rest, relayDir); return; }
   // Safety gate: a CLI agent running inside a workflow subagent (Slice F)
   // must not chat-post directly — chat-facing side effects are reserved
   // for `hostExecutor` activities so they can be tracked via
@@ -2836,10 +3034,23 @@ async function cmdSend(rest: string[]): Promise<void> {
   const sessionIdArg = argValue(rest, '--session-id');
   const images = argValues(rest, '--image', '--images');
   const files = argValues(rest, '--file', '--files');
+  // stdin can't be both the message body (which `botmux send` reads from it) and
+  // a `--file`/`--image` attachment — the second read sees EOF and the upload
+  // fails *after* the message is already sent, leaving the caller to resend.
+  // Reject up front so exit≠0 reliably means "nothing was sent".
+  const stdinAlias = findStdinAliasAttachment([...images, ...files]);
+  if (stdinAlias) {
+    console.error(
+      `不能把 stdin（${stdinAlias}）当作 --file/--image 附件：botmux send 已从 stdin 读取消息正文，\n` +
+      `同一个 stdin 没法既当正文又当附件（第二次读到的是 EOF）。\n` +
+      `要发送管道内容，先落到临时文件：  数据来源 > /tmp/x && botmux send --files /tmp/x …`,
+    );
+    process.exit(1);
+  }
   const mentionArgs = argValues(rest, '--mention');  // "open_id:Display Name"
   const contentFile = argValue(rest, '--content-file');
-  // 回复一律走交互卡片。`--card` / `--text` 仅为向后兼容被容忍并忽略：纯文本 post
-  // 路径已删除——只有卡片能承载「🔊 语音总结」按钮，且守护进程兜底也一直只发卡片。
+  // 回复一律走交互卡片。`--card` / `--text` 是隐藏的旧脚本兼容 no-op：纯文本
+  // post 路径已删除，只有卡片能承载「🔊 语音总结」按钮，且守护进程兜底也一直只发卡片。
   // Publish-mode flags: post a fresh top-level message in a chat instead of
   // replying into the bound thread. Lets a session "publish" to a different
   // chat (e.g. a public release-notes group) while keeping its own thread
@@ -2861,6 +3072,10 @@ async function cmdSend(rest: string[]): Promise<void> {
   // @ hard-gate: every reply must explicitly choose one of these.
   const mentionBack = rest.includes('--mention-back');
   const noMention = rest.includes('--no-mention');
+  // --attention[=kind]: raise a hand — post this message AND light the dashboard
+  // needs-you column for this session. Parsed specially (not argValue) so a bare
+  // `--attention "我卡住了"` doesn't eat the message as the flag value.
+  const attention = parseAttentionFlag(rest);
 
   const ancestorCtx = findAncestorSessionContext();
   const sid = sessionIdArg ?? ancestorCtx?.sessionId ?? null;
@@ -2881,7 +3096,7 @@ async function cmdSend(rest: string[]): Promise<void> {
     if (!existsSync(contentFile)) { console.error(`文件不存在: ${contentFile}`); process.exit(1); }
     content = readFileSync(contentFile, 'utf-8');
   } else {
-    const pos = positionals(rest, ['--card', '--text', '--top-level', '--no-quote', '--mention-back', '--no-mention', '--anyway', '--voice']);
+    const pos = positionals(rest, ['--card', '--text', '--top-level', '--no-quote', '--mention-back', '--no-mention', '--anyway', '--voice', '--attention']);
     if (pos.length > 0) {
       content = pos.join(' ');
     } else {
@@ -2893,6 +3108,18 @@ async function cmdSend(rest: string[]): Promise<void> {
     console.error('没有内容可发送。用法:\n  echo "消息" | botmux send\n  botmux send "消息"\n  botmux send --content-file /tmp/msg.md --images /tmp/chart.png');
     process.exit(1);
   }
+
+  // --attention guard: only valid replying into the current session with a text
+  // reason (clear-on-reply binds to this anchor; dashboard needs a reason).
+  const attentionErr = attentionUsageError({
+    requested: attention.requested,
+    sendTopLevel,
+    overrideChatId,
+    sendInto,
+    asVoice,
+    hasText: !!content.trim(),
+  });
+  if (attentionErr) { console.error(`botmux send: ${attentionErr}`); process.exit(2); }
 
   // ── Voice mode ──────────────────────────────────────────────────────────
   // Synthesize the (already-condensed, colloquial) content into a Feishu voice
@@ -3344,7 +3571,7 @@ async function cmdSend(rest: string[]): Promise<void> {
         inlinedIds: usedIds,
       });
       if (footerRecipients.length > 0) {
-        footerParts.push(`发送给：${footerRecipients.map(id => `<at id=${id}></at>`).join(' ')}`);
+        footerParts.push(`${t('card.sent_to', undefined, localeForBot(appId))}${footerRecipients.map(id => `<at id=${id}></at>`).join(' ')}`);
       }
       // Footer line (brand 个性签名 + 发送给) and the optional 🔊 语音总结 button
       // share ONE row: footer text on the left (weighted, fills), button pinned
@@ -3412,12 +3639,16 @@ async function cmdSend(rest: string[]): Promise<void> {
     // closed a pending response card for this turn.
     if (shouldRecordBridgeMarker) recordBridgeSendMarker(sentAtMs, messageId, text);
 
-    // Send file attachments as separate messages
-    const fileIds: string[] = [];
-    for (const fp of files) {
-      const fileKey = await uploadFile(appId, fp);
-      const fid = await dispatch(JSON.stringify({ file_key: fileKey }), 'file');
-      fileIds.push(fid);
+    // Send file attachments as separate messages — best-effort. The primary
+    // message is already delivered above; a failing attachment must not throw
+    // out to the catch below (which would report total failure / exit 1 for an
+    // already-sent message and make the caller resend). Warn instead, and list
+    // the failures in the success JSON.
+    const { failed: failedAttachments } = await sendFileAttachments(
+      { uploadFile, dispatch }, appId, files,
+    );
+    for (const f of failedAttachments) {
+      console.error(`⚠️ 附件未发送（主消息已送达 ${messageId}，请勿重发）: ${f.path} — ${f.error}`);
     }
 
     // Bot-to-bot 转发依赖飞书"获取群组中其他机器人和用户@当前机器人的消息"权限：
@@ -3430,12 +3661,42 @@ async function cmdSend(rest: string[]): Promise<void> {
       ? `@${mentions.map(m => m.name || m.open_id).join(',')}`
       : '未@任何人';
     console.error(`✓ 已发送 ${messageId} ｜ ${primaryQuotedId ? `引用 ${primaryQuotedId}` : '未引用'} ｜ ${atSummary}`);
+
+    // --attention: message is already delivered above; now flip the dashboard
+    // needs-you state via the daemon (botmux send is direct-to-Lark, so the
+    // daemon-held ds.agentAttention must be set out-of-band). Best-effort: a
+    // failure here must NOT fail the send (else the agent retries → duplicate
+    // messages) — warn on stderr and surface in the JSON for log observability.
+    let attentionRaised: boolean | undefined;
+    let attentionError: string | undefined;
+    if (attention.requested) {
+      try {
+        const daemon = findDaemon(appId);
+        if (!daemon) throw new Error(`找不到 daemon (larkAppId=${appId})`);
+        const res = await fetch(`http://127.0.0.1:${daemon.ipcPort}/api/attention`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ sessionId: sid, larkAppId: appId, action: 'raise', kind: attention.kind, reason: text.trim() }),
+        });
+        if (!res.ok) throw new Error(`daemon HTTP ${res.status}`);
+        attentionRaised = true;
+        console.error(`🙋 已举手：本会话已进 dashboard「需要你」列（用户回复后自动撤下）`);
+      } catch (err) {
+        attentionRaised = false;
+        attentionError = err instanceof Error ? err.message : String(err);
+        console.error(`⚠️ 消息已发送，但举手(needs-you)置位失败（不影响消息）：${attentionError}`);
+      }
+    }
     console.log(JSON.stringify({
       success: true,
       messageId,
       sessionId: sid,
       quotedMessageId: primaryQuotedId,
       mentioned: mentions.map(m => ({ open_id: m.open_id, name: m.name })),
+      ...(attention.requested ? { attentionRaised, attentionError } : {}),
+      ...(failedAttachments.length > 0
+        ? { failedAttachments: failedAttachments.map(f => f.path) }
+        : {}),
     }));
   } catch (err: any) {
     console.error(`发送失败: ${err.message}`);
@@ -4329,6 +4590,37 @@ async function cmdBots(sub: string, rest: string[]): Promise<void> {
 
 // ─── botmux lang ─────────────────────────────────────────────────────────────
 
+/** Notify every online daemon to hot-reload its UI locale from disk, so a
+ *  `botmux lang` change takes effect on live cards without a restart. Best
+ *  effort: unreachable daemons pick up the new value when they next restart. */
+async function notifyDaemonsReloadLocale(): Promise<{ notified: number; failed: number }> {
+  const daemons = listOnlineDaemons();
+  let notified = 0;
+  let failed = 0;
+  await Promise.all(daemons.map(async (d) => {
+    try {
+      const r = await fetch(`http://127.0.0.1:${d.ipcPort}/api/locale/reload`, { method: 'POST' });
+      if (r.ok) notified++;
+      else failed++;
+    } catch { failed++; }
+  }));
+  return { notified, failed };
+}
+
+/** Fan the locale change out to live daemons and tell the user whether it took
+ *  effect immediately or will apply on next daemon start. */
+async function reportLocaleApplied(): Promise<void> {
+  const { notified, failed } = await notifyDaemonsReloadLocale();
+  if (notified > 0) {
+    console.log(`✅ Applied live to ${notified} running daemon(s) — no restart needed.`);
+  } else {
+    console.log(`No running daemon to notify; the change applies when daemons next start.`);
+  }
+  if (failed > 0) {
+    console.log(`(${failed} daemon(s) did not acknowledge; they'll pick it up on restart.)`);
+  }
+}
+
 /**
  * `botmux lang [zh|en] [--bot N] [--unset]`
  *
@@ -4338,9 +4630,11 @@ async function cmdBots(sub: string, rest: string[]): Promise<void> {
  * `--unset` → clear the global config's `lang` (or, with `--bot N`, drop
  *   the per-bot override).
  *
- * On any write, hint the user to `botmux restart` so live daemons pick it up.
+ * On any write, notify online daemons to hot-reload the locale (no restart) —
+ * cards switch language on the next message; the change still persists for
+ * future restarts.
  */
-function cmdLang(args: string[]): void {
+async function cmdLang(args: string[]): Promise<void> {
   ensureConfigDir();
   const cfg = readGlobalConfig();
   const globalLang: Locale | undefined = cfg.lang;
@@ -4395,7 +4689,7 @@ function cmdLang(args: string[]): void {
       writeBotsJsonAtomic(bots);
       console.log(`✅ Set bot ${botFlag} (${bots[botFlag].larkAppId}) lang → ${target}.`);
     }
-    console.log(`Run \`botmux restart\` for changes to take effect.`);
+    await reportLocaleApplied();
     return;
   }
 
@@ -4403,7 +4697,7 @@ function cmdLang(args: string[]): void {
   if (unset) {
     setGlobalLocale(null);
     console.log(`✅ Cleared global lang (will default to zh).`);
-    console.log(`Run \`botmux restart\` for changes to take effect.`);
+    await reportLocaleApplied();
     return;
   }
 
@@ -4414,7 +4708,7 @@ function cmdLang(args: string[]): void {
   }
   setGlobalLocale(target);
   console.log(`✅ Set global lang → ${target}.`);
-  console.log(`Run \`botmux restart\` for changes to take effect.`);
+  await reportLocaleApplied();
 }
 
 // ─── botmux worker-budget ───────────────────────────────────────────────────
@@ -4830,6 +5124,7 @@ switch (command) {
   case 'del':
   case 'rm':      cmdDelete(); break;
   case 'resume':  await cmdResume(); break;
+  case 'term-link': await cmdTermLink(process.argv.slice(3)); break;
   case 'schedule': await cmdSchedule(process.argv[3] ?? '', process.argv.slice(4)); break;
   case 'ask': {
     // `botmux ask buttons --options ...` → sub='buttons', rest=['--options', ...]
@@ -4858,7 +5153,7 @@ switch (command) {
   case 'preset':   await cmdPreset(process.argv[3] ?? '', process.argv.slice(4)); break;
   case 'history':  await cmdHistory(process.argv.slice(3)); break;
   case 'quoted':   await cmdQuoted(process.argv.slice(3)); break;
-  case 'lang':     cmdLang(process.argv.slice(3)); break;
+  case 'lang':     await cmdLang(process.argv.slice(3)); break;
   case 'voice':    await cmdVoiceSetup(process.argv.slice(3)); break;
   case 'worker-budget': cmdWorkerBudget(process.argv.slice(3)); break;
   case 'thread':   {

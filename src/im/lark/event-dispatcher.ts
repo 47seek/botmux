@@ -10,6 +10,7 @@ import { getBot, getAllBots, findOncallChat, getOwnerOpenId, type BotState } fro
 import { config } from '../../config.js';
 import { getChatInfo, getChatMode, getCachedChatMode, listChatBotMembers, replyMessage, sendUserMessage, isHumanOpenId, updateMessage } from './client.js';
 import { logger } from '../../utils/logger.js';
+import { BoundedMap } from '../../utils/bounded-map.js';
 import { serializeByAnchor } from '../../utils/anchor-serializer.js';
 import { parseForceTopicInvocation } from '../../core/command-handler.js';
 import { shouldAutoStartOnNewTopic } from '../../core/auto-start.js';
@@ -281,7 +282,9 @@ export async function checkRequiredScopes(larkAppId: string): Promise<void> {
 // groups (oncall chats often have 3rd-party oncall/form/AI-search bots).
 
 export const CHAT_CACHE_TTL = 5 * 60_000; // 5 minutes
-const chatStatsCache = new Map<string, { userCount: number; botCount: number; fetchedAt: number }>();
+// Bounded: keyed per chat; TTL gates freshness on read, the cap stops the
+// entry count growing with every distinct chat the bot ever serves.
+const chatStatsCache = new BoundedMap<string, { userCount: number; botCount: number; fetchedAt: number }>(1000);
 
 // ─── Event callback ACK safety ──────────────────────────────────────────────
 //
@@ -424,12 +427,12 @@ async function handleCardActionAckSafe(data: any, larkAppId: string, handlers: E
   // on/off) legitimately repeat and must not be pinned for the whole TTL.
   if (eventId && !claimEventOnce(key)) {
     logger.info(`[event-dedupe] duplicate card action ignored (claimed): ${key}`);
-    return { toast: { type: 'info', content: '操作已收到，请勿重复点击' } };
+    return { toast: { type: 'info', content: t('toast.action_received_no_repeat', undefined, localeForBot(larkAppId)) } };
   }
 
   if (cardActionInFlight.has(key)) {
     logger.info(`[event-dedupe] duplicate card action ignored while in-flight: ${key}`);
-    return { toast: { type: 'info', content: '操作正在处理中，请稍候' } };
+    return { toast: { type: 'info', content: t('toast.action_in_progress', undefined, localeForBot(larkAppId)) } };
   }
 
   cardActionInFlight.add(key);
@@ -461,7 +464,7 @@ async function handleCardActionAckSafe(data: any, larkAppId: string, handlers: E
   if (result === CARD_ACTION_TIMEOUT) {
     timedOut = true;
     logger.warn(`[card-action] handler exceeded ${CARD_ACTION_ACK_TIMEOUT_MS}ms; ACKing first and continuing in background: ${key}`);
-    return { toast: { type: 'info', content: '操作已收到，后台处理中' } };
+    return { toast: { type: 'info', content: t('toast.action_received_bg', undefined, localeForBot(larkAppId)) } };
   }
   return result;
 }

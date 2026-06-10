@@ -11,11 +11,13 @@ import {
   botDisplayName,
   botAvatarHtml,
   chatDisplayTitle,
+  attentionWaitSince,
   escapeHtml,
   loadNameMaps,
   relTime,
   stripMentionPrefix,
   t,
+  ui,
 } from './ui.js';
 
 function th(sort: string, label: string): string {
@@ -46,6 +48,7 @@ const CLI_FILTER_OPTIONS = [
   'copilot',
   'aiden',
   'coco',
+  'oh-my-pi',
   'unknown',
 ];
 
@@ -76,9 +79,67 @@ function terminalHref(s: any): string | null {
   return `http://${location.hostname}:${port}${suffix}`;
 }
 
+// Cohesive icon set for the session-card action bar — stroke-based (CSS sets
+// stroke:currentColor), 16px viewBox to match the sidebar nav glyphs. Icons
+// instead of text labels keep the row a fixed width across locales: the EN
+// labels used to be wider than zh and overflowed the narrow card, spilling
+// "Close" onto its own line.
+const ICON = {
+  pin: '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 14.3s4.2-3.9 4.2-7.3A4.2 4.2 0 0 0 8 2.9a4.2 4.2 0 0 0-4.2 4.1C3.8 10.4 8 14.3 8 14.3z"/><circle cx="8" cy="6.9" r="1.5"/></svg>',
+  openChat: '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M9.4 2.8h3.8v3.8"/><path d="M13.2 2.8 7.3 8.7"/><path d="M11.5 9.3v2.9a1.2 1.2 0 0 1-1.2 1.2H3.8a1.2 1.2 0 0 1-1.2-1.2V5.7a1.2 1.2 0 0 1 1.2-1.2h2.9"/></svg>',
+  details: '<svg viewBox="0 0 16 16" aria-hidden="true"><rect x="2.2" y="2.9" width="11.6" height="10.2" rx="1.8"/><path d="M9.9 2.9v10.2"/></svg>',
+  terminal: '<svg viewBox="0 0 16 16" aria-hidden="true"><rect x="1.7" y="2.7" width="12.6" height="10.6" rx="2"/><path d="M4.4 6.3 6.4 8.1 4.4 9.9"/><path d="M8.2 10.2h3.4"/></svg>',
+  key: '<svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="6" cy="6.1" r="3"/><path d="M8.1 8.2 13 13.1"/><path d="M11.3 11.4 12.6 10.1"/><path d="M12.7 12.8 13.7 11.8"/></svg>',
+  close: '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4.2 4.2 11.8 11.8"/><path d="M11.8 4.2 4.2 11.8"/></svg>',
+};
+
+/** Compact icon action button for the card bar. `kind` adds a tint variant. */
+function cardActBtn(action: string, icon: string, label: string, kind = ''): string {
+  return `<button type="button" class="card-act${kind ? ' ' + kind : ''}" data-action="${action}" title="${escapeHtml(label)}" aria-label="${escapeHtml(label)}">${icon}</button>`;
+}
+
+// Terminal access pill for a live session: a read-only "open" segment (always
+// shown) plus — for authenticated users — a "key" segment that mints the
+// writable (token-bearing) link on demand. Icon-only + tooltip keeps it compact;
+// the writable segment carries the accent fill so it reads as the real action.
+function terminalControlsHtml(url: string | null): string {
+  if (!url) return '';
+  const open = `<a class="term-btn term-open" href="${escapeHtml(url)}" target="_blank" rel="noopener" title="${escapeHtml(t('sessions.openTerminal'))}" aria-label="${escapeHtml(t('sessions.openTerminal'))}">${ICON.terminal}</a>`;
+  if (!ui.authed) return `<span class="term-pill solo">${open}</span>`;
+  const write = `<button type="button" class="term-btn term-write" data-action="write-link" title="${escapeHtml(t('sessions.writeLinkHint'))}" aria-label="${escapeHtml(t('sessions.writeLink'))}">${ICON.key}</button>`;
+  return `<span class="term-pill">${open}${write}</span>`;
+}
+
+// Mint + open the writable web terminal for `s`. The tab is opened synchronously
+// inside the click gesture (then navigated post-fetch) so the popup blocker —
+// which fires when window.open trails an await — stays quiet. The token lands in
+// the new tab's address bar, same as the Lark card's link, by design.
+async function openWriteLink(s: any, btn?: HTMLButtonElement): Promise<void> {
+  const tab = window.open('about:blank', '_blank');
+  if (tab) tab.opener = null;
+  if (btn) btn.disabled = true;
+  try {
+    const r = await fetch(`/api/sessions/${encodeURIComponent(s.sessionId)}/write-link`);
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok || body?.ok === false || !body?.url) {
+      tab?.close();
+      // 401 already raises the global read-only toast — don't double-alert.
+      if (r.status !== 401) alert(`${t('sessions.writeLinkFail')}: ${body?.error ?? r.status}`);
+      return;
+    }
+    if (tab) tab.location.href = body.url;
+    else window.open(body.url, '_blank', 'noopener');
+  } catch (e) {
+    tab?.close();
+    alert(`${t('sessions.writeLinkFail')}: ${e}`);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
 function deriveSessionBoardColumn(s: any): BoardColumnId | null {
   if (s.status === 'closed') return null;
-  if (s.pendingRepo || s.tuiPromptActive || s.status === 'limited') return 'needs-you';
+  if (s.pendingRepo || s.tuiPromptActive || s.agentAttention || s.status === 'limited') return 'needs-you';
   if (s.status === 'starting') return 'starting';
   if (s.status === 'working' || s.status === 'analyzing' || s.status === 'active') return 'working';
   return 'idle';
@@ -236,10 +297,15 @@ export function renderSessionsPage(root: HTMLElement) {
   // 打开群聊的 applink。旧 daemon 上报的行没有 scope 字段，保持定位行为。
   function chatScopeLink(s: any): string | null {
     if (s.scope !== 'chat' || !s.feishuChatLink) return null;
-    return `<a class="btn-link" href="${escapeHtml(s.feishuChatLink)}" target="_blank" rel="noopener">${t('sessions.openChat')}</a>`;
+    const label = t('sessions.openChat');
+    return `<a class="card-act" href="${escapeHtml(s.feishuChatLink)}" target="_blank" rel="noopener" title="${escapeHtml(label)}" aria-label="${escapeHtml(label)}">${ICON.openChat}</a>`;
   }
 
   function boardSignalLabel(s: any): string {
+    // Agent-raised reason is the most informative — show it verbatim so the
+    // human sees *why* the task is stuck, not a generic label.
+    if (s.agentAttention?.reason) return s.agentAttention.reason;
+    if (s.agentAttention) return t('sessions.board.signalAgent');
     if (s.pendingRepo) return t('sessions.board.signalRepo');
     if (s.tuiPromptActive) return t('sessions.board.signalPrompt');
     if (s.status === 'limited') return t('sessions.board.signalLimited');
@@ -255,6 +321,7 @@ export function renderSessionsPage(root: HTMLElement) {
     const chatTitle = chatDisplayTitle(s);
     const terminal = terminalHref(s);
     const signal = boardSignalLabel(s);
+    const repo = repoBasename(s.workingDir);
     return `<article class="session-card${isSelected ? ' selected' : ''}" data-id="${escapeHtml(s.sessionId)}" aria-pressed="${isSelected}">
       <div class="session-card-top">
         ${botAvatarHtml({ name: botName, larkAppId: s.larkAppId, size: 'sm' })}
@@ -264,26 +331,28 @@ export function renderSessionsPage(root: HTMLElement) {
         </div>
         <span class="status status-${escapeHtml(s.status ?? 'unknown')}">${escapeHtml(s.status ?? 'unknown')}</span>
       </div>
-      <div class="session-card-meta">
-        <span title="${escapeHtml(s.workingDir ?? '')}">${escapeHtml(repoBasename(s.workingDir))}</span>
+      ${repo !== '-' || s.adopt ? `<div class="session-card-meta">
+        ${repo !== '-' ? `<span title="${escapeHtml(s.workingDir ?? '')}">${escapeHtml(repo)}</span>` : ''}
         ${s.adopt ? '<span class="badge">adopt</span>' : ''}
-      </div>
+      </div>` : ''}
       <div class="session-card-time">
-        <span>${escapeHtml(t('sessions.last'))}: ${relTime(s.lastMessageAt)}</span>
-        ${signal ? `<span class="session-signal">${escapeHtml(signal)} · ${relTime(s.lastMessageAt)}</span>` : ''}
+        <span>${s.agentAttention?.at
+          ? `${escapeHtml(t('sessions.board.waiting'))} ${relTime(attentionWaitSince(s))}`
+          : `${escapeHtml(t('sessions.last'))}: ${relTime(s.lastMessageAt)}`}</span>
       </div>
+      ${signal ? `<div class="session-signal" title="${escapeHtml(signal)}">${escapeHtml(signal)}</div>` : ''}
       <div class="session-card-actions">
-        ${chatScopeLink(s) ?? `<button type="button" data-action="locate">${t('sessions.locate')}</button>`}
-        <button type="button" data-action="details">${t('sessions.details')}</button>
-        ${terminal ? `<a class="btn-link primary" href="${escapeHtml(terminal)}" target="_blank" rel="noopener">${t('sessions.openTerminal')}</a>` : ''}
-        <button type="button" class="contrast" data-action="close">${t('sessions.close')}</button>
+        ${chatScopeLink(s) ?? cardActBtn('locate', ICON.pin, t('sessions.locate'))}
+        ${cardActBtn('details', ICON.details, t('sessions.details'))}
+        ${terminalControlsHtml(terminal)}
+        ${cardActBtn('close', ICON.close, t('sessions.close'), 'danger')}
       </div>
     </article>`;
   }
 
   function compareBoardRows(a: any, b: any, column: BoardColumnId): number {
-    const av = Number(a.lastMessageAt ?? 0);
-    const bv = Number(b.lastMessageAt ?? 0);
+    const av = column === 'needs-you' ? attentionWaitSince(a) : Number(a.lastMessageAt ?? 0);
+    const bv = column === 'needs-you' ? attentionWaitSince(b) : Number(b.lastMessageAt ?? 0);
     if (av !== bv) return column === 'needs-you' ? av - bv : bv - av;
     return String(a.title ?? a.sessionId).localeCompare(String(b.title ?? b.sessionId));
   }
@@ -514,10 +583,12 @@ export function renderSessionsPage(root: HTMLElement) {
       <p><b>${t('sessions.workingDir')}:</b> ${escapeHtml(s.workingDir ?? '-')}</p>
       <div class="actions">
         ${chatScopeLink(s) ?? `<button id="locate-btn" type="button">${t('sessions.locate')}</button>`}
-        ${terminal ? `<a class="btn-link primary" href="${escapeHtml(terminal)}" target="_blank" rel="noopener">${t('sessions.openTerminal')}</a>` : ''}
+        ${terminalControlsHtml(terminal)}
         ${closed ? `<button id="resume-btn" type="button" class="primary">${t('sessions.resume')}</button>` : ''}
         ${!closed ? `<button id="close-btn" type="button" class="contrast">${t('sessions.close')}</button>` : ''}
+        <button id="land-btn" type="button">${t('sessions.land')}</button>
       </div>
+      <div id="land-area"></div>
       <form method="dialog"><button>${t('sessions.dismiss')}</button></form>
     </article>`;
 
@@ -532,6 +603,13 @@ export function renderSessionsPage(root: HTMLElement) {
     const locateBtn = drawer.querySelector<HTMLButtonElement>('#locate-btn');
     if (locateBtn) {
       locateBtn.onclick = () => void locateSession(s, locateBtn);
+    }
+
+    // Writable-terminal segment (.term-write) lives inside the drawer, outside
+    // the board's click delegation — wire it directly.
+    const writeBtn = drawer.querySelector<HTMLButtonElement>('.term-write');
+    if (writeBtn) {
+      writeBtn.onclick = () => void openWriteLink(s, writeBtn);
     }
 
     const resumeBtn = drawer.querySelector<HTMLButtonElement>('#resume-btn');
@@ -558,6 +636,48 @@ export function renderSessionsPage(root: HTMLElement) {
     if (closeBtn) {
       closeBtn.onclick = async () => {
         if (await closeSession(s, closeBtn)) drawer.close();
+      };
+    }
+
+    // Sandbox landing: fetch the clone's diff, show it, then apply/discard.
+    const landBtn = drawer.querySelector<HTMLButtonElement>('#land-btn');
+    const landArea = drawer.querySelector<HTMLDivElement>('#land-area');
+    if (landBtn && landArea) {
+      landBtn.onclick = async () => {
+        landBtn.disabled = true;
+        landArea.innerHTML = `<p>${t('sessions.landLoading')}</p>`;
+        try {
+          const r = await fetch(`/api/sessions/${encodeURIComponent(s.sessionId)}/sandbox-diff`);
+          const d = await r.json().catch(() => ({}));
+          if (!d.ok) { landArea.innerHTML = `<p>${t('sessions.landUnavailable')}: ${escapeHtml(d.error ?? String(r.status))}</p>`; landBtn.disabled = false; return; }
+          if (d.empty) { landArea.innerHTML = `<p>${t('sessions.landEmpty')}</p>`; landBtn.disabled = false; return; }
+          const full = String(d.patch ?? '');
+          const patch = full.slice(0, 20000) + (full.length > 20000 ? '\n…(truncated)' : '');
+          landArea.innerHTML = `
+            <p><b>${d.files}</b> files (+${d.insertions}/-${d.deletions}) → <code>${escapeHtml(String(d.workingDir ?? ''))}</code></p>
+            <pre style="max-height:320px;overflow:auto;white-space:pre-wrap">${escapeHtml(patch)}</pre>
+            <div class="actions">
+              <button id="land-apply" type="button" class="primary">${t('sessions.landApply')}</button>
+              <button id="land-discard" type="button" class="contrast">${t('sessions.landDiscard')}</button>
+            </div>`;
+          const applyBtn = landArea.querySelector<HTMLButtonElement>('#land-apply')!;
+          const discardBtn = landArea.querySelector<HTMLButtonElement>('#land-discard')!;
+          applyBtn.onclick = async () => {
+            applyBtn.disabled = true; discardBtn.disabled = true;
+            const rr = await fetch(`/api/sessions/${encodeURIComponent(s.sessionId)}/sandbox-land/apply`, { method: 'POST' });
+            const res = await rr.json().catch(() => ({}));
+            landArea.innerHTML = res.ok
+              ? `<p>✅ ${t('sessions.landApplied')}: ${res.files} files (+${res.insertions}/-${res.deletions}) → <code>${escapeHtml(String(res.workingDir ?? ''))}</code></p>`
+              : `<p>❌ ${t('sessions.landFailed')}: ${escapeHtml(res.error ?? String(rr.status))}</p>`;
+          };
+          discardBtn.onclick = async () => {
+            await fetch(`/api/sessions/${encodeURIComponent(s.sessionId)}/sandbox-land/discard`, { method: 'POST' });
+            landArea.innerHTML = `<p>🗑 ${t('sessions.landDiscarded')}</p>`;
+          };
+        } catch (e) {
+          landArea.innerHTML = `<p>${t('sessions.landUnavailable')}: ${escapeHtml(String(e))}</p>`;
+          landBtn.disabled = false;
+        }
       };
     }
 
@@ -600,6 +720,7 @@ export function renderSessionsPage(root: HTMLElement) {
     if (actionButton) {
       const action = actionButton.dataset.action;
       if (action === 'details') openDrawer(s);
+      else if (action === 'write-link') void openWriteLink(s, actionButton);
       else if (action === 'locate') void locateSession(s, actionButton);
       else if (action === 'close') void closeSession(s, actionButton).then(ok => {
         if (ok) {
