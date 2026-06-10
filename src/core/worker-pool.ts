@@ -26,6 +26,7 @@ import { findUniqueClaudeSessionByCwd } from './session-discovery.js';
 import { buildMarkdownCard, buildContextualReplyCard } from '../im/lark/md-card.js';
 import { TmuxBackend } from '../adapters/backend/tmux-backend.js';
 import { HerdrBackend } from '../adapters/backend/herdr-backend.js';
+import { ZellijBackend } from '../adapters/backend/zellij-backend.js';
 import { getBot, getAllBots, resolveBrandLabel } from '../bot-registry.js';
 import { normalizeBrand } from '../im/lark/lark-hosts.js';
 import { dashboardEventBus } from './dashboard-events.js';
@@ -967,7 +968,16 @@ export function ensureClaudeFolderTrust(workingDir: string, stateJsonPath: strin
 
 export function killWorker(ds: DaemonSession): void {
   clearUsageLimitState(ds);
-  if (!ds.worker || ds.worker.killed) return;
+  if (!ds.worker || ds.worker.killed) {
+    // No live worker to receive {type:'close'}, so its destroySession() — which
+    // tears down the persistent backing session (tmux/herdr/zellij) — never
+    // fires. Those sessions survive a worker exit BY DESIGN (idle-suspend /
+    // lazy-restore keep the CLI alive for later resume), so /close on such a
+    // session would leave an orphaned CLI running in tmux that still replies.
+    // Destroy the backing session directly here so /close always terminates it.
+    destroyOrphanedBackingSession(ds);
+    return;
+  }
   try {
     ds.worker.send({ type: 'close' } as DaemonToWorker);
   } catch { /* IPC already closed */ }
@@ -980,6 +990,44 @@ export function killWorker(ds: DaemonSession): void {
 
 export function isSuspendableBackendType(backendType: BackendType | undefined): boolean {
   return backendType === 'tmux' || backendType === 'herdr' || backendType === 'zellij';
+}
+
+/** Resolve a session's backend type when killing it without a live worker:
+ *  prefer the worker's stored init config, then the bot/daemon config. */
+function resolveBackendTypeForKill(ds: DaemonSession): BackendType | undefined {
+  if (ds.initConfig?.backendType) return ds.initConfig.backendType;
+  try {
+    const cfg = getBot(ds.larkAppId).config.backendType;
+    if (cfg) return cfg;
+  } catch { /* bot not registered — fall through to daemon default */ }
+  return config.daemon.backendType;
+}
+
+/**
+ * Tear down a persistent backing session (tmux/herdr/zellij) directly from the
+ * daemon when there is no live worker to do it via the 'close' IPC. The session
+ * name is deterministic from the session UUID, and each killSession() is a no-op
+ * if the session is already gone.
+ *
+ * Adopt sessions are skipped: botmux never owned the user's pane (ownsSession is
+ * false worker-side too), so killing it would violate the bridge invariant of
+ * leaving the user's own CLI untouched.
+ */
+function destroyOrphanedBackingSession(ds: DaemonSession): void {
+  if (ds.initConfig?.adoptMode || ds.adoptedFrom) return;
+  const backendType = resolveBackendTypeForKill(ds);
+  if (!isSuspendableBackendType(backendType)) return;
+  const sessionId = ds.session.sessionId;
+  try {
+    switch (backendType) {
+      case 'tmux': TmuxBackend.killSession(TmuxBackend.sessionName(sessionId)); break;
+      case 'herdr': HerdrBackend.killSession(HerdrBackend.sessionName(sessionId)); break;
+      case 'zellij': ZellijBackend.killSession(ZellijBackend.sessionName(sessionId)); break;
+    }
+    logger.info(`[${tag(ds)}] killWorker: no live worker — destroyed orphaned ${backendType} backing session`);
+  } catch (err) {
+    logger.warn(`[${tag(ds)}] killWorker: failed to destroy orphaned ${backendType} backing session: ${err}`);
+  }
 }
 
 export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle'): boolean {
