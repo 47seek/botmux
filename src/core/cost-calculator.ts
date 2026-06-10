@@ -34,6 +34,9 @@ export interface SessionTokenUsageQuery {
   sessionId: string;
   cliSessionId?: string;
   cwd?: string;
+  /** Bypass the reparse throttle (stat short-circuit and incremental folding
+   *  still apply). Use at low-frequency exact points like ledger snapshots. */
+  fresh?: boolean;
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -376,7 +379,7 @@ interface UsageReadResult {
   result: SessionTokenUsage | null;
 }
 
-function readSessionTokenAggregateCached(path: string, kind: CachedUsageKind): UsageReadResult | null {
+function readSessionTokenAggregateCached(path: string, kind: CachedUsageKind, opts?: { fresh?: boolean }): UsageReadResult | null {
   const key = `${kind}:${path}`;
   let st: Stats | null = null;
   try {
@@ -400,7 +403,8 @@ function readSessionTokenAggregateCached(path: string, kind: CachedUsageKind): U
   const cached = usageFileCache.get(key);
   if (cached) {
     const unchanged = cached.mtimeMs === st.mtimeMs && cached.size === st.size;
-    if (unchanged || now - cached.parsedAtMs < USAGE_REPARSE_MIN_INTERVAL_MS) {
+    const throttled = !opts?.fresh && now - cached.parsedAtMs < USAGE_REPARSE_MIN_INTERVAL_MS;
+    if (unchanged || throttled) {
       return { agg: cached.previewAgg, result: cached.result };
     }
   }
@@ -479,8 +483,8 @@ function readSessionTokenAggregateCached(path: string, kind: CachedUsageKind): U
 /** Read a transcript's token usage through the stat/incremental cache.
  *  This is the reusable entry point for dashboard rows and, later, the
  *  persistent usage ledger. */
-export function readSessionTokenUsageFile(path: string, kind: CachedUsageKind): SessionTokenUsage | null {
-  return readSessionTokenAggregateCached(path, kind)?.result ?? null;
+export function readSessionTokenUsageFile(path: string, kind: CachedUsageKind, opts?: { fresh?: boolean }): SessionTokenUsage | null {
+  return readSessionTokenAggregateCached(path, kind, opts)?.result ?? null;
 }
 
 function readTokenUsageFromAidenCheckpoint(path: string): SessionTokenUsage | null {
@@ -571,11 +575,11 @@ export function getSessionTokenUsage(q: SessionTokenUsageQuery): SessionTokenUsa
         null,
     );
     if (!checkpointPath || !existsSync(checkpointPath)) return null;
-    return readSessionTokenUsageFile(checkpointPath, 'aiden');
+    return readSessionTokenUsageFile(checkpointPath, 'aiden', { fresh: q.fresh });
   }
   const path = tokenUsagePathForSession(q);
   if (!path || !existsSync(path)) return null;
-  return readSessionTokenUsageFile(path, usageKindForCli(q.cliId));
+  return readSessionTokenUsageFile(path, usageKindForCli(q.cliId), { fresh: q.fresh });
 }
 
 export function formatNumber(n: number): string {
