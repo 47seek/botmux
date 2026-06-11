@@ -87,7 +87,9 @@ function saveTokenForApp(token: TokenStore, appId: string): void {
   const path = tokenPathForApp(appId);
   const dir = dirname(path);
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-  atomicWriteFileSync(path, JSON.stringify(token, null, 2));
+  // 0600：OAuth token 是密钥，且原子写每次重建文件，不传 mode 会把用户
+  // 手动收紧过的权限在自动刷新时悄悄改回 0644。
+  atomicWriteFileSync(path, JSON.stringify(token, null, 2), { mode: 0o600 });
 }
 
 function isValid(isoDate: string): boolean {

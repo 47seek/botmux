@@ -13,10 +13,17 @@
  *
  * 约束：tmp 与目标同目录（同 fs 才保证 rename 原子且不跨设备失败）；失败时
  * best-effort 清理 tmp，绝不破坏旧文件。
+ *
+ * symlink：写前把目标解析到真实路径（realpath）再 rename。否则目标若是
+ * symlink（如 dotfiles 用户软链管理的 ~/.claude/settings.json），rename 会把
+ * 链接本体替换成普通文件——链接断掉、真实目标变孤儿；而被换掉的 in-place 写
+ * 是穿透链接写真实目标的。目标不存在时退而解析父目录（覆盖「软链目录里建新
+ * 文件」），悬空 symlink 这种病态形态不特判。
  */
-import { writeFileSync, renameSync, unlinkSync } from 'node:fs';
+import { writeFileSync, renameSync, unlinkSync, realpathSync } from 'node:fs';
 import { promises as fsp } from 'node:fs';
 import { randomBytes } from 'node:crypto';
+import { dirname, basename, join } from 'node:path';
 
 export interface AtomicWriteOptions {
   /** 文件权限（如 0o600 密钥 / 0o755 可执行脚本）。设置在 tmp 上，rename 后保留。 */
@@ -30,6 +37,17 @@ function tmpPathFor(filePath: string): string {
   return `${filePath}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`;
 }
 
+/** 解析 symlink 到真实路径；目标不存在时解析父目录，保持 in-place 写的穿透语义。 */
+function resolveRealPathSync(filePath: string): string {
+  try { return realpathSync(filePath); } catch { /* 目标尚不存在 */ }
+  try { return join(realpathSync(dirname(filePath)), basename(filePath)); } catch { return filePath; }
+}
+
+async function resolveRealPath(filePath: string): Promise<string> {
+  try { return await fsp.realpath(filePath); } catch { /* 目标尚不存在 */ }
+  try { return join(await fsp.realpath(dirname(filePath)), basename(filePath)); } catch { return filePath; }
+}
+
 /**
  * 原子写（同步）：写同目录唯一 tmp → rename 覆盖目标。
  * 任何失败都不会影响目标文件的旧内容；tmp 残留会被 best-effort 清理。
@@ -39,6 +57,7 @@ export function atomicWriteFileSync(
   data: string | Buffer,
   options: AtomicWriteOptions = {},
 ): void {
+  filePath = resolveRealPathSync(filePath);
   const tmp = tmpPathFor(filePath);
   try {
     writeFileSync(tmp, data, {
@@ -60,6 +79,7 @@ export async function atomicWriteFile(
   data: string | Buffer,
   options: AtomicWriteOptions = {},
 ): Promise<void> {
+  filePath = await resolveRealPath(filePath);
   const tmp = tmpPathFor(filePath);
   try {
     await fsp.writeFile(tmp, data, {

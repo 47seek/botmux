@@ -8,7 +8,20 @@
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
-import { mkdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
+import { mkdirSync, writeFileSync, readFileSync, existsSync, renameSync, unlinkSync } from 'node:fs';
+
+// 原子写（与 src/utils/atomic-write.ts 同构，.mjs 不依赖 dist 故内联）：
+// 这个 wrapper 随时被并发会话 exec，裸写半截会让它们的 `botmux send` 全体失败。
+function atomicWriteFileSync(filePath, data, mode) {
+  const tmp = `${filePath}.${process.pid}.${Math.random().toString(16).slice(2, 10)}.tmp`;
+  try {
+    writeFileSync(tmp, data, { mode });
+    renameSync(tmp, filePath);
+  } catch (err) {
+    try { unlinkSync(tmp); } catch { /* tmp 可能根本没写出来 */ }
+    throw err;
+  }
+}
 
 // 逃生阀：偶尔只想 build 不想抢全局时 `BOTMUX_NO_CLAIM=1 pnpm use:here`
 if (process.env.BOTMUX_NO_CLAIM) {
@@ -33,7 +46,7 @@ try {
   if (existing === content) {
     console.log(`✓ 全局 botmux 已指向本 checkout（${cliScript}）`);
   } else {
-    writeFileSync(wrapper, content, { mode: 0o755 });
+    atomicWriteFileSync(wrapper, content, 0o755);
     console.log(`✅ 全局 botmux → 本 checkout（${cliScript}）`);
     console.log('   下一步 `botmux restart` 即从本 checkout 重启 daemon。');
   }

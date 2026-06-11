@@ -2,10 +2,11 @@
  * atomic-write.test.ts — utils/atomic-write 的单元测试。
  *
  * 覆盖：基本写入/覆盖、Buffer、mode 透传、写失败不破坏旧文件、tmp 清理、
- * 并发写同一目标时读者永远看到完整内容（同进程并发近似模拟多进程场景）。
+ * 并发写同一目标时读者永远看到完整内容（同进程并发近似模拟多进程场景）、
+ * symlink 目标穿透写真实文件不替换链接本体。
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, readFileSync, rmSync, statSync, readdirSync, writeFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, statSync, readdirSync, writeFileSync, existsSync, symlinkSync, lstatSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -66,6 +67,32 @@ describe('atomicWriteFileSync', () => {
     expect(readdirSync(dir)).toEqual([]);
   });
 
+  it('目标是 symlink 时穿透写真实文件，不替换链接本体（dotfiles 场景）', () => {
+    // 模拟 dotfiles：~/.claude/settings.json -> ~/dotfiles/claude-settings.json
+    const real = join(dir, 'real-settings.json');
+    writeFileSync(real, '{"old":true}');
+    const link = join(dir, 'settings.json');
+    symlinkSync(real, link);
+
+    atomicWriteFileSync(link, '{"new":true}');
+
+    expect(lstatSync(link).isSymbolicLink()).toBe(true);   // 链接本体还在
+    expect(readFileSync(real, 'utf-8')).toBe('{"new":true}'); // 真实目标被更新
+    expect(readFileSync(link, 'utf-8')).toBe('{"new":true}');
+  });
+
+  it('父目录是 symlink、目标尚不存在时，新文件落在真实目录', () => {
+    const realDir = join(dir, 'real-dir');
+    mkdirSync(realDir);
+    const linkDir = join(dir, 'link-dir');
+    symlinkSync(realDir, linkDir);
+
+    atomicWriteFileSync(join(linkDir, 'new.json'), '{"x":1}');
+
+    expect(readFileSync(join(realDir, 'new.json'), 'utf-8')).toBe('{"x":1}');
+    expect(lstatSync(linkDir).isSymbolicLink()).toBe(true);
+  });
+
   it('并发写者各用唯一 tmp，互不相撕', () => {
     // 同一目标连续/交错写多次后内容必须是某一次写入的完整值，
     // 且目录里没有 tmp 残留（唯一名保证两次写不会共用 tmp）。
@@ -104,5 +131,17 @@ describe('atomicWriteFile (async)', () => {
     const buf = Buffer.from('blob-content-'.repeat(100));
     await atomicWriteFile(fp, buf);
     expect(readFileSync(fp)).toEqual(buf);
+  });
+
+  it('目标是 symlink 时穿透写真实文件，不替换链接本体', async () => {
+    const real = join(dir, 'real.json');
+    writeFileSync(real, 'old');
+    const link = join(dir, 'link.json');
+    symlinkSync(real, link);
+
+    await atomicWriteFile(link, 'new');
+
+    expect(lstatSync(link).isSymbolicLink()).toBe(true);
+    expect(readFileSync(real, 'utf-8')).toBe('new');
   });
 });
