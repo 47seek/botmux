@@ -1479,6 +1479,12 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
 
   const locTarget = localeForBot(targetDs.larkAppId);
 
+  // `/close` deletes the active-map entry without touching sessionId or
+  // pendingRepo — identity against the map is the only tell that the session
+  // this flow captured is gone. Checked alongside the generation snapshots.
+  const repoSessionKey = sessionKey(rootId, larkAppId!);
+  const sessionStillActive = () => activeSessions.get(repoSessionKey) === targetDs;
+
   // Shared commit path for a resolved directory: pin it on the session, then
   // either fork the pending CLI (first selection) or close + recreate the
   // session (mid-session switch). The worktree flow funnels back in here with
@@ -1512,9 +1518,10 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         { larkAppId: targetDs.larkAppId, chatId: targetDs.chatId },
       );
       // Last-line defence: prompt prep awaited above — if anything replaced
-      // the session in that window, forking now would clobber it.
-      if (targetDs.session.sessionId !== commitGenSessionId) {
-        logger.warn(`[${tag(targetDs)}] Session replaced while preparing the pending-CLI prompt (${commitGenSessionId} → ${targetDs.session.sessionId}) — aborting this fork`);
+      // OR closed the session in that window, forking now would clobber it
+      // (or resurrect a /close'd session).
+      if (!sessionStillActive() || targetDs.session.sessionId !== commitGenSessionId) {
+        logger.warn(`[${tag(targetDs)}] Session replaced or closed while preparing the pending-CLI prompt (${commitGenSessionId} → ${targetDs.session.sessionId}, active=${sessionStillActive()}) — aborting this fork`);
         return;
       }
       rememberLastCliInput(targetDs, pendingPrompt, prompt);
@@ -1592,7 +1599,9 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     const startSessionId = targetDs.session.sessionId;
     const wasPending = !!targetDs.pendingRepo;
     const sessionChanged = () =>
-      targetDs.session.sessionId !== startSessionId || !!targetDs.pendingRepo !== wasPending;
+      !sessionStillActive() ||
+      targetDs.session.sessionId !== startSessionId ||
+      !!targetDs.pendingRepo !== wasPending;
     const notSwitched = async (creation: { path: string; branch: string }, when: string) => {
       logger.info(`[${tag(targetDs)}] Worktree ${creation.path} created but session changed ${when} — not switching`);
       await sessionReply(rootId, t('cmd.repo.worktree_created_not_switched', { path: creation.path, branch: creation.branch }, locTarget));

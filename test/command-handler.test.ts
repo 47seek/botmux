@@ -345,7 +345,7 @@ import type { LarkMessage, Session } from '../src/types.js';
 import { killWorker, forkWorker, getCurrentCliVersion, deliverEphemeralOrReply, deliverWritableTerminalCardTo } from '../src/core/worker-pool.js';
 import { getOwnerOpenId } from '../src/bot-registry.js';
 import { canOperate } from '../src/im/lark/event-dispatcher.js';
-import { getSessionWorkingDir, buildNewTopicPrompt } from '../src/core/session-manager.js';
+import { getSessionWorkingDir, buildNewTopicPrompt, getAvailableBots } from '../src/core/session-manager.js';
 import * as sessionStore from '../src/services/session-store.js';
 import * as scheduleStore from '../src/services/schedule-store.js';
 import * as scheduler from '../src/core/scheduler.js';
@@ -1211,6 +1211,25 @@ describe('handleCommand', () => {
       expect(ds.pendingRepo).toBe(true); // not consumed
       const replies = vi.mocked(deps.sessionReply).mock.calls.map(c => c[1]).join();
       expect(replies).toContain('已有一个 worktree 正在创建');
+    });
+
+    it('aborts the pending fork when the session is /close\'d during prompt prep (last-line defence)', async () => {
+      const ds = makeDaemonSession({ pendingRepo: true, pendingPrompt: 'hello world' });
+      const deps = makeDeps(ds);
+      deps.lastRepoScan.set(CHAT_ID, SCAN as any);
+      vi.mocked(createRepoWorktree).mockResolvedValue(CREATION);
+      // /close lands inside forkPendingCli's prompt prep — deletes the
+      // active-map entry but mutates neither sessionId nor pendingRepo; only
+      // the pre-fork identity check can stop the fork.
+      vi.mocked(getAvailableBots).mockImplementationOnce(async () => {
+        deps.activeSessions.delete(sessionKey(ROOT_ID, LARK_APP_ID));
+        return [];
+      });
+
+      await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo wt 1'), deps, LARK_APP_ID);
+
+      expect(forkWorker).not.toHaveBeenCalled();
+      expect(ds.worktreeCreating).toBe(false);
     });
 
     it('reports a commit failure as a switch failure — the worktree exists by then', async () => {

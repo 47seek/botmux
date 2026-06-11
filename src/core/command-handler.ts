@@ -1048,9 +1048,12 @@ export async function handleCommand(
               { larkAppId, chatId: ds!.chatId },
             );
             // Last-line defence: prompt prep awaited above — if anything
-            // replaced the session in that window, forking now would clobber it.
-            if (ds!.session.sessionId !== commitGenSessionId) {
-              logger.warn(`[${logTag}] Session replaced while preparing the pending-CLI prompt (${commitGenSessionId} → ${ds!.session.sessionId}) — aborting this fork`);
+            // replaced OR closed the session in that window (`/close` deletes
+            // the active-map entry without touching sessionId), forking now
+            // would clobber it or resurrect a closed session.
+            const stillActive = activeSessions.get(sessionKey(rootId, larkAppId!)) === ds;
+            if (!stillActive || ds!.session.sessionId !== commitGenSessionId) {
+              logger.warn(`[${logTag}] Session replaced or closed while preparing the pending-CLI prompt (${commitGenSessionId} → ${ds!.session.sessionId}, active=${stillActive}) — aborting this fork`);
               return;
             }
             rememberLastCliInput(ds!, pendingPrompt, prompt);
@@ -1141,7 +1144,11 @@ export async function handleCommand(
           // session it just spawned. Mirror of the card-side guard.
           const startSessionId = ds.session.sessionId;
           const wasPending = !!ds.pendingRepo;
+          // Identity against the active map catches `/close` (which deletes
+          // the entry without touching sessionId/pendingRepo) alongside the
+          // generation snapshots.
           const wtSessionChanged = () =>
+            activeSessions.get(sessionKey(rootId, larkAppId!)) !== ds ||
             ds!.session.sessionId !== startSessionId || !!ds!.pendingRepo !== wasPending;
           // Hold the in-flight lock through commit (matching the card path) —
           // releasing it right after `git` would let a second `/repo wt` start

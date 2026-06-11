@@ -333,6 +333,42 @@ describe('repo select card — worktree open', () => {
     expect(forkWorker).not.toHaveBeenCalled();
   });
 
+  it('does NOT switch when the session is /close\'d while git runs (identity guard)', async () => {
+    const ds = makeDs({ pendingRepo: true, pendingPrompt: 'hi', worker: null });
+    const { deps, sessionReply } = makeDeps(ds);
+    const d = deferred<{ path: string; branch: string; baseRef: string }>();
+    vi.mocked(createRepoWorktree).mockReturnValue(d.promise as any);
+
+    await handleCardAction(makeSelectEvent('repo_worktree', '/repos/alpha'), deps, APP_ID);
+    // /close deletes the active-map entry but mutates neither sessionId nor
+    // pendingRepo — identity against the map is the only tell.
+    deps.activeSessions.delete(sessionKey(ROOT_ID, APP_ID));
+
+    d.resolve({ path: '/repos/alpha-wt-1', branch: 'wt/1', baseRef: 'origin/master' });
+    await vi.waitFor(() => expect(ds.worktreeCreating).toBe(false));
+
+    expect(forkWorker).not.toHaveBeenCalled();
+    expect(killWorker).not.toHaveBeenCalled();
+    expect(sessionReply.mock.calls.map(c => c[1]).join()).toContain('未自动切换');
+  });
+
+  it('aborts the pending fork when the session is /close\'d during prompt prep (last-line defence)', async () => {
+    const ds = makeDs({ pendingRepo: true, pendingPrompt: 'hi', worker: null });
+    const { deps } = makeDeps(ds);
+    vi.mocked(createRepoWorktree).mockResolvedValue({ path: '/repos/alpha-wt-1', branch: 'wt/1', baseRef: 'origin/master' });
+    // The close lands inside commitSelection's prompt prep — past every
+    // earlier guard; only the pre-fork identity check can stop the fork.
+    vi.mocked(getAvailableBots).mockImplementationOnce(async () => {
+      deps.activeSessions.delete(sessionKey(ROOT_ID, APP_ID));
+      return [];
+    });
+
+    await handleCardAction(makeSelectEvent('repo_worktree', '/repos/alpha'), deps, APP_ID);
+    await vi.waitFor(() => expect(ds.worktreeCreating).toBe(false));
+
+    expect(forkWorker).not.toHaveBeenCalled();
+  });
+
   it('reports a switch failure as such — the worktree DOES exist on disk', async () => {
     const ds = makeDs({ pendingRepo: true, pendingPrompt: 'hi', worker: null });
     const { deps, sessionReply } = makeDeps(ds);
