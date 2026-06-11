@@ -34,7 +34,7 @@ import { composeRowFromActive, composeRowFromClosed } from './dashboard-rows.js'
 import { publishAttentionPatch } from './session-activity.js';
 import { knownBotOpenIdsFromCrossRef, type BotMentionEntry } from '../utils/bot-routing.js';
 import { emitSessionLifecycleHook, emitSessionStateTransitionHook } from '../services/session-lifecycle-hooks.js';
-import { anchorUsageForDaemonSession, recordUsageForDaemonSession, reconcileUsageForDaemonSession } from '../services/usage-ledger.js';
+import { anchorUsageForDaemonSession, recordOwnershipForDaemonSession, recordUsageForDaemonSession, reconcileUsageForDaemonSession } from '../services/usage-ledger.js';
 import type { CliId } from '../adapters/cli/types.js';
 import type { DaemonToWorker, WorkerToDaemon, Session, DisplayMode } from '../types.js';
 import { sessionKey, sessionAnchorId, type DaemonSession } from './types.js';
@@ -1564,6 +1564,7 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
   // was submitted by botmux (anchoring would swallow it).
   if (resume) reconcileUsageForDaemonSession(ds);
   else anchorUsageForDaemonSession(ds);
+  recordOwnershipForDaemonSession(ds);
 }
 
 // ─── Shared worker IPC handler ──────────────────────────────────────────────
@@ -1780,6 +1781,10 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
       case 'cli_session_id': {
         ds.session.cliSessionId = msg.cliSessionId;
         sessionStore.updateSession(ds.session);
+        // Usage ledger: publish ownership the moment the CLI-native session id
+        // is known, so consumers exclude this session from native parsers
+        // before its first positive-delta record exists.
+        recordOwnershipForDaemonSession(ds);
         break;
       }
 
@@ -2503,6 +2508,7 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
   });
   // Adopted CLIs come with pre-botmux history — anchor it out of the ledger.
   anchorUsageForDaemonSession(ds);
+  recordOwnershipForDaemonSession(ds);
 }
 
 // ─── Kill stale PIDs ────────────────────────────────────────────────────────

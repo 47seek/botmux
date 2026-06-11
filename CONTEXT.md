@@ -33,6 +33,10 @@ line (recordId, ts, session/bot/chat context, caller open_id, token deltas
 plus cumulative totals). Baselines are anchored at worker spawn so resumed or
 pre-botmux transcript history is never recorded. External trackers (e.g.
 kaboo) consume this directory; botmux never uploads it anywhere itself.
+Zero-delta records with `kind: "ownership"` are written at worker spawn (and
+when the CLI-native session id is first learned) so consumers can exclude a
+session from their native parsers before its first positive delta lands; they
+are markers, not accounting events, and never re-seed baselines.
 _Avoid_: usage log, billing database
 
 ## Example Dialogue

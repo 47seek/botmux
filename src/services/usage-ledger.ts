@@ -25,6 +25,10 @@ import type { DaemonSession } from '../core/types.js';
 
 export interface UsageLedgerRecord {
   v: 1;
+  /** 'ownership' marks a zero-delta marker written at session spawn so
+   *  consumers can exclude the session from native parsers BEFORE its first
+   *  positive delta lands; absent for normal usage records. */
+  kind?: 'ownership';
   recordId: string;
   ts: string;
   /** Baseline reset epoch this delta was measured in — lets the ledger itself
@@ -92,7 +96,11 @@ const sessionBaselineMemory = new Map<string, SessionBaseline | null>();
 
 export function __resetUsageLedgerMemoryForTest(): void {
   sessionBaselineMemory.clear();
+  ownershipWritten.clear();
 }
+
+/** Ownership markers already written by this process (recordId-keyed). */
+const ownershipWritten = new Set<string>();
 
 function baselineMemoryKey(larkAppId: string | undefined, sessionId: string): string {
   return `${larkAppId ?? ''}\u0000${sessionId}`;
@@ -128,7 +136,9 @@ function baselineFromLedger(dir: string, sessionId: string): SessionBaseline | n
       if (!line.includes(sessionId)) continue;
       try {
         const rec = JSON.parse(line);
-        if (rec?.sessionId === sessionId) latest = rec;
+        // Ownership markers are not accounting events — their zero totals
+        // must never re-seed a baseline.
+        if (rec?.sessionId === sessionId && rec?.kind !== 'ownership') latest = rec;
       } catch { /* skip malformed lines */ }
     }
     if (latest) {
@@ -402,6 +412,95 @@ export function recordUsageForDaemonSession(ds: DaemonSession, opts?: DaemonSess
     return recordSessionUsage({ ...args, usage: args.usage, ...opts });
   } catch (err: any) {
     logger.error(`usage-ledger: failed to record daemon session usage: ${err?.message ?? err}`);
+    return null;
+  }
+}
+
+export interface RecordSessionOwnershipArgs {
+  sessionId: string;
+  cliSessionId?: string;
+  larkAppId?: string;
+  cliId?: string;
+  chatId?: string;
+  title?: string;
+  workingDir?: string;
+  callerOpenId?: string;
+  now?: Date;
+  ledgerDir?: string;
+}
+
+/**
+ * Append a zero-delta ownership marker tying a botmux session to its
+ * CLI-native session id. Written at spawn / as soon as the CLI session id is
+ * known — consumers (kaboo) exclude the session from their native parsers the
+ * moment this line exists, closing the "native parser uploads the transcript
+ * before the first positive delta lands" double-count window. Does NOT touch
+ * baselines; the deterministic recordId makes cross-restart repeats collapse
+ * at the consumer.
+ */
+export function recordSessionOwnership(args: RecordSessionOwnershipArgs): UsageLedgerRecord | null {
+  try {
+    if (!args.cliSessionId) return null;
+    const recordId = createHash('sha256')
+      .update(`ownership|${args.sessionId}|${args.cliSessionId}`)
+      .digest('hex')
+      .slice(0, 32);
+    if (ownershipWritten.has(recordId)) return null;
+
+    const now = args.now ?? new Date();
+    const dir = args.ledgerDir ?? defaultLedgerDir();
+    mkdirSync(dir, { recursive: true });
+
+    const record: UsageLedgerRecord = {
+      v: 1,
+      kind: 'ownership',
+      recordId,
+      ts: now.toISOString(),
+      epoch: 0,
+      ...(args.larkAppId ? { larkAppId: args.larkAppId } : {}),
+      sessionId: args.sessionId,
+      ...(args.cliId ? { cliId: args.cliId } : {}),
+      cliSessionId: args.cliSessionId,
+      ...(args.chatId ? { chatId: args.chatId } : {}),
+      ...(args.title ? { title: args.title } : {}),
+      ...(args.workingDir ? { workingDir: args.workingDir } : {}),
+      ...(args.callerOpenId ? { callerOpenId: args.callerOpenId } : {}),
+      model: '',
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheReadTokens: 0,
+      cacheCreateTokens: 0,
+      totalInputTokens: 0,
+      totalOutputTokens: 0,
+      totalCacheReadTokens: 0,
+      totalCacheCreateTokens: 0,
+    };
+    appendFileSync(ledgerFilePath(dir, now), JSON.stringify(record) + '\n');
+    ownershipWritten.add(recordId);
+    return record;
+  } catch (err: any) {
+    logger.error(`usage-ledger: failed to record session ownership: ${err?.message ?? err}`);
+    return null;
+  }
+}
+
+/** Ownership marker from a live daemon session (no transcript read needed). */
+export function recordOwnershipForDaemonSession(ds: DaemonSession, opts?: DaemonSessionLedgerOpts): UsageLedgerRecord | null {
+  try {
+    const s = ds.session;
+    return recordSessionOwnership({
+      sessionId: s.sessionId,
+      cliSessionId: s.cliSessionId,
+      larkAppId: ds.larkAppId ?? s.larkAppId,
+      cliId: s.cliId,
+      chatId: s.chatId,
+      title: s.title,
+      workingDir: ds.workingDir ?? s.workingDir,
+      callerOpenId: s.lastCallerOpenId ?? s.creatorOpenId ?? s.ownerOpenId,
+      ...opts,
+    });
+  } catch (err: any) {
+    logger.error(`usage-ledger: failed to record daemon session ownership: ${err?.message ?? err}`);
     return null;
   }
 }

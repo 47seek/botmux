@@ -27,6 +27,8 @@ import {
   recordUsageForDaemonSession,
   anchorUsageForDaemonSession,
   reconcileUsageForDaemonSession,
+  recordSessionOwnership,
+  recordOwnershipForDaemonSession,
   __resetUsageLedgerMemoryForTest,
   type UsageLedgerRecord,
 } from '../src/services/usage-ledger.js';
@@ -389,5 +391,82 @@ describe('reconcileUsageForDaemonSession (daemon restart)', () => {
       inputTokens: 100,
       outputTokens: 20,
     });
+  });
+});
+
+describe('ownership records', () => {
+  it('writes a zero-delta ownership marker with a deterministic recordId', () => {
+    const rec = recordSessionOwnership({
+      ...baseArgs(),
+      ledgerDir: dir,
+    });
+
+    expect(rec).toMatchObject({
+      v: 1,
+      kind: 'ownership',
+      sessionId: 'sess-1',
+      cliSessionId: 'cli-sess-1',
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheReadTokens: 0,
+      cacheCreateTokens: 0,
+      totalInputTokens: 0,
+      totalOutputTokens: 0,
+    });
+    expect(ledgerLines(dir)).toHaveLength(1);
+
+    // Same process: repeated markers are suppressed entirely.
+    expect(recordSessionOwnership({ ...baseArgs(), ledgerDir: dir })).toBeNull();
+    expect(ledgerLines(dir)).toHaveLength(1);
+
+    // Across a restart the line may repeat, but with the SAME recordId so the
+    // consumer's DedupKey collapses it.
+    __resetUsageLedgerMemoryForTest();
+    const again = recordSessionOwnership({ ...baseArgs({ now: new Date('2026-06-10T13:00:00Z') }), ledgerDir: dir });
+    expect(again!.recordId).toBe(rec!.recordId);
+  });
+
+  it('skips when cliSessionId is unknown', () => {
+    expect(recordSessionOwnership({ ...baseArgs({ cliSessionId: undefined }), ledgerDir: dir })).toBeNull();
+    expect(readdirSync(dir).filter((f) => f.startsWith('usage-'))).toHaveLength(0);
+  });
+
+  it('ownership markers never act as recovery baselines', () => {
+    // usage record 100/10, then an ownership marker (totals 0) lands AFTER it.
+    recordSessionUsage({ ...baseArgs(), ledgerDir: dir, usage: cumulative(100, 10) });
+    recordSessionOwnership({ ...baseArgs({ now: new Date('2026-06-10T12:30:00Z') }), ledgerDir: dir });
+
+    // State and memory lost: recovery must use the USAGE record (100/10) as
+    // baseline, not the newer zero-total ownership marker — otherwise the
+    // next snapshot would re-bill the whole 150.
+    const statePath = readdirSync(dir).find((f) => f.startsWith('state'));
+    writeFileSync(join(dir, statePath!), JSON.stringify({ v: 1, sessions: {} }));
+    __resetUsageLedgerMemoryForTest();
+
+    const rec = recordSessionUsage({
+      ...baseArgs({ now: new Date('2026-06-10T13:00:00Z') }),
+      ledgerDir: dir,
+      usage: cumulative(150, 15),
+    });
+    expect(rec).toMatchObject({ inputTokens: 50, outputTokens: 5 });
+  });
+
+  it('recordOwnershipForDaemonSession does not require a readable transcript', () => {
+    vi.mocked(getSessionTokenUsage).mockReturnValue(null);
+    const ds = {
+      larkAppId: 'cli_app',
+      workingDir: '/live-repo',
+      session: {
+        sessionId: 'sess-own',
+        cliId: 'claude-code',
+        cliSessionId: 'cli-sess-own',
+        chatId: 'oc_chat',
+        title: '新会话',
+        lastCallerOpenId: 'ou_last',
+      },
+    } as any;
+
+    const rec = recordOwnershipForDaemonSession(ds, { ledgerDir: dir });
+    expect(rec).toMatchObject({ kind: 'ownership', cliSessionId: 'cli-sess-own' });
   });
 });
