@@ -326,6 +326,9 @@ export function renderSessionsPage(root: HTMLElement) {
   let kanbanDragClusterCol: SessionKanbanColumn | null = null;
   // 团队清单（groupBy='team' 首次激活时懒加载：本地托管团队 + 远程 roster）
   let kanbanTeams: Array<{ key: string; label: string; botIds: Set<string> }> = [];
+  // 群 → 在场 bot 集合（来自 /api/groups 矩阵）。「团队群」= 含该团队任一 bot
+  // 的群（飞书手动拉的 / dashboard 建的都覆盖）；团队看板按它过滤会话。
+  let kanbanChatBots: Map<string, Set<string>> | null = null;
   let kanbanTeamsLoaded = false;
   let kanbanTeamsLoading = false;
   let kanbanTeamKey: string = (() => {
@@ -336,10 +339,17 @@ export function renderSessionsPage(root: HTMLElement) {
     if (kanbanTeamsLoading || kanbanTeamsLoaded) return;
     kanbanTeamsLoading = true;
     try {
-      const [hosted, remote] = await Promise.all([
+      const [hosted, remote, groups] = await Promise.all([
         fetch('/api/team/hosted').then(r => r.json()).catch(() => null),
         fetch('/api/team/remote-roster').then(r => r.json()).catch(() => null),
+        fetch('/api/groups').then(r => r.json()).catch(() => null),
       ]);
+      if (Array.isArray(groups?.chats)) {
+        kanbanChatBots = new Map(groups.chats.map((c: any) => [
+          String(c.chatId),
+          new Set<string>((c.memberBots ?? []).filter((mb: any) => mb.inChat).map((mb: any) => String(mb.larkAppId))),
+        ]));
+      }
       const teams: typeof kanbanTeams = [];
       for (const tm of hosted?.teams ?? []) {
         teams.push({
@@ -665,7 +675,18 @@ export function renderSessionsPage(root: HTMLElement) {
         void loadKanbanTeams();
       } else {
         const team = kanbanTeams.find(tm => tm.key === kanbanTeamKey) ?? kanbanTeams[0];
-        const teamRows = team ? rows.filter(r => team.botIds.has(String(r.larkAppId))) : [];
+        // 「团队群」过滤：会话所在群含该团队任一 bot 即保留——同群里其他 bot
+        // 的会话也展示（这正是协作视角要看的）。群矩阵缺失时退回按会话归属 bot。
+        const teamRows = team
+          ? rows.filter(r => {
+              const inChat = kanbanChatBots?.get(String(r.chatId));
+              if (inChat) {
+                for (const id of team.botIds) if (inChat.has(id)) return true;
+                return false;
+              }
+              return team.botIds.has(String(r.larkAppId));
+            })
+          : [];
         html = kanbanFlowHtml(teamRows);
       }
     } else {
@@ -788,7 +809,12 @@ export function renderSessionsPage(root: HTMLElement) {
       if (!historyModal.open) return;
       const bodyEl = historyModal.querySelector<HTMLElement>('.history-body')!;
       if (!r.ok || body?.ok === false) {
-        bodyEl.innerHTML = `<div class="history-error">${escapeHtml(t('sessions.history.fail'))}: ${escapeHtml(String(body?.error ?? r.status))}</div>`;
+        const errCode = String(body?.error ?? r.status);
+        // not_found_yet = dashboard 进程没有该路由；not_found = daemon 没有 ——
+        // 都是进程仍跑旧 build 的特征，明示重启而不是让人猜。
+        const stale = errCode === 'not_found_yet' || errCode === 'not_found';
+        bodyEl.innerHTML = `<div class="history-error">${escapeHtml(t('sessions.history.fail'))}: ${escapeHtml(errCode)}${
+          stale ? `<br><span>${escapeHtml(t('sessions.history.staleHint'))}</span>` : ''}</div>`;
         return;
       }
       const messages: any[] = Array.isArray(body.messages) ? body.messages : [];

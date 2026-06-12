@@ -1286,8 +1286,36 @@ button.primary {
   display: none !important;
 }
 
+/* 团队下拉做成与右侧 .segmented 同款胶囊：同高、同边框、圆角 999，
+   去掉原生箭头换内嵌 chevron */
 .kanban-team-select {
+  appearance: none;
+  -webkit-appearance: none;
   max-width: 200px;
+  min-height: 38px;
+  padding: 0 30px 0 14px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background-color: var(--surface);
+  color: var(--fg);
+  font: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1;
+  cursor: pointer;
+  background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'%3E%3Cpath d='M2.6 4.4 6 7.8l3.4-3.4' fill='none' stroke='%238b98aa' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 12px center;
+  background-size: 12px;
+}
+
+.kanban-team-select:hover {
+  background-color: var(--surface-muted);
+}
+
+.kanban-team-select:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
 }
 
 /* 机器人视角：bot 多时列不再无限压缩——固定列宽 + 容器横向滚动 */
