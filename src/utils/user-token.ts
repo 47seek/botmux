@@ -203,6 +203,13 @@ const DEFAULT_SCOPES = [
   'im:message:readonly',
   'im:resource',
   'offline_access',
+  // 飞书文档订阅入口（/subscribe-lark-doc）：订阅文档事件 + 读写评论 + 读文档/wiki
+  // 正文做上下文。评论事件官方推荐用户身份订阅，故这些 scope 进 User Token。
+  'docs:document.comment:read',
+  'docs:document.comment',
+  'docx:document:readonly',
+  'drive:drive:readonly',
+  'wiki:wiki:readonly',
 ].join(' ');
 
 /**

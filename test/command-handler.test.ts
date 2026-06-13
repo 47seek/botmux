@@ -497,8 +497,9 @@ describe('DAEMON_COMMANDS set', () => {
   });
 
   it('should have the correct size', () => {
-    // 23 = 21 original + /land (sandbox-landing) + /term (operable-terminal slash).
-    expect(DAEMON_COMMANDS.size).toBe(23);
+    // 24 = 21 original + /land (sandbox-landing) + /term (operable-terminal slash)
+    //      + /subscribe-lark-doc (Feishu doc comment entry).
+    expect(DAEMON_COMMANDS.size).toBe(24);
   });
 
   it('contains the /list-slash-command lister and its /slash alias', () => {

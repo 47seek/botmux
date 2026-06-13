@@ -265,6 +265,13 @@ export interface BotConfig {
    */
   regularGroupMentionMode?: 'always' | 'topic' | 'never';
   /**
+   * 飞书文档订阅入口（/subscribe-lark-doc）新订阅的默认评论触发范围：
+   *   • 'mention-only'（或 undefined）— 仅评论里 @bot 才触发（默认，防噪声）
+   *   • 'all'                        — 该文档所有新评论都触发
+   * 单条订阅的触发范围之后可在 dashboard 逐文档改（doc-subscriptions 表）。
+   */
+  docSubscribeDefaultMode?: 'mention-only' | 'all';
+  /**
    * Per-bot voice-engine override for the voice-summary feature. Merged OVER
    * the global `voice` block in ~/.botmux/config.json (per-bot wins field by
    * field). When this bot has usable voice creds (here or globally), its reply
@@ -743,6 +750,9 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       regularGroupMentionMode: entry.regularGroupMentionMode === 'topic' || entry.regularGroupMentionMode === 'never'
         ? entry.regularGroupMentionMode
         : undefined,
+      // 文档订阅默认触发范围。只 'all' 有意义；'mention-only'（默认）归一化为
+      // undefined 让 bots.json 保持干净。
+      docSubscribeDefaultMode: entry.docSubscribeDefaultMode === 'all' ? 'all' : undefined,
       voice,
     });
   }

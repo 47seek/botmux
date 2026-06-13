@@ -1524,6 +1524,8 @@ interface SessionData {
   /** Chat-scope quote chain — see Session.quoteTargetId in types.ts. */
   quoteTargetId?: string;
   currentReplyTarget?: { rootMessageId: string; turnId: string; updatedAt: string };
+  /** 文档评论入口当前轮回评论落点（见 Session.currentDocCommentTarget in types.ts）。 */
+  currentDocCommentTarget?: { fileToken: string; fileType: string; commentId: string; replyToName?: string; turnId: string };
   quoteTargetSenderOpenId?: string;
   quoteTargetSenderIsBot?: boolean;
   pendingResponseCardId?: string;
@@ -3316,6 +3318,51 @@ async function cmdSend(rest: string[]): Promise<void> {
       process.exit(1);
     }
     if (dir) { try { rmSync(dir, { recursive: true, force: true }); } catch { /* */ } }
+    return;
+  }
+
+  // ── 文档评论入口分流（/subscribe-lark-doc）──────────────────────────────────
+  // 本轮若由飞书文档评论触发（daemon 已把落点写进 session.currentDocCommentTarget），
+  // 把用户可见回复发表为飞书文档评论，而非发回飞书会话。绕过 @ 硬门（评论不 @ 飞书
+  // 用户）。显式改路由（--top-level / --chat-id / --into）时不分流，让模型仍能主动
+  // 发回飞书。turnId 对得上才分流（防串到下一轮普通飞书消息）。
+  const docTarget = s.currentDocCommentTarget;
+  if (docTarget && !sendTopLevel && !overrideChatId && !sendInto
+      && (!currentTurnId || currentTurnId === docTarget.turnId)) {
+    const { registerBot, loadBotConfigs } = await import('./bot-registry.js');
+    try { for (const cfg of loadBotConfigs()) registerBot(cfg); } catch { /* */ }
+    const { replyToDocComment, chunkCommentText } = await import('./im/lark/doc-comment.js');
+    const appId = s.larkAppId!;
+    const loc = localeForBot(appId);
+    try {
+      // 嵌套回复到用户那条评论 thread（已挂其下，无需 ↪ 前缀）。
+      const chunks = chunkCommentText(content);
+      for (const chunk of chunks) {
+        await replyToDocComment(appId, { fileToken: docTarget.fileToken, fileType: docTarget.fileType }, docTarget.commentId, chunk);
+      }
+      // 写 bridge send marker → 抑制 worker 的 final_output 兜底（否则会再补一条评论）。
+      try {
+        const markerDir = join(resolveDataDir(), 'turn-sends');
+        if (!existsSync(markerDir)) mkdirSync(markerDir, { recursive: true });
+        appendFileSync(join(markerDir, `${sid}.jsonl`), JSON.stringify({ sentAtMs: Date.now(), messageId: `doc:${docTarget.commentId}`, contentLength: content.length }) + '\n');
+      } catch { /* best-effort：漏记只多一条兜底 */ }
+      // 收尾飞书侧占位卡（streaming-disabled 会话）避免停在「处理中」。
+      try {
+        const pendingCardId = claimPendingResponseCard(s);
+        const latest = pendingCardId ? loadSessionFresh(s) : undefined;
+        if (pendingCardId && latest?.pendingResponseCardId === pendingCardId) {
+          const { updateMessage } = await import('./im/lark/client.js');
+          const { buildMarkdownCard } = await import('./im/lark/md-card.js');
+          await updateMessage(appId, pendingCardId, buildMarkdownCard(t('daemon.doc_comment_replied_card', undefined, loc), undefined, resolveBrandLabel(appId), loc));
+          if (markPendingResponseCardPatchedIfCurrent(latest, pendingCardId)) saveSession(latest);
+        }
+      } catch { /* best-effort */ }
+      console.error(`✓ 已回复文档评论 ${docTarget.commentId.slice(0, 12)}（${chunks.length} 条）`);
+      console.log(JSON.stringify({ success: true, commentId: docTarget.commentId, sessionId: sid, kind: 'doc-comment', chunks: chunks.length }));
+    } catch (e: any) {
+      console.error(`文档评论发送失败：${e?.message ?? e}`);
+      process.exit(1);
+    }
     return;
   }
 

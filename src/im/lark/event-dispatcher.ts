@@ -17,6 +17,8 @@ import { parseForceTopicInvocation } from '../../core/command-handler.js';
 import { shouldAutoStartOnNewTopic } from '../../core/auto-start.js';
 import { stripLeadingMentions } from './message-parser.js';
 import { recordObservedBots } from '../../services/observed-bots-store.js';
+import { getDocSubscription, type DocSubscription } from '../../services/doc-subs-store.js';
+import { getDocComment, isBotAuthoredReply, hasBotSentinel } from './doc-comment.js';
 import { BOTMUX_REQUIRED_SCOPES, buildScopeDeepLink } from '../../setup/verify-permissions.js';
 import { type Brand, larkHosts, normalizeBrand, sdkDomain } from './lark-hosts.js';
 import { tryHandleGrantCommand } from './grant-command.js';
@@ -935,6 +937,24 @@ export interface EventHandlers {
    *  — which in a 话题群 wraps each top-level message in a fresh topic.
    *  Best-effort fire-and-forget; the dispatcher proceeds either way. */
   onChatModeConverted?: (chatId: string, larkAppId: string) => void;
+  /** 文档评论入口（/subscribe-lark-doc）：一条命中订阅的文档评论被喂进其绑定
+   *  会话。daemon 负责定位会话、投递给 worker、记录该轮回评论的落点。 */
+  handleDocComment?: (ctx: DocCommentContext) => Promise<void>;
+}
+
+/** 一条已通过订阅 + 触发范围 + 自触发过滤的文档评论，交给 daemon 投递。 */
+export interface DocCommentContext {
+  larkAppId: string;
+  /** 命中的文档订阅（含 sessionAnchor / scope / chatId）。 */
+  sub: DocSubscription;
+  /** 触发评论的 comment_id。 */
+  commentId: string;
+  /** 触发的具体回复 id（作 turnId，回评论落点也按它走）；缺省退回 commentId。 */
+  replyId?: string;
+  /** 评论纯文本（喂给模型的用户消息）。 */
+  text: string;
+  /** 评论发表者 open_id。 */
+  authorOpenId?: string;
 }
 
 /**
@@ -1168,6 +1188,85 @@ export async function decideRouting(
   return { scope, anchor };
 }
 
+/** 从评论事件 payload 里尽量挖出 { fileToken, fileType, commentId, replyId,
+ *  noticeType, operatorOpenId }。飞书评论事件的字段路径在不同版本/命名下不完全
+ *  一致，故多路径兜底，并 debug 打出原始 shape 方便真机定位。 */
+function parseCommentEvent(data: any): {
+  fileToken?: string; fileType?: string; commentId?: string; replyId?: string;
+  noticeType?: string; operatorOpenId?: string;
+} {
+  const d = data ?? {};
+  return {
+    fileToken: d.file_token ?? d.token ?? d.event?.file_token,
+    fileType: d.file_type ?? d.event?.file_type,
+    commentId: d.comment_id ?? d.event?.comment_id,
+    replyId: d.reply_id ?? d.event?.reply_id,
+    noticeType: d.notice_type ?? d.subscriber_type ?? d.event?.notice_type,
+    operatorOpenId: d.operator_id?.open_id ?? d.user_id?.open_id ?? d.event?.operator_id?.open_id,
+  };
+}
+
+/** 评论事件入口：去重 ACK-safe 包装 + 订阅匹配 + 自触发/触发范围过滤后转 daemon。 */
+function handleCommentEventAckSafe(data: any, larkAppId: string, handlers: EventHandlers): void {
+  const parsed = parseCommentEvent(data);
+  const eventKey = `drive.comment_add:${larkAppId}:${eventIdForKey(data) ?? `${parsed.fileToken ?? '?'}:${parsed.replyId ?? parsed.commentId ?? '?'}`}`;
+  scheduleAckSafeEvent(eventKey, async () => {
+    try {
+      await processCommentEvent(parsed, larkAppId, handlers);
+    } catch (err) {
+      logger.error(`Error handling doc-comment event: ${err}`);
+    }
+  }, 'doc-comment event');
+}
+
+async function processCommentEvent(
+  parsed: ReturnType<typeof parseCommentEvent>,
+  larkAppId: string,
+  handlers: EventHandlers,
+): Promise<void> {
+  if (!handlers.handleDocComment) return;
+  const { fileToken, commentId } = parsed;
+  if (!fileToken || !commentId) {
+    logger.debug(`[doc-comment] event missing fileToken/commentId; raw keys=${Object.keys(parsed).filter(k => (parsed as any)[k] !== undefined).join(',')}`);
+    return;
+  }
+
+  // 1) 必须是已订阅的文档（per-文档订阅 → 主键命中才处理）
+  const sub = getDocSubscription(config.session.dataDir, larkAppId, fileToken);
+  if (!sub) return;
+
+  // 2) 拉评论 thread 取权威正文 / 作者 / @ 列表（事件 payload 不保证带全），
+  //    同时用最新一条回复作为"触发回复"。
+  const comment = await getDocComment(larkAppId, { fileToken, fileType: sub.fileType }, commentId);
+  if (!comment || comment.replies.length === 0) return;
+  const trigger = parsed.replyId
+    ? comment.replies.find(r => r.replyId === parsed.replyId) ?? comment.replies[comment.replies.length - 1]
+    : comment.replies[comment.replies.length - 1];
+
+  // 3) 自触发过滤：bot 用 user token 发的评论作者=授权用户本人，无法靠作者区分。
+  //    用 reply_id 集合 + 文本隐形哨兵双保险跳过自己的评论，防死循环。
+  if (isBotAuthoredReply(trigger.replyId) || hasBotSentinel(trigger.text)) return;
+
+  // 4) 触发范围：mention-only 要求评论 @ 到本 bot
+  const botOpenId = getBot(larkAppId).botOpenId;
+  if (sub.commentTriggerMode === 'mention-only') {
+    if (!botOpenId || !trigger.mentions.includes(botOpenId)) return;
+  }
+
+  const text = trigger.text.trim();
+  if (!text) return;
+
+  logger.info(`[doc-comment] dispatch file=${fileToken.slice(0, 12)} comment=${commentId.slice(0, 12)} mode=${sub.commentTriggerMode} → session anchor=${sub.sessionAnchor.slice(0, 12)}`);
+  await handlers.handleDocComment({
+    larkAppId,
+    sub,
+    commentId,
+    replyId: trigger.replyId || commentId,
+    text,
+    authorOpenId: trigger.userId,
+  });
+}
+
 /**
  * Create and start the Lark WSClient with event dispatching.
  * Returns the WSClient instance for lifecycle management.
@@ -1193,6 +1292,11 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
       }
       }, 'bot-added event');
     },
+    // 文档评论入口（/subscribe-lark-doc）。飞书评论事件命名在 v1/v2 间有差异，
+    // 两个候选名都注册（同一处理器）——真机一锤定音后可删冗余。需在开发者后台
+    // 订阅对应事件。注意：评论事件是 per-文档 推送（订阅时按 file_token 注册）。
+    'drive.file.comment_add_v1': (data: any) => handleCommentEventAckSafe(data, larkAppId, handlers),
+    'drive.notice.comment_add_v1': (data: any) => handleCommentEventAckSafe(data, larkAppId, handlers),
     'card.action.trigger': (data: any) => handleCardActionAckSafe(data, larkAppId, handlers),
     'im.message.receive_v1': (data: any) => {
       const messageIdForKey = data?.message?.message_id;
