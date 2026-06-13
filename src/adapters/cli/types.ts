@@ -150,6 +150,12 @@ export interface CliAdapter {
     readonly configPath: string;
     /** 写入格式：决定 installer 如何合并进既有配置。 */
     readonly format: 'claude-settings' | 'opencode-plugin';
+    /** 可选（仅 claude-settings）：同时把 SessionStart「真就绪」hook 命令写进**全局**
+     *  settings.json。进程级 --settings 也带一份（见 buildArgs），二者幂等（worker 的
+     *  session_ready 处理对重复触发 no-op）。装全局是为了 wrapperCli=`aiden x claude`
+     *  这类会剥掉 --settings 的启动器——它们拿不到进程级 hook，只能靠全局这条拿就绪信号，
+     *  否则首条 prompt 会空等 45s 超时。命令缺 BOTMUX_* env 时静默 exit 0，不扰独立 claude。 */
+    readonly sessionStartCommand?: string;
   };
 
   /** true = 该 CLI 通过 hook 接管 askUserQuestion（不再装 botmux-ask skill 兜底）。
