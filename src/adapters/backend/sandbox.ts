@@ -183,12 +183,14 @@ export function buildSandboxArgs(plan: SandboxPlan): string[] {
  *
  * The caller feeds in EVERY path that will be exec'd inside the sandbox, not just
  * the direct bwrap target: the cliBin, the daemon's own node (process.execPath),
- * AND the raw cliArgs — the last covers SECOND-STAGE binaries a runner spawns
- * later, e.g. the codex-app adapter's `--codex-bin /run/.../codex` (its
- * resolvedBin is the daemon node running the runner, so without this the real
- * codex path would still be masked). Non-path argv tokens (`--session-id`, ids,
- * `app-server`, …) have a dirname of `.` and are silently ignored, so passing the
- * whole cliArgs through is safe.
+ * AND each adapter-declared SECOND-STAGE executable (CliAdapter.sandboxExtraExecPaths)
+ * — e.g. the codex-app adapter's resolved `codex` (its resolvedBin is the daemon
+ * node running the runner, which spawns the real codex later for the app-server,
+ * so without this the codex path would still be masked). We deliberately do NOT
+ * scan raw cliArgs: a path arg like `--cwd /run/user/<uid>/proj` would re-bind its
+ * PARENT `/run/user/<uid>`, shadowing the project overlay mounted there and
+ * exposing sibling files / IPC sockets — re-exposing must be limited to declared
+ * executables.
  *
  * Pure: returns the `--ro-bind-try <dir> <dir>` args (deduped, `/run/`-subpaths
  * only — NEVER `/run` itself, which would clobber the tmpfs and the relay shim
@@ -282,6 +284,10 @@ export function prepareSandbox(opts: {
   /** This CLI's auth/login paths (CliAdapter.authPaths) to keep real+writable so
    *  token refresh / login persists. `~` expanded; missing paths skipped. */
   authPaths?: readonly string[];
+  /** Adapter-declared SECOND-STAGE executables (CliAdapter.sandboxExtraExecPaths)
+   *  spawned inside the sandbox beyond cliBin — re-exposed if under /run. ONLY
+   *  executable paths (never cwd/path args). undefined → none. */
+  extraExecPaths?: readonly string[];
 }): SandboxSpawn | null {
   if (!opts.enabled) return null;
   if (process.platform !== 'linux') return null; // overlayfs + bwrap are Linux-only
@@ -390,14 +396,13 @@ export function prepareSandbox(opts: {
   args.push('--ro-bind-try', pluginDir, pluginDir);
   // Re-expose any bin dir living under /run (fnm/nvm/volta symlink farms) that the
   // `--tmpfs /run` above just masked — else the resolved cliBin / the node its
-  // shebang needs / a second-stage binary the runner spawns vanish in-sandbox and
-  // the CLI crash-loops on spawn. We feed in every in-sandbox executable path:
+  // shebang needs / an adapter's declared second-stage binary vanish in-sandbox
+  // and the CLI crash-loops on spawn. ONLY executable paths (never cwd/path args):
   //  - opts.cliBin: the direct bwrap target
   //  - process.execPath: the daemon's own node (under /run too when fnm-managed)
-  //  - opts.cliArgs: covers second-stage binaries, e.g. codex-app's --codex-bin
-  //    (resolvedBin there is the daemon node, so cliBin alone misses the real
-  //    codex path). Non-path tokens are ignored by reexposeRunBinArgs.
-  args.push(...reexposeRunBinArgs([opts.cliBin, process.execPath, ...opts.cliArgs]));
+  //  - opts.extraExecPaths: adapter-declared second-stage execs, e.g. codex-app's
+  //    real codex (its resolvedBin is the daemon node, so cliBin alone misses it).
+  args.push(...reexposeRunBinArgs([opts.cliBin, process.execPath, ...(opts.extraExecPaths ?? [])]));
 
   // Authoritative child env via bwrap --setenv (works on pty AND tmux — the tmux
   // backend only forwards a fixed whitelist, which excludes HOME/PATH/relay).
