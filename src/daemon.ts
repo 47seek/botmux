@@ -1454,9 +1454,13 @@ function getActiveCount(): number {
  * sees no visible response.
  */
 function beginNewTurn(ds: DaemonSession, title: string): void {
-  // 每开新轮先清掉上一轮可能残留的「回评论落点」——只有 handleDocComment 在本调用
-  // 之后才会重新设值，所以普通飞书轮天然回到飞书，不会误投到文档评论。
-  ds.session.currentDocCommentTarget = undefined;
+  // 每开新轮先清掉上一轮可能残留的「回评论落点」并**落盘**——botmux send 子进程只
+  // 从磁盘读会话态判断"本轮是否文档评论轮"，所以磁盘必须权威：飞书轮清掉，文档轮
+  // 由随后的 handleDocComment 重新设值+落盘。只在确有残留时写盘，避免普通轮多余写。
+  if (ds.session.currentDocCommentTarget) {
+    ds.session.currentDocCommentTarget = undefined;
+    try { sessionStore.updateSession(ds.session); } catch { /* best-effort */ }
+  }
   // `/card` summon is one-shot: it forces a live card only for the turn it ran
   // in. A new turn returns to the config default (noCardChats / disableStreamingCard).
   // Use `/card on` to persistently restore cards for the chat.
@@ -3264,6 +3268,9 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     // any restored streaming-card reference; worker_ready will POST a fresh
     // card instead of PATCHing the previous turn's card in place.
     logger.info(`[${tag(ds)}] Worker not running, re-forking...`);
+    // 这是飞书消息轮（非文档评论轮）：清掉可能残留的回评论落点，避免本轮 botmux
+    // send 误投到上一次文档评论（本路径不走 beginNewTurn，故显式清盘）。
+    ds.session.currentDocCommentTarget = undefined;
     if (ds.usageLimitRetryTimer) {
       clearTimeout(ds.usageLimitRetryTimer);
       ds.usageLimitRetryTimer = undefined;

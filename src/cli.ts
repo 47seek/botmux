@@ -3325,10 +3325,11 @@ async function cmdSend(rest: string[]): Promise<void> {
   // 本轮若由飞书文档评论触发（daemon 已把落点写进 session.currentDocCommentTarget），
   // 把用户可见回复发表为飞书文档评论，而非发回飞书会话。绕过 @ 硬门（评论不 @ 飞书
   // 用户）。显式改路由（--top-level / --chat-id / --into）时不分流，让模型仍能主动
-  // 发回飞书。turnId 对得上才分流（防串到下一轮普通飞书消息）。
+  // 「磁盘上有 currentDocCommentTarget」即权威信号=本轮是文档评论轮（beginNewTurn
+  // 在飞书轮已清盘）。故只看 docTarget 存在 + 无显式改路由，不再卡 turnId 相等
+  // （之前 currentTurnId 取自 cliPidMarker，文档轮里取值不稳导致误判落到 @ 硬门）。
   const docTarget = s.currentDocCommentTarget;
-  if (docTarget && !sendTopLevel && !overrideChatId && !sendInto
-      && (!currentTurnId || currentTurnId === docTarget.turnId)) {
+  if (docTarget && !sendTopLevel && !overrideChatId && !sendInto) {
     const { registerBot, loadBotConfigs } = await import('./bot-registry.js');
     try { for (const cfg of loadBotConfigs()) registerBot(cfg); } catch { /* */ }
     const { replyToDocComment, chunkCommentText } = await import('./im/lark/doc-comment.js');
