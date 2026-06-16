@@ -12,7 +12,9 @@ import {
   decorateResumeForWrapper,
   isTtadkWrapper,
   ttadkAcceptsModel,
+  ttadkConfigModelChoices,
   TTADK_DEFAULT_MODEL,
+  TTADK_MODEL_SUGGESTIONS,
 } from '../src/setup/cli-selection.js';
 
 describe('CLI_SELECT_OPTIONS / CLI_SELECT_TREE', () => {
@@ -258,6 +260,24 @@ describe('isTtadkWrapper / ttadkAcceptsModel', () => {
   });
 });
 
+describe('ttadkConfigModelChoices', () => {
+  it('returns the ttadk model suggestions for a managed-model ttadk bot', () => {
+    expect(ttadkConfigModelChoices('ttadk claude')).toEqual([...TTADK_MODEL_SUGGESTIONS]);
+    expect(ttadkConfigModelChoices('ttadk cursor-cli')).toEqual([...TTADK_MODEL_SUGGESTIONS]);
+  });
+
+  it('returns an empty list for ttadk CoCo (no model dropdown)', () => {
+    expect(ttadkConfigModelChoices('ttadk coco')).toEqual([]);
+  });
+
+  it('returns null for non-ttadk bots so callers fall back to the adapter choices', () => {
+    expect(ttadkConfigModelChoices('cjadk claude')).toBeNull();
+    expect(ttadkConfigModelChoices('aiden x claude')).toBeNull();
+    expect(ttadkConfigModelChoices(undefined)).toBeNull();
+    expect(ttadkConfigModelChoices('')).toBeNull();
+  });
+});
+
 describe('decorateResumeForWrapper', () => {
   it('rewrites the leading bin to the wrapper prefix', () => {
     expect(decorateResumeForWrapper('claude --resume ID', 'aiden x claude')).toBe('aiden x claude --resume ID');
@@ -267,5 +287,20 @@ describe('decorateResumeForWrapper', () => {
   it('returns the command unchanged when no wrapper is set', () => {
     expect(decorateResumeForWrapper('claude --resume ID', undefined)).toBe('claude --resume ID');
     expect(decorateResumeForWrapper('claude --resume ID', '   ')).toBe('claude --resume ID');
+  });
+
+  it('keeps ttadk non-interactive flags (-m / --skip-check) in the resume command', () => {
+    expect(decorateResumeForWrapper('claude --resume ID', 'ttadk claude', { ttadkModel: 'glm-5.1' }))
+      .toBe('ttadk claude -m glm-5.1 --skip-check --resume ID');
+  });
+
+  it('uses the default ttadk model in the resume command when none is set', () => {
+    expect(decorateResumeForWrapper('codex resume ID', 'ttadk codex'))
+      .toBe(`ttadk codex -m ${TTADK_DEFAULT_MODEL} --skip-check resume ID`);
+  });
+
+  it('omits -m for ttadk CoCo resume (still adds --skip-check)', () => {
+    expect(decorateResumeForWrapper('coco --resume ID', 'ttadk coco', { ttadkModel: 'glm-5.1' }))
+      .toBe('ttadk coco --skip-check --resume ID');
   });
 });

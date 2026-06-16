@@ -224,10 +224,27 @@ export interface WrappedLaunchOptions {
 }
 
 /**
- * ttadk 前缀构造：`ttadk <子命令> [-m <model>] --skip-check <CLI 参数…>`。
+ * ttadk 前缀参数（不含 bin `ttadk` 本身）：`<子命令> [-m <model>] --skip-check`。
  *   - `-m <model>`：跳过 ttadk 交互式选模型菜单（CoCo 等 requiresManagedModel=false 的子命令不注入）
  *   - `--skip-check`：跳过 ttadk preflight，避免交互/卡顿
- *   - CLI 参数 bare 透传（ttadk code 命令 allowUnknownOption + enablePositionalOptions），无需 `--`
+ * 单一事实源：spawn（{@link buildTtadkLaunch}）与 session-closed 卡片的手动 resume
+ * 命令（{@link decorateResumeForWrapper}）都用它，保证两处的 ttadk 启动形态一致。
+ */
+function ttadkPrefixArgs(tokens: ReadonlyArray<string>, ttadkModel: string | undefined): string[] {
+  // tokens = ['ttadk', '<子命令>', ...(罕见的额外前缀 token)]
+  const sub = tokens[1];
+  const out: string[] = [];
+  if (sub) out.push(sub);
+  if (sub && !TTADK_NO_MODEL_SUBCOMMANDS.has(sub)) {
+    out.push('-m', (ttadkModel ?? '').trim() || TTADK_DEFAULT_MODEL);
+  }
+  out.push('--skip-check');
+  return [...out, ...tokens.slice(2)];
+}
+
+/**
+ * ttadk 启动构造：`ttadk <子命令> [-m <model>] --skip-check <CLI 参数…>`。
+ * CLI 参数 bare 透传（ttadk code 命令 allowUnknownOption + enablePositionalOptions），无需 `--`。
  * 模型由调用方从 bot.model 传入（见 worker.ts），故不写死在 wrapperCli 里、可在 dashboard 动态改。
  */
 function buildTtadkLaunch(
@@ -236,16 +253,17 @@ function buildTtadkLaunch(
   binResolver: (bin: string) => string,
   ttadkModel: string | undefined,
 ): { bin: string; args: string[] } {
-  // tokens = ['ttadk', '<子命令>', ...(罕见的额外前缀 token)]
-  const sub = tokens[1];
-  const prefix: string[] = [];
-  if (sub) prefix.push(sub);
-  if (sub && !TTADK_NO_MODEL_SUBCOMMANDS.has(sub)) {
-    const model = (ttadkModel ?? '').trim() || TTADK_DEFAULT_MODEL;
-    prefix.push('-m', model);
-  }
-  prefix.push('--skip-check');
-  return { bin: binResolver('ttadk'), args: [...prefix, ...tokens.slice(2), ...cliArgs] };
+  return { bin: binResolver('ttadk'), args: [...ttadkPrefixArgs(tokens, ttadkModel), ...cliArgs] };
+}
+
+/**
+ * /botconfig 等配置卡的 ttadk 模型候选：ttadk 网关 bot 返回 ttadk 模型候选
+ * （{@link TTADK_MODEL_SUGGESTIONS}；CoCo 等不接受 -m 的返回 `[]` = 不渲染模型下拉）；
+ * 非 ttadk 返回 `null`，调用方据此回落底层适配器自己的 modelChoices。
+ */
+export function ttadkConfigModelChoices(wrapperCli: string | undefined): string[] | null {
+  if (!isTtadkWrapper(wrapperCli)) return null;
+  return ttadkAcceptsModel(wrapperCli) ? [...TTADK_MODEL_SUGGESTIONS] : [];
 }
 
 /**
@@ -272,9 +290,21 @@ export function buildWrappedLaunch(
  * 把适配器给出的「裸 CLI 恢复命令」改写成 wrapperCli 形态，供 session-closed 卡片里
  * 展示给用户手动 resume。例：`claude --resume <id>` + 前缀 `aiden x claude` →
  * `aiden x claude --resume <id>`。wrapperCli 未设时原样返回。
+ *
+ * ttadk 特例：必须带上 `-m <model> --skip-check`（与 {@link buildTtadkLaunch} 同），
+ * 否则用户复制粘贴这条 resume 命令会卡在 ttadk 的交互式选模型菜单。模型从
+ * `opts.ttadkModel`（= bot.model）取，空则用默认值（CoCo 不带 -m）。
  */
-export function decorateResumeForWrapper(cmd: string, wrapperCli: string | undefined): string {
+export function decorateResumeForWrapper(
+  cmd: string,
+  wrapperCli: string | undefined,
+  opts: { ttadkModel?: string } = {},
+): string {
   if (!wrapperCli || !wrapperCli.trim()) return cmd;
   const rest = cmd.replace(/^\S+\s*/, ''); // 去掉首个 token（底层 bin 名）
+  if (isTtadkWrapper(wrapperCli)) {
+    const prefix = ['ttadk', ...ttadkPrefixArgs(parseWrapperCli(wrapperCli), opts.ttadkModel)].join(' ');
+    return `${prefix} ${rest}`.trimEnd();
+  }
   return `${wrapperCli.trim()} ${rest}`.trimEnd();
 }
