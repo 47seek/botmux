@@ -493,8 +493,8 @@ describe('supportsTypeAhead flag', () => {
     expect(createCodexAdapter('/bin/codex').supportsTypeAhead).toBe(true);
   });
 
-  it('pi: true (parks submit-while-busy in its TUI queue, avoiding missed idle detection)', () => {
-    expect(createPiAdapter('/bin/pi').supportsTypeAhead).toBe(true);
+  it('pi: undefined (uses busy marker probes instead of type-ahead)', () => {
+    expect(createPiAdapter('/bin/pi').supportsTypeAhead).toBeUndefined();
   });
 
   it('pi: exposes Working... as the explicit busy marker', () => {
@@ -503,8 +503,8 @@ describe('supportsTypeAhead flag', () => {
     expect(adapter.busyPattern?.test('已完成，等待下一条输入')).toBe(false);
   });
 
-  it('pi: opts into queued-input merging', () => {
-    expect(createPiAdapter('/bin/pi').mergeQueuedInput).toBe(true);
+  it('pi: does not squash queued botmux turns', () => {
+    expect(createPiAdapter('/bin/pi').mergeQueuedInput).toBeUndefined();
   });
 
   it('non-pi type-ahead adapters do not squash queued botmux turns', () => {
