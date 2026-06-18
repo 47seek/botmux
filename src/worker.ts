@@ -39,6 +39,7 @@ import { cocoEventsPathForSession, drainCocoEvents, findCocoSessionByPid } from 
 import { currentHermesStateOffset, drainHermesStateDb } from './services/hermes-transcript.js';
 import { currentMtrSessionOffset, drainMtrSession, findLatestMtrSessionByDirectory, findMtrSessionById, type MtrTranscriptSource } from './services/mtr-transcript.js';
 import { drainCursorTranscript, findCursorChatIdByPid, findCursorTranscriptByChatId, findCursorTranscriptByPid } from './services/cursor-transcript.js';
+import { shouldObserveCursorChatId, shouldPersistObservedCursorChatId } from './services/cursor-resume-policy.js';
 import { baselineJsonlCursor } from './services/jsonl-cursor.js';
 import { dirname } from 'node:path';
 import { createServer as createHttpServer, type IncomingMessage } from 'node:http';
@@ -122,6 +123,7 @@ let reattachIdleProbeTimer: ReturnType<typeof setTimeout> | null = null;
  *  setup so even the tick that fires between spawnCli-start and the
  *  adapter's hermesBridgeAttach reads the correct mode. */
 let lastSpawnEffectiveResume = false;
+let lastSpawnEffectiveCliSessionId: string | undefined;
 let idleDetector: IdleDetector | null = null;
 let isTmuxMode = false;
 /** Adopt-bridge mode using TmuxPipeBackend: not a tmux attach client, all
@@ -2824,14 +2826,21 @@ function persistCliSessionId(cliSessionId: string): void {
 
 function observeCursorCliSessionId(pid: number, label = 'spawn'): void {
   if (!Number.isInteger(pid) || pid <= 0) return;
-  if (lastInitConfig?.cliId !== 'cursor') return;
-  if (lastInitConfig.cliSessionId) return;
+  if (!shouldObserveCursorChatId({
+    cliId: lastInitConfig?.cliId,
+    effectiveResume: lastSpawnEffectiveResume,
+    effectiveCliSessionId: lastSpawnEffectiveCliSessionId,
+  })) return;
 
   const backendAtSpawn = backend;
   let attempts = 0;
   const maxAttempts = 60; // Cursor may open store.db only after its startup render settles.
   const tick = () => {
-    if (!backend || lastInitConfig?.cliId !== 'cursor' || lastInitConfig.cliSessionId) return;
+    if (!backend || !shouldObserveCursorChatId({
+      cliId: lastInitConfig?.cliId,
+      effectiveResume: lastSpawnEffectiveResume,
+      effectiveCliSessionId: lastSpawnEffectiveCliSessionId,
+    })) return;
     if (backend !== backendAtSpawn) return;
     const currentPid = backend.getChildPid?.();
     if (currentPid && currentPid !== pid) return;
@@ -2839,6 +2848,14 @@ function observeCursorCliSessionId(pid: number, label = 'spawn'): void {
     const realPid = findLaunchedCliPid(pid, 'cursor') ?? pid;
     const chatId = findCursorChatIdByPid(realPid);
     if (chatId) {
+      if (!shouldPersistObservedCursorChatId({
+        effectiveResume: lastSpawnEffectiveResume,
+        effectiveCliSessionId: lastSpawnEffectiveCliSessionId,
+        observedChatId: chatId,
+      })) {
+        log(`Observed Cursor chatId via pid ${realPid}${realPid === pid ? '' : ` (launcher ${pid})`} (${label}) but kept existing resume target ${lastSpawnEffectiveCliSessionId}`);
+        return;
+      }
       persistCliSessionId(chatId);
       log(`Observed Cursor chatId via pid ${realPid}${realPid === pid ? '' : ` (launcher ${pid})`} (${label}): ${chatId}`);
       return;
@@ -3679,6 +3696,7 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   // `lastInitConfig.resume` (= true) and baseline an empty store, swallowing
   // the fresh session's first turn.
   lastSpawnEffectiveResume = effectiveResume;
+  lastSpawnEffectiveCliSessionId = effectiveCliSessionId;
 
   // ttadk 网关：模型走 ttadk 自己的 `-m`（启动期注入到 ttadk 前缀，见下方 wrapperCli
   // 分支），不能再把 cfg.model 透给底层适配器，否则真实 CLI 会再吃一个 --model 重复。
