@@ -1,6 +1,10 @@
 import type { Session } from '../types.js';
 
-export const COMPLETED_REACTION_EMOJI_TYPE = 'GoGoGo';
+// Two-phase turn reactions (gated behind `enableReactions`, default off):
+//   - RECEIVED lands the instant the bot starts working on the turn (冲! `GoGoGo`).
+//   - On turn completion the RECEIVED reaction is removed and DONE (✅) replaces it.
+export const RECEIVED_REACTION_EMOJI_TYPE = 'GoGoGo';
+export const DONE_REACTION_EMOJI_TYPE = 'DONE';
 
 type PendingResponseSession = Pick<Session, 'pendingResponseCardId' | 'pendingResponseCardState' | 'lastPatchedResponseCardId'>;
 

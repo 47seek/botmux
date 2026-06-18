@@ -2,7 +2,8 @@ import { describe, expect, it } from 'vitest';
 
 import {
   claimPendingResponseCard,
-  COMPLETED_REACTION_EMOJI_TYPE,
+  DONE_REACTION_EMOJI_TYPE,
+  RECEIVED_REACTION_EMOJI_TYPE,
   createPendingResponseQueue,
   isPendingResponseCardOpen,
   markPendingResponseCardPatched,
@@ -17,8 +18,9 @@ import {
 } from '../src/core/pending-response.js';
 
 describe('pending response state', () => {
-  it('uses the Feishu GoGoGo emoji for completion notification', () => {
-    expect(COMPLETED_REACTION_EMOJI_TYPE).toBe('GoGoGo');
+  it('uses the Feishu GoGoGo/DONE emojis for the two-phase turn reaction', () => {
+    expect(RECEIVED_REACTION_EMOJI_TYPE).toBe('GoGoGo');
+    expect(DONE_REACTION_EMOJI_TYPE).toBe('DONE');
   });
 
   it('starts and patches pending response state explicitly', () => {

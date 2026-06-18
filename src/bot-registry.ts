@@ -206,6 +206,16 @@ export interface BotConfig {
    */
   disableStreamingCard?: boolean;
   /**
+   * Two-phase turn reactions on the user's triggering message. When true:
+   *   - the bot reacts with 「我来处理了」(✋ `OnIt`) the moment it starts working
+   *     on the turn, as a "got it, on it" acknowledgement;
+   *   - when the turn finishes (CLI returns to idle) that reaction is removed
+   *     and replaced with 完成 (✅ `DONE`).
+   * Default (undefined/false) never auto-reacts. Independent of card mode;
+   * driven centrally off the worker's status transitions.
+   */
+  enableReactions?: boolean;
+  /**
    * Conversation mode for 1:1 private chats (DMs) with the bot:
    *   - 'thread' (default, stored as undefined): every top-level DM message
    *     starts a fresh thread-scoped session — the official/legacy behavior,
@@ -800,6 +810,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       // means "use default botmux brand". Don't trim-to-undefined here.
       brandLabel: typeof entry.brandLabel === 'string' ? entry.brandLabel : undefined,
       disableStreamingCard: entry.disableStreamingCard === true || undefined,
+      enableReactions: entry.enableReactions === true || undefined,
       // Only 'chat' is meaningful; 'thread' (and anything else) normalizes to
       // undefined — the legacy thread-per-message default. Keeps bots.json clean.
       p2pMode: entry.p2pMode === 'chat' ? 'chat' : undefined,
