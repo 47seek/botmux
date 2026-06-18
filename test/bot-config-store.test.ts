@@ -124,6 +124,35 @@ describe('bot-config store', () => {
     expect(registry.getBot('app_default').config.disableStreamingCard).toBeUndefined();
   });
 
+  it('number field (maxLiveWorkers) round-trips and clears on null', async () => {
+    const { registry, store } = await loaded();
+    const spec = store.findConfigField('maxLiveWorkers')!;
+    expect(spec.kind).toBe('number');
+    expect(spec.effect).toBe('immediate');
+
+    const r1 = await store.applyConfigField('app_default', spec, 6);
+    expect(r1.ok).toBe(true);
+    if (r1.ok) { expect(r1.oldText).toBe('∅'); expect(r1.newText).toBe('6'); }
+    expect(readConfig().maxLiveWorkers).toBe(6);
+    expect(registry.getBot('app_default').config.maxLiveWorkers).toBe(6);
+
+    const r2 = await store.applyConfigField('app_default', spec, null);
+    expect(r2.ok).toBe(true);
+    expect(readConfig().maxLiveWorkers).toBeUndefined();
+    expect(registry.getBot('app_default').config.maxLiveWorkers).toBeUndefined();
+  });
+
+  it('coerceConfigValue(number) accepts positive integers and rejects junk/≤0/fractions', async () => {
+    const { store } = await loaded();
+    const spec = store.findConfigField('maxLiveWorkers')!;
+    expect(store.coerceConfigValue(spec, 4)).toEqual({ ok: true, value: 4 });
+    expect(store.coerceConfigValue(spec, '12')).toEqual({ ok: true, value: 12 });
+    expect(store.coerceConfigValue(spec, 0)).toEqual({ ok: false, reason: 'invalid_number' });
+    expect(store.coerceConfigValue(spec, -3)).toEqual({ ok: false, reason: 'invalid_number' });
+    expect(store.coerceConfigValue(spec, 1.5)).toEqual({ ok: false, reason: 'invalid_number' });
+    expect(store.coerceConfigValue(spec, 'abc')).toEqual({ ok: false, reason: 'invalid_number' });
+  });
+
   it('cli field persists the chosen adapter id', async () => {
     const { registry, store } = await loaded();
     const spec = store.findConfigField('cli')!;
@@ -131,6 +160,41 @@ describe('bot-config store', () => {
     expect(r.ok).toBe(true);
     expect(readConfig().cliId).toBe('codex');
     expect(registry.getBot('app_default').config.cliId).toBe('codex');
+  });
+
+  it('stringList (customPassthroughCommands) coerces, dedupes, drops daemon-shadowing + junk', async () => {
+    const { store } = await freshModules();
+    const spec = store.findConfigField('customPassthroughCommands')!;
+    expect(spec.kind).toBe('stringList');
+    // 逗号/空格混排、缺前导 / 自动补、大写归一、去重；/status 遮蔽 daemon 命令被丢、`/b@d` 非法字符被丢。
+    expect(store.coerceConfigValue(spec, 'goal, /export /GOAL /status /b@d'))
+      .toEqual({ ok: true, value: ['/goal', '/export'] });
+    // 全部非法/被过滤 → empty。
+    expect(store.coerceConfigValue(spec, '/status /!nope')).toEqual({ ok: false, reason: 'empty' });
+  });
+
+  it('stringList field round-trips array to disk + memory; empty/unset clears the key', async () => {
+    const { registry, store } = await loaded();
+    const spec = store.findConfigField('customPassthroughCommands')!;
+
+    const r1 = await store.applyConfigField('app_default', spec, ['/goal', '/export']);
+    expect(r1.ok).toBe(true);
+    if (r1.ok) { expect(r1.oldText).toBe('∅'); expect(r1.newText).toBe('/goal, /export'); expect(r1.effect).toBe('immediate'); }
+    expect(readConfig().customPassthroughCommands).toEqual(['/goal', '/export']);
+    expect(registry.getBot('app_default').config.customPassthroughCommands).toEqual(['/goal', '/export']);
+
+    // 空数组等价清除（bots.json 保持干净）。
+    const r2 = await store.applyConfigField('app_default', spec, []);
+    expect(r2.ok).toBe(true);
+    expect(readConfig().customPassthroughCommands).toBeUndefined();
+    expect(registry.getBot('app_default').config.customPassthroughCommands).toBeUndefined();
+  });
+
+  it('getConfigCardData surfaces customPassthroughCommands as a space-joined string', async () => {
+    const { store } = await loaded({ customPassthroughCommands: ['/goal', '/export'] });
+    expect(store.getConfigCardData('app_default')?.customPassthroughCommands).toBe('/goal /export');
+    const { store: store2 } = await loaded();
+    expect(store2.getConfigCardData('app_default')?.customPassthroughCommands).toBeNull();
   });
 
   it('getConfigSnapshot reports current values + info', async () => {

@@ -64,6 +64,7 @@ import {
 import { ipcRoute, jsonRes, readJsonBody, setBotName, setLarkAppId, startIpcServer, setWorkflowRunner } from './core/dashboard-ipc-server.js';
 import { saveFrozenCards, deleteFrozenCards } from './services/frozen-card-store.js';
 import { DAEMON_COMMANDS, SESSIONLESS_DAEMON_COMMANDS, resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, handleCommand, handleCardCommand, handleTermLinkCommand, parseSlashCommandInvocation, parseForceTopicInvocation } from './core/command-handler.js';
+import { SLASH_COMMAND_SHAPE } from './core/passthrough-commands.js';
 import type { CommandHandlerDeps } from './core/command-handler.js';
 import { findInheritablePeer } from './core/inherit-peer.js';
 import { isCallbackUrl, handleCallbackUrl } from './utils/user-token.js';
@@ -89,7 +90,7 @@ import {
 } from './core/session-manager.js';
 import { beginReplyTargetTurn, resolveSessionReplyTarget, syncReplyTargetState } from './core/reply-target.js';
 import { sweepOrphanSandboxes } from './adapters/backend/sandbox.js';
-import { sweepIdleWorkers } from './core/idle-worker-sweeper.js';
+import { sweepIdleWorkers, DEFAULT_MAX_LIVE_WORKERS } from './core/idle-worker-sweeper.js';
 import { handleCardAction } from './im/lark/card-handler.js';
 import type { CardHandlerDeps } from './im/lark/card-handler.js';
 import {
@@ -253,7 +254,10 @@ function parsePositiveIntEnv(name: string): number {
   const raw = process.env[name];
   if (!raw) return 0;
   const parsed = Number(raw);
-  if (!Number.isFinite(parsed) || parsed <= 0) {
+  // `0` is the documented "off" sentinel that the daemon spawn always passes
+  // (`BOTMUX_MEMORY_DIAG_INTERVAL_MS ?? '0'`) — treat it as a silent no-op, only
+  // warn on genuinely malformed values (non-numeric / negative).
+  if (!Number.isFinite(parsed) || parsed < 0) {
     logger.warn(`[memdiag] ignoring invalid ${name}=${JSON.stringify(raw)}`);
     return 0;
   }
@@ -547,7 +551,10 @@ export function grantRestrictedSlashCommandText(
   senderOpenId: string | undefined,
   cmd: string,
 ): string | undefined {
-  if (!/^\/[a-z][a-z0-9_-]*$/.test(cmd)) return undefined;
+  // 用与 passthrough 归一化同一套 shape 正则（SLASH_COMMAND_SHAPE），否则像
+  // `/foo:bar`、`/1cmd` 这类 passthrough 认、本闸不认的命令会让 grant-only 用户在
+  // restrictGrantCommands=true 下绕过限制直达 raw passthrough（路由里本闸在 passthrough 之前）。
+  if (!SLASH_COMMAND_SHAPE.test(cmd)) return undefined;
   return grantRestrictedCommandText(larkAppId, chatId, senderOpenId, cmd);
 }
 
@@ -3748,9 +3755,13 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   }
 
   const idleWorkerSweepTimer = setInterval(() => {
-    const suspended = sweepIdleWorkers(activeSessions);
+    // Re-read the live per-bot cap each tick so a dashboard edit (which mutates
+    // bot.config in place via applyConfigField) takes effect within 60s without
+    // a restart. Unset → DEFAULT_MAX_LIVE_WORKERS; ≤0 → no cap.
+    const maxLiveWorkers = getBot(cfg.larkAppId).config.maxLiveWorkers;
+    const suspended = sweepIdleWorkers(activeSessions, { maxLiveWorkers });
     if (suspended.length > 0) {
-      logger.info(`[idle-worker-sweeper] suspended ${suspended.length} idle worker(s)`);
+      logger.info(`[idle-worker-sweeper] suspended ${suspended.length} session(s) over per-bot cap ${maxLiveWorkers ?? DEFAULT_MAX_LIVE_WORKERS}`);
     }
   }, 60_000);
   idleWorkerSweepTimer.unref?.();

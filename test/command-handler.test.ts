@@ -137,6 +137,13 @@ vi.mock('../src/services/git-worktree.js', () => ({
   createRepoWorktree: vi.fn(),
 }));
 
+vi.mock('../src/services/worktree-slug-ai.js', () => ({
+  worktreeSlugFromContextAI: vi.fn(async (title?: string, firstPrompt?: string) => {
+    const text = title?.trim() || firstPrompt?.trim();
+    return text?.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+  }),
+}));
+
 vi.mock('../src/im/lark/card-builder.js', () => ({
   buildRepoSelectCard: vi.fn(() => '{"card":"json"}'),
   buildAdoptSelectCard: vi.fn(() => '{"card":"adopt-select"}'),
@@ -358,7 +365,7 @@ import * as sessionStore from '../src/services/session-store.js';
 import * as scheduleStore from '../src/services/schedule-store.js';
 import * as scheduler from '../src/core/scheduler.js';
 import { deleteMessage, sendMessage, listChatBotMembers } from '../src/im/lark/client.js';
-import { buildSlashListCard } from '../src/im/lark/card-builder.js';
+import { buildSlashListCard, buildSessionClosedCard } from '../src/im/lark/card-builder.js';
 import { createGroupWithBots } from '../src/services/group-creator.js';
 import { getAllBots, getBot } from '../src/bot-registry.js';
 import { generateAuthUrl, getTokenStatus } from '../src/utils/user-token.js';
@@ -535,6 +542,26 @@ describe('/list-slash-command discovery', () => {
       }),
       expect.anything(),
     );
+  });
+
+  it('shows only effective custom passthrough commands (drops daemon-shadow + junk, normalizes)', async () => {
+    // 手写 bots.json 可能留下 `/status`（遮蔽 daemon 命令，parser 出于兼容会保留但
+    // 路由会丢弃）、非法项、大小写不一；展示侧须与 resolvePassthroughCommands 同口径。
+    vi.mocked(getBot).mockImplementation(((id: string = 'app-1') => {
+      const b = defaultGetBot(id);
+      (b.config as any).customPassthroughCommands = ['/status', '/b@d', '/GOAL', '/export', '/goal'];
+      return b;
+    }) as any);
+    try {
+      const deps = makeDeps(makeDaemonSession());
+      await handleCommand('/slash', ROOT_ID, makeLarkMessage('/slash'), deps, LARK_APP_ID);
+      expect(buildSlashListCard).toHaveBeenCalledWith(
+        expect.objectContaining({ custom: ['/goal', '/export'] }),
+        expect.anything(),
+      );
+    } finally {
+      vi.mocked(getBot).mockImplementation(defaultGetBot as any);
+    }
   });
 
   it('keeps Claude-family filesystem discovery enabled', async () => {
@@ -740,6 +767,33 @@ describe('handleCommand', () => {
       const cardJson = replyArgs[1] as string;
       expect(cardJson).toContain('botmux resume');
       expect(cardJson).toContain('"action":"resume"');
+    });
+
+    it('keeps ttadk non-interactive flags in the closed-card resume command', async () => {
+      // A ttadk × Claude bot: the manual resume command on the closed card must
+      // carry `-m <model> --skip-check`, else copy-pasting it hits ttadk's model
+      // picker. Verifies the /close construction passes { ttadkModel: bot.model }
+      // (not just the decorateResumeForWrapper helper in isolation).
+      vi.mocked(getBot).mockImplementation(((id: string = 'app-1') => ({
+        botName: 'Claude',
+        config: {
+          larkAppId: id,
+          larkAppSecret: 'secret-1',
+          cliId: 'claude-code' as const,
+          wrapperCli: 'ttadk claude',
+          model: 'glm-5.1',
+          workingDir: '~/projects',
+          workingDirs: ['~/projects'],
+        },
+      })) as any);
+      const ds = makeDaemonSession();
+      const deps = makeDeps(ds);
+
+      await handleCommand('/close', ROOT_ID, makeLarkMessage('/close'), deps, LARK_APP_ID);
+
+      // 6th positional arg to buildSessionClosedCard is the cliResumeCommand.
+      const resumeArg = vi.mocked(buildSessionClosedCard).mock.calls[0]?.[5];
+      expect(resumeArg).toBe('ttadk claude -m glm-5.1 --skip-check --resume sess-001');
     });
 
     it('should reply with no-session message when session does not exist', async () => {
@@ -1207,12 +1261,29 @@ describe('handleCommand', () => {
 
       await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo wt 1'), deps, LARK_APP_ID);
 
-      expect(createRepoWorktree).toHaveBeenCalledWith('/home/testuser/project-a', { branch: undefined });
+      expect(createRepoWorktree).toHaveBeenCalledWith('/home/testuser/project-a', {
+        branch: undefined,
+        slug: 'test-session',
+      });
       expect(ds.workingDir).toBe('/home/testuser/project-a-wt-1');
       expect(forkWorker).toHaveBeenCalledWith(ds, '', false);
       expect(ds.worktreeCreating).toBe(false);
       const replies = vi.mocked(deps.sessionReply).mock.calls.map(c => c[1]).join();
       expect(replies).toContain('worktree 已创建');
+    });
+
+    it('keeps an explicit branch instead of auto semantic naming', async () => {
+      const ds = makeDaemonSession({ pendingRepo: false });
+      const deps = makeDeps(ds);
+      deps.lastRepoScan.set(CHAT_ID, SCAN as any);
+      vi.mocked(createRepoWorktree).mockResolvedValue({ ...CREATION, branch: 'feat/manual' });
+
+      await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo wt 1 feat/manual'), deps, LARK_APP_ID);
+
+      expect(createRepoWorktree).toHaveBeenCalledWith('/home/testuser/project-a', {
+        branch: 'feat/manual',
+        slug: undefined,
+      });
     });
 
     it('holds the in-flight lock through the created-notice reply (post-git window)', async () => {

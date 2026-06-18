@@ -17,6 +17,7 @@ import { expandHomePath } from '../utils/working-dir.js';
 import { resolveTeamRoleFile } from '../core/role-resolver.js';
 import { statSync } from 'node:fs';
 import { logger } from '../utils/logger.js';
+import { parseCustomPassthroughInput } from '../core/passthrough-commands.js';
 
 /**
  * 生效时机：
@@ -26,7 +27,7 @@ import { logger } from '../utils/logger.js';
  */
 export type ConfigEffect = 'immediate' | 'next-session';
 
-export type ConfigFieldKind = 'string' | 'boolean' | 'enum' | 'cli' | 'dir' | 'allowedUsers';
+export type ConfigFieldKind = 'string' | 'stringList' | 'boolean' | 'number' | 'enum' | 'cli' | 'dir' | 'allowedUsers';
 
 export interface ConfigFieldSpec {
   /** 用户面命令里用的字段名（大小写不敏感匹配，见 {@link findConfigField}）。 */
@@ -64,6 +65,8 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'disableCliBypass', configKey: 'disableCliBypass', kind: 'boolean', effect: 'next-session', clearable: false, hint: '不加 CLI 审批/sandbox 绕过参数 on|off' },
   { key: 'restrictGrantCommands', configKey: 'restrictGrantCommands', kind: 'boolean', effect: 'immediate', clearable: false, hint: '被授权人仅能纯对话、拦截斜杠命令 on|off' },
   { key: 'p2pMode', configKey: 'p2pMode', kind: 'enum', effect: 'immediate', clearable: true, enumValues: ['thread', 'chat'], hint: '私聊单聊模式 thread|chat；chat=扁平连续会话，thread/unset 回默认（每条 DM 独立会话）' },
+  { key: 'maxLiveWorkers', configKey: 'maxLiveWorkers', kind: 'number', effect: 'immediate', clearable: true, hint: '最大同时活跃会话数；超过后最久未用的会话自动休眠（杀 worker+CLI 回收内存，下条消息冷恢复）；unset=默认 30' },
+  { key: 'customPassthroughCommands', configKey: 'customPassthroughCommands', kind: 'stringList', effect: 'immediate', clearable: true, hint: '额外放行透传给 CLI 的 slash 命令（逗号/空格分隔，如 /goal /export）；unset 回仅内置白名单' },
 ];
 
 /** 大小写不敏感地按 key 找字段 spec。 */
@@ -88,7 +91,7 @@ export function parseBooleanValue(raw: string): boolean | undefined {
 /** 展示某字段当前值的人类可读文本。 */
 function formatFieldValue(spec: ConfigFieldSpec, value: unknown): string {
   if (spec.kind === 'boolean') return value === true ? 'on' : 'off';
-  if (spec.kind === 'allowedUsers') {
+  if (spec.kind === 'allowedUsers' || spec.kind === 'stringList') {
     const arr = Array.isArray(value) ? value : [];
     return arr.length ? arr.join(', ') : '∅';
   }
@@ -140,34 +143,37 @@ export type ApplyFieldResult =
 export async function applyConfigField(
   larkAppId: string,
   spec: ConfigFieldSpec,
-  value: string | boolean | null,
+  value: string | string[] | boolean | number | null,
 ): Promise<ApplyFieldResult> {
   if (spec.kind === 'allowedUsers') return { ok: false, reason: 'use_setBotAllowedUsers' };
   let bot;
   try { bot = getBot(larkAppId); } catch { return { ok: false, reason: 'bot_not_registered' }; }
   const oldText = formatFieldValue(spec, (bot.config as any)[spec.configKey]);
 
+  // 空数组（stringList 全被过滤）等价清除，bots.json 保持干净。
+  const effective = spec.kind === 'stringList' && Array.isArray(value) && value.length === 0 ? null : value;
+
   const r = await rmwBotEntry<null>(larkAppId, (entry) => {
-    if (value === null) {
+    if (effective === null) {
       delete entry[spec.configKey];
     } else if (spec.kind === 'boolean') {
       // 与 parseBotConfigsFromText 一致：true 才写，false → 删 key（bots.json 保持干净）。
-      if (value === true) entry[spec.configKey] = true;
+      if (effective === true) entry[spec.configKey] = true;
       else delete entry[spec.configKey];
     } else {
-      entry[spec.configKey] = value;
+      entry[spec.configKey] = effective;
     }
     return { write: true, result: null };
   });
   if (!r.ok) return { ok: false, reason: r.reason };
 
   // 同步内存 config（与 oncall/grant-prefs store 一致，路由/spawn 不重启即生效）。
-  if (value === null) {
+  if (effective === null) {
     (bot.config as any)[spec.configKey] = undefined;
   } else if (spec.kind === 'boolean') {
-    (bot.config as any)[spec.configKey] = value || undefined;
+    (bot.config as any)[spec.configKey] = effective || undefined;
   } else {
-    (bot.config as any)[spec.configKey] = value;
+    (bot.config as any)[spec.configKey] = effective;
   }
   const newText = formatFieldValue(spec, (bot.config as any)[spec.configKey]);
   logger.info(`[config:${larkAppId}] set ${spec.key}: ${oldText} -> ${newText}`);
@@ -214,8 +220,8 @@ export async function setBotAllowedUsers(
 }
 
 export type CoerceResult =
-  | { ok: true; value: string | boolean }
-  | { ok: false; reason: 'invalid_bool' | 'invalid_enum' | 'invalid_cli' | 'invalid_dir' | 'empty' };
+  | { ok: true; value: string | string[] | boolean | number }
+  | { ok: false; reason: 'invalid_bool' | 'invalid_enum' | 'invalid_cli' | 'invalid_dir' | 'invalid_number' | 'empty' };
 
 /**
  * 把一个**原始**字段值（来自卡片下拉/输入或别处）按字段 kind 解析校验成可落盘的
@@ -228,9 +234,17 @@ export function coerceConfigValue(spec: ConfigFieldSpec, raw: unknown): CoerceRe
     const b = parseBooleanValue(String(raw ?? ''));
     return b === undefined ? { ok: false, reason: 'invalid_bool' } : { ok: true, value: b };
   }
+  if (spec.kind === 'number') {
+    const n = typeof raw === 'number' ? raw : Number(String(raw ?? '').trim());
+    return Number.isInteger(n) && n > 0 ? { ok: true, value: n } : { ok: false, reason: 'invalid_number' };
+  }
   const s = String(raw ?? '').trim();
   if (!s) return { ok: false, reason: 'empty' };
   switch (spec.kind) {
+    case 'stringList': {
+      const arr = parseCustomPassthroughInput(s);
+      return arr.length ? { ok: true, value: arr } : { ok: false, reason: 'empty' };
+    }
     case 'enum':
       return spec.enumValues?.includes(s.toLowerCase())
         ? { ok: true, value: s.toLowerCase() }
@@ -269,6 +283,8 @@ export interface ConfigCardData {
   defaultWorkingDir: string | null;
   /** 入群主动开工首轮 prompt（autoStartOnGroupJoinPrompt）。 */
   autoStartPrompt: string | null;
+  /** 额外放行透传的 slash 命令（customPassthroughCommands），空格分隔；null = 未设。 */
+  customPassthroughCommands: string | null;
   /** team 级默认角色文本（不在 bots.json，存独立角色文件）。 */
   teamRole: string | null;
   /** messageQuota.defaultLimit（被授权人默认消息额度）；null = 不限。 */
@@ -294,6 +310,7 @@ export function getConfigCardData(larkAppId: string, modelChoices: readonly stri
     brandLabel: cfg.brandLabel ?? null,
     defaultWorkingDir: cfg.defaultWorkingDir ?? null,
     autoStartPrompt: cfg.autoStartOnGroupJoinPrompt ?? null,
+    customPassthroughCommands: cfg.customPassthroughCommands?.length ? cfg.customPassthroughCommands.join(' ') : null,
     teamRole: resolveTeamRoleFile(larkAppId),
     quota: typeof q === 'number' && Number.isInteger(q) && q > 0 ? q : null,
     admins: bot.resolvedAllowedUsers.length,

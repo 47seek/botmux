@@ -13,7 +13,8 @@ import * as scheduleStore from '../services/schedule-store.js';
 import * as scheduler from './scheduler.js';
 import { scanProjects, scanMultipleProjects, describeProjectDir } from '../services/project-scanner.js';
 import { createRepoWorktree } from '../services/git-worktree.js';
-import { buildRepoSelectCard, buildAdoptSelectCard, buildCodexAppThreadSelectCard, buildSessionClosedCard, buildSlashListCard, getCliDisplayName, buildConfigCard, buildLandCard } from '../im/lark/card-builder.js';
+import { worktreeSlugFromContextAI } from '../services/worktree-slug-ai.js';
+import { buildRepoSelectCard, buildAdoptSelectCard, buildCodexAppThreadSelectCard, buildSlashListCard, getCliDisplayName, buildConfigCard, buildLandCard } from '../im/lark/card-builder.js';
 import { computeSandboxDiff } from '../services/sandbox-land.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import type { CliId, ResumableSession } from '../adapters/cli/types.js';
@@ -38,10 +39,11 @@ import {
 import { bindOncall, unbindOncall, getOncallStatus } from '../services/oncall-store.js';
 import {
   CONFIG_FIELDS, findConfigField, settableFieldKeys, parseBooleanValue,
-  applyConfigField, setBotAllowedUsers, getConfigSnapshot, getConfigCardData, type ConfigEffect,
+  applyConfigField, setBotAllowedUsers, getConfigSnapshot, getConfigCardData, coerceConfigValue, type ConfigEffect,
 } from '../services/bot-config-store.js';
 import { resolveCliId, findInvalidAllowedUserEntries } from '../setup/bot-config-editor.js';
-import { decorateResumeForWrapper } from '../setup/cli-selection.js';
+import { buildClosedSessionCard } from './closed-session-card.js';
+import { ttadkConfigModelChoices } from '../setup/cli-selection.js';
 import { publishAttentionPatch, announcePendingRepoSession } from './session-activity.js';
 import { setCardMode } from '../services/card-mode-store.js';
 import { canOperate } from '../im/lark/event-dispatcher.js';
@@ -55,7 +57,13 @@ import { t, localeForBot, type Locale } from '../i18n/index.js';
 
 // ─── Exported constants ──────────────────────────────────────────────────────
 
-export const DAEMON_COMMANDS = new Set(['/close', '/restart', '/status', '/help', '/cd', '/repo', '/schedule', '/role', '/botconfig', '/pair', '/login', '/adopt', '/detach', '/disconnect', '/oncall', '/group', '/g', '/relay', '/card', '/term', '/list-slash-command', '/slash', '/land', '/subscribe-lark-doc']);
+// DAEMON_COMMANDS / PASSTHROUGH_COMMANDS / normalizePassthroughCommand now live
+// in the leaf ./passthrough-commands.js so the config store can share the
+// normalization without a circular import; imported for internal use and
+// re-exported to keep callers (daemon.ts, tests) importing from command-handler
+// unchanged.
+import { DAEMON_COMMANDS, PASSTHROUGH_COMMANDS, normalizePassthroughCommand, parseCustomPassthroughInput } from './passthrough-commands.js';
+export { DAEMON_COMMANDS, PASSTHROUGH_COMMANDS };
 
 /**
  * Daemon commands that act on the chat itself rather than opening a
@@ -66,30 +74,6 @@ export const DAEMON_COMMANDS = new Set(['/close', '/restart', '/status', '/help'
  * that pollutes the dashboard's session list. Handle them without a session.
  */
 export const SESSIONLESS_DAEMON_COMMANDS = new Set(['/group', '/g', '/list-slash-command', '/slash', '/botconfig']);
-
-/**
- * Slash commands that are forwarded verbatim to the underlying CLI (e.g.
- * Claude Code's `/compact`, `/model`, `/usage`). The daemon does NOT handle
- * these — it just relays them to the worker via a raw_input IPC message,
- * bypassing the normal prompt-wrapping and bracketed-paste path so the CLI's
- * own slash-command parser sees them.
- */
-export const PASSTHROUGH_COMMANDS = new Set([
-  '/compact', '/model', '/clear', '/plugin', '/usage',
-  // 只读 / 低副作用，飞书卡片里能直接吐文本：
-  '/context', '/cost', '/mcp', '/diff',
-  '/code-review', '/security-review', '/review',
-  // Codex：/btw 向当前会话追加一条旁注/引导消息
-  '/btw',
-]);
-
-function normalizePassthroughCommand(cmd: unknown): string | null {
-  if (typeof cmd !== 'string') return null;
-  const normalized = cmd.trim().toLowerCase();
-  if (!/^\/[a-z0-9][a-z0-9:_-]*$/.test(normalized)) return null;
-  if (DAEMON_COMMANDS.has(normalized)) return null;
-  return normalized;
-}
 
 export function resolveAdapterDefaultPassthroughCommands(larkAppId?: string): string[] {
   if (!larkAppId) return [];
@@ -657,8 +641,14 @@ async function handleConfigCommand(
   const cardLoc = cardLocaleArg(sub);
   if (!sub || cardLoc) {
     const renderLoc: Locale = cardLoc ?? loc;
-    let modelChoices: readonly string[] = [];
-    try { modelChoices = createCliAdapterSync(bot.config.cliId, bot.config.cliPathOverride).modelChoices ?? []; } catch { /* 无候选 → 不渲染 model 下拉 */ }
+    // ttadk 网关 bot：模型候选用 ttadk 网关模型（glm-5.1…），不是底层适配器的
+    // opus/gpt-5（那会被 worker 注入成 `ttadk -m opus` 用错模型启动失败）；CoCo 无候选。
+    // 非 ttadk（返回 null）才回落底层适配器自己的 modelChoices。
+    const ttadkChoices = ttadkConfigModelChoices(bot.config.wrapperCli);
+    let modelChoices: readonly string[] = ttadkChoices ?? [];
+    if (ttadkChoices === null) {
+      try { modelChoices = createCliAdapterSync(bot.config.cliId, bot.config.cliPathOverride).modelChoices ?? []; } catch { /* 无候选 → 不渲染 model 下拉 */ }
+    }
     const data = getConfigCardData(larkAppId, modelChoices);
     if (!data) { await reply(buildConfigHelp(renderLoc)); return; }
     const cardJson = buildConfigCard(data, renderLoc);
@@ -702,8 +692,22 @@ async function handleConfigCommand(
     const rawValue = parts.slice(2).join(' ').trim();
     if (!rawValue) { await reply(t('cmd.config.value_required', { field: spec.key }, loc)); return; }
 
-    let value: string | boolean;
+    let value: string | string[] | boolean | number;
     switch (spec.kind) {
+      case 'stringList': {
+        const arr = parseCustomPassthroughInput(rawValue);
+        if (arr.length === 0) { await reply(t('cmd.config.value_required', { field: spec.key }, loc)); return; }
+        value = arr;
+        break;
+      }
+      case 'number': {
+        // 统一走 coerceConfigValue 的 number 校验（正整数），避免文字路径把 '6'
+        // 当字符串写进 maxLiveWorkers（与 card/API 路径同口径）。
+        const coerced = coerceConfigValue(spec, rawValue);
+        if (!coerced.ok) { await reply(t('cmd.config.invalid_number', { field: spec.key, value: rawValue }, loc)); return; }
+        value = coerced.value;
+        break;
+      }
       case 'boolean': {
         const b = parseBooleanValue(rawValue);
         if (b === undefined) { await reply(t('cmd.config.invalid_bool', { field: spec.key, value: rawValue }, loc)); return; }
@@ -904,34 +908,12 @@ export async function handleCommand(
     switch (cmd) {
       case '/close': {
         if (ds) {
-          const closedSessionId = ds.session.sessionId;
-          const closedTitle = ds.session.title;
-          const botCfg = getBot(ds.larkAppId).config;
-          const closedCliId = ds.session.cliId ?? botCfg.cliId;
-          const closedAnchor = sessionAnchorId(ds);
-          const closedWorkingDir = ds.session.workingDir;
-          const cliResumeCommand = (() => {
-            try {
-              const adapter = createCliAdapterSync(closedCliId, botCfg.cliPathOverride);
-              const raw = adapter.buildResumeCommand?.({
-                sessionId: closedSessionId,
-                cliSessionId: ds.session.cliSessionId,
-              }) ?? null;
-              return raw ? decorateResumeForWrapper(raw, botCfg.wrapperCli) : null;
-            } catch { return null; }
-          })();
+          // Capture the closed-session card BEFORE killWorker/closeSession —
+          // it reads the live session's identity off `ds`.
+          const card = buildClosedSessionCard(ds, loc);
           killWorker(ds);
-          sessionStore.closeSession(closedSessionId);
+          sessionStore.closeSession(ds.session.sessionId);
           activeSessions.delete(sessionKey(rootId, larkAppId!));
-          const card = buildSessionClosedCard(
-            closedSessionId,
-            closedAnchor,
-            closedTitle,
-            closedCliId,
-            closedWorkingDir,
-            cliResumeCommand,
-            loc,
-          );
           // 「会话已关闭」卡片优先「仅自己可见」：普通群里走 ephemeral 只发给执行
           // /close 的本人；话题群不支持 ephemeral(18053) 时回退为正常的群内可见回复
           // ——与流式卡片上「关闭会话」按钮的送达方式保持一致。
@@ -1145,19 +1127,45 @@ export async function handleCommand(
         // close + recreate the session (mid-session switch). Used by both the
         // numeric `/repo <N>` form and the `/repo <path|name>` form.
         const commitRepoSelection = async (selectedPath: string, displayName: string, how: string) => {
-          ds!.workingDir = selectedPath;
-          ds!.session.workingDir = selectedPath;
-          sessionStore.updateSession(ds!.session);
-
           if (ds!.pendingRepo) {
+            // First spawn: pin the new cwd onto the CURRENT session, then fork.
+            ds!.workingDir = selectedPath;
+            ds!.session.workingDir = selectedPath;
+            sessionStore.updateSession(ds!.session);
             await forkPendingCli(t('cmd.repo.selected_in_pending', { name: displayName }, loc));
           } else {
+            // Safety net: a mid-session `/repo` switch closes the running
+            // session and spawns a fresh one on the SAME anchor. Without a
+            // trace, the old context silently vanishes (relay/adopt/resume all
+            // hit `anchor_occupied` once the new session holds the anchor).
+            // So, before displacing it, post the same "session closed" card
+            // `/close` emits — it keeps the old session visible and carries the
+            // terminal `claude --resume` command. (Its in-card resume button
+            // still hits anchor_occupied while the new session occupies this
+            // anchor — expected; `/close` the new one first, or use the
+            // command.) Mirrors the `/close` case above.
+            //
+            // The new cwd is NOT written onto the old session here — it would
+            // pollute the displaced session's stored workingDir (and the closed
+            // card), so `claude --resume` later would reopen the old context in
+            // the new repo's cwd. The new repo is pinned onto the fresh session
+            // below instead.
+            const closedCard = buildClosedSessionCard(ds!, loc);
             killWorker(ds!);
             sessionStore.closeSession(ds!.session.sessionId);
+            await deliverEphemeralOrReply(
+              ds!,
+              message.senderId,
+              closedCard,
+              'interactive',
+              () => sessionReply(rootId, closedCard, 'interactive'),
+            );
+
             const session = sessionStore.createSession(ds!.chatId, rootId, displayName, ds!.chatType);
             ds!.session = session;
             ds!.lastUserPrompt = undefined;
             ds!.lastCliInput = undefined;
+            ds!.workingDir = selectedPath;
             ds!.session.workingDir = selectedPath;
             ds!.session.larkAppId = ds!.larkAppId;
             sessionStore.updateSession(ds!.session);
@@ -1174,7 +1182,8 @@ export async function handleCommand(
 
         // `/repo wt <N|name|path> [branch]` → create a worktree off the repo's
         // remote default branch and open THAT as the session repo. Without a
-        // branch arg the branch/dir are auto-named (wt/N, <repo>-wt-N).
+        // branch arg the branch/dir are auto-named from the topic title / first
+        // pending prompt when possible (fallback: wt/N, <repo>-wt-N).
         if (ds && /^wt(\s|$)/i.test(repoArg)) {
           const rest = repoArg.replace(/^wt\s*/i, '').trim().split(/\s+/).filter(Boolean);
           if (rest.length < 1 || rest.length > 2) {
@@ -1226,7 +1235,11 @@ export async function handleCommand(
             await sessionReply(rootId, t('cmd.repo.worktree_creating', { repo: repoPath }, loc));
             let creation;
             try {
-              creation = await createRepoWorktree(repoPath, { branch: branchArg });
+              const slug = branchArg ? undefined : await worktreeSlugFromContextAI(ds!.session.title, ds!.pendingPrompt);
+              creation = await createRepoWorktree(repoPath, {
+                branch: branchArg,
+                slug,
+              });
             } catch (e) {
               await sessionReply(rootId, t('cmd.repo.worktree_failed', { error: e instanceof Error ? e.message : String(e) }, loc));
               break;
@@ -2361,7 +2374,14 @@ export async function handleCommand(
         const workingDir = getSessionWorkingDir(ds);
         const builtin = [...PASSTHROUGH_COMMANDS];
         const adapterDefaults = resolveAdapterDefaultPassthroughCommands(larkAppId);
-        const custom = botCfg?.customPassthroughCommands ?? [];
+        // 只展示「实际生效」的 custom 命令：用与 resolvePassthroughCommands 同一套
+        // normalize 过滤掉手写 bots.json 里遮蔽 daemon 命令 / 非法的项（parser 出于
+        // 兼容会保留它们，但路由会丢弃），避免 `/status` 之类被展示成可用却走 daemon。
+        const custom = [...new Set(
+          (botCfg?.customPassthroughCommands ?? [])
+            .map(normalizePassthroughCommand)
+            .filter((c): c is string => !!c),
+        )];
         let cliAdapter;
         try {
           cliAdapter = createCliAdapterSync(cliId, botCfg?.cliPathOverride);

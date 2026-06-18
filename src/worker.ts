@@ -57,7 +57,7 @@ import {
   resolveRenderDimensions,
 } from './utils/render-dimensions.js';
 import { createCliAdapterSync, locateOnPath } from './adapters/cli/registry.js';
-import { buildWrappedLaunch } from './setup/cli-selection.js';
+import { buildWrappedLaunch, parseWrapperCli, isTtadkWrapper } from './setup/cli-selection.js';
 import { findLaunchedCliPid, scheduleWrapperRealCliPid } from './core/session-discovery.js';
 import { claudeJsonlPathForSession, resolveJsonlFromPid, findOpenClaudeSessionIds, DEFAULT_CLAUDE_DATA_DIR } from './adapters/cli/claude-code.js';
 import { mtrSessionIdForBotmuxSession } from './adapters/cli/mtr.js';
@@ -152,7 +152,7 @@ function ensureZellijAttachConfig(): string {
 
 let sessionId = '';
 let lastInitConfig: Extract<DaemonToWorker, { type: 'init' }> | null = null;
-const CLI_DISPLAY_NAMES: Record<string, string> = { 'claude-code': 'Claude', seed: 'Seed', aiden: 'Aiden', coco: 'CoCo', codex: 'Codex', 'codex-app': 'Codex App', cursor: 'Cursor', gemini: 'Gemini', opencode: 'OpenCode', antigravity: 'Antigravity', mtr: 'MTR', hermes: 'Hermes', mira: 'Mira', traex: 'TRAE', pi: 'Pi', copilot: 'Copilot', 'oh-my-pi': 'Oh My Pi' };
+const CLI_DISPLAY_NAMES: Record<string, string> = { 'claude-code': 'Claude', seed: 'Seed', relay: 'Relay', aiden: 'Aiden', coco: 'CoCo', codex: 'Codex', 'codex-app': 'Codex App', cursor: 'Cursor', gemini: 'Gemini', opencode: 'OpenCode', antigravity: 'Antigravity', mtr: 'MTR', hermes: 'Hermes', mira: 'Mira', traex: 'TRAE', pi: 'Pi', copilot: 'Copilot', 'oh-my-pi': 'Oh My Pi' };
 function cliName(): string { return CLI_DISPLAY_NAMES[lastInitConfig?.cliId ?? ''] ?? 'CLI'; }
 let isPromptReady = false;
 /** Mutex for async flushPending — prevents concurrent flush loops. */
@@ -3566,6 +3566,9 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   // the fresh session's first turn.
   lastSpawnEffectiveResume = effectiveResume;
 
+  // ttadk 网关：模型走 ttadk 自己的 `-m`（启动期注入到 ttadk 前缀，见下方 wrapperCli
+  // 分支），不能再把 cfg.model 透给底层适配器，否则真实 CLI 会再吃一个 --model 重复。
+  const ttadkGateway = isTtadkWrapper(cfg.wrapperCli);
   const args = cliAdapter.buildArgs({
     sessionId: effectiveAdapterSessionId,
     resume: effectiveResume,
@@ -3575,7 +3578,7 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     botName: cfg.botName,
     botOpenId: cfg.botOpenId,
     locale: cfg.locale,
-    model: cfg.model,
+    model: ttadkGateway ? undefined : cfg.model,
     disableCliBypass: cfg.disableCliBypass === true,
   });
 
@@ -3775,15 +3778,46 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   // bin 走 PATH 解析），无需 wrapper 脚本、跨系统。aiden x claude 形态会剥掉 aiden 拒收的
   // --settings（见 buildWrappedLaunch）。与文件沙盒互斥：沙盒已把命令重写成 bwrap，叠加
   // 前缀会破坏隔离，故 sandboxOn 时跳过并告警（网关 + oncall 沙盒本就不是合理组合）。
+  // CJADK_INTERACTIVE is a cjadk-only knob we set on the cjadk wrapper branch
+  // below. Strip any value inherited from the daemon's own env first so a
+  // daemon launched under `cjadk feishu` (which exports it) can't leak it via
+  // the tmux env allowlist into EVERY bot's pane — only the cjadk branch should
+  // ever (re)set it. Harmless for non-cjadk CLIs (they don't read it), but this
+  // keeps the behaviour intentional rather than ambient. (Codex review note.)
+  delete (childEnv as Record<string, string>).CJADK_INTERACTIVE;
+
   if (cfg.wrapperCli && cfg.wrapperCli.trim()) {
     if (sandboxOn) {
       log(`wrapperCli="${cfg.wrapperCli}" ignored: file sandbox enabled and takes precedence (cannot combine launch prefix with bwrap)`);
     } else {
-      const launch = buildWrappedLaunch(cfg.wrapperCli, spawnArgs, (b) => locateOnPath(b) ?? b);
+      const launch = buildWrappedLaunch(cfg.wrapperCli, spawnArgs, (b) => locateOnPath(b) ?? b, {
+        ttadkModel: cfg.model,
+      });
       if (launch.bin) {
         spawnBin = launch.bin;
         spawnArgs = launch.args;
         log(`Launch prefix: spawning ${spawnBin} ${spawnArgs.slice(0, 2).join(' ')} … (cliId=${cfg.cliId})`);
+        // ttadk runs its launched agent through a gateway that pops an interactive
+        // model-picker unless `-m <model>` is given. buildWrappedLaunch injects
+        // `-m <bot.model || glm-5.1> --skip-check` into the ttadk prefix above
+        // (CoCo excluded — it takes no -m). The model is sourced from the bot's
+        // `model` config (editable in the dashboard), NOT baked into wrapperCli.
+        if (ttadkGateway) {
+          log(`ttadk launcher: model=${(cfg.model ?? '').trim() || 'glm-5.1 (default)'} injected as -m, suppressed on underlying ${cfg.cliId}`);
+        }
+        // cjadk runs its launched agent in an INTERACTIVE wrapper by default —
+        // a model/session selector at startup plus terminal quirks that fight
+        // botmux's automated input (the selector eats the first prompt; the
+        // pre-render lag fragments multi-line messages; follow-ups can stick in
+        // the input box). cjadk's own botmux integration (`cjadk feishu`, see its
+        // botmux-wrapper-writer) sets CJADK_INTERACTIVE=0 to disable all of that.
+        // We mirror it here so a `cjadk <agent>` wrapperCli is driven the way
+        // cjadk intends — no selector, clean soft-newline input. Keyed on the
+        // wrapper's leading token so only cjadk launches are affected.
+        if (parseWrapperCli(cfg.wrapperCli)[0] === 'cjadk') {
+          (childEnv as Record<string, string>).CJADK_INTERACTIVE = '0';
+          log('cjadk launcher: set CJADK_INTERACTIVE=0 (non-interactive, mirrors cjadk feishu wrapper)');
+        }
       }
     }
   }
@@ -4924,7 +4958,15 @@ process.on('message', async (raw: unknown) => {
       log('Suspend requested');
       stopScreenshotLoop();
       stopBridgeWatcher();
-      try { backend?.kill(); } catch { /* detach best-effort */ }
+      // Free the CLI's memory, not just the worker's: destroySession kills the
+      // backing tmux/herdr/zellij session AND the CLI process inside it (kill()
+      // would only detach the pty viewer and leave the CLI running in the
+      // background — defeating the whole point of a session cap, since the CLI
+      // is the memory hog). On the next message the session cold-resumes via
+      // forkWorker(resume=true) → a fresh `new-session --resume <cliSessionId>`
+      // that rebuilds context from the on-disk transcript (same path the daemon
+      // uses to recover sessions after a reboot kills the tmux server).
+      try { (backend?.destroySession ?? backend?.kill)?.call(backend); } catch { /* best-effort */ }
       backend = null;
       isPromptReady = false;
       // Suspend INTENDS to resume later: preserve the sandbox overlay mount + the

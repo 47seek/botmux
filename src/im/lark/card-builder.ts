@@ -163,6 +163,8 @@ export function buildConfigTextCard(data: ConfigCardData, locale?: Locale): stri
     { tag: 'hr' },
     ...section('card.config.lbl_prompt', 'autoStartPrompt', data.autoStartPrompt),
     { tag: 'hr' },
+    ...section('card.config.lbl_passthrough', 'customPassthroughCommands', data.customPassthroughCommands),
+    { tag: 'hr' },
     ...section('card.config.lbl_role', 'teamRole', data.teamRole),
   ];
   return JSON.stringify({
@@ -175,6 +177,7 @@ export function buildConfigTextCard(data: ConfigCardData, locale?: Locale): stri
 const cliDisplayNames: Record<CliId, string> = {
   'claude-code': 'Claude',
   'seed': 'Seed',
+  'relay': 'Relay',
   'aiden': 'Aiden',
   'coco': 'CoCo',
   'codex': 'Codex',
