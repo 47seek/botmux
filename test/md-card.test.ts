@@ -306,6 +306,29 @@ describe('buildCardBodyElements image rows', () => {
     const out = buildCardBodyElements('![](img_v2_real) ![](https://x.test/b.png)');
     expect(out.some(e => e.tag === 'column_set')).toBe(false);
   });
+
+  it('near-miss srcs (img_v2foo.png / img_v2:x) are NOT treated as img_keys', () => {
+    // Full-key match required: a bare versioned prefix without the `_<id>` part
+    // (or with stray punctuation) is not a real key → no native row.
+    expect(buildCardBodyElements('![](img_v2foo.png) ![](img_v3bar.png)')
+      .some(e => e.tag === 'column_set')).toBe(false);
+    expect(buildCardBodyElements('![](img_v2:x) ![](img_v3:y)')
+      .some(e => e.tag === 'column_set')).toBe(false);
+  });
+
+  it('image line inside a 4-backtick block with an inner 3-backtick fence stays code', () => {
+    // The inner ``` must NOT close the outer ```` block; the image line after
+    // it is still code, so it must not be promoted to a native row.
+    const input = '````\n```\n![](img_v2_a) ![](img_v2_b)\n```\n````';
+    const out = buildCardBodyElements(input);
+    expect(out.some(e => e.tag === 'column_set')).toBe(false);
+    expect(mdElements(out).map(e => e.content).join('\n')).toContain('![](img_v2_a) ![](img_v2_b)');
+  });
+
+  it('a 4-space indented image line (indented code block) is NOT promoted', () => {
+    const out = buildCardBodyElements('text\n\n    ![](img_v2_a) ![](img_v2_b)');
+    expect(out.some(e => e.tag === 'column_set')).toBe(false);
+  });
 });
 
 describe('buildImageCardElements', () => {

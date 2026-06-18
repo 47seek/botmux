@@ -274,17 +274,23 @@ function imageRowElement(imgKeys: string[]): any {
 
 /** A markdown image token: `![alt](src)`, capturing the src (img_key). */
 const IMG_TOKEN_SRC = /!\[[^\]]*\]\(([^)\s]+)\)/g;
-/** A whole line that is nothing but 2+ image tokens (the "image row" form). */
-const IMG_ROW_LINE = /^\s*(?:!\[[^\]]*\]\([^)\s]+\)\s*){2,}$/;
 /**
- * Feishu-uploaded image keys look like `img_v2_…` / `img_v3_…`. Only a line
- * whose every src is such a key is promoted to a native `img` row — a model
- * reply may emit a `![](https://…) ![](…)` URL line, and a native `img`
- * element with a URL as its "img_key" makes Feishu reject the whole card.
- * Non-img_key lines fall through to the markdown widget unchanged (same as
- * before this feature existed).
+ * A whole line that is nothing but 2+ image tokens (the "image row" form).
+ * At most 3 leading spaces: a 4+-space indent is a CommonMark indented code
+ * block, whose contents `markdown-it` protects — the pre-pass must not yank an
+ * indented `![](k1) ![](k2)` line out of one and promote it to a native row.
  */
-const FEISHU_IMG_KEY = /^img_v\d/i;
+const IMG_ROW_LINE = /^ {0,3}(?:!\[[^\]]*\]\([^)\s]+\)\s*){2,}$/;
+/**
+ * Feishu-uploaded image keys look like `img_v2_<id>` / `img_v3_<id>` (the
+ * `<id>` is alphanumerics, `-` and `_`). Only a line whose every src is a full
+ * such key is promoted to a native `img` row — a model reply may emit a
+ * `![](https://…) ![](…)` URL line (or other non-key src like `img_v2foo.png`),
+ * and a native `img` element with a non-key as its "img_key" makes Feishu reject
+ * the whole card. Non-key lines fall through to the markdown widget unchanged
+ * (same as before this feature existed).
+ */
+const FEISHU_IMG_KEY = /^img_v\d+_[A-Za-z0-9_-]+$/i;
 
 type BodySegment = { type: 'text'; content: string } | { type: 'imgrow'; keys: string[] };
 
@@ -297,13 +303,24 @@ function splitImageRowSegments(input: string): BodySegment[] {
   const segs: BodySegment[] = [];
   let buf: string[] = [];
   const flush = () => { if (buf.length) { segs.push({ type: 'text', content: buf.join('\n') }); buf = []; } };
+  // Track the open fence's char AND run length so a 4-backtick outer block
+  // isn't closed by an inner 3-backtick fence. Per CommonMark a closing fence
+  // is the same char, length ≥ the opening run, and nothing but whitespace
+  // after the run (no info string).
   let fenceChar = '';
+  let fenceLen = 0;
   for (const line of input.split('\n')) {
-    const fence = line.match(/^\s*(`{3,}|~{3,})/);
+    const fence = line.match(/^ {0,3}(`{3,}|~{3,})(.*)$/);
     if (fence) {
-      const ch = fence[1][0];
-      if (!fenceChar) fenceChar = ch;            // opening fence
-      else if (ch === fenceChar) fenceChar = ''; // closing fence (same char)
+      const run = fence[1];
+      const ch = run[0];
+      if (!fenceChar) {
+        fenceChar = ch;                           // opening fence
+        fenceLen = run.length;
+      } else if (ch === fenceChar && run.length >= fenceLen && fence[2].trim() === '') {
+        fenceChar = '';                           // valid closing fence
+        fenceLen = 0;
+      }
       buf.push(line);
       continue;
     }
