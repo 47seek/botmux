@@ -369,24 +369,6 @@ export function buildSessionClosedCard(
   return JSON.stringify(card);
 }
 
-/** Build the lightweight placeholder shown while a no-streaming-card bot works. */
-export function buildPendingResponseCard(locale?: Locale): string {
-  return JSON.stringify({
-    schema: '2.0',
-    config: { update_multi: true },
-    header: {
-      template: 'blue',
-      title: { tag: 'plain_text', content: t('card.pending.title', undefined, locale) },
-    },
-    body: {
-      direction: 'vertical',
-      elements: [
-        { tag: 'markdown', content: t('card.pending.body', undefined, locale) },
-      ],
-    },
-  });
-}
-
 /** Collapse whitespace and clip a discovered-command description for a table cell. */
 function clipDesc(desc?: string): string {
   if (!desc) return '—';
@@ -518,23 +500,6 @@ export function buildDetouredPendingResponseCard(locale?: Locale): string {
       direction: 'vertical',
       elements: [
         { tag: 'markdown', content: t('card.pending.detoured_body', undefined, locale) },
-      ],
-    },
-  });
-}
-
-export function buildMentionedPendingResponseCard(locale?: Locale): string {
-  return JSON.stringify({
-    schema: '2.0',
-    config: { update_multi: true },
-    header: {
-      template: 'grey',
-      title: { tag: 'plain_text', content: t('card.pending.detoured_title', undefined, locale) },
-    },
-    body: {
-      direction: 'vertical',
-      elements: [
-        { tag: 'markdown', content: t('card.pending.mentioned_body', undefined, locale) },
       ],
     },
   });

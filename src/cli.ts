@@ -73,6 +73,7 @@ import { type Brand, chatAppLink, larkHosts, normalizeBrand, sdkDomain } from '.
 import { mergeGlobalConfig, readGlobalConfig, setGlobalLocale, globalConfigPath } from './global-config.js';
 import { buildBridgeSendMarkerContent } from './services/bridge-fallback-gate.js';
 import { writeManualIntentIfAbsentTo } from './services/restart-intent-store.js';
+import { stripLegacyPendingCardFields } from './services/session-store.js';
 
 // Resolve the CLI's UI locale once from the global config file, so subsequent
 // CLI output (and any t() callers that don't pass an explicit locale) honour
@@ -1539,9 +1540,6 @@ interface SessionData {
   currentDocCommentTarget?: { fileToken: string; fileType: string; commentId: string; replyToName?: string; replyToOpenId?: string; turnId: string };
   quoteTargetSenderOpenId?: string;
   quoteTargetSenderIsBot?: boolean;
-  pendingResponseCardId?: string;
-  pendingResponseCardState?: 'open' | 'patched';
-  lastPatchedResponseCardId?: string;
   // Markers that a real CLI ever ran in this session (vs a daemon-command
   // scratch placeholder). Persisted by the daemon; only presence is checked
   // here, so they're typed loosely. Used by cmdList to avoid reporting an
@@ -1661,13 +1659,17 @@ function saveSession(session: SessionData): void {
   if (existsSync(fp)) {
     try { data = JSON.parse(readFileSync(fp, 'utf-8')); } catch { /* start fresh */ }
   }
-  data[session.sessionId] = mergePendingResponseState(session, data[session.sessionId]);
+  data[session.sessionId] = session;
 
-  // Clean up entries where file key doesn't match the entry's sessionId (data corruption)
+  // Clean up entries where file key doesn't match the entry's sessionId (data
+  // corruption), and strip legacy placeholder-card fields so the file converges
+  // to clean (see stripLegacyPendingCardFields in services/session-store).
   for (const [key, val] of Object.entries(data)) {
     if (val && typeof val === 'object' && 'sessionId' in val && (val as SessionData).sessionId !== key) {
       delete data[key];
+      continue;
     }
+    if (val && typeof val === 'object') stripLegacyPendingCardFields(val as unknown as Record<string, unknown>);
   }
 
   const tmpFp = fp + '.tmp';
@@ -3093,9 +3095,7 @@ function argValues(args: string[], ...flags: string[]): string[] {
 // Card v2 body builder helpers — extracted to im/lark/md-card.ts so the
 // daemon's bridge fallback path can produce identical cards. cmdSend
 // keeps using `buildImageCardElements` from there.
-import { buildMentionedPendingResponseCard } from './im/lark/card-builder.js';
 import { buildImageCardElements, brandFooterSegment } from './im/lark/md-card.js';
-import { COMPLETED_REACTION_EMOJI_TYPE, claimPendingResponseCard, isPendingResponseCardOpen, markPendingResponseCardPatchedIfCurrent, mergePendingResponseState, shouldMarkPendingAsMentionedSend, shouldPatchPendingOnExplicitSend } from './core/pending-response.js';
 import { resolveBrandLabel } from './bot-registry.js';
 import { config } from './config.js';
 import { resolveQuoteTarget, validateMentionDecision, parseAttentionFlag, attentionUsageError } from './services/send-policy.js';
@@ -3367,17 +3367,6 @@ async function cmdSend(rest: string[]): Promise<void> {
         if (!existsSync(markerDir)) mkdirSync(markerDir, { recursive: true });
         appendFileSync(join(markerDir, `${sid}.jsonl`), JSON.stringify({ sentAtMs: Date.now(), messageId: `doc:${docTarget.commentId}`, contentLength: content.length }) + '\n');
       } catch { /* best-effort：漏记只多一条兜底 */ }
-      // 收尾飞书侧占位卡（streaming-disabled 会话）避免停在「处理中」。
-      try {
-        const pendingCardId = claimPendingResponseCard(s);
-        const latest = pendingCardId ? loadSessionFresh(s) : undefined;
-        if (pendingCardId && latest?.pendingResponseCardId === pendingCardId) {
-          const { updateMessage } = await import('./im/lark/client.js');
-          const { buildMarkdownCard } = await import('./im/lark/md-card.js');
-          await updateMessage(appId, pendingCardId, buildMarkdownCard(t('daemon.doc_comment_replied_card', undefined, loc), undefined, resolveBrandLabel(appId), loc));
-          if (markPendingResponseCardPatchedIfCurrent(latest, pendingCardId)) saveSession(latest);
-        }
-      } catch { /* best-effort */ }
       console.error(`✓ 已回复文档评论 ${docTarget.commentId.slice(0, 12)}（${chunks.length} 条）`);
       console.log(JSON.stringify({ success: true, commentId: docTarget.commentId, sessionId: sid, kind: 'doc-comment', chunks: chunks.length }));
     } catch (e: any) {
@@ -3431,7 +3420,7 @@ async function cmdSend(rest: string[]): Promise<void> {
   const { registerBot, loadBotConfigs, findOncallChatForAnyBot } = await import('./bot-registry.js');
   try { for (const cfg of loadBotConfigs()) registerBot(cfg); } catch { /* */ }
 
-  const { sendMessage, replyMessage, uploadImage, uploadFile, updateMessage, addReaction, MessageWithdrawnError } = await import('./im/lark/client.js');
+  const { sendMessage, replyMessage, uploadImage, uploadFile, MessageWithdrawnError } = await import('./im/lark/client.js');
   const appId = s.larkAppId!;
   // Effective target chat for top-level mode (defaults to session's chat)
   const targetChatId = overrideChatId ?? s.chatId;
@@ -3512,51 +3501,6 @@ async function cmdSend(rest: string[]): Promise<void> {
   };
 
   const shouldRecordBridgeMarker = !sendTopLevel && !overrideChatId && !sendInto;
-  let hasNotificationMentionsForPending = mentionArgs.length > 0;
-
-  const dispatchOrPatchPending = async (content: string, msgType: string): Promise<string> => {
-    const pendingCardId = shouldPatchPendingOnExplicitSend(s, { msgType, sendTopLevel, overrideChatId: !!overrideChatId, sendInto: !!sendInto, hasNotificationMentions: hasNotificationMentionsForPending })
-      ? claimPendingResponseCard(s)
-      : undefined;
-    if (!pendingCardId) {
-      const sentId = await dispatchPrimary(content, msgType);
-      if (shouldMarkPendingAsMentionedSend({ msgType, sendTopLevel, overrideChatId: !!overrideChatId, sendInto: !!sendInto, hasNotificationMentions: hasNotificationMentionsForPending })) {
-        const stalePendingCardId = claimPendingResponseCard(s);
-        const latest = stalePendingCardId ? loadSessionFresh(s) : undefined;
-        if (stalePendingCardId && latest?.pendingResponseCardId === stalePendingCardId) {
-          updateMessage(appId, stalePendingCardId, buildMentionedPendingResponseCard(localeForBot(appId)))
-            .then(() => {
-              if (markPendingResponseCardPatchedIfCurrent(latest, stalePendingCardId)) saveSession(latest);
-            })
-            .catch((err: any) => logger.warn(`[send:${sid.substring(0, 8)}] failed to mark pending card after mentioned send: ${err?.message ?? err}`));
-        }
-      }
-      return sentId;
-    }
-
-    const latest = loadSessionFresh(s);
-    if (latest?.pendingResponseCardId !== pendingCardId) return dispatchPrimary(content, msgType);
-
-    try {
-      await updateMessage(appId, pendingCardId, content);
-      if (markPendingResponseCardPatchedIfCurrent(latest, pendingCardId)) {
-        saveSession(latest);
-        if (latest.quoteTargetId) {
-          addReaction(appId, latest.quoteTargetId, COMPLETED_REACTION_EMOJI_TYPE)
-            .catch((err: any) => logger.warn(`[send:${sid.substring(0, 8)}] failed to add completion reaction to ${latest.quoteTargetId}: ${err?.message ?? err}`));
-        }
-      }
-      return pendingCardId;
-    } catch (err: any) {
-      if (err instanceof MessageWithdrawnError) {
-        logger.warn(`[send:${sid.substring(0, 8)}] pending card withdrawn before explicit send patch; sending a new reply`);
-        markPendingResponseCardPatchedIfCurrent(latest, pendingCardId);
-        saveSession(latest);
-        return dispatchPrimary(content, msgType);
-      }
-      throw err;
-    }
-  };
 
   // Quote chain (普通群): the primary message replies to the turn's target so
   // Lark renders a 引用 chain. --quote overrides, --no-quote opts out. Thread
@@ -3702,7 +3646,6 @@ async function cmdSend(rest: string[]): Promise<void> {
     } catch { /* best-effort */ }
 
     const explicitKnownBotMention = hasKnownBotMention(text, mentions, botEntries, crossRef, appId);
-    hasNotificationMentionsForPending ||= explicitKnownBotMention;
     const knownBotOpenIds = knownBotOpenIdsFromCrossRef(crossRef, botEntries, appId);
     // --no-mention 显式不 @ 任何人 → 连 footer 的"发送给/cc"寻址 <at> 也清空，
     // 否则 footer 仍会 @ 人，与 --no-mention 语义和"未@任何人"输出自相矛盾
@@ -3835,7 +3778,7 @@ async function cmdSend(rest: string[]): Promise<void> {
         config: { update_multi: true },
         body: { direction: 'vertical', elements },
       });
-      messageId = await dispatchOrPatchPending(cardJson, 'interactive');
+      messageId = await dispatchPrimary(cardJson, 'interactive');
     }
 
     // Bridge fallback marker — append-only jsonl per session. Same-thread
