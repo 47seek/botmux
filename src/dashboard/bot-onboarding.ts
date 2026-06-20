@@ -135,6 +135,10 @@ export function renderQrSvgDataUrl(value: string): string {
 
 export class BotOnboardingManager {
   private readonly jobs = new Map<string, BotOnboardingSnapshot>();
+  // needs_owner 状态下「待落盘」的 bot 配置（含 secret）——故意不写进 bots.json,
+  // 避免在 owner 确认前就有一个空 allowlist 的可启动 bot 留在磁盘上（重启即 fail-open）。
+  // 也不放进 jobs 快照（那个会序列化给前端、会泄漏 secret）。owner 校验通过后才 append。
+  private readonly pendingBots = new Map<string, Record<string, any>>();
   private readonly registerApp: RegisterAppFn;
   private readonly validateCredentials: ValidateCredentialsFn;
   private readonly automateOpenPlatform: AutomateOpenPlatformFn;
@@ -230,51 +234,48 @@ export class BotOnboardingManager {
     if (result.brand === 'lark') {
       bot.brand = 'lark';
     }
-    const addedBotIndex = bots.length;
-    writeBotsJsonAtomic(this.opts.botsJsonPath, [...bots, normalizeBotConfig(bot)]);
+    // 注意：此处 **不** 立刻把 bot 写进 bots.json。空 allowedUsers 的 bot 一旦落盘,
+    // 就是一个「可被 botmux start/restart 读取、运行时按无白名单全开放」的 fail-open
+    // 隐患（哪怕没出 restart hint, 关弹窗 / 重启 / pm2 重启都会以开放模式起）。
+    // 只有「能确认 owner」时才落盘——见下方两条路径。
 
-    // bots.json 已落盘——bot 本身已添加. 接下来跑 setup 同款开放平台自动配置
-    // (导入权限 / 配 redirect / 建并发版). 这一步失败不回滚 bot, 只降级到
-    // 手动权限步骤提示——和 `botmux setup` 的 finishOpenPlatformSetup 行为一致.
+    // 跑 setup 同款开放平台自动配置 (导入权限 / 配 redirect / 建并发版)。
     const auto = await this.runPermissionAutomation(id, result.appId, result.brand, { cliId, workingDir });
 
-    // 关键顺序：先把 owner 解析/落盘, 再决定终态。completed 必须意味着「有一个
-    // 可解析的 owner」——绝不产出空 allowedUsers 的可启动 bot：运行时把「无任何
-    // 白名单」判成「全开放」, 任何能触达该 bot 的人都能做 /grant 等 operate 操作
-    // (fail-open)。把 completed 放在 owner 落盘之后, 也消掉「completed 早于 owner
-    // 写入、用户抢先重启 daemon 以开放模式起」的竞态。
-    let ownerWritten = false;
+    // 关键顺序：先确认 owner, 再决定是否落盘 + 终态。completed 必须意味着「bots.json
+    // 里这个 bot 带着至少一个 owner」, 绝不产出空 allowedUsers 的可启动 bot。
+    let ownerEntry: string | undefined;
     if (result.userOpenId) {
       // registerApp 返回的 open_id 来自扫码链路; 用新 app 自身凭证验证, 失败不
       // fallback 写入该 (常为跨 app 的) ou_——避免把其他 app 视角的 open_id 固化
       // 成 owner, 导致 /grant 和授权卡片一直判 non-owner。
-      ownerWritten = await this.applyScannerAllowedUser(result.appId, result.appSecret, result.userOpenId, result.brand);
+      ownerEntry = await resolveScannerAllowedUser(result.appId, result.appSecret, result.userOpenId, result.brand);
     }
 
-    // 扫码 owner 写不进去 → needs_owner, 由前端引导用户手动填写并校验后再 complete。
-    this.finalizePermissions(id, result.appId, result.brand, addedBotIndex, auto, ownerWritten ? 'completed' : 'needs_owner');
+    if (ownerEntry) {
+      const addedBotIndex = this.persistBot({ ...bot, allowedUsers: [ownerEntry] });
+      this.finalizePermissions(id, result.appId, result.brand, addedBotIndex, auto, 'completed');
+    } else {
+      // owner 没法自动确认：bot 先不落盘, 暂存内存等用户手动填 owner 校验通过后再写。
+      this.pendingBots.set(id, bot);
+      this.finalizePermissions(id, result.appId, result.brand, undefined, auto, 'needs_owner');
+    }
   }
 
-  /** 返回 true 表示已把可验证的扫码人身份写进 allowedUsers (或已存在 owner)。 */
-  private async applyScannerAllowedUser(
-    appId: string,
-    appSecret: string,
-    scannerOpenId: string,
-    brand: Brand,
-  ): Promise<boolean> {
-    const allowedUser = await resolveScannerAllowedUser(appId, appSecret, scannerOpenId, brand);
-    if (!allowedUser) return false;
-
+  /** 把 bot append/更新进 bots.json（按 larkAppId upsert, 幂等），返回它的行号。 */
+  private persistBot(bot: Record<string, any>): number {
     const bots = readBotsJsonOrEmpty(this.opts.botsJsonPath);
-    const index = bots.findIndex((bot: any) => bot?.larkAppId === appId);
-    if (index < 0) return false;
-    const current = bots[index] as Record<string, any>;
-    if (Array.isArray(current.allowedUsers) && current.allowedUsers.length > 0) return true;
-
-    const next = [...bots];
-    next[index] = normalizeBotConfig({ ...current, allowedUsers: [allowedUser] });
-    writeBotsJsonAtomic(this.opts.botsJsonPath, next);
-    return true;
+    const normalized = normalizeBotConfig(bot);
+    const existing = bots.findIndex((b: any) => b?.larkAppId === bot.larkAppId);
+    if (existing >= 0) {
+      const next = [...bots];
+      next[existing] = normalized;
+      writeBotsJsonAtomic(this.opts.botsJsonPath, next);
+      return existing;
+    }
+    const index = bots.length;
+    writeBotsJsonAtomic(this.opts.botsJsonPath, [...bots, normalized]);
+    return index;
   }
 
   /**
@@ -287,8 +288,8 @@ export class BotOnboardingManager {
     const job = this.jobs.get(id);
     if (!job) return { ok: false, error: 'unknown_onboarding_job' };
     if (job.status !== 'needs_owner') return { ok: false, error: 'not_awaiting_owner' };
-    const appId = job.appId;
-    if (!appId) return { ok: false, error: 'missing_app' };
+    const pending = this.pendingBots.get(id);
+    if (!pending) return { ok: false, error: 'missing_app' };
 
     const entries = rawEntries.map(e => e.trim()).filter(Boolean);
     const invalid = findInvalidAllowedUserEntries(entries);
@@ -299,11 +300,8 @@ export class BotOnboardingManager {
       return { ok: false, error: 'no_owner', message: '至少需要一个完整邮箱、union_id(on_) 或 open_id(ou_) 作为 owner。' };
     }
 
-    const bots = readBotsJsonOrEmpty(this.opts.botsJsonPath);
-    const index = bots.findIndex((bot: any) => bot?.larkAppId === appId);
-    if (index < 0) return { ok: false, error: 'missing_app' };
-    const current = bots[index] as Record<string, any>;
-    const appSecret = typeof current.larkAppSecret === 'string' ? current.larkAppSecret : '';
+    const appId = typeof pending.larkAppId === 'string' ? pending.larkAppId : '';
+    const appSecret = typeof pending.larkAppSecret === 'string' ? pending.larkAppSecret : '';
     const brand: Brand = job.brand ?? 'feishu';
 
     const unusable = await detectUnusableOwnerEntries(appId, appSecret, brand, entries);
@@ -315,10 +313,10 @@ export class BotOnboardingManager {
       };
     }
 
-    const next = [...bots];
-    next[index] = normalizeBotConfig({ ...current, allowedUsers: entries });
-    writeBotsJsonAtomic(this.opts.botsJsonPath, next);
-    this.patch(id, { status: 'completed' });
+    // 校验通过才落盘：此刻 bot 第一次进入 bots.json, 且带着非空 allowedUsers。
+    const addedBotIndex = this.persistBot({ ...pending, allowedUsers: entries });
+    this.pendingBots.delete(id);
+    this.patch(id, { status: 'completed', addedBotIndex });
     return { ok: true };
   }
 
@@ -367,12 +365,15 @@ export class BotOnboardingManager {
     }
   }
 
-  /** 在 owner 落盘后统一落终态：completed (有 owner) 或 needs_owner (待用户手动填)。 */
+  /**
+   * 统一落终态：completed (已落盘 + 有 owner) 或 needs_owner (尚未落盘、待用户手动填)。
+   * needs_owner 时 addedBotIndex 为 undefined——bot 还没进 bots.json, 没有行号。
+   */
   private finalizePermissions(
     id: string,
     appId: string,
     brand: 'feishu' | 'lark',
-    addedBotIndex: number,
+    addedBotIndex: number | undefined,
     auto: OpenPlatformAutomationResult,
     status: 'completed' | 'needs_owner',
   ): void {
@@ -387,7 +388,7 @@ export class BotOnboardingManager {
       : { ok: false, reason: auto.reason, message: auto.message };
     this.patch(id, {
       status,
-      addedBotIndex,
+      ...(addedBotIndex !== undefined ? { addedBotIndex } : {}),
       platformQrDataUrl: undefined,
       permission,
       ...(auto.ok ? {} : { remainingSteps: buildRemainingSteps(appId, brand) }),

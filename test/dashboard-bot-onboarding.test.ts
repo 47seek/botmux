@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { BotOnboardingManager } from '../src/dashboard/bot-onboarding.js';
@@ -75,9 +75,10 @@ describe('BotOnboardingManager', () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
-  it('does not complete with an empty allowedUsers when the scanner cannot be verified', async () => {
-    // 回归：扫码人身份验证不了时绝不产出「空 allowedUsers + completed」的可启动
-    // bot——运行时会把无白名单判成「全开放」让任何人 operate。改走 needs_owner。
+  it('does not write a startable empty-allowlist bot when the scanner cannot be verified', async () => {
+    // 回归：扫码人身份验证不了时绝不在磁盘留下「空 allowedUsers 的可启动 bot」——
+    // 它一旦被 botmux start/restart 读到, 运行时按无白名单全开放, 任何人可 operate。
+    // 改走 needs_owner, 且 bots.json 此刻根本没有这个 bot（待手动填 owner 后才落盘）。
     const dir = mkdtempSync(join(tmpdir(), 'botmux-onboard-'));
     const manager = new BotOnboardingManager({
       botsJsonPath: join(dir, 'bots.json'),
@@ -100,20 +101,15 @@ describe('BotOnboardingManager', () => {
     expect(status).toMatchObject({
       status: 'needs_owner',
       appId: 'cli_new',
-      addedBotIndex: 0,
       // 权限摘要照常附带, 只是没进 completed。
       permission: { ok: true, scopeCount: 9 },
     });
+    // needs_owner 尚未落盘, 没有行号, 也绝不泄漏 secret。
+    expect(status?.addedBotIndex).toBeUndefined();
     expect(JSON.stringify(status)).not.toContain('super-secret-value');
 
-    const bots = JSON.parse(readFileSync(join(dir, 'bots.json'), 'utf-8'));
-    expect(bots).toEqual([{
-      larkAppId: 'cli_new',
-      larkAppSecret: 'super-secret-value',
-      cliId: 'claude-code',
-      workingDir: '~',
-    }]);
-    expect(bots[0]).not.toHaveProperty('allowedUsers');
+    // 核心回归：磁盘上没有这个 bot（不存在「空 allowlist 可启动 bot」）。
+    expect(existsSync(join(dir, 'bots.json'))).toBe(false);
     expect(userGetMock).toHaveBeenCalledWith({
       path: { user_id: 'ou_owner' },
       params: { user_id_type: 'open_id' },
@@ -140,6 +136,8 @@ describe('BotOnboardingManager', () => {
     const job = manager.start();
     await job.done;
     expect(manager.get(job.id)?.status).toBe('needs_owner');
+    // 提交前：磁盘上没有这个 bot。
+    expect(existsSync(join(dir, 'bots.json'))).toBe(false);
 
     // 该邮箱在本企业可解析 → usable → 通过。
     batchGetIdMock.mockResolvedValueOnce({
@@ -150,8 +148,10 @@ describe('BotOnboardingManager', () => {
     expect(r.ok).toBe(true);
 
     expect(manager.get(job.id)?.status).toBe('completed');
+    // 提交后才第一次落盘, 且带着非空 allowedUsers + 完整配置。
     const bots = JSON.parse(readFileSync(join(dir, 'bots.json'), 'utf-8'));
-    expect(bots[0].allowedUsers).toEqual(['owner@corp.com']);
+    expect(bots).toHaveLength(1);
+    expect(bots[0]).toMatchObject({ larkAppId: 'cli_new', cliId: 'claude-code', allowedUsers: ['owner@corp.com'] });
 
     rmSync(dir, { recursive: true, force: true });
   });
@@ -180,9 +180,9 @@ describe('BotOnboardingManager', () => {
     expect(r.ok).toBe(false);
     expect(r.error).toBe('unusable_owner');
 
+    // 仍是 needs_owner, 且磁盘上没有落下任何 bot（更没有空 allowlist 的）。
     expect(manager.get(job.id)?.status).toBe('needs_owner');
-    const bots = JSON.parse(readFileSync(join(dir, 'bots.json'), 'utf-8'));
-    expect(bots[0]).not.toHaveProperty('allowedUsers');
+    expect(existsSync(join(dir, 'bots.json'))).toBe(false);
 
     rmSync(dir, { recursive: true, force: true });
   });
@@ -271,9 +271,18 @@ describe('BotOnboardingManager', () => {
     await job.done;
 
     const status = manager.get(job.id);
-    // 无扫码人身份 → 不能自动定 owner → needs_owner (bot 配置仍照常写入)。
+    // 无扫码人身份 → 不能自动定 owner → needs_owner (此刻尚未落盘)。
     expect(status?.status).toBe('needs_owner');
     expect(status).toMatchObject({ cliId: 'codex', workingDir: dir });
+    expect(existsSync(join(dir, 'bots.json'))).toBe(false);
+
+    // 手动填一个可解析的 owner 后, 表单选的字段才随 bot 一起落盘。
+    batchGetIdMock.mockResolvedValueOnce({
+      code: 0,
+      data: { user_list: [{ email: 'admin@corp.com', user_id: 'ou_admin' }] },
+    });
+    const r = await manager.submitOwner(job.id, ['admin@corp.com']);
+    expect(r.ok).toBe(true);
 
     const bots = JSON.parse(readFileSync(join(dir, 'bots.json'), 'utf-8'));
     expect(bots[0]).toMatchObject({
@@ -281,6 +290,7 @@ describe('BotOnboardingManager', () => {
       cliId: 'codex',
       workingDir: dir,
       model: 'gpt-5',
+      allowedUsers: ['admin@corp.com'],
     });
 
     rmSync(dir, { recursive: true, force: true });
@@ -339,15 +349,22 @@ describe('BotOnboardingManager', () => {
     await job.done;
 
     const status = manager.get(job.id);
-    // bot 仍写入 (核心成功), 仅权限需手动补 → 给出深链步骤. 无扫码人身份故 needs_owner.
+    // 权限自动配置失败仍给出手动深链步骤; 无扫码人身份故 needs_owner（尚未落盘）。
     expect(status?.status).toBe('needs_owner');
     expect(status?.permission).toMatchObject({ ok: false, reason: 'missing_csrf' });
     expect(Array.isArray(status?.remainingSteps)).toBe(true);
     expect(status!.remainingSteps!.length).toBeGreaterThan(0);
     expect(status!.remainingSteps!.every(s => typeof s.url === 'string' && s.url.includes('cli_f'))).toBe(true);
+    expect(existsSync(join(dir, 'bots.json'))).toBe(false);
 
+    // 手动填 owner 后才落盘——权限手动步骤不影响 bot 最终被加入（带 owner）。
+    batchGetIdMock.mockResolvedValueOnce({
+      code: 0,
+      data: { user_list: [{ email: 'admin@corp.com', user_id: 'ou_admin' }] },
+    });
+    expect((await manager.submitOwner(job.id, ['admin@corp.com'])).ok).toBe(true);
     const bots = JSON.parse(readFileSync(join(dir, 'bots.json'), 'utf-8'));
-    expect(bots[0]).toMatchObject({ larkAppId: 'cli_f', cliId: 'claude-code' });
+    expect(bots[0]).toMatchObject({ larkAppId: 'cli_f', cliId: 'claude-code', allowedUsers: ['admin@corp.com'] });
 
     rmSync(dir, { recursive: true, force: true });
   });
