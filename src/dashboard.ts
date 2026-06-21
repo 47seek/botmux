@@ -40,7 +40,14 @@ import {
 import { invalidWorkingDirs } from './utils/working-dir.js';
 import { mergeDashboardConfig, mergeGlobalConfig, mergeMaintenanceConfig, parseMaintenancePatch, readGlobalConfig, setGlobalLocale, type DashboardGlobalConfig, type MaintenanceConfig, type RepoPickerMode } from './global-config.js';
 import { isLocale } from './i18n/types.js';
-import { isLocalDevInstall } from './utils/install-info.js';
+import { isLocalDevInstall, botmuxVersion } from './utils/install-info.js';
+import { checkNode, detectBotmuxInstalls, resolveCurrentVersion } from './utils/install-diagnostics.js';
+import { fetchLatestVersion, fetchReleasesSince, isNewerVersion, type ChangelogResult } from './core/update-check.js';
+import { GITHUB_REPO } from './core/restart-report.js';
+import { spawnDetachedRestart, npmGlobalUpdateLockTarget } from './core/maintenance.js';
+import { writeRestartIntent } from './services/restart-intent-store.js';
+import { withFileLock } from './utils/file-lock.js';
+import { spawn } from 'node:child_process';
 import { listTeamReports, readTeamBoard, setTeamBoardEntry } from './services/team-board-store.js';
 import type { CliId } from './adapters/cli/types.js';
 import type { ConnectorDefinition } from './services/connector-store.js';
@@ -163,6 +170,68 @@ async function readJsonBody(req: IncomingMessage): Promise<unknown> {
   for await (const c of req) chunks.push(c as Buffer);
   const raw = Buffer.concat(chunks).toString('utf8').trim();
   return raw ? JSON.parse(raw) : {};
+}
+
+/** Fast in-process guard against double-clicks within this dashboard process.
+ *  Cross-process serialization against the maintenance auto-update (a different
+ *  process) is handled separately by the shared file lock in the run route. */
+let updateInFlight = false;
+
+// Cache the upstream version/changelog lookups so the nav-badge check + the
+// Settings card don't hammer the npm registry / GitHub on every page load.
+// GitHub's unauthenticated API is only 60 req/h per IP, so caching the changelog
+// also keeps us from exhausting it. Failures cache briefly so they self-heal.
+const LATEST_TTL_MS = 30 * 60_000;
+const CHANGELOG_TTL_MS = 15 * 60_000;
+const FAILURE_TTL_MS = 60_000;
+let latestVersionCache: { value: string | null; at: number } | null = null;
+let changelogCache: { key: string; value: ChangelogResult; at: number } | null = null;
+
+async function cachedLatestVersion(now = Date.now()): Promise<string | null> {
+  const ttl = latestVersionCache?.value ? LATEST_TTL_MS : FAILURE_TTL_MS;
+  if (latestVersionCache && now - latestVersionCache.at < ttl) return latestVersionCache.value;
+  const value = await fetchLatestVersion();
+  latestVersionCache = { value, at: now };
+  return value;
+}
+
+async function cachedChangelog(current: string, now = Date.now()): Promise<ChangelogResult> {
+  const ttl = changelogCache?.value.ok ? CHANGELOG_TTL_MS : FAILURE_TTL_MS;
+  if (changelogCache && changelogCache.key === current && now - changelogCache.at < ttl) return changelogCache.value;
+  const value = await fetchReleasesSince(current);
+  changelogCache = { key: current, value, at: now };
+  return value;
+}
+
+/**
+ * Run `npm install -g botmux@latest` for the manual-update flow WITHOUT blocking
+ * the event loop (async spawn, not execSync — the dashboard must keep serving
+ * during the ~10-30s install). Resolves on exit 0; rejects with the tail of
+ * stdout/stderr on a non-zero exit, spawn error, or 3-minute timeout. Args are
+ * a fixed literal — no shell interpolation of untrusted input.
+ */
+function runNpmInstallLatest(): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    const child = spawn('npm', ['install', '-g', 'botmux@latest'], {
+      env: process.env,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      shell: process.platform === 'win32', // resolve npm.cmd on Windows
+    });
+    let tail = '';
+    const capture = (d: Buffer): void => { tail = (tail + d.toString()).slice(-2000); };
+    child.stdout?.on('data', capture);
+    child.stderr?.on('data', capture);
+    const timer = setTimeout(() => {
+      child.kill('SIGKILL');
+      reject(new Error('npm install timed out after 180s'));
+    }, 180_000);
+    child.on('error', (e) => { clearTimeout(timer); reject(e); });
+    child.on('exit', (code) => {
+      clearTimeout(timer);
+      if (code === 0) resolve();
+      else reject(new Error(`npm exited ${code}: ${tail.trim().slice(-500)}`));
+    });
+  });
 }
 
 /**
@@ -865,6 +934,89 @@ const server = createServer(async (req, res) => {
       }
       if (!touched) return jsonRes(res, 400, { ok: false, error: 'empty_patch' });
       return jsonRes(res, 200, { ok: true, settings: resolveDashboardSettings() });
+    }
+
+    // ─── Version & manual update ─────────────────────────────────────────────
+    // `npm install -g` and a host restart are privileged: none of these paths
+    // are on PUBLIC_READ_PATHS, so decideDashboardAuth already 401s an
+    // unauthenticated caller (in both normal and public-read mode). The explicit
+    // `authed` guards on the two mutations are defense-in-depth for host actions.
+    if (req.method === 'GET' && url.pathname === '/api/update/status') {
+      const current = resolveCurrentVersion();
+      // Compare against the npm `latest` dist-tag (always stable; the update
+      // button installs `@latest`). isNewerVersion uses semver precedence, so a
+      // canary running AHEAD of the latest stable (e.g. 2.87.0-canary.0 vs
+      // 2.86.0) is NOT flagged behind — exactly the canary case we want.
+      const latest = await cachedLatestVersion();
+      return jsonRes(res, 200, {
+        current,
+        latest,
+        behind: !!latest && isNewerVersion(latest, current),
+        localDevInstall: isLocalDevInstall(),
+        node: checkNode(),
+        installs: detectBotmuxInstalls(),
+      });
+    }
+
+    if (req.method === 'GET' && url.pathname === '/api/update/changelog') {
+      const current = resolveCurrentVersion();
+      const result = await cachedChangelog(current);
+      return jsonRes(res, 200, {
+        current,
+        ok: result.ok,
+        rateLimited: result.rateLimited === true,
+        releases: result.releases,
+        releasesUrl: `https://github.com/${GITHUB_REPO}/releases`,
+      });
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/update/run') {
+      if (!authed) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
+      if (isLocalDevInstall()) return jsonRes(res, 400, { ok: false, error: 'local_dev_no_update' });
+      const node = checkNode();
+      if (!node.ok) return jsonRes(res, 400, { ok: false, error: 'node_too_old', node });
+      if (updateInFlight) return jsonRes(res, 409, { ok: false, error: 'update_in_flight' });
+      updateInFlight = true;
+      const oldVersion = botmuxVersion();
+      // Acquire the shared cross-process lock so a scheduled maintenance
+      // auto-update (running in the bot-0 daemon) can't `npm install -g` at the
+      // same time. `acquired` distinguishes "lock held by maintenance" (409)
+      // from "npm itself failed" (500). Short wait: don't block the request on a
+      // full in-progress install — report busy fast.
+      let acquired = false;
+      try {
+        await withFileLock(npmGlobalUpdateLockTarget(), async () => {
+          acquired = true;
+          await runNpmInstallLatest();
+        }, { maxWaitMs: 2_000 });
+      } catch (e) {
+        if (!acquired) return jsonRes(res, 409, { ok: false, error: 'update_in_flight' });
+        return jsonRes(res, 500, { ok: false, error: 'npm_failed', detail: e instanceof Error ? e.message : String(e) });
+      } finally {
+        updateInFlight = false;
+      }
+      const newVersion = botmuxVersion();
+      return jsonRes(res, 200, { ok: true, oldVersion, newVersion, changed: newVersion !== oldVersion });
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/update/restart') {
+      if (!authed) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
+      let body: Record<string, unknown> = {};
+      try {
+        const parsed = await readJsonBody(req);
+        if (parsed && typeof parsed === 'object') body = parsed as Record<string, unknown>;
+      } catch { /* empty / bad body → plain restart */ }
+      const upd = body.update && typeof body.update === 'object' ? body.update as Record<string, unknown> : null;
+      // After a manual update, leave an `update` breadcrumb so the fresh daemon
+      // DMs the owner the changelog (reuses the restart-report pipeline). A plain
+      // restart leaves none here; cmdRestart writes a `manual` breadcrumb itself.
+      if (upd && typeof upd.oldVersion === 'string' && typeof upd.newVersion === 'string' && upd.oldVersion !== upd.newVersion) {
+        try {
+          writeRestartIntent({ kind: 'update', oldVersion: upd.oldVersion, newVersion: upd.newVersion, at: new Date().toISOString() });
+        } catch { /* breadcrumb is best-effort */ }
+      }
+      spawnDetachedRestart('dashboard');
+      return jsonRes(res, 200, { ok: true });
     }
 
     if (req.method === 'GET' && url.pathname === '/api/skills') {
