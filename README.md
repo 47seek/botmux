@@ -120,32 +120,6 @@ botmux dispatch --title "实现登录模块" \
 - 子 bot 须已在群里、可被 @（具备 `im:message.group_at_msg.include_bot` 权限）。
 - 一条话题可放多个 bot，它们在话题内互相 @ 协作（如 coder 写完 @ reviewer 审）。
 
-### 本地白板（Whiteboard）
-
-同一个群里的多个机器人 / 会话共享一块**本地 markdown 白板**，用来沉淀跨会话、跨 bot 的「当前项目状态」（目标 / 方案 / 进展 / 下一步）。白板是一份**最新状态快照**（`update` 整体覆盖、不堆历史），让后来的 agent 一读就拿到最新共识，而不必翻聊天记录。
-
-**默认关闭**，按需开启（enable 只打开能力、不会自动建板，首次需要时才按群懒创建）：
-
-```bash
-botmux whiteboard enable      # 或在 Dashboard 设置页打开
-botmux whiteboard status      # 查看开关与白板数量
-```
-
-- **按群共享** —— 同群不同 bot、不同工作目录默认共享同一块板（绑定键 `chat:<chatId>:default`）。
-- **agent 自动引导** —— 启用后 daemon 在每轮 prompt 注入一个 `<whiteboard>` 块，告诉 agent 如何读写（只暴露白板 id 与命令，**不暴露本地文件路径**，并提示不要写入密钥 / 隐私）。
-- **并发安全** —— 写入走每板文件锁串行化；agent 先 `read --json` 拿内容 + 版本号，再 `update --expected-updated-at <版本号>` 做乐观并发（CAS）冲突检测，避免多 agent 互相覆盖。空内容会被拒写，防止误清空。
-- **Dashboard 白板页** —— 按「群 → 白板」分组查看当前内容、受保护删除（需 dashboard token；白板读写 API 默认不对匿名只读访客开放）。
-
-常用命令：
-
-```bash
-botmux whiteboard read   --id <id> --json                          # 读内容 + updatedAt
-botmux whiteboard update --id <id> --expected-updated-at <ts> "新的完整状态"
-botmux whiteboard list                                             # 列出本机白板
-```
-
-也可以让 agent 直接用 `botmux-whiteboard` Skill（说「更新一下白板 / 看看项目上下文」即可触发）。
-
 ### Tmux 会话常驻
 
 安装 tmux 后自动启用。CLI 进程常驻在 tmux session 内，所有功能不受影响。

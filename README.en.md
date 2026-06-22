@@ -227,32 +227,6 @@ When a sub-bot finishes, it reports progress/completion back with `botmux report
 - Sub-bots must already be in the group and @-mentionable (i.e. have the `im:message.group_at_msg.include_bot` permission).
 - A single topic can hold multiple bots, and they @-mention each other to collaborate within the topic (e.g. the coder @-mentions the reviewer once the code is done).
 
-### Local Whiteboard
-
-Multiple bots / sessions in the same group share a **local markdown whiteboard** that captures the "current project state" (goals / plan / progress / next steps) across sessions and bots. The board is a **latest-state snapshot** (`update` overwrites the whole thing rather than appending history), so a later agent reads the current consensus directly instead of scrolling chat history.
-
-**Disabled by default**, opt in when you want it (enabling only turns the capability on — it does not create a board; the board is created lazily per group on first use):
-
-```bash
-botmux whiteboard enable      # or toggle it on the Dashboard Settings page
-botmux whiteboard status      # show whether it's enabled + board count
-```
-
-- **Per-group sharing** — different bots and working directories in the same group share one board by default (binding key `chat:<chatId>:default`).
-- **Auto-guided for agents** — once enabled, the daemon injects a small `<whiteboard>` block into each prompt telling the agent how to read/write it (only the board id + commands are exposed, **never local file paths**, with a reminder not to store secrets / private data).
-- **Concurrency-safe** — writes are serialized by a per-board file lock; an agent reads with `read --json` to get the content + version, then `update --expected-updated-at <version>` for optimistic-concurrency (CAS) conflict detection so concurrent agents don't clobber each other. Empty content is rejected to avoid accidentally blanking the board.
-- **Dashboard whiteboard page** — browse current content grouped by "group → board", with protected deletion (requires the dashboard token; the whiteboard read/write API is not exposed to anonymous read-only visitors).
-
-Common commands:
-
-```bash
-botmux whiteboard read   --id <id> --json                          # read content + updatedAt
-botmux whiteboard update --id <id> --expected-updated-at <ts> "the full new state"
-botmux whiteboard list                                             # list local boards
-```
-
-Agents can also just use the `botmux-whiteboard` Skill (triggered by asking it to "update the whiteboard / show the project context").
-
 ### Tmux Persistence
 
 When tmux is installed, botmux automatically uses it. CLI processes persist inside tmux sessions — all features work unchanged.
