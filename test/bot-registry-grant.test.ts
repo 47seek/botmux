@@ -164,6 +164,7 @@ describe('bot-registry grant additions', () => {
         name: 'summary-trigger',
         enabled: true,
         scope: 'both',
+        allowBotMessages: true,
         match: { type: 'keyword', pattern: '总结', caseSensitive: false },
         history: {
           topic: { mode: 'current-thread' },
@@ -177,6 +178,7 @@ describe('bot-registry grant additions', () => {
       name: 'summary-trigger',
       enabled: true,
       scope: 'both',
+      allowBotMessages: true,
       match: { type: 'keyword', pattern: '总结', caseSensitive: false },
       history: {
         topic: { mode: 'current-thread' },

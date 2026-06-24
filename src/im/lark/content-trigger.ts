@@ -42,10 +42,12 @@ export function findMatchingContentTrigger(
   triggers: ContentTriggerConfig[] | undefined,
   text: string | null | undefined,
   chatKind: ContentTriggerChatKind | undefined,
+  options?: { botAuthored?: boolean },
 ): MatchedContentTrigger | undefined {
   if (!triggers || triggers.length === 0 || !text || !chatKind) return undefined;
   for (const trigger of triggers) {
     if (!triggerAppliesToChatKind(trigger, chatKind)) continue;
+    if (options?.botAuthored && trigger.allowBotMessages !== true) continue;
     if (matchContentTrigger(trigger, text)) return { trigger, chatKind, triggerText: text };
   }
   return undefined;

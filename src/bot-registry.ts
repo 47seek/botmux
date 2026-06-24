@@ -21,6 +21,11 @@ export interface ContentTriggerConfig {
   name: string;
   enabled: boolean;
   scope: ContentTriggerScope;
+  /**
+   * Default false. When true, this trigger may be matched by non-@ messages
+   * authored by other bots. The current bot's own messages are still ignored.
+   */
+  allowBotMessages?: boolean;
   match: {
     type: ContentTriggerMatchType;
     pattern: string;
@@ -172,6 +177,7 @@ function normalizeContentTriggers(raw: unknown, botIndex: number): ContentTrigge
       name,
       enabled,
       scope,
+      ...(entry.allowBotMessages === true ? { allowBotMessages: true } : {}),
       match: { type, pattern, caseSensitive },
       history: {
         topic: { mode: 'current-thread' },
@@ -494,7 +500,9 @@ export interface BotConfig {
    * Content/keyword triggers: opt-in per bot. When a group/topic message matches
    * one of these rules, the dispatcher may route it to this bot even without an
    * explicit @mention, then feeds `action.prompt` plus the configured chat
-   * history to the CLI instead of the raw trigger text.
+   * history to the CLI instead of the raw trigger text. Human senders still go
+   * through canTalk. Bot-authored messages require per-trigger
+   * `allowBotMessages: true`.
    */
   contentTriggers?: ContentTriggerConfig[];
   /**

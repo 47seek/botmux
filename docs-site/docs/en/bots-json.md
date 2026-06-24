@@ -113,7 +113,7 @@ Run one bot on a GLM Coding Plan (or any Anthropic-compatible provider) while an
 
 | Field | Description |
 |------|------|
-| `contentTriggers` | Per-bot keyword / regex triggers. The default remains @-only; only messages matching one of these rules can wake this bot without an @ in groups or topics. On match, botmux sends `action.prompt` plus the configured history context to the CLI instead of treating the original message as the user prompt. The sender still must pass `canTalk`; bot-authored messages without an @ do not trigger |
+| `contentTriggers` | Per-bot keyword / regex triggers. The default remains @-only; only messages matching one of these rules can wake this bot without an @ in groups or topics. On match, botmux sends `action.prompt` plus the configured history context to the CLI instead of treating the original message as the user prompt. Human senders still must pass `canTalk`; bot-authored non-@ messages are ignored by default, but a single trigger can set `allowBotMessages: true` to opt in to messages from other bots |
 
 Example:
 
@@ -124,6 +124,7 @@ Example:
       "name": "summary-trigger",
       "enabled": true,
       "scope": "both",
+      "allowBotMessages": false,
       "match": { "type": "keyword", "pattern": "summary", "caseSensitive": false },
       "history": {
         "topic": { "mode": "current-thread" },
@@ -139,6 +140,7 @@ Example:
 ```
 
 - `scope`: `topic`, `regularGroup`, or `both`.
+- `allowBotMessages`: defaults to `false`. When `true`, non-@ text/card messages from other bots may match this trigger. The current bot's own messages are still ignored to avoid loops.
 - `match.type`: `keyword` or `regex`; invalid regexes are dropped with a log message and do not crash the daemon.
 - `history.topic.mode`: currently `current-thread`, reading the current topic/thread.
 - `history.regularGroup.mode`: currently `recent-messages`. `limit` means the latest N messages; `sinceHours` means the latest N hours. A value of `0` means unlimited for that dimension. If `limit` is omitted, it defaults to 50.

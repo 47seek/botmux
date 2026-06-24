@@ -2821,6 +2821,81 @@ describe('im.message.receive_v1 — content triggers', () => {
     expect(mockListChatMessages).not.toHaveBeenCalled();
     expect(mockListThreadMessages).not.toHaveBeenCalled();
   });
+
+  it('routes bot-authored card messages only when the trigger explicitly allows bots', async () => {
+    setupBotState({
+      contentTriggers: [summaryContentTrigger({
+        allowBotMessages: true,
+        match: { type: 'keyword', pattern: '本次问题已解决', caseSensitive: false },
+        history: {
+          topic: { mode: 'current-thread' },
+          regularGroup: { mode: 'recent-messages', limit: 0, sinceHours: 0 },
+        },
+        action: { type: 'start-or-wake-session', prompt: '请总结本次已解决问题。' },
+      })],
+    });
+    mockListChatMessages.mockResolvedValue([
+      {
+        message_id: 'm1',
+        msg_type: 'text',
+        body: { content: JSON.stringify({ text: '排查记录 A' }) },
+        sender: { id: 'ou_a', sender_type: 'user' },
+        create_time: '1000',
+      },
+    ]);
+    const event = makeBotMessageEvent({
+      senderOpenId: OTHER_BOT_OPEN_ID,
+      senderType: 'bot',
+      content: JSON.stringify({
+        title: '标记问题已解决',
+        elements: [[
+          { tag: 'text', text: '@田长远 标记问题已解决' },
+        ], [
+          { tag: 'text', text: '本次问题已解决，安静一小时后本群将自动解散。' },
+        ]],
+      }),
+      rootId: 'quoted-root',
+      threadId: null,
+      messageId: 'msg-bot-card-trigger',
+      chatId: 'chat-content-trigger',
+    });
+    (event.message as any).message_type = 'interactive';
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(mockListChatMessages).toHaveBeenCalledWith(MY_APP_ID, 'chat-content-trigger', 0);
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'chat',
+      anchor: 'chat-content-trigger',
+      contentTrigger: { name: 'summary-trigger', chatKind: 'regularGroup' },
+      promptOverride: expect.stringContaining('请总结本次已解决问题。'),
+    }));
+    const ctx = handlers.handleNewTopic.mock.calls[0][1] as any;
+    expect(ctx.promptOverride).toContain('本次问题已解决，安静一小时后本群将自动解散。');
+    expect(ctx.promptOverride).toContain('排查记录 A');
+  });
+
+  it('still ignores self-authored messages even when a trigger allows bot messages', async () => {
+    setupBotState({
+      botOpenId: MY_OPEN_ID,
+      contentTriggers: [summaryContentTrigger({ allowBotMessages: true })],
+    });
+    const event = makeBotMessageEvent({
+      senderOpenId: MY_OPEN_ID,
+      content: JSON.stringify({ text: '总结' }),
+      rootId: 'root-self-trigger',
+      chatId: 'chat-content-trigger',
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    expect(mockListChatMessages).not.toHaveBeenCalled();
+    expect(mockListThreadMessages).not.toHaveBeenCalled();
+  });
 });
 
 describe('im.message.receive_v1 — /introduce command', () => {

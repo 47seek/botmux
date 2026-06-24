@@ -15,7 +15,7 @@ import { BoundedMap } from '../../utils/bounded-map.js';
 import { serializeByAnchor } from '../../utils/anchor-serializer.js';
 import { parseForceTopicInvocation } from '../../core/command-handler.js';
 import { shouldAutoStartOnNewTopic } from '../../core/auto-start.js';
-import { stripLeadingMentions } from './message-parser.js';
+import { extractCardContent, stripLeadingMentions, unwrapUserDslContent } from './message-parser.js';
 import { recordObservedBots, listObservedBots } from '../../services/observed-bots-store.js';
 import { getDocSubscription, listAllDocSubscriptions, type DocSubscription } from '../../services/doc-subs-store.js';
 import { getDocComment, isBotAuthoredReply, hasBotSentinel } from './doc-comment.js';
@@ -1087,6 +1087,30 @@ export function extractMessageTextForRouting(message: any): string | null {
   return null;
 }
 
+function extractMessageTextForContentTrigger(message: any): string | null {
+  const text = extractMessageTextForRouting(message);
+  if (text) return text;
+  if (!message?.content) return null;
+
+  try {
+    const obj = JSON.parse(message.content);
+    const messageType = message.message_type ?? message.msg_type;
+    const looksLikeCard = messageType === 'interactive'
+      || typeof obj?.user_dsl === 'string'
+      || typeof obj?.title === 'string'
+      || !!obj?.header
+      || !!obj?.body
+      || Array.isArray(obj?.elements);
+    if (!looksLikeCard) return null;
+    const rawCard = unwrapUserDslContent(message.content) ?? message.content;
+    const rendered = extractCardContent(rawCard).trim();
+    if (!rendered || rendered === '[卡片]' || rendered === '[卡片 (模板)]') return null;
+    return rendered;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * If the inbound message starts with `/t` / `/topic` AND the routing
  * currently lands on chat-scope, override to thread-scope anchored at
@@ -1289,12 +1313,13 @@ async function resolveContentTriggerMatch(input: {
   chatType: 'group' | 'p2p';
   routingSource: RoutingSource;
   message: any;
+  botAuthored?: boolean;
 }): Promise<MatchedContentTrigger | undefined> {
   const triggers = getBot(input.larkAppId).config.contentTriggers;
   if (!triggers || triggers.length === 0) return undefined;
-  const text = extractMessageTextForRouting(input.message);
+  const text = extractMessageTextForContentTrigger(input.message);
   const chatKind = await classifyContentTriggerChatKind(input);
-  return findMatchingContentTrigger(triggers, text, chatKind);
+  return findMatchingContentTrigger(triggers, text, chatKind, { botAuthored: input.botAuthored });
 }
 
 const SUMMARY_COMMAND_RE = /^\/summary(?:\s|$)/i;
@@ -1525,8 +1550,40 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
               .catch(err => logger.error(`Error handling message event: ${err}`));
             return;
           }
-          // Foreign bot: only route on @mention of us.
-          if (!isBotMentioned(larkAppId, message, undefined)) return;
+          const foreignBotMentionedThisBot = isBotMentioned(larkAppId, message, undefined);
+          if (!foreignBotMentionedThisBot) {
+            const decision = await decideRoutingWithSource(larkAppId, message);
+            const contentTriggerMatch = await resolveContentTriggerMatch({
+              larkAppId,
+              chatId,
+              chatType,
+              routingSource: decision.source,
+              message,
+              botAuthored: true,
+            });
+            if (!contentTriggerMatch) return;
+
+            const ctx: RoutingContext = {
+              chatId,
+              messageId,
+              chatType,
+              larkAppId,
+              scope: decision.scope,
+              anchor: decision.anchor,
+              promptOverride: await buildContentTriggerPrompt({ larkAppId, chatId, message, match: contentTriggerMatch }),
+              contentTrigger: { name: contentTriggerMatch.trigger.name, chatKind: contentTriggerMatch.chatKind },
+            };
+            logger.info(
+              `[content-trigger] "${contentTriggerMatch.trigger.name}" matched bot-authored msg=${messageId.substring(0, 12)} ` +
+              `chat=${chatId.substring(0, 12)} kind=${contentTriggerMatch.chatKind}`,
+            );
+            const ownsSession = handlers.isSessionOwner?.(ctx.anchor, larkAppId) ?? false;
+            await serializeByAnchor(ctx.anchor, () => ownsSession
+              ? handlers.handleThreadReply(data, ctx)
+              : handlers.handleNewTopic(data, ctx))
+              .catch(err => logger.error(`Error handling bot content-trigger: ${err}`));
+            return;
+          }
           const decision = await decideRoutingWithSource(larkAppId, message);
           const ctx = { scope: decision.scope, anchor: decision.anchor };
           // Honor `/t` / `/topic` from bot senders too, aligning with the human

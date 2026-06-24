@@ -113,7 +113,7 @@
 
 | 字段 | 说明 |
 |------|------|
-| `contentTriggers` | 按 bot 配置的关键词 / 正则触发器。默认仍然只有 @ 才响应；只有命中这里的规则时，群消息或话题消息才可免 @ 唤醒本 bot。命中后发送 `action.prompt` 加历史上下文给 CLI，而不是把原消息当普通问题。仅 `canTalk` 已放行的发送者可触发；bot 自己和其它 bot 的非 @ 消息不会触发 |
+| `contentTriggers` | 按 bot 配置的关键词 / 正则触发器。默认仍然只有 @ 才响应；只有命中这里的规则时，群消息或话题消息才可免 @ 唤醒本 bot。命中后发送 `action.prompt` 加历史上下文给 CLI，而不是把原消息当普通问题。仅 `canTalk` 已放行的真人发送者可触发；bot 自己和其它 bot 的非 @ 消息默认不会触发，单条 trigger 可用 `allowBotMessages: true` 显式允许其它 bot 的消息触发 |
 
 示例：
 
@@ -124,6 +124,7 @@
       "name": "summary-trigger",
       "enabled": true,
       "scope": "both",
+      "allowBotMessages": false,
       "match": { "type": "keyword", "pattern": "总结", "caseSensitive": false },
       "history": {
         "topic": { "mode": "current-thread" },
@@ -139,6 +140,7 @@
 ```
 
 - `scope`: `topic` / `regularGroup` / `both`。
+- `allowBotMessages`: 默认 `false`。设为 `true` 时，其它 bot 发出的非 @ 文本/卡片消息也可命中该 trigger；本 bot 自己发出的消息仍会被忽略，避免循环。
 - `match.type`: `keyword` 或 `regex`；非法正则会被丢弃并写日志，不会导致 daemon 崩溃。
 - `history.topic.mode`: 当前仅支持 `current-thread`，读取当前话题/thread。
 - `history.regularGroup.mode`: 当前支持 `recent-messages`。`limit` 表示最近 N 条，`sinceHours` 表示最近 N 小时；任一参数为 `0` 表示该维度不限。未配置 `limit` 时默认 50。
