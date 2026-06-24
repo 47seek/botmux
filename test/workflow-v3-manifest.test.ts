@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -83,6 +83,18 @@ describe('v3 manifest validator', () => {
 
     await expect(validateManifest(baseFile('/etc/passwd'), outputDir)).rejects.toThrow(/path must be relative/);
     await expect(validateManifest(baseFile('../secret.txt'), outputDir)).rejects.toThrow(/escapes outputDir/);
+  });
+
+  it('rejects a symlink inside outputDir that resolves outside it', async () => {
+    // The relativePath itself is clean ("escape.md") — `path.resolve` alone would
+    // accept it. Only the `fs.realpath` + isPathInside check catches that the
+    // symlink target escapes outputDir. This guards against anyone "simplifying"
+    // realpath back to resolve (codex test-gap #9).
+    const outside = join(dir, 'secret.txt');
+    writeFileSync(outside, 'secret', 'utf-8');
+    symlinkSync(outside, join(outputDir, 'escape.md'));
+
+    await expect(validateManifest(baseFile('escape.md'), outputDir)).rejects.toThrow(/escapes outputDir/);
   });
 
   it('rejects mismatched bytes and sha256', async () => {

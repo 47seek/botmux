@@ -196,6 +196,15 @@ export async function driveV3Run(runId: string, deps: V3DaemonRunDeps): Promise<
   }
   const binding = grill.chatBinding;
 
+  // Was the run ALREADY terminal before this (re-)drive?  A coalesced re-drive or
+  // a `/start` retry of a finished run re-runs no work (the journal is terminal),
+  // but the notify block below would otherwise re-post cards / re-fire onTerminal
+  // — duplicate "done/failed" messages. Capture now, short-circuit after runWorkflow.
+  const journalPath = join(runDir, 'journal.ndjson');
+  const wasAlreadyTerminal =
+    existsSync(journalPath) &&
+    ['succeeded', 'failed'].includes(materialize(readJournal(journalPath)).runStatus);
+
   const bots = (deps.loadBots ?? loadBotConfigs)();
   // Secret resolver by larkAppId from live bots.json; no env fallback (contract).
   const secretById = new Map(bots.map((b) => [b.larkAppId, b.larkAppSecret]));
@@ -225,6 +234,12 @@ export async function driveV3Run(runId: string, deps: V3DaemonRunDeps): Promise<
   };
 
   const outcome = await runWorkflow(dag, runtimeDeps, opts);
+
+  if (wasAlreadyTerminal) {
+    // Re-drive of an already-finished run: no work re-ran, so don't re-post
+    // gate/blocked cards or re-fire onTerminal (would duplicate the terminal msg).
+    return outcome;
+  }
 
   if (outcome.reason === 'awaitingGate') {
     if (!binding) {

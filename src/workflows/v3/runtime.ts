@@ -773,8 +773,8 @@ export async function runWorkflow(
     const relayAbort = (): void => controller.abort();
     if (opts.cancelSignal?.aborted) relayAbort();
     else opts.cancelSignal?.addEventListener('abort', relayAbort, { once: true });
-    nodeControllers.set(node.id, controller);
-    nodeAbortCleanups.set(node.id, () => opts.cancelSignal?.removeEventListener('abort', relayAbort));
+    nodeControllers.set(dispatchKey, controller);
+    nodeAbortCleanups.set(dispatchKey, () => opts.cancelSignal?.removeEventListener('abort', relayAbort));
 
     const req: RunNodeRequest = {
       runId: dag.runId,
@@ -944,15 +944,21 @@ export async function runWorkflow(
         });
       })
       .finally(() => {
-        inFlight.delete(node.id);
-        if (nodeControllers.get(node.id) === controller) {
-          nodeControllers.delete(node.id);
-          nodeAbortCleanups.get(node.id)?.();
-          nodeAbortCleanups.delete(node.id);
+        // Key by dispatchKey (instance-scoped), NOT node.id: after a cross-node
+        // revisit, D#001 and D#002 can be in-flight at once under the same
+        // node.id. An unguarded inFlight.delete(node.id) here would let the stale
+        // D#001's settle remove the LIVE D#002 entry → a healthy run trips the
+        // "no progress possible" guard and crashes. Guard mirrors the controller
+        // delete below.
+        if (inFlight.get(dispatchKey) === p) inFlight.delete(dispatchKey);
+        if (nodeControllers.get(dispatchKey) === controller) {
+          nodeControllers.delete(dispatchKey);
+          nodeAbortCleanups.get(dispatchKey)?.();
+          nodeAbortCleanups.delete(dispatchKey);
         }
         releaseSlots(botKey, botSnap.cliId);
       });
-    inFlight.set(node.id, p);
+    inFlight.set(dispatchKey, p);
   }
 
   /** A node's transitive downstream cone (the node itself + every node reachable
@@ -1237,7 +1243,7 @@ export async function runWorkflow(
       detail: a.detail,
     });
 
-    nodeControllers.get(a.nodeId)?.abort();
+    nodeControllers.get(instanceId ?? a.nodeId)?.abort();
     const gateKey = `${a.nodeId}::gate`;
     if (inFlight.has(gateKey)) inFlight.delete(gateKey);
     return true;

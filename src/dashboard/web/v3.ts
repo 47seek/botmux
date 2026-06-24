@@ -23,6 +23,14 @@ import type { RunView, RunNodeView } from '../../workflows/v3/ops-projection.js'
 
 const POLL_MS = 2000;
 
+/** Single source of truth for "stop polling": only succeeded/failed are terminal.
+ *  `running` and `blocked` (awaiting human retry/grant) can still change, so the
+ *  detail page keeps polling. Used by both poll() and loop() so the stop/re-arm
+ *  decisions can't drift apart. */
+function isTerminalRunStatus(status: RunView['runStatus'] | undefined): boolean {
+  return status === 'succeeded' || status === 'failed';
+}
+
 const NODE_LABEL: Record<RunNodeView['status'], string> = {
   pending: '待机',
   gateWaiting: '等审批',
@@ -528,7 +536,7 @@ function renderV3DetailPage(root: HTMLElement, runId: string): () => void {
       renderGraph(view);
       renderPanel();
       // Stop polling once the run is terminal (one final render already done).
-      if (view.runStatus !== 'running') { if (timer !== null) window.clearTimeout(timer); timer = null; return; }
+      if (isTerminalRunStatus(view.runStatus)) { if (timer !== null) window.clearTimeout(timer); timer = null; return; }
     } catch {
       /* transient — next tick retries */
     }
@@ -536,7 +544,7 @@ function renderV3DetailPage(root: HTMLElement, runId: string): () => void {
 
   function loop(): void {
     if (disposed) return;
-    void poll().then(() => { if (!disposed && lastView?.runStatus !== 'failed' && lastView?.runStatus !== 'succeeded') timer = window.setTimeout(loop, POLL_MS); });
+    void poll().then(() => { if (!disposed && !isTerminalRunStatus(lastView?.runStatus)) timer = window.setTimeout(loop, POLL_MS); });
   }
   loop();
   return () => { disposed = true; if (timer !== null) window.clearTimeout(timer); };

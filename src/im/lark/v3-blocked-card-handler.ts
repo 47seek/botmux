@@ -84,9 +84,13 @@ export async function handleV3BlockedAction(
     | { text: string; by: string }
     | undefined;
   try {
+    // Only accept a genuine string: `String(obj)` would coerce a forged object/
+    // array form value to "[object Object]"/"a,b" — non-empty, so it would slip
+    // past the "请先填写答案" guard and feed garbage to the agent (codex nit #16).
+    const rawTextAnswer = formValue?.[V3_BLOCKED_ASK_TEXT_FIELD];
     const textAnswer =
       isAsk && 'answerKind' in value && value.answerKind === 'text'
-        ? String(formValue?.[V3_BLOCKED_ASK_TEXT_FIELD] ?? '').trim()
+        ? (typeof rawTextAnswer === 'string' ? rawTextAnswer.trim() : '')
         : undefined;
     if (isAsk && 'answerKind' in value && value.answerKind === 'text' && !textAnswer) {
       return { toast: { type: 'warning', content: '请先填写答案' } };

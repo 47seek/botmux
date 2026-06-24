@@ -7,7 +7,7 @@
  * place so host commands do not hand-roll goal-mode env/layout details.
  */
 
-import { mkdirSync, readFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { createEphemeralPool, type EphemeralPoolDeps } from './ephemeral-pool.js';
@@ -127,6 +127,12 @@ export async function runArchitect(input: RunArchitectInput): Promise<RunArchite
   const inputsPath = join(attemptDir, 'inputs.json');
   const manifestPath = join(attemptDir, 'manifest.json');
   const goalPath = join(attemptDir, 'goal.txt');
+  // Architect always reuses attempt 001 (no nextAttemptId increment). Wipe any
+  // prior attempt first: otherwise a `revise-dag` re-architect leaves the old
+  // manifest.json + work/dag.json in place, the pool's manifest watcher sees a
+  // stable manifest and immediately finishes 'ok' WITHOUT running the new
+  // worker, so the revision silently validates the previous dag and never takes.
+  rmSync(attemptDir, { recursive: true, force: true });
   mkdirSync(outputDir, { recursive: true });
 
   const goal = buildArchitectGoal(input.specPath, input.specJsonPath);

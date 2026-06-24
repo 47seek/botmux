@@ -32,6 +32,7 @@ import { finalizeSpec, SpecValidationError } from './spec.js';
 import { runArchitect as realRunArchitect, type RunArchitectInput, type RunArchitectResult } from './architect.js';
 import { loadDag } from './dag.js';
 import { isValidRunId } from './ops-projection.js';
+import { botToSnapshot } from './bot-resolve.js';
 import type { BotSnapshot } from './contract.js';
 
 // ─── Core operations (dep-injected, pure of CLI / process concerns) ─────────
@@ -372,16 +373,12 @@ async function runArchitectCli(runId: string, baseDir: string, rest: string[]): 
   if (!bot) throw new Error(`找不到 bot "${selector}"`);
 
   const secretById = new Map(bots.map((b) => [b.larkAppId, b.larkAppSecret]));
-  // Mirror cli-run.ts's BotConfig → BotSnapshot mapping exactly.
-  const workingDir = argValue(rest, '--working-dir')
-    ?? bot.defaultWorkingDir ?? bot.workingDir ?? bot.workingDirs?.[0] ?? '~';
-  const botSnapshot: BotSnapshot = {
-    larkAppId: bot.larkAppId,
-    cliId: bot.cliId,
-    ...(bot.cliPathOverride ? { cliPathOverride: bot.cliPathOverride } : {}),
-    ...(bot.model ? { model: bot.model } : {}),
-    workingDir,
-  };
+  // Use the authoritative BotConfig → BotSnapshot constructor so restricted bots
+  // keep `disableCliBypass` here too — a hand-rolled snapshot that drops it would
+  // let the architect goal-worker (writes files / runs commands / produces the
+  // dag.json that drives the whole run) silently start with --dangerously-skip-
+  // permissions, violating the "downgrade-only" capability invariant.
+  const botSnapshot: BotSnapshot = botToSnapshot(bot, argValue(rest, '--working-dir'));
 
   return hostArchitect(runDirFor(runId, baseDir), {
     runArchitect: realRunArchitect,

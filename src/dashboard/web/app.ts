@@ -271,7 +271,10 @@ function route() {
   } else if (hash.startsWith('#/v3')) {
     window.location.replace(`#/workflows${hash.slice('#/v3'.length)}`);
     return;
-  } else if (hash.startsWith('#/workflows/catalog') || hash.startsWith('#/workflows-catalog')) {
+  } else if (/^#\/workflows(?:\/|-)catalog(?:[/?].*)?$/.test(hash)) {
+    // Bounded match (NOT startsWith): a v3 runId can begin with "catalog"
+    // (goal slug → `catalog-all-open-prs-…`), and `#/workflows/catalog-…`
+    // must open that run's detail, not bounce to the list.
     window.location.replace('#/workflows');
     return;
   }

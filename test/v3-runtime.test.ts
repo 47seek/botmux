@@ -201,6 +201,46 @@ describe('runWorkflow — research→summarize 最小闭环', () => {
   });
 });
 
+describe('runWorkflow — capability downgrade reaches the worker snapshot (P2 安全红线看门测试)', () => {
+  it('restricted override → runNode 收到的 req.botSnapshot.disableCliBypass === true', async () => {
+    const base = mkdtempSync(join(tmpdir(), 'v3-rt-cap-'));
+    try {
+      const seen: Record<string, BotSnapshot> = {};
+      const runNode: RunNode = async (req) => {
+        seen[req.node.id] = req.botSnapshot;
+        const file = product(req.outputDir, 'out.md', `# ${req.node.id}`);
+        const manifestPath = writeManifest(req, {
+          schemaVersion: 1, status: 'ok', summary: 'done', files: [file],
+        });
+        return { status: 'ok', manifestPath };
+      };
+      // resolveBotSnapshot returns a FULL-power snapshot (no disableCliBypass):
+      // the node override must be what forces the restriction onto the worker.
+      const fullPowerResolve = (): BotSnapshot => ({ larkAppId: 'cli_test', cliId: 'claude-code', workingDir: '/tmp' });
+      const dag = validateDag({
+        runId: 'cap-001',
+        nodes: [
+          { id: 'open', type: 'goal', goal: 'full power', depends: [], inputs: [] },
+          { id: 'restricted', type: 'goal', goal: 'locked down', depends: [], inputs: [], override: { permissionMode: 'restricted' } },
+        ],
+      });
+      const deps: V3RuntimeDeps = { runNode, validateManifest, resolveBotSnapshot: fullPowerResolve };
+      const outcome = await runWorkflow(dag, deps, { baseDir: base });
+      expect(outcome).toMatchObject({ reason: 'terminal', runStatus: 'succeeded' });
+
+      // The restricted node's worker MUST receive disableCliBypass. A regression
+      // that wires the un-merged snapshot (botSnap instead of effSnap) at the
+      // runNode call site would run the restricted node at FULL permission while
+      // every mergeNodeCapability unit test still passes — this is its watchdog.
+      expect(seen['restricted']?.disableCliBypass).toBe(true);
+      // Sibling without override keeps the resolved (full) capability.
+      expect(seen['open']?.disableCliBypass).toBeUndefined();
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('runWorkflow — edge activation', () => {
   const branchDag = (decision: 'pass' | 'fail' | 'rework') => validateDag({
     runId: `branch-${decision}`,

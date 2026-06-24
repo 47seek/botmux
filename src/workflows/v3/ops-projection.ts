@@ -26,6 +26,16 @@ export function isValidRunId(runId: string): boolean {
   return RUN_ID_RE.test(runId);
 }
 
+/** Allowlist for the gate/wait id (`<instanceId|nodeId>-gate`, e.g. `A#001-gate`).
+ *  Same defense as {@link isValidRunId}: a card callback's `waitId` is joined into
+ *  `runDir/waits/<waitId>.json`, so it must be validated BEFORE the join or a
+ *  `../..` waitId escapes the run dir. Includes `#` for instance-scoped ids; the
+ *  nonce check alone is NOT sufficient (it is non-secret and reproducible). */
+const WAIT_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._#-]{0,127}$/;
+export function isValidWaitId(waitId: string): boolean {
+  return WAIT_ID_RE.test(waitId);
+}
+
 /** Default run root, aligned with cli-run.ts / grill-state.ts. */
 export function defaultRunsDir(): string {
   return join(homedir(), '.botmux', 'v3-runs');

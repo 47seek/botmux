@@ -3255,10 +3255,13 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
   // 自定义回复拦截：该话题有未结的 ask 时，把这条文字当答案，走 submitCustomReply
   // settle 掉 ask（替代选项语义），不再当作新一轮指令喂给 CLI。此时发起 ask 的 CLI
   // 正阻塞等结果，回什么都得先等 ask 结束，故无副作用。仅拦截纯文字（slash 命令 /
-  // 回调 URL / workflow 已在上方各自 return，可用来中止）。答复权限 = canTalk，由
+  // 回调 URL 已在上方 return，可用来中止）。答复权限 = canTalk，由
   // broker 在 submitCustomReply 内按注入的 canTalkChecker 判定：非授权人返回
   // 'unauthorized'，这里 fall through 到正常路由。卡片由 broker.onSettle 自动 PATCH。
-  if (threadSenderOpenId && threadChatId) {
+  // `!threadGrill`：grill goal 分支只改写 promptContent 后 fall-through（不 return），
+  // cmdContent 仍是字面量 `/workflow new <目标>`；若不排除，待回答 ask 会把它当答案吞掉，
+  // grill 永远不启动。grill 必须穿过拦截器走正常转发。
+  if (threadSenderOpenId && threadChatId && !threadGrill) {
     const askReplyText = cmdContent.trim();
     if (askReplyText) {
       const pendingAsk = findPendingAskByAnchor({ larkAppId, chatId: threadChatId, anchor });

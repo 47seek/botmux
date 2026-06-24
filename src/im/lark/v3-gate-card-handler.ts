@@ -23,7 +23,7 @@ import {
   type RunChatBinding,
 } from '../../workflows/v3/grill-state.js';
 import { readWait } from '../../workflows/v3/human-gate.js';
-import { isValidRunId } from '../../workflows/v3/ops-projection.js';
+import { isValidRunId, isValidWaitId } from '../../workflows/v3/ops-projection.js';
 
 export function isV3GateAction(action: unknown): boolean {
   return action === V3_GATE_APPROVE_ACTION || action === V3_GATE_REJECT_ACTION;
@@ -52,9 +52,14 @@ export async function handleV3GateAction(
   deps: V3GateCardHandlerDeps,
 ): Promise<unknown> {
   const baseDir = deps.baseDir ?? defaultBaseDir();
-  // Guard the externally-supplied runId before any path join (codex #2).
+  // Guard BOTH externally-supplied ids before any path join: waitId flows into
+  // `runDir/waits/<waitId>.json` (resolveV3GateClick → human-gate), and the
+  // reproducible non-secret nonce can't stop a `../..` waitId on its own.
   if (!isValidRunId(value.runId)) {
     return { toast: { type: 'warning', content: 'gate 已失效（非法 run）' } };
+  }
+  if (typeof value.waitId !== 'string' || !isValidWaitId(value.waitId)) {
+    return { toast: { type: 'warning', content: 'gate 已失效（非法 wait）' } };
   }
   // Nonce check (codex medium): the card carries a stable nonce; a value whose
   // nonce doesn't match the run/wait pair is a tampered/foreign card → stale.
