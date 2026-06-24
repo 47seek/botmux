@@ -6,6 +6,9 @@
  *
  * Three independent toggles:
  *   • disableStreamingCard      — suppress the live streaming session card
+ *   • silentTurnReactions       — in card-off sessions, also drop the ✋→✅
+ *                                  lightweight status reactions on the trigger
+ *                                  message (only meaningful while the card is off)
  *   • writableTerminalLinkInCard — embed a directly-usable writable terminal
  *                                  link in the streaming card body
  *   • privateCard               — `/card` sends a private ephemeral snapshot
@@ -21,6 +24,7 @@ import { logger } from '../utils/logger.js';
 
 export interface BotCardPrefs {
   disableStreamingCard: boolean;
+  silentTurnReactions: boolean;
   writableTerminalLinkInCard: boolean;
   privateCard: boolean;
   /** 主动开工 — 场景①: auto-start when added to a new chat (see auto-start.ts). */
@@ -33,6 +37,8 @@ export interface BotCardPrefs {
   regularGroupReplyMode: ChatReplyMode;
   /** Per-bot 3-tier @-requirement policy for regular groups (default 'always'). */
   regularGroupMentionMode: 'always' | 'topic' | 'never';
+  /** 文档订阅新订阅默认评论触发范围（default 'mention-only'）。 */
+  docSubscribeDefaultMode: 'mention-only' | 'all';
 }
 
 /** Current card prefs for a bot (booleans default false, prompt defaults '' when unset). */
@@ -41,6 +47,7 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
     const c = getBot(larkAppId).config;
     return {
       disableStreamingCard: c.disableStreamingCard === true,
+      silentTurnReactions: c.silentTurnReactions === true,
       writableTerminalLinkInCard: c.writableTerminalLinkInCard === true,
       privateCard: c.privateCard === true,
       autoStartOnGroupJoin: c.autoStartOnGroupJoin === true,
@@ -49,10 +56,12 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
       regularGroupReplyMode: c.regularGroupReplyMode ?? 'chat',
       regularGroupMentionMode: c.regularGroupMentionMode === 'topic' || c.regularGroupMentionMode === 'never'
         ? c.regularGroupMentionMode : 'always',
+      docSubscribeDefaultMode: c.docSubscribeDefaultMode === 'all' ? 'all' : 'mention-only',
     };
   } catch {
     return {
       disableStreamingCard: false,
+      silentTurnReactions: false,
       writableTerminalLinkInCard: false,
       privateCard: false,
       autoStartOnGroupJoin: false,
@@ -60,6 +69,7 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
       autoStartOnNewTopic: false,
       regularGroupReplyMode: 'chat',
       regularGroupMentionMode: 'always',
+      docSubscribeDefaultMode: 'mention-only',
     };
   }
 }
@@ -102,9 +112,16 @@ export async function updateBotCardPrefs(
     if (val === 'topic' || val === 'never') entry[key] = val;
     else delete entry[key];
   };
+  // 文档订阅默认触发范围：只存 'all'；'mention-only'（默认）删键保持 bots.json 干净。
+  const applyDocMode = (entry: any, key: keyof BotCardPrefs, val: 'mention-only' | 'all' | undefined) => {
+    if (val === undefined) return;
+    if (val === 'all') entry[key] = 'all';
+    else delete entry[key];
+  };
 
   const r = await rmwBotEntry<BotCardPrefs>(larkAppId, (entry) => {
     apply(entry, 'disableStreamingCard', patch.disableStreamingCard);
+    apply(entry, 'silentTurnReactions', patch.silentTurnReactions);
     apply(entry, 'writableTerminalLinkInCard', patch.writableTerminalLinkInCard);
     apply(entry, 'privateCard', patch.privateCard);
     apply(entry, 'autoStartOnGroupJoin', patch.autoStartOnGroupJoin);
@@ -112,10 +129,12 @@ export async function updateBotCardPrefs(
     apply(entry, 'autoStartOnNewTopic', patch.autoStartOnNewTopic);
     applyMode(entry, 'regularGroupReplyMode', patch.regularGroupReplyMode);
     applyMention(entry, 'regularGroupMentionMode', patch.regularGroupMentionMode);
+    applyDocMode(entry, 'docSubscribeDefaultMode', patch.docSubscribeDefaultMode);
     return {
       write: true,
       result: {
         disableStreamingCard: entry.disableStreamingCard === true,
+        silentTurnReactions: entry.silentTurnReactions === true,
         writableTerminalLinkInCard: entry.writableTerminalLinkInCard === true,
         privateCard: entry.privateCard === true,
         autoStartOnGroupJoin: entry.autoStartOnGroupJoin === true,
@@ -127,6 +146,7 @@ export async function updateBotCardPrefs(
         regularGroupMentionMode: (entry.regularGroupMentionMode === 'topic' || entry.regularGroupMentionMode === 'never')
           ? entry.regularGroupMentionMode
           : 'always',
+        docSubscribeDefaultMode: entry.docSubscribeDefaultMode === 'all' ? 'all' : 'mention-only',
       },
     };
   });
@@ -135,6 +155,9 @@ export async function updateBotCardPrefs(
   // Sync in-memory config so live card builders / routing react without a restart.
   if (patch.disableStreamingCard !== undefined) {
     bot.config.disableStreamingCard = patch.disableStreamingCard || undefined;
+  }
+  if (patch.silentTurnReactions !== undefined) {
+    bot.config.silentTurnReactions = patch.silentTurnReactions || undefined;
   }
   if (patch.writableTerminalLinkInCard !== undefined) {
     bot.config.writableTerminalLinkInCard = patch.writableTerminalLinkInCard || undefined;
@@ -161,8 +184,12 @@ export async function updateBotCardPrefs(
       ? patch.regularGroupMentionMode
       : undefined;
   }
+  if (patch.docSubscribeDefaultMode !== undefined) {
+    bot.config.docSubscribeDefaultMode = patch.docSubscribeDefaultMode === 'all' ? 'all' : undefined;
+  }
   logger.info(
     `[card-prefs:${larkAppId}] disableStreamingCard=${r.result.disableStreamingCard} ` +
+    `silentTurnReactions=${r.result.silentTurnReactions} ` +
     `writableTerminalLinkInCard=${r.result.writableTerminalLinkInCard} privateCard=${r.result.privateCard} ` +
     `autoStartOnGroupJoin=${r.result.autoStartOnGroupJoin} autoStartOnNewTopic=${r.result.autoStartOnNewTopic} ` +
     `regularGroupReplyMode=${r.result.regularGroupReplyMode} regularGroupMentionMode=${r.result.regularGroupMentionMode} ` +

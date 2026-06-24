@@ -16,8 +16,9 @@
  * production wiring.
  */
 import { execSync, spawn } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, writeFileSync, writeSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { dirname, join } from 'node:path';
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
 import { readGlobalConfig, type MaintenanceConfig } from '../global-config.js';
@@ -25,6 +26,7 @@ import { evaluateDue } from './maintenance-schedule.js';
 import { anyDaemonBusy } from './daemon-heartbeat.js';
 import { writeRestartIntent, type RestartIntent } from '../services/restart-intent-store.js';
 import { isLocalDevInstall, botmuxVersion, botmuxCliEntry } from '../utils/install-info.js';
+import { withFileLockSync } from '../utils/file-lock.js';
 
 export interface MaintenanceState {
   /** Local date the auto-update run was last handled (fired or skipped). */
@@ -136,6 +138,86 @@ export function writeMaintenanceStateTo(dir: string, s: MaintenanceState): void 
  *  within the same minute it's reached. */
 export const MAINTENANCE_TICK_MS = 60_000;
 
+/** Where the auto-restart driver's stdout/stderr is captured, so a failed
+ *  restart-to-apply is diagnosable (previously stdio was 'ignore'). */
+export function maintenanceRestartLogPath(): string {
+  return join(homedir(), '.botmux', 'logs', 'maintenance-restart.log');
+}
+
+/**
+ * Cross-process lock target that serializes `npm install -g botmux@latest`
+ * between the scheduled auto-update (this daemon process) and a
+ * dashboard-triggered manual update (the separate `botmux-dashboard` process),
+ * so the two never write the global npm prefix concurrently. Both sides acquire
+ * `withFileLock(Sync)` on this path.
+ */
+export function npmGlobalUpdateLockTarget(): string {
+  return join(config.session.dataDir, 'npm-global-update');
+}
+
+/**
+ * Build the command to launch `botmux restart` for applying an auto-update.
+ *
+ * The restart driver must NOT remain a descendant of the daemon it's about to
+ * tear down: `botmux restart` deletes botmux-0 (the very daemon that spawned
+ * this), and when PM2 kills botmux-0 a child in its process tree gets
+ * interrupted — so the restart aborts after deleting botmux-0 and never
+ * restarts the rest (the 2026-06-11 incident). `setsid` starts it in a brand
+ * new session, reparented to init, immune to botmux-0's teardown. Without
+ * setsid we fall back to a plain spawn (still detached by the caller).
+ */
+export function buildRestartLauncher(
+  node: string,
+  cliEntry: string,
+  hasSetsid: boolean,
+): { cmd: string; args: string[] } {
+  if (hasSetsid) return { cmd: 'setsid', args: [node, cliEntry, 'restart'] };
+  return { cmd: node, args: [cliEntry, 'restart'] };
+}
+
+function setsidAvailable(): boolean {
+  try {
+    execSync('command -v setsid', { stdio: 'ignore' });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Spawn a detached `botmux restart`, immune to this process's own teardown
+ * (setsid → a new session reparented to init, so PM2 killing the current
+ * process doesn't interrupt the restart driver). Output is appended to the
+ * maintenance-restart log so a failed restart stays diagnosable. Shared by the
+ * maintenance timer (auto-update) and the dashboard's manual update/restart.
+ *
+ * @param reason short tag written to the log (e.g. 'auto-update', 'dashboard').
+ */
+export function spawnDetachedRestart(reason: string): void {
+  const logFile = maintenanceRestartLogPath();
+  let fd: number | undefined;
+  try {
+    mkdirSync(dirname(logFile), { recursive: true });
+    fd = openSync(logFile, 'a');
+    writeSync(fd, `\n[${new Date().toISOString()}] ${reason}: launching restart\n`);
+  } catch {
+    fd = undefined; // fall back to discarding output rather than failing the restart
+  }
+  const { cmd, args } = buildRestartLauncher(process.execPath, botmuxCliEntry(), setsidAvailable());
+  const child = spawn(cmd, args, {
+    detached: true,
+    stdio: fd !== undefined ? ['ignore', fd, fd] : 'ignore',
+    env: process.env,
+  });
+  // A detached child's 'error' (e.g. spawn ENOENT) would otherwise throw
+  // unhandled and crash this process — log it instead.
+  child.on('error', (e) => logger.error(`[maintenance] restart launch failed: ${e instanceof Error ? e.message : e}`));
+  child.unref();
+  if (fd !== undefined) {
+    try { closeSync(fd); } catch { /* the detached child holds its own dup */ }
+  }
+}
+
 function productionDeps(): MaintenanceDeps {
   return {
     now: () => Date.now(),
@@ -146,17 +228,18 @@ function productionDeps(): MaintenanceDeps {
     isLocalDev: () => isLocalDevInstall(),
     currentVersion: () => botmuxVersion(),
     runUpdate: () => {
-      execSync('npm install -g botmux@latest', { stdio: 'inherit' });
+      // Hold the shared update lock for the whole install so a concurrent
+      // dashboard manual update can't run `npm install -g` at the same time.
+      // Short wait: if the dashboard holds it (a manual update is mid-flight),
+      // don't block the daemon thread waiting out a 30s install — throw a lock
+      // timeout fast so the tick logs it and slips to the next day (the manual
+      // update is already bumping to latest anyway).
+      withFileLockSync(npmGlobalUpdateLockTarget(), () => {
+        execSync('npm install -g botmux@latest', { stdio: 'inherit' });
+      }, { maxWaitMs: 500 });
     },
     writeIntent: (intent) => writeRestartIntent(intent),
-    triggerRestart: () => {
-      const child = spawn(process.execPath, [botmuxCliEntry(), 'restart'], {
-        detached: true,
-        stdio: 'ignore',
-        env: process.env,
-      });
-      child.unref();
-    },
+    triggerRestart: () => spawnDetachedRestart('auto-update'),
     log: (msg) => logger.info(`[maintenance] ${msg}`),
   };
 }

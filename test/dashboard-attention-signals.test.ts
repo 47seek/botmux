@@ -9,7 +9,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { readFileSync } from 'fs';
 import { composeRowFromActive } from '../src/core/dashboard-rows.js';
-import { publishAttentionPatch, announcePendingRepoSession, clearAgentAttention } from '../src/core/session-activity.js';
+import { announcePendingRepoSession, announceSessionRow, clearAgentAttention, publishAttentionPatch } from '../src/core/session-activity.js';
 import { dashboardEventBus, type DashboardEvent } from '../src/core/dashboard-events.js';
 import { attentionWaitSince } from '../src/dashboard/web/ui.js';
 import {
@@ -147,6 +147,17 @@ describe('attention signals', () => {
     expect(row.status).toBe('starting'); // no screen yet → starting
   });
 
+  it('announceSessionRow publishes a full session.spawned row for restored active sessions', () => {
+    const seen = collectEvents();
+    announceSessionRow(makeDs({ hasHistory: true }));
+    expect(seen).toHaveLength(1);
+    expect(seen[0].type).toBe('session.spawned');
+    const row = (seen[0] as any).body.session;
+    expect(row.sessionId).toBe('sess-1');
+    expect(row.hasHistory).toBe(true);
+    expect(row.status).toBe('starting');
+  });
+
   it('announcePendingRepoSession is a no-op when the session is not pending', () => {
     const seen = collectEvents();
     announcePendingRepoSession(makeDs({ pendingRepo: false }));
@@ -158,7 +169,10 @@ describe('attention signals', () => {
     const src = readFileSync(new URL('../src/daemon.ts', import.meta.url), 'utf-8');
     const start = src.indexOf('async function handleThreadReply(');
     expect(start).toBeGreaterThanOrEqual(0);
-    const region = src.slice(start, start + 12000);
+    // 16000：窗口需罩住函数头到最后一个拦截点 (findPendingAskByAnchor) 的全部
+    // 源码——passthrough 冷启动等合法插入会把后续 marker 往后推，窗口太紧会误报。
+    // 语义断言不变：clear 在所有拦截点之前。
+    const region = src.slice(start, start + 16000);
     const clearIdx = region.indexOf('clearAgentAttentionForHumanInbound();');
     expect(clearIdx).toBeGreaterThanOrEqual(0);
     for (const marker of [

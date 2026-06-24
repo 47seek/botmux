@@ -5,17 +5,22 @@ import { renderSessionsPage } from './sessions.js';
 import { renderSchedulesPage } from './schedules.js';
 import { renderGroupsPage } from './groups.js';
 import { renderBotDefaultsPage } from './bot-defaults.js';
-import { renderRolesPage } from './roles.js';
+import { renderSkillsPage } from './skills.js';
+import { renderRoleProfilesPage, renderRolesPage } from './roles.js';
 import { renderTeamFederationPage, renderTeamManagePage } from './team-federation.js';
 import { renderConnectorsPage } from './connectors.js';
 import { renderSettingsPage } from './settings.js';
 import { renderWorkflowsPage } from './workflows.js';
 import { renderWorkflowCatalogPage } from './workflow-catalog.js';
 import { renderV3RunsPage } from './v3.js';
+import { renderOfficePage } from './office.js';
+import { renderWhiteboardsPage } from './whiteboards.js';
+import { renderInsightsPage } from './insights.js';
 import { wireBotOnboardingButton } from './bot-onboarding.js';
 import { attentionReason, attentionWaitSince, botDisplayName, escapeHtml, loadNameMaps, relTime, t, ui } from './ui.js';
 import { initThemeMenu, paintThemeMenu } from './theme-menu.js';
-import type { DashboardLocale } from './i18n.js';
+import { normalizeDashboardLocale, type DashboardLocale } from './i18n.js';
+import { readStoredSidebarMode, writeStoredSidebarMode, type SidebarMode } from './preferences.js';
 
 const root = document.getElementById('root')!;
 
@@ -30,7 +35,7 @@ let publicReadOnly = false;
 
 // Management pages are token-gated end-to-end (no public GET) — a read-only
 // visitor must not reach them. `data-route` values from index.html's nav.
-const MANAGE_ROUTES = ['roles', 'bot-defaults', 'team', 'connectors'];
+const MANAGE_ROUTES = ['roles', 'role-profiles', 'bot-defaults', 'skills', 'team', 'connectors', 'insights', 'whiteboards'];
 
 // ── Auth-expiry overlay ──────────────────────────────────────────────────────
 // Shown only when the dashboard token was rotated WHILE public read-only is off
@@ -156,9 +161,33 @@ async function loadAuthState(): Promise<void> {
     if (r.ok) {
       const j = await r.json();
       isAuthed = !!j.authed;
+      // Share the cookie-auth verdict with per-row renderers (the sessions
+      // board's writable-terminal segment reads ui.authed at render time).
+      ui.authed = isAuthed;
       publicReadOnly = !!(j.settings && j.settings.publicReadOnly);
+      // The global UI locale (`botmux lang`) is the single source of truth: when
+      // set, it wins over the browser-detected / locally-stored locale so the
+      // dashboard always reflects the same language as the Feishu cards. When
+      // unset (null), keep the browser/local default ui.init() already picked.
+      const serverLocale = normalizeDashboardLocale(j.lang);
+      if (serverLocale) ui.setLocale(serverLocale);
     }
   } catch { /* keep defaults */ }
+}
+
+// Persist a language choice back to the global config so it drives `botmux lang`
+// and the Feishu cards too (the server fans the change out to every daemon
+// live). Authed-only — read-only visitors just change their local view, which
+// the server-authoritative locale overrides on their next load.
+async function persistLocale(locale: DashboardLocale): Promise<void> {
+  if (!isAuthed) return;
+  try {
+    await fetch('/api/settings', {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ lang: locale }),
+    });
+  } catch { /* best-effort; UI already switched locally */ }
 }
 
 // Read-only visitors can't use the management pages (all token-gated), so hide
@@ -172,6 +201,25 @@ function applyAuthVisibility(): void {
   if (addBot) addBot.style.display = isAuthed ? '' : 'none';
 }
 
+// Show a small dot on the Settings nav when a newer botmux version is published,
+// so an available update is visible without opening the page. Authed-only (the
+// status endpoint is token-gated; the result is server-cached so this is cheap).
+// Best-effort and silent on failure.
+async function checkUpdateBadge(): Promise<void> {
+  if (!isAuthed) return;
+  try {
+    const r = await fetch('/api/update/status');
+    if (!r.ok) return;
+    const j = await r.json();
+    const a = document.querySelector<HTMLAnchorElement>('.sidebar-nav a[data-route="settings"]');
+    if (!a) return;
+    const behind = j.behind === true;
+    a.classList.toggle('nav-has-update', behind);
+    if (behind) a.title = t('update.navBadgeTitle', { version: `v${j.latest}` });
+    else a.removeAttribute('title');
+  } catch { /* best-effort */ }
+}
+
 function renderAuthRequiredPage(host: HTMLElement): void {
   host.innerHTML =
     '<section class="auth-required" style="max-width:520px;margin:64px auto;text-align:center;' +
@@ -179,7 +227,7 @@ function renderAuthRequiredPage(host: HTMLElement): void {
     'padding:40px 36px;box-shadow:0 8px 28px rgba(0,0,0,.12)">' +
     '<h2 style="margin:0 0 12px;font-size:20px;color:var(--fg)">此页需要授权链接</h2>' +
     '<p style="margin:0 0 24px;line-height:1.7;color:var(--muted);font-size:14px">' +
-    '你当前是只读访问，管理页（角色 / Bot 配置 / 团队 / Webhook）需要授权链接。' +
+    '你当前是只读访问，管理页（群角色 / Profiles / Bot 配置 / 团队 / Webhook）需要授权链接。' +
     '运行 <code>botmux dashboard</code> 获取最新链接后即可管理。</p>' +
     '<a href="#/" style="display:inline-block;padding:8px 22px;background:var(--accent);' +
     'color:var(--on-accent);border-radius:8px;text-decoration:none;font-size:14px">返回总览</a>' +
@@ -193,7 +241,11 @@ let pageDispose: (() => void) | null = null;
 function highlightNav(hash: string): void {
   for (const a of document.querySelectorAll<HTMLAnchorElement>('.sidebar-nav a')) {
     const href = a.getAttribute('href') ?? '#/';
-    a.classList.toggle('active', href === (hash || '#/'));
+    const current = hash || '#/';
+    const isActive = href === current || (
+      href !== '#/' && (current.startsWith(`${href}?`) || current.startsWith(`${href}/`))
+    );
+    a.classList.toggle('active', isActive);
   }
 }
 
@@ -223,12 +275,21 @@ function route() {
   else if (hash.startsWith('#/groups')) renderGroupsPage(root);
   else if (hash.startsWith('#/settings')) void renderSettingsPage(root);
   else if (hash.startsWith('#/bot-defaults')) renderBotDefaultsPage(root);
+  else if (hash.startsWith('#/skills')) void renderSkillsPage(root);
   else if (hash.startsWith('#/connectors')) renderConnectorsPage(root);
   else if (hash.startsWith('#/team/manage')) renderTeamManagePage(root);
   else if (hash.startsWith('#/team')) renderTeamFederationPage(root);
+  else if (hash.startsWith('#/role-profiles')) {
+    window.location.replace(`#/roles/profile${hash.slice('#/role-profiles'.length)}`);
+    return;
+  }
+  else if (hash.startsWith('#/roles/profile')) renderRoleProfilesPage(root);
   else if (hash.startsWith('#/roles')) renderRolesPage(root);
   else if (hash.startsWith('#/schedules')) renderSchedulesPage(root);
+  else if (hash.startsWith('#/whiteboards')) void renderWhiteboardsPage(root);
   else if (hash.startsWith('#/sessions')) renderSessionsPage(root);
+  else if (hash.startsWith('#/office')) pageDispose = renderOfficePage(root) ?? null;
+  else if (hash.startsWith('#/insights')) pageDispose = renderInsightsPage(root);
   else void renderOverviewPage(root);
 
   highlightNav(hash);
@@ -255,9 +316,58 @@ function paintChrome() {
 
 function wireChromeControls() {
   document.querySelectorAll<HTMLButtonElement>('[data-locale]').forEach(btn => {
-    btn.onclick = () => ui.setLocale(btn.dataset.locale as DashboardLocale);
+    btn.onclick = () => {
+      const locale = btn.dataset.locale as DashboardLocale;
+      ui.setLocale(locale);
+      void persistLocale(locale);
+    };
   });
   initThemeMenu();
+  wireSidebarToggle();
+}
+
+// 左上角 brand 显示部署 owner（「我」）的飞书头像：localStorage 缓存先出图
+// 防闪烁，再后台刷新；拿不到（未绑定 owner / 只读访客 401）保持渐变球。
+const OWNER_AVATAR_KEY = 'botmux.ownerAvatar.v1';
+
+function paintOwnerAvatar(avatarUrl: string, name?: string): void {
+  const mark = document.querySelector<HTMLElement>('.brand-mark');
+  if (!mark || !avatarUrl) return;
+  mark.innerHTML = `<img class="brand-owner-img" src="${escapeHtml(avatarUrl)}" alt="" decoding="async" referrerpolicy="no-referrer" onerror="this.remove()">`;
+  if (name) mark.title = name;
+}
+
+function initOwnerAvatar(): void {
+  try {
+    const cached = JSON.parse(window.localStorage.getItem(OWNER_AVATAR_KEY) ?? 'null');
+    if (cached?.avatarUrl) paintOwnerAvatar(String(cached.avatarUrl), cached.name ? String(cached.name) : undefined);
+  } catch { /* 缓存损坏忽略 */ }
+  void fetch('/api/owner-profile')
+    .then(r => (r.ok ? r.json() : null))
+    .then(body => {
+      if (!body?.ok || !body.avatarUrl) return;
+      paintOwnerAvatar(String(body.avatarUrl), body.name ? String(body.name) : undefined);
+      try { window.localStorage.setItem(OWNER_AVATAR_KEY, JSON.stringify({ avatarUrl: body.avatarUrl, name: body.name ?? '' })); } catch { /* 忽略 */ }
+    })
+    .catch(() => { /* 只读访客/离线：保持渐变球 */ });
+}
+
+// 左侧菜单栏收起/展开：状态挂在 <html data-sidebar>，CSS 收窄成图标栏；
+// 偏好进 localStorage，刷新/换页保持。
+function wireSidebarToggle() {
+  const btn = document.getElementById('sidebar-toggle');
+  if (!btn) return;
+  let mode: SidebarMode = readStoredSidebarMode(window.localStorage);
+  const apply = () => {
+    document.documentElement.dataset.sidebar = mode;
+    btn.title = t(mode === 'collapsed' ? 'nav.sidebarExpand' : 'nav.sidebarCollapse');
+  };
+  apply();
+  btn.addEventListener('click', () => {
+    mode = mode === 'collapsed' ? 'expanded' : 'collapsed';
+    writeStoredSidebarMode(window.localStorage, mode);
+    apply();
+  });
 }
 
 // esbuild's IIFE bundle does not support top-level await — use an async IIFE.
@@ -276,6 +386,8 @@ void (async () => {
   // hidden and route guards are active for read-only visitors from frame one.
   await loadAuthState();
   applyAuthVisibility();
+  void checkUpdateBadge();
+  initOwnerAvatar();
   try {
     await bootstrap();
   } catch (err) {

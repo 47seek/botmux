@@ -5,6 +5,7 @@ import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import { delay, scaleMs } from '../../utils/timing.js';
 import type { CliAdapter, PtyHandle } from './types.js';
+import { discoverAntigravitySessions } from '../../services/resumable-session-discovery.js';
 
 /**
  * Adapter for Google Antigravity CLI (`agy`).
@@ -130,6 +131,7 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
   let cachedBin: string | undefined;
   return {
     id: 'antigravity',
+    authPaths: ['~/.gemini/oauth_creds.json', '~/.gemini/antigravity-cli/antigravity-oauth-token'],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
     buildArgs({ resume, resumeSessionId, disableCliBypass }) {
@@ -167,6 +169,13 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
       // ~/.gemini/antigravity-cli/conversations/.
       if (!cliSessionId) return null;
       return `agy --conversation ${cliSessionId}`;
+    },
+
+    /** Import path: the submit log `~/.gemini/antigravity-cli/history.jsonl`
+     *  records `{display, timestamp, workspace, conversationId}` per submit —
+     *  enough to discover resumable conversations (deduped by conversationId). */
+    listResumableSessions({ limit, exclude }) {
+      return discoverAntigravitySessions(HISTORY_PATH, limit, exclude);
     },
 
     async writeInput(pty: PtyHandle, content: string) {

@@ -136,6 +136,7 @@ vi.mock('../src/core/worker-pool.js', async (importOriginal) => {
 
 vi.mock('../src/core/session-manager.js', () => ({
   getSessionWorkingDir: vi.fn(() => '/tmp'),
+  ensureSessionWhiteboard: vi.fn(),
   buildNewTopicPrompt: vi.fn(() => 'mock-prompt'),
   // card-handler now persists streaming-card state on every toggle so it
   // survives daemon restart; the integration tests don't care about disk
@@ -186,6 +187,7 @@ function makeDaemonSession(overrides?: Partial<DaemonSession>): DaemonSession {
       updatedAt: Date.now(),
       pid: null,
       chatType: 'group',
+      scope: 'chat',
     },
     worker: { killed: false, send: vi.fn() } as any,
     workerPort: 8080,
@@ -193,6 +195,10 @@ function makeDaemonSession(overrides?: Partial<DaemonSession>): DaemonSession {
     larkAppId: APP_ID,
     chatId: 'oc_chat',
     chatType: 'group',
+    // Flat 普通群 session: status confirmations (restart/close/resume/not-ready)
+    // go out as "visible-to-you" ephemeral cards. Thread-scope sessions take the
+    // visible in-thread reply instead — covered by the thread-scope cases below.
+    scope: 'chat',
     spawnedAt: Date.now(),
     cliVersion: '1.0',
     lastMessageAt: Date.now(),
@@ -512,7 +518,7 @@ describe('Card integration: full event flow', () => {
       // privateCard on + an owner in allowedUsers. Sticky (close path calls
       // getBot several times); restored in finally so it can't leak.
       vi.mocked(botRegMod.getBot).mockReturnValue({
-        config: { larkAppId: APP_ID, cliId: 'claude-code', privateCard: true },
+        config: { larkAppId: APP_ID, cliId: 'claude-code', privateCard: true, allowedUsers: ['ou_owner'] },
         resolvedAllowedUsers: ['ou_owner'],
         botOpenId: 'ou_bot',
       } as any);
@@ -553,7 +559,7 @@ describe('Card integration: full event flow', () => {
       // still go ephemeral — its visibility is pinned to the card, not to the
       // current (mutable) config.
       vi.mocked(botRegMod.getBot).mockReturnValue({
-        config: { larkAppId: APP_ID, cliId: 'claude-code', privateCard: false },
+        config: { larkAppId: APP_ID, cliId: 'claude-code', privateCard: false, allowedUsers: ['ou_owner'] },
         resolvedAllowedUsers: ['ou_owner'],
         botOpenId: 'ou_bot',
       } as any);
@@ -597,7 +603,7 @@ describe('Card integration: full event flow', () => {
       vi.mocked(sessionStoreMod.getSession).mockReturnValue({
         sessionId, chatId: 'oc_chat', rootMessageId: ROOT_ID,
         title: 'closed', status: 'closed', createdAt: '2026-01-01T00:00:00.000Z',
-        larkAppId: APP_ID, scope: 'thread', cliId: 'claude-code',
+        larkAppId: APP_ID, scope: 'chat', cliId: 'claude-code',
       } as any);
 
       const sm = await import('../src/core/session-manager.js');
@@ -606,6 +612,7 @@ describe('Card integration: full event flow', () => {
         larkAppId: APP_ID,
         chatId: 'oc_chat',
         chatType: 'group',
+        scope: 'chat',  // flat 普通群 → resume notice goes out ephemeral
       };
       vi.mocked(sm.resumeSession).mockReturnValue({ ok: true, ds: fakeDs } as any);
 
@@ -705,7 +712,8 @@ describe('Card integration: full event flow', () => {
       // operator, then verify resumeSession was never called and no reply went out.
       const botRegMod = await import('../src/bot-registry.js');
       vi.mocked(botRegMod.getBot).mockReturnValueOnce({
-        config: { larkAppId: APP_ID, larkAppSecret: 'secret', cliId: 'claude-code' } as any,
+        // config.allowedUsers 是原始配置（hasAllowlist 据此判定）；resolvedAllowedUsers 是解析结果。
+        config: { larkAppId: APP_ID, larkAppSecret: 'secret', cliId: 'claude-code', allowedUsers: ['ou_other_user'] } as any,
         resolvedAllowedUsers: ['ou_other_user'],
         botOpenId: 'ou_bot',
       } as any);
@@ -727,6 +735,86 @@ describe('Card integration: full event flow', () => {
 
       expect(sm.resumeSession).not.toHaveBeenCalled();
       expect(deps.sessionReply).not.toHaveBeenCalled();
+    });
+  });
+
+  // ── Scenario 4b: thread-scope confirmations stay in-thread (no leak) ───
+  //
+  // Regression guard: the ephemeral API has no thread anchor, so a 话题 (a
+  // thread-scope session inside a 普通群) must NOT use ephemeral — the
+  // restart/close/resume confirmation has to stay in the topic via the visible
+  // in-thread reply (sessionReply → reply_in_thread). Flat 普通群 (scope:'chat',
+  // tested in Scenario 4) keeps the ephemeral "visible-to-you" behaviour.
+
+  describe('Scenario 4b: thread-scope status cards stay in the thread', () => {
+    it('restart confirmation in a thread-scope session is a visible in-thread reply, never ephemeral', async () => {
+      const clientMod = await import('../src/im/lark/client.js');
+      const workerSend = vi.fn();
+      const ds = makeDaemonSession({
+        scope: 'thread',
+        worker: { killed: false, send: workerSend } as any,
+      });
+      const sessions = new Map<string, DaemonSession>();
+      sessions.set(sessionKey(ROOT_ID, APP_ID), ds);
+      const deps = makeDeps(sessions);
+
+      await handleCardAction(makeRestartEvent(ROOT_ID), deps, APP_ID);
+
+      expect(workerSend).toHaveBeenCalledWith({ type: 'restart' });
+      expect(vi.mocked(clientMod.sendEphemeralCard)).not.toHaveBeenCalled();
+      expect(deps.sessionReply).toHaveBeenCalledWith(
+        ROOT_ID, expect.stringContaining('重启'), undefined, APP_ID,
+      );
+    });
+
+    it('close card in a thread-scope session is replied in-thread, never ephemeral', async () => {
+      const clientMod = await import('../src/im/lark/client.js');
+      const ds = makeDaemonSession({ scope: 'thread' });
+      const sessions = new Map<string, DaemonSession>();
+      const sKey = sessionKey(ROOT_ID, APP_ID);
+      sessions.set(sKey, ds);
+      const deps = makeDeps(sessions);
+
+      await handleCardAction(makeCloseEvent(ROOT_ID), deps, APP_ID);
+
+      expect(killWorker).toHaveBeenCalledWith(ds);
+      expect(sessions.has(sKey)).toBe(false);
+      expect(vi.mocked(clientMod.sendEphemeralCard)).not.toHaveBeenCalled();
+      expect(deps.sessionReply).toHaveBeenCalledWith(
+        ROOT_ID, expect.stringContaining('"type":"closed"'), 'interactive', APP_ID,
+      );
+    });
+
+    it('resume notice in a thread-scope session is replied in-thread, never ephemeral', async () => {
+      const clientMod = await import('../src/im/lark/client.js');
+      const sessionId = 'closed-uuid-thread';
+      const sessions = new Map<string, DaemonSession>();
+      const deps = makeDeps(sessions);
+
+      const sessionStoreMod = await import('../src/services/session-store.js');
+      vi.mocked(sessionStoreMod.getSession).mockReturnValue({
+        sessionId, chatId: 'oc_chat', rootMessageId: ROOT_ID,
+        title: 'closed', status: 'closed', createdAt: '2026-01-01T00:00:00.000Z',
+        larkAppId: APP_ID, scope: 'thread', cliId: 'claude-code',
+      } as any);
+
+      const sm = await import('../src/core/session-manager.js');
+      const fakeDs: any = {
+        session: { sessionId, cliId: 'claude-code' },
+        larkAppId: APP_ID,
+        chatId: 'oc_chat',
+        chatType: 'group',
+        scope: 'thread',  // 话题里恢复 → 确认留在话题内
+      };
+      vi.mocked(sm.resumeSession).mockReturnValue({ ok: true, ds: fakeDs } as any);
+
+      await handleCardAction(makeResumeEvent(ROOT_ID, sessionId), deps, APP_ID);
+
+      expect(sm.resumeSession).toHaveBeenCalledWith(sessionId, sessions);
+      expect(vi.mocked(clientMod.sendEphemeralCard)).not.toHaveBeenCalled();
+      expect(deps.sessionReply).toHaveBeenCalledWith(
+        ROOT_ID, expect.stringContaining('已恢复'), undefined, APP_ID,
+      );
     });
   });
 

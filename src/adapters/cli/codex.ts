@@ -1,8 +1,10 @@
 import { existsSync, statSync, openSync, readSync, closeSync } from 'node:fs';
+import { join } from 'node:path';
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import type { CliAdapter, PtyHandle } from './types.js';
-import { codexHistoryPath } from '../../services/codex-paths.js';
+import { codexHistoryPath, codexHome, codexSessionsRoot } from '../../services/codex-paths.js';
+import { discoverRolloutSessions } from '../../services/resumable-session-discovery.js';
 import { delay, scaleMs } from '../../utils/timing.js';
 
 /** Global submit log — Codex appends one JSON line here on every successful
@@ -123,12 +125,15 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
   let cachedBin: string | undefined;
   return {
     id: 'codex',
+    authPaths: ['~/.codex/auth.json'],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
     buildArgs({ sessionId, resume, resumeSessionId, workingDir, model, disableCliBypass }) {
       const baseArgs = [
         ...(!disableCliBypass ? ['--dangerously-bypass-approvals-and-sandbox'] : []),
         '--no-alt-screen',
+        '-c',
+        `shell_environment_policy.set.BOTMUX_SESSION_ID=${JSON.stringify(sessionId)}`,
       ];
       if (model && model.trim()) {
         // Codex 接受 `--model <id>` / `-m <id>`，写全名最稳，错的会在 codex 自己启动时报。
@@ -138,11 +143,13 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
       const freshArgs = workingDir
         ? [...baseArgs, '-C', workingDir]
         : baseArgs;
-      if (!resume) return freshArgs;
-
-      const codexSessionId = resumeSessionId ?? latestCodexSessionForBotmuxSession(sessionId);
-      if (!codexSessionId) return freshArgs;
-      return ['resume', ...baseArgs, codexSessionId];
+      const codexSessionId = resume
+        ? resumeSessionId ?? latestCodexSessionForBotmuxSession(sessionId)
+        : undefined;
+      const codexArgs = codexSessionId
+        ? ['resume', ...baseArgs, codexSessionId]
+        : freshArgs;
+      return codexArgs;
     },
 
     buildResumeCommand({ sessionId, cliSessionId }) {
@@ -153,6 +160,12 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
       const sid = cliSessionId ?? latestCodexSessionForBotmuxSession(sessionId);
       if (!sid) return null;
       return `codex resume ${sid}`;
+    },
+
+    /** Import path: scan the rollout files under `<CODEX_HOME>/sessions` for
+     *  resumable sessions (session_meta carries the resume id + cwd). */
+    listResumableSessions({ limit, exclude }) {
+      return discoverRolloutSessions(codexSessionsRoot(), limit, exclude);
     },
 
     async writeInput(pty: PtyHandle, content: string) {
@@ -236,6 +249,7 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
 
     completionPattern: undefined,
     readyPattern: /›|\d+% left/,  // › for input box, or status bar pattern (e.g. "97% left")
+    defaultPassthroughCommands: ['/goal'],
     systemHints: BOTMUX_SHELL_HINTS,
     // Codex 0.134.0+ accepts a message while the current turn is still running:
     // it parks it ("Messages to be submitted after next tool call") via an
@@ -260,10 +274,12 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
     // (CODEX_SKILLS_DIR/...), and `[[skills.config]]`'s `path` (enable/disable
     // only — can't register an arbitrary path) all fail to add a scan root.
     // Codex only reads hard-coded roots, so — like gemini/opencode/cursor — we
-    // install into the global ~/.codex/skills. This is visible to a standalone
-    // `codex` too, but every botmux-* skill's description is tightly bound to
-    // "当前飞书话题", so implicit mis-fire risk is negligible.
-    skillsDir: '~/.codex/skills',
+    // install into Codex's global skills dir under CODEX_HOME (default ~/.codex;
+    // a getter so a custom CODEX_HOME is honored, matching where Codex actually
+    // scans). This is visible to a standalone `codex` too, but every botmux-*
+    // skill's description is tightly bound to "当前飞书话题", so implicit
+    // mis-fire risk is negligible.
+    get skillsDir(): string { return join(codexHome(), 'skills'); },
     modelChoices: ['gpt-5', 'gpt-5-codex', 'o3', 'o3-mini'],
   };
 }

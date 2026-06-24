@@ -9,12 +9,12 @@ export function createPiAdapter(pathOverride?: string): CliAdapter {
   const bin = resolveCommand(pathOverride ?? 'pi');
   return {
     id: 'pi',
+    authPaths: ['~/.pi/agent/auth.json'],
     resolvedBin: bin,
 
     buildArgs({ sessionId, initialPrompt }) {
       const args = [
         '--session-id', sessionId,
-        '--tools', 'read,bash,edit,write,grep,find,ls',
       ];
       // Pi's interactive mode processes positional initial messages after TUI
       // startup, avoiding stdin races while keeping the native TUI visible.
@@ -41,6 +41,7 @@ export function createPiAdapter(pathOverride?: string): CliAdapter {
     },
 
     completionPattern: undefined,
+    busyPattern: /Working\.\.\./,
     readyPattern: undefined,
     systemHints: BOTMUX_SHELL_HINTS,
     altScreen: true,

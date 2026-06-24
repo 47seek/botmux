@@ -2,9 +2,11 @@ import * as pty from 'node-pty';
 import { execSync, execFileSync } from 'node:child_process';
 import { accessSync, constants as fsConstants } from 'node:fs';
 import { basename } from 'node:path';
+import { randomBytes } from 'node:crypto';
 import type { SessionBackend, SpawnOpts, SessionProbe } from './types.js';
 import { probeTmuxFunctional, tmuxEnv } from '../../setup/ensure-tmux.js';
 import { REDACTED_CHILD_ENV_KEYS } from '../../utils/child-env.js';
+import { sanitizePerBotEnv } from '../../core/per-bot-env.js';
 import { logger } from '../../utils/logger.js';
 
 /**
@@ -69,6 +71,17 @@ export class TmuxBackend implements SessionBackend {
     return `bmx-${sessionId.slice(0, 8)}`;
   }
 
+  /**
+   * Name of the parked crash-diagnostic shell session. DISTINCT from
+   * {@link sessionName} on purpose: the diagnostic shell must never collide with
+   * the live CLI's backing-session name, or restore/cold-resume/`botmux resume`
+   * would reattach the bare shell as if it were the CLI. Stays `bmx-`-prefixed
+   * so adopt-discovery still skips it.
+   */
+  static diagnosticSessionName(sessionId: string): string {
+    return `bmx-diag-${sessionId.slice(0, 8)}`;
+  }
+
   /** Check if a named tmux session exists. */
   static hasSession(name: string): boolean {
     return TmuxBackend.probeSession(name) === 'exists';
@@ -77,12 +90,16 @@ export class TmuxBackend implements SessionBackend {
   /**
    * Tri-state existence probe. `tmux has-session` exits 0 when the session
    * exists and exits 1 (clean status, no signal) when the server answered but
-   * the session is absent — including "no server running", which means every
-   * pane is genuinely gone. That is an authoritative 'missing'. Anything else —
-   * a timeout (signal/killed) or a spawn failure (binary not on PATH → ENOENT,
-   * not executable → EACCES; neither carries a numeric exit status) — means we
-   * never got an answer → 'unknown', so a flaky/unavailable tmux can't be
-   * mistaken for a gone session.
+   * the session is absent — INCLUDING "no server running". Both collapse to
+   * 'missing' here. The caller MUST disambiguate before treating 'missing' as a
+   * destructive signal: a single gone pane (server still up) is a true zombie,
+   * but "no server running" means the *whole* server died (e.g. machine reboot)
+   * and every pane vanished at once — those sessions are still resumable from
+   * the CLI transcript on disk. Use `serverState()` to tell the two apart (the
+   * restore path does exactly this). Anything else — a timeout (signal/killed)
+   * or a spawn failure (binary not on PATH → ENOENT, not executable → EACCES;
+   * neither carries a numeric exit status) — means we never got an answer →
+   * 'unknown', so a flaky/unavailable tmux can't be mistaken for a gone session.
    *
    * Uses execFileSync (NOT a shell string): running tmux directly keeps a
    * missing/unrunnable binary as ENOENT/EACCES. A shell would instead surface
@@ -95,6 +112,35 @@ export class TmuxBackend implements SessionBackend {
       return 'exists';
     } catch (e: any) {
       if (e && typeof e.status === 'number' && !e.signal) return 'missing';
+      return 'unknown';
+    }
+  }
+
+  /**
+   * Tri-state liveness of the tmux SERVER itself (not a specific session).
+   *
+   *   - 'running' — `tmux list-sessions` exited 0, so the server is up with ≥1
+   *                 session. (A tmux server with zero sessions doesn't exist —
+   *                 it self-terminates when its last session closes — so exit 0
+   *                 is an authoritative "server alive".)
+   *   - 'down'    — clean non-zero exit (no signal): "no server running on …".
+   *                 Every pane the server held is gone *at once*.
+   *   - 'unknown' — timeout / signal / spawn failure (ENOENT/EACCES): no answer.
+   *
+   * Why this matters: `probeSession` returns 'missing' BOTH when the server is
+   * up but one session is gone AND when the whole server is down (machine
+   * reboot). Those are very different — a reboot wipes every bmx-* pane
+   * simultaneously, but the CLI transcripts on disk are still resumable. The
+   * restore path uses this to avoid mass-closing every session on the first
+   * boot after a reboot (which would otherwise read each pane as an
+   * authoritative 'missing' zombie and tear it down).
+   */
+  static serverState(): 'running' | 'down' | 'unknown' {
+    try {
+      execFileSync('tmux', ['list-sessions'], { stdio: 'ignore', env: tmuxEnv(), timeout: 3000 });
+      return 'running';
+    } catch (e: any) {
+      if (e && typeof e.status === 'number' && !e.signal) return 'down';
       return 'unknown';
     }
   }
@@ -116,6 +162,41 @@ export class TmuxBackend implements SessionBackend {
       return out.split('\n').filter(s => s.startsWith('bmx-'));
     } catch {
       return [];
+    }
+  }
+
+  /**
+   * Create a parked diagnostic session after a CLI has exited. The worker uses
+   * this only after it has already captured the failed pane's output, so the
+   * browser can still attach to `bmx-*` and see the startup error while daemon
+   * auto-restart is paused.
+   */
+  static parkDiagnosticSession(name: string, opts: { cwd: string; cols: number; rows: number; contentPath: string }): boolean {
+    try {
+      TmuxBackend.killSession(name);
+      const shellSpec = resolveUserShell();
+      execFileSync('tmux', [
+        'new-session',
+        '-d',
+        '-s', name,
+        '-x', String(opts.cols),
+        '-y', String(opts.rows),
+        '--',
+        shellSpec.shell, ...shellSpec.flags, '-c', DIAGNOSTIC_SHELL_SCRIPT, '_',
+        opts.cwd,
+        opts.contentPath,
+        shellSpec.shell,
+      ], {
+        stdio: 'ignore',
+        cwd: opts.cwd,
+        env: tmuxEnv(),
+        timeout: 5000,
+      });
+      configureTmuxSessionOptions(name);
+      return true;
+    } catch (err) {
+      logger.warn(`[tmux:${name}] failed to park diagnostic session: ${err instanceof Error ? err.message : err}`);
+      return false;
     }
   }
 
@@ -179,7 +260,7 @@ export class TmuxBackend implements SessionBackend {
       //     could `unset` or `export` over it before the CLI sees it. env(1)
       //     injection happens after rcfile load and is authoritative.
       const shellSpec = resolveUserShell();
-      const envAssignments = buildBotmuxEnvAssignments(opts.env);
+      const envAssignments = buildBotmuxEnvAssignments(opts.env, opts.injectEnv);
       // Debug knob — when on, the wrapper does NOT `exec` the CLI; it runs the
       // CLI as a child and then drops into an interactive `$shell -i` so the
       // user can poke at PATH / NVM / pnpm in the web terminal after exiting
@@ -222,21 +303,7 @@ export class TmuxBackend implements SessionBackend {
     // backfill options added after the session was originally created.
     // Setting an already-applied option is idempotent.
     setTimeout(() => {
-      try {
-        const t = shellescape(this.sessionName);
-        const env = tmuxEnv();
-        execSync(`tmux set-option -t ${t} status off`, { stdio: 'ignore', env });
-        execSync(`tmux set-option -t ${t} mouse on`, { stdio: 'ignore', env });
-        // set-clipboard is a server option — enable OSC 52 passthrough for web copy
-        execSync(`tmux set-option -s set-clipboard on`, { stdio: 'ignore', env });
-        execSync(`tmux set-option -t ${t} history-limit 50000`, { stdio: 'ignore', env });
-        // Prevent web terminal clients (smaller viewport) from shrinking the
-        // tmux window.  If a web client at 80×24 causes tmux to resize the
-        // window down, reflowed content shifts buffer positions and the
-        // terminal renderer's baseline tracking breaks — historical output
-        // leaks into the streaming card.
-        execSync(`tmux set-option -t ${t} window-size largest`, { stdio: 'ignore', env });
-      } catch { /* session may not be ready yet — benign */ }
+      configureTmuxSessionOptions(this.sessionName);
     }, 500);
   }
 
@@ -314,17 +381,33 @@ export class TmuxBackend implements SessionBackend {
    */
   pasteText(text: string): void {
     this.exitCopyModeIfNeeded();
-    execFileSync('tmux', ['load-buffer', '-'], {
-      input: text,
-      stdio: ['pipe', 'ignore', 'ignore'],
-      timeout: 5000,
-      env: tmuxEnv(),
-    });
-    execFileSync('tmux', ['paste-buffer', '-t', this.cmdTarget, '-d', '-p'], {
-      stdio: 'ignore',
-      timeout: 5000,
-      env: tmuxEnv(),
-    });
+    const bufferName = `botmux-${randomBytes(8).toString('hex')}`;
+    let loaded = false;
+    try {
+      execFileSync('tmux', ['load-buffer', '-b', bufferName, '-'], {
+        input: text,
+        stdio: ['pipe', 'ignore', 'ignore'],
+        timeout: 5000,
+        env: tmuxEnv(),
+      });
+      loaded = true;
+      execFileSync('tmux', ['paste-buffer', '-b', bufferName, '-t', this.cmdTarget, '-d', '-p'], {
+        stdio: 'ignore',
+        timeout: 5000,
+        env: tmuxEnv(),
+      });
+      loaded = false;
+    } finally {
+      if (loaded) {
+        try {
+          execFileSync('tmux', ['delete-buffer', '-b', bufferName], {
+            stdio: 'ignore',
+            timeout: 1000,
+            env: tmuxEnv(),
+          });
+        } catch { /* best-effort cleanup after a failed paste */ }
+      }
+    }
   }
 
   private exitCopyModeIfNeeded(): void {
@@ -502,6 +585,11 @@ const BOTMUX_INJECTED_ENV_KEYS = [
   // Seed CLI（Claude Code fork）的数据根目录。worker 为 seed 注入它指向 seed 自己的
   // `.claude-runtime`，bridge 才能盯对文件；不进白名单 tmux pane 就拿不到。
   'CLAUDE_CONFIG_DIR',
+  // cjadk wrapperCli（`cjadk <agent>`）启动时 worker 注入 `0`，让 cjadk 跑非交互模式
+  // （跳过启动选择器、清掉吃首条/碎裂多行的输入怪癖），对齐 cjadk 官方 `cjadk feishu`
+  // wrapper。只有 cjadk 启动会被设上此值，其它 bot 不带 → 不进白名单 tmux pane 拿不到，
+  // cjadk 就回到交互模式（本次 bug 的根因）。
+  'CJADK_INTERACTIVE',
 ] as const;
 
 /**
@@ -510,13 +598,29 @@ const BOTMUX_INJECTED_ENV_KEYS = [
  * `IS_SANDBOX` for instance is only set when the daemon is running as root.
  * Pure function for unit-testing without spawning tmux.
  */
-export function buildBotmuxEnvAssignments(env: NodeJS.ProcessEnv | undefined): string[] {
-  if (!env) return [];
+export function buildBotmuxEnvAssignments(
+  env: NodeJS.ProcessEnv | undefined,
+  injectEnv?: Record<string, string>,
+): string[] {
   const out: string[] = [];
-  for (const key of BOTMUX_INJECTED_ENV_KEYS) {
-    const val = env[key];
-    if (val === undefined) continue;
-    out.push(`${key}=${val}`);
+  if (env) {
+    for (const key of BOTMUX_INJECTED_ENV_KEYS) {
+      const val = env[key];
+      if (val === undefined) continue;
+      out.push(`${key}=${val}`);
+    }
+  }
+  // Per-bot env (bots.json `env`): appended AFTER the botmux-managed keys so a
+  // bot's provider creds win over any same-named leftover, and emitted ONLY
+  // here (the per-pane `/usr/bin/env` prefix) — never via the tmux client env —
+  // so they don't pollute the shared server global and leak across bots. These
+  // are argv items consumed as `"$@"` by the shell wrapper, so values with
+  // spaces / quotes / `$` need no escaping. Re-sanitized defensively (the value
+  // crossed an IPC boundary from the daemon).
+  if (injectEnv) {
+    for (const [key, val] of Object.entries(sanitizePerBotEnv(injectEnv))) {
+      out.push(`${key}=${val}`);
+    }
   }
   return out;
 }
@@ -535,6 +639,16 @@ export function buildBotmuxEnvAssignments(env: NodeJS.ProcessEnv | undefined): s
  * bash/zsh/sh by resolveUserShell() so they hit the same SCRIPT path.
  */
 export const SHELL_WRAPPER_SCRIPT = `cd -- "$1" && shift && ${REDACTED_ENV_UNSET_CLAUSE} && exec /usr/bin/env "$@"`;
+
+export const DIAGNOSTIC_SHELL_SCRIPT = [
+  'cd -- "$1" 2>/dev/null || cd "$HOME" 2>/dev/null || cd /',
+  REDACTED_ENV_UNSET_CLAUSE,
+  'clear',
+  `printf '\\033[1;31m[botmux] Agent CLI exited. Auto-restart is paused and the last terminal output is preserved below.\\033[0m\\n\\n'`,
+  'cat -- "$2" 2>/dev/null || true',
+  `printf '\\n\\033[1;33m[botmux] Fix the startup error, then send a new message to retry. Type exit to close this diagnostic shell.\\033[0m\\n'`,
+  'exec "$3" -i',
+].join('; ');
 
 /**
  * Debug variant of the wrapper script — same prelude, but the CLI runs as
@@ -586,6 +700,23 @@ function specForKind(shell: string, kind: ShellKind): ShellSpec {
   else if (kind === 'zsh') flags.push('-l', '-i');
   // 'sh' adds nothing — POSIX sh has no portable interactive rcfile.
   return { shell, flags };
+}
+
+function configureTmuxSessionOptions(sessionName: string): void {
+  try {
+    const t = shellescape(sessionName);
+    const env = tmuxEnv();
+    execSync(`tmux set-option -t ${t} status off`, { stdio: 'ignore', env });
+    execSync(`tmux set-option -t ${t} mouse on`, { stdio: 'ignore', env });
+    // set-clipboard is a server option — enable OSC 52 passthrough for web copy
+    execSync(`tmux set-option -s set-clipboard on`, { stdio: 'ignore', env });
+    execSync(`tmux set-option -t ${t} history-limit 50000`, { stdio: 'ignore', env });
+    // Prevent web terminal clients (smaller viewport) from shrinking the
+    // tmux window. If a web client at 80x24 causes tmux to resize the window
+    // down, reflowed content shifts buffer positions and historical output
+    // leaks into the streaming card.
+    execSync(`tmux set-option -t ${t} window-size largest`, { stdio: 'ignore', env });
+  } catch { /* session may not be ready yet — benign */ }
 }
 
 /** Classify a shell binary path by basename. Returns null for shells whose

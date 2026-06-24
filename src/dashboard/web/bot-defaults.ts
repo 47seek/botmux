@@ -4,14 +4,33 @@
 // after the save; existing chats are left alone, and chats already auto-bound
 // once stay user-controlled.
 import { store } from './store.js';
-import { botAvatarHtml, escapeHtml, loadNameMaps, t } from './ui.js';
+import { botAvatarHtml, escapeHtml, loadNameMaps, loadingHtml, t } from './ui.js';
 
 let cache: { bots: any[] } = { bots: [] };
 let loadError: string | null = null;
 // master-detail：左侧员工名册选中谁，右侧就渲染谁的档案
 let selectedAppId: string | null = null;
 
-/** /api/bots 不带 cliId — 从 store 里该 bot 最近的会话上推。 */
+export function displayCliId(bot: any, sessionFallback: string): string {
+  return typeof bot?.cliId === 'string' && bot.cliId ? bot.cliId : sessionFallback;
+}
+
+type BotProfileRoleItem = {
+  profileId: string;
+  loaded?: boolean;
+  loading?: boolean;
+  content?: string | null;
+  error?: string;
+};
+type BotProfileRoleState = {
+  loaded: boolean;
+  loading: boolean;
+  error?: string;
+  items: BotProfileRoleItem[];
+};
+const botProfileRoleCache = new Map<string, BotProfileRoleState>();
+
+/** Fallback for old /api/bots payloads: infer from the bot's recent sessions. */
 function cliIdOf(appId: string): string {
   let best: any = null;
   for (const s of store.sessions.values()) {
@@ -85,7 +104,11 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
 
   refreshBtn.onclick = async () => {
     refreshBtn.disabled = true;
-    try { await loadBots(); rerender(); } finally { refreshBtn.disabled = false; }
+    try {
+      botProfileRoleCache.clear();
+      await loadBots();
+      rerender();
+    } finally { refreshBtn.disabled = false; }
   };
 
   // 帮助文字默认折叠成一行；点说明文字本身展开/收起（preventDefault 拦掉
@@ -98,6 +121,8 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
     }
   });
 
+  // /api/bots 要逐 daemon 探活，慢——先亮 loading 占住右侧详情区。
+  listEl.innerHTML = loadingHtml();
   await loadBots();
 
   function rerender() {
@@ -136,7 +161,7 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
 
   function renderRosterItem(b: any): string {
     const name = b.botName ?? b.larkAppId;
-    const cli = cliIdOf(b.larkAppId);
+    const cli = displayCliId(b, cliIdOf(b.larkAppId));
     const flag = b.defaultOncall?.enabled
       ? `<span class="bd-roster-flag">oncall</span>`
       : '';
@@ -164,7 +189,7 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
     const def = b.defaultOncall ?? { enabled: false, workingDir: '', since: 0 };
     const enabled = !!def.enabled;
     const name = b.botName ?? b.larkAppId;
-    const cli = cliIdOf(b.larkAppId);
+    const cli = displayCliId(b, cliIdOf(b.larkAppId));
     return `<article class="bd-card bd-profile" data-appid="${escapeHtml(b.larkAppId)}">
       <header class="bd-profile-head">
         ${botAvatarHtml({ name, larkAppId: b.larkAppId, dot: 'ok' })}
@@ -205,7 +230,7 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
           ${renderSandboxSection(b)}
         </section>
         <section class="bd-tile">${renderRoleSection(b)}</section>
-        <section class="bd-tile">${renderSessionModeSection(b)}</section>
+        <section class="bd-tile">${renderSessionModeSection(b)}${renderSessionCapSection(b)}${renderStartupCommandsSection(b)}${renderEnvSection(b)}</section>
         <section class="bd-tile">${renderCardBehaviorSection(b)}${renderBrandSection(b)}</section>
         <section class="bd-tile">${renderGrantSection(b)}</section>
       </div>
@@ -232,7 +257,34 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
         <button type="button" data-action="delete-role"${loaded ? '' : ' disabled'}>${t('botDefaults.roleDelete')}</button>
         <span class="oncall-status" data-role-status></span>
       </div>
+      <div class="bd-profile-roles" data-profile-roles>
+        <h4 class="bd-subsection-title">${t('botDefaults.profileRoles')}</h4>
+        <p class="bd-section-note">${t('botDefaults.profileRolesHelp')}</p>
+        <div class="bd-profile-role-list" data-profile-role-list>${renderProfileRoleList(b.larkAppId)}</div>
+      </div>
     </section>`;
+  }
+
+  function renderProfileRoleList(appId: string): string {
+    const state = botProfileRoleCache.get(appId);
+    if (!state || state.loading) return loadingHtml();
+    if (state.error) return `<p class="hint-warn-inline">${escapeHtml(t('botDefaults.profileRolesLoadFailed', { error: state.error }))}</p>`;
+    if (state.items.length === 0) return `<p class="empty">${t('botDefaults.profileRolesEmpty')}</p>`;
+    return state.items.map(item => `
+      <details class="bd-profile-role-entry" data-profile-id="${escapeHtml(item.profileId)}">
+        <summary><code>${escapeHtml(item.profileId)}</code></summary>
+        <div class="bd-profile-role-content" data-profile-role-body="${escapeHtml(item.profileId)}">
+          ${renderProfileRoleContent(item)}
+        </div>
+      </details>
+    `).join('');
+  }
+
+  function renderProfileRoleContent(item: BotProfileRoleItem): string {
+    if (item.loading) return loadingHtml();
+    if (item.error) return `<p class="hint-warn-inline">${escapeHtml(t('botDefaults.profileRoleDetailLoadFailed', { error: item.error }))}</p>`;
+    if (!item.loaded) return `<p class="empty">${t('botDefaults.profileRoleClickToLoad')}</p>`;
+    return `<pre>${escapeHtml(item.content ?? '')}</pre>`;
   }
 
   // brandLabel is null when unset (→ default botmux), '' when off, else custom.
@@ -265,11 +317,14 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
     </section>`;
   }
 
-  // Two per-bot card-behaviour toggles. Both auto-save on change (no explicit
-  // save button — each checkbox PUTs immediately). The writable-link toggle is
-  // moot while the streaming card is disabled, so we disable it in that state.
+  // Per-bot card-behaviour toggles. Each auto-saves on change (no explicit save
+  // button — each checkbox PUTs immediately). Two are gated on the streaming-card
+  // state: the writable-link toggle is moot WHILE the card is disabled; the
+  // status-reactions toggle only matters WHILE the card is disabled (the ✋→✅
+  // reactions only appear in card-off sessions), so it's editable only then.
   function renderCardBehaviorSection(b: any): string {
     const disableStreaming = b.disableStreamingCard === true;
+    const silentReactions = b.silentTurnReactions === true;
     const writableLink = b.writableTerminalLinkInCard === true;
     const privateCard = b.privateCard === true;
     return `<section class="bd-section">
@@ -279,6 +334,12 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
         <span class="switch" aria-hidden="true"></span>
         <span class="toggle-tx"><strong>${t('botDefaults.disableStreaming')}</strong>
         <small>${t('botDefaults.disableStreamingHelp')}</small></span>
+      </label>
+      <label class="toggle-row">
+        <input type="checkbox" data-action="toggle-silent-reactions" ${silentReactions ? 'checked' : ''} ${disableStreaming ? '' : 'disabled'}>
+        <span class="switch" aria-hidden="true"></span>
+        <span class="toggle-tx"><strong>${t('botDefaults.silentTurnReactions')}</strong>
+        <small>${t('botDefaults.silentTurnReactionsHelp')}</small></span>
       </label>
       <label class="toggle-row">
         <input type="checkbox" data-action="toggle-writable-link" ${writableLink ? 'checked' : ''} ${disableStreaming ? 'disabled' : ''}>
@@ -311,10 +372,13 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
       ? b.regularGroupReplyMode : 'chat';
     const mention: string = (b.regularGroupMentionMode === 'topic' || b.regularGroupMentionMode === 'never')
       ? b.regularGroupMentionMode : 'always';
+    const docMode: string = b.docSubscribeDefaultMode === 'all' ? 'all' : 'mention-only';
     const opt = (v: string, label: string) =>
       `<option value="${v}" ${regular === v ? 'selected' : ''}>${escapeHtml(label)}</option>`;
     const mopt = (v: string, label: string) =>
       `<option value="${v}" ${mention === v ? 'selected' : ''}>${escapeHtml(label)}</option>`;
+    const dopt = (v: string, label: string) =>
+      `<option value="${v}" ${docMode === v ? 'selected' : ''}>${escapeHtml(label)}</option>`;
     return `<section class="bd-section">
       <h3 class="bd-section-title">${t('botDefaults.sectionSessionMode')}</h3>
       <div class="bd-row">
@@ -358,7 +422,88 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
           <span class="oncall-status" data-mention-mode-status></span>
         </div>
       </div>
+      <div class="bd-row">
+        <label>
+          <span>${t('botDefaults.docSubscribeMode')}</span>
+          <select data-input="docSubscribeDefaultMode">
+            ${dopt('mention-only', t('botDefaults.docSubscribeModeMention'))}
+            ${dopt('all', t('botDefaults.docSubscribeModeAll'))}
+          </select>
+        </label>
+        <small class="bd-help">${t('botDefaults.docSubscribeModeHelp')}</small>
+        <div class="actions">
+          <span class="oncall-status" data-doc-subscribe-mode-status></span>
+        </div>
+      </div>
     </section>`;
+  }
+
+  function sessionCapStateLabel(cap: number | null): string {
+    return cap == null
+      ? t('botDefaults.maxLiveWorkersStateDefault')
+      : t('botDefaults.maxLiveWorkersStateOn', { count: cap });
+  }
+
+  // 最大同时活跃会话数（maxLiveWorkers）：数字输入 + 保存/恢复默认按钮（空＝用默认 30）。
+  // 超过上限时最久未用的会话自动休眠（worker+CLI 一起杀回收内存），下条消息冷恢复。
+  // PUT /api/bots/:appId/max-live-workers 落 bots.json，daemon 每分钟读实时值即时生效。
+  function renderSessionCapSection(b: any): string {
+    const cap: number | null = typeof b.maxLiveWorkers === 'number' ? b.maxLiveWorkers : null;
+    return `<div class="bd-subsection">
+      <h4 class="bd-subsection-title">${t('botDefaults.sectionSessionCap')}</h4>
+      <div class="bd-row bd-quota">
+        <label>
+          <span>${t('botDefaults.maxLiveWorkers')}</span>
+          <input type="number" min="1" step="1" data-input="maxLiveWorkers"
+            placeholder="${escapeHtml(t('botDefaults.maxLiveWorkersPlaceholder'))}"
+            value="${cap == null ? '' : cap}">
+        </label>
+        <small data-session-cap-state>${escapeHtml(sessionCapStateLabel(cap))}</small>
+        <small class="bd-help">${t('botDefaults.maxLiveWorkersHelp')}</small>
+        <div class="actions">
+          <button type="button" class="primary" data-action="save-session-cap">${t('botDefaults.maxLiveWorkersSave')}</button>
+          <button type="button" data-action="off-session-cap">${t('botDefaults.maxLiveWorkersOff')}</button>
+          <span class="oncall-status" data-session-cap-status></span>
+        </div>
+      </div>
+    </div>`;
+  }
+
+  // 启动命令 startupCommands：开会话后、首条消息前自动按序发给 CLI 的 slash 命令（可带
+  // 参数，如 /effort ultracode）。文本域，逗号/换行分隔，每行一条；空＝不发。next-session
+  // 生效（含 resume，每次新会话重放）。PUT /api/bots/:appId/startup-commands 落 bots.json。
+  function renderStartupCommandsSection(b: any): string {
+    const val: string = typeof b.startupCommands === 'string' ? b.startupCommands : '';
+    return `<div class="bd-subsection">
+      <h4 class="bd-subsection-title">${t('botDefaults.sectionStartupCommands')}</h4>
+      <p class="bd-section-note">${t('botDefaults.startupCommandsHelp')}</p>
+      <textarea data-input="startupCommands" rows="3"
+        placeholder="${escapeHtml(t('botDefaults.startupCommandsPlaceholder'))}"
+        style="width:100%;box-sizing:border-box;font:13px/1.5 ui-monospace,Menlo,monospace;padding:10px">${escapeHtml(val)}</textarea>
+      <div class="actions">
+        <button type="button" class="primary" data-action="save-startup-commands">${t('botDefaults.startupCommandsSave')}</button>
+        <span class="oncall-status" data-startup-commands-status></span>
+      </div>
+    </div>`;
+  }
+
+  // 环境变量 env：注入到本 bot CLI 进程的环境变量（JSON 对象），如让某个 bot 走 GLM/
+  // 第三方服务商（ANTHROPIC_BASE_URL+ANTHROPIC_AUTH_TOKEN）或设 HTTPS_PROXY。next-session
+  // 生效（下个新会话起注入）。PUT /api/bots/:appId/env 落 bots.json，跨后端按会话注入
+  // （不进共享 tmux server 全局 env，不会串到别的 bot）。
+  function renderEnvSection(b: any): string {
+    const val: string = typeof b.env === 'string' ? b.env : '';
+    return `<div class="bd-subsection">
+      <h4 class="bd-subsection-title">${t('botDefaults.sectionEnv')}</h4>
+      <p class="bd-section-note">${t('botDefaults.envHelp')}</p>
+      <textarea data-input="env" rows="5"
+        placeholder="${escapeHtml(t('botDefaults.envPlaceholder'))}"
+        style="width:100%;box-sizing:border-box;font:13px/1.5 ui-monospace,Menlo,monospace;padding:10px">${escapeHtml(val)}</textarea>
+      <div class="actions">
+        <button type="button" class="primary" data-action="save-env">${t('botDefaults.envSave')}</button>
+        <span class="oncall-status" data-env-status></span>
+      </div>
+    </div>`;
   }
 
   // File sandbox (oncall): a per-bot toggle. ON → this bot's sessions run inside
@@ -385,13 +530,20 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
       : t('botDefaults.quotaStateOn', { count: quota });
   }
 
-  // 授权（/grant）相关：命令限制开关（auto-save 复选框）+ 默认消息额度（数字输入 + 保存/关闭按钮，
-  // 空＝关闭无限）。两者都通过 PUT /api/bots/:appId/grant-prefs 落到 bots.json，daemon 内存同步即时生效。
+  // 授权（/grant）相关：自动申请卡、命令限制开关 + 默认消息额度。都通过
+  // PUT /api/bots/:appId/grant-prefs 落到 bots.json，daemon 内存同步即时生效。
   function renderGrantSection(b: any): string {
     const restrict = b.restrictGrantCommands === true;
+    const autoCard = b.autoGrantRequestCards !== false;
     const quota: number | null = typeof b.messageQuotaDefaultLimit === 'number' ? b.messageQuotaDefaultLimit : null;
     return `<section class="bd-section">
       <h3 class="bd-section-title">${t('botDefaults.sectionGrant')}</h3>
+      <label class="toggle-row">
+        <input type="checkbox" data-action="toggle-auto-grant-card" ${autoCard ? 'checked' : ''}>
+        <span class="switch" aria-hidden="true"></span>
+        <span class="toggle-tx"><strong>${t('botDefaults.autoGrantCard')}</strong>
+        <small>${t('botDefaults.autoGrantCardHelp')}</small></span>
+      </label>
       <label class="toggle-row">
         <input type="checkbox" data-action="toggle-restrict-grant" ${restrict ? 'checked' : ''}>
         <span class="switch" aria-hidden="true"></span>
@@ -454,9 +606,91 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
     </div>`;
   }
 
+  function liveCard(appId: string): HTMLElement | null {
+    return listEl.querySelector<HTMLElement>(`.bd-card[data-appid="${CSS.escape(appId)}"]`);
+  }
+
+  function renderProfileRolesInto(card: HTMLElement | null, appId: string): void {
+    const target = card?.querySelector<HTMLElement>('[data-profile-role-list]');
+    if (!target) return;
+    target.innerHTML = renderProfileRoleList(appId);
+    wireProfileRoleDetails(card!, appId);
+  }
+
+  async function ensureProfileRolesLoaded(appId: string, card: HTMLElement): Promise<void> {
+    let state = botProfileRoleCache.get(appId);
+    if (state?.loaded || state?.loading) {
+      renderProfileRolesInto(card, appId);
+      return;
+    }
+
+    state = { loaded: false, loading: true, items: [] };
+    botProfileRoleCache.set(appId, state);
+    renderProfileRolesInto(card, appId);
+    try {
+      const r = await fetch('/api/role-profiles');
+      const body = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(body?.error ?? String(r.status));
+      const profiles = Array.isArray(body.profiles) ? body.profiles : [];
+      state.items = profiles
+        .filter((profile: any) => (profile.botEntries ?? []).some((entry: any) =>
+          entry?.larkAppId === appId && entry?.hasEntry,
+        ))
+        .map((profile: any) => ({ profileId: String(profile.profileId) }));
+      state.loaded = true;
+    } catch (e: any) {
+      state.error = e?.message ?? String(e);
+      state.loaded = true;
+    } finally {
+      state.loading = false;
+      renderProfileRolesInto(liveCard(appId), appId);
+    }
+  }
+
+  function wireProfileRoleDetails(card: HTMLElement, appId: string): void {
+    card.querySelectorAll<HTMLDetailsElement>('details.bd-profile-role-entry[data-profile-id]').forEach(detail => {
+      detail.addEventListener('toggle', () => {
+        if (!detail.open) return;
+        const profileId = detail.dataset.profileId;
+        if (profileId) void ensureProfileRoleDetailLoaded(appId, profileId);
+      });
+    });
+  }
+
+  async function ensureProfileRoleDetailLoaded(appId: string, profileId: string): Promise<void> {
+    const state = botProfileRoleCache.get(appId);
+    const item = state?.items.find(i => i.profileId === profileId);
+    if (!item || item.loaded || item.loading) return;
+    item.loading = true;
+    renderProfileRoleBody(appId, profileId);
+    try {
+      const r = await fetch(`/api/role-profiles/${encodeURIComponent(profileId)}/${encodeURIComponent(appId)}`);
+      const body = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(body?.error ?? String(r.status));
+      item.content = body?.hasEntry ? String(body.content ?? '') : '';
+      item.loaded = true;
+    } catch (e: any) {
+      item.error = e?.message ?? String(e);
+    } finally {
+      item.loading = false;
+      renderProfileRoleBody(appId, profileId);
+    }
+  }
+
+  function renderProfileRoleBody(appId: string, profileId: string): void {
+    const state = botProfileRoleCache.get(appId);
+    const item = state?.items.find(i => i.profileId === profileId);
+    if (!item) return;
+    const body = liveCard(appId)?.querySelector<HTMLElement>(
+      `[data-profile-role-body="${CSS.escape(profileId)}"]`,
+    );
+    if (body) body.innerHTML = renderProfileRoleContent(item);
+  }
+
   function wireCardHandlers() {
     listEl.querySelectorAll<HTMLElement>('.bd-card').forEach(card => {
       const appId = card.dataset.appid!;
+      void ensureProfileRolesLoaded(appId, card);
       const toggle = card.querySelector<HTMLInputElement>('input[data-action=toggle]');
       const input = card.querySelector<HTMLInputElement>('input[data-input=workingDir]');
       const saveBtn = card.querySelector<HTMLButtonElement>('button[data-action=save]');
@@ -567,6 +801,7 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
 
       // ── Card behaviour toggles (auto-save on change) ──────────────────────
       const disableStreamingCb = card.querySelector<HTMLInputElement>('input[data-action=toggle-disable-streaming]');
+      const silentReactionsCb = card.querySelector<HTMLInputElement>('input[data-action=toggle-silent-reactions]');
       const writableLinkCb = card.querySelector<HTMLInputElement>('input[data-action=toggle-writable-link]');
       const privateCardCb = card.querySelector<HTMLInputElement>('input[data-action=toggle-private-card]');
       const cardPrefStatusEl = card.querySelector<HTMLSpanElement>('[data-card-pref-status]');
@@ -598,6 +833,7 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
             const cached = cache.bots.find((bb: any) => bb.larkAppId === appId);
             if (cached) {
               cached.disableStreamingCard = body.disableStreamingCard;
+              cached.silentTurnReactions = body.silentTurnReactions;
               cached.writableTerminalLinkInCard = body.writableTerminalLinkInCard;
               cached.privateCard = body.privateCard;
               cached.autoStartOnGroupJoin = body.autoStartOnGroupJoin;
@@ -605,6 +841,7 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
               cached.autoStartOnNewTopic = body.autoStartOnNewTopic;
               cached.regularGroupReplyMode = body.regularGroupReplyMode;
               cached.regularGroupMentionMode = body.regularGroupMentionMode;
+              cached.docSubscribeDefaultMode = body.docSubscribeDefaultMode;
             }
           } else {
             statusEl.textContent = `✗ ${body.error ?? r.status}`;
@@ -616,6 +853,8 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
         } finally {
           // The writable-link checkbox stays disabled while streaming is off.
           if (selfEl === writableLinkCb) selfEl.disabled = !!disableStreamingCb?.checked;
+          // The status-reactions checkbox is only editable while streaming is off.
+          else if (selfEl === silentReactionsCb) selfEl.disabled = !disableStreamingCb?.checked;
           else selfEl.disabled = false;
         }
       }
@@ -625,8 +864,16 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
           const off = disableStreamingCb.checked;
           // Streaming off → the writable-link toggle has nothing to attach to.
           if (writableLinkCb) writableLinkCb.disabled = off;
+          // Status reactions only exist in card-off sessions, so this toggle is
+          // editable only while streaming is off.
+          if (silentReactionsCb) silentReactionsCb.disabled = !off;
           if (cardPrefMootEl) cardPrefMootEl.hidden = !off;
           putCardPref({ disableStreamingCard: off }, disableStreamingCb);
+        });
+      }
+      if (silentReactionsCb) {
+        silentReactionsCb.addEventListener('change', () => {
+          putCardPref({ silentTurnReactions: silentReactionsCb.checked }, silentReactionsCb);
         });
       }
       if (writableLinkCb) {
@@ -757,6 +1004,20 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
         });
       }
 
+      // ── 文档订阅默认触发范围（bot-global）─────────────────────────────────
+      // mention-only = 仅评论 @ 我才触发（默认）；all = 所有新评论都触发。
+      const docModeSel = card.querySelector<HTMLSelectElement>('select[data-input=docSubscribeDefaultMode]');
+      const docModeStatusEl = card.querySelector<HTMLSpanElement>('[data-doc-subscribe-mode-status]');
+      if (docModeSel) {
+        docModeSel.addEventListener('change', () => {
+          putCardPref(
+            { docSubscribeDefaultMode: docModeSel.value },
+            docModeSel,
+            docModeStatusEl,
+          );
+        });
+      }
+
       // ── Team role (one role per bot, cross-chat) ──────────────────────────
       const roleTextarea = card.querySelector<HTMLTextAreaElement>('textarea[data-input=teamRole]');
       const roleSaveBtn = card.querySelector<HTMLButtonElement>('button[data-action=save-role]');
@@ -856,7 +1117,8 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
         });
       }
 
-      // ── 授权偏好：命令限制开关 + 默认消息额度 ──────────────────────────
+      // ── 授权偏好：自动申请卡 + 命令限制开关 + 默认消息额度 ──────────────
+      const autoGrantCardCb = card.querySelector<HTMLInputElement>('input[data-action=toggle-auto-grant-card]');
       const restrictCb = card.querySelector<HTMLInputElement>('input[data-action=toggle-restrict-grant]');
       const quotaInput = card.querySelector<HTMLInputElement>('input[data-input=quotaLimit]');
       const quotaSaveBtn = card.querySelector<HTMLButtonElement>('button[data-action=save-quota]');
@@ -864,10 +1126,11 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
       const grantStatusEl = card.querySelector<HTMLSpanElement>('[data-grant-status]');
       const quotaStateEl = card.querySelector<HTMLElement>('[data-quota-state]');
 
-      // PUT a partial grant-prefs patch ({ restrictGrantCommands? } and/or
-      // { messageQuotaDefaultLimit: number|null }). Mirrors putCardPref.
+      // PUT a partial grant-prefs patch ({ autoGrantRequestCards? },
+      // { restrictGrantCommands? } and/or { messageQuotaDefaultLimit: number|null }).
+      // Mirrors putCardPref.
       async function putGrantPref(
-        patch: { restrictGrantCommands?: boolean; messageQuotaDefaultLimit?: number | null },
+        patch: { autoGrantRequestCards?: boolean; restrictGrantCommands?: boolean; messageQuotaDefaultLimit?: number | null },
         selfEl: HTMLInputElement | HTMLButtonElement,
       ) {
         if (!grantStatusEl) return;
@@ -887,6 +1150,7 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
             const next: number | null = typeof body.messageQuotaDefaultLimit === 'number' ? body.messageQuotaDefaultLimit : null;
             const cached = cache.bots.find((bb: any) => bb.larkAppId === appId);
             if (cached) {
+              cached.autoGrantRequestCards = body.autoGrantRequestCards !== false;
               cached.restrictGrantCommands = body.restrictGrantCommands === true;
               cached.messageQuotaDefaultLimit = next;
             }
@@ -906,6 +1170,11 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
         }
       }
 
+      if (autoGrantCardCb) {
+        autoGrantCardCb.addEventListener('change', () => {
+          putGrantPref({ autoGrantRequestCards: autoGrantCardCb.checked }, autoGrantCardCb);
+        });
+      }
       if (restrictCb) {
         restrictCb.addEventListener('change', () => {
           putGrantPref({ restrictGrantCommands: restrictCb.checked }, restrictCb);
@@ -930,6 +1199,147 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
         quotaOffBtn.addEventListener('click', () => {
           quotaInput.value = '';
           putGrantPref({ messageQuotaDefaultLimit: null }, quotaOffBtn);
+        });
+      }
+
+      // ── 最大同时活跃会话数 maxLiveWorkers（空＝回落默认 30） ──────────────────
+      const capInput = card.querySelector<HTMLInputElement>('input[data-input=maxLiveWorkers]');
+      const capSaveBtn = card.querySelector<HTMLButtonElement>('button[data-action=save-session-cap]');
+      const capOffBtn = card.querySelector<HTMLButtonElement>('button[data-action=off-session-cap]');
+      const capStatusEl = card.querySelector<HTMLSpanElement>('[data-session-cap-status]');
+      const capStateEl = card.querySelector<HTMLElement>('[data-session-cap-state]');
+
+      // PUT { maxLiveWorkers: number | null } to the bot's daemon (via the
+      // dashboard proxy). null = unlimited. Mirrors putGrantPref.
+      async function putMaxLiveWorkers(value: number | null, selfEl: HTMLInputElement | HTMLButtonElement) {
+        if (!capStatusEl) return;
+        capStatusEl.textContent = '';
+        capStatusEl.className = 'oncall-status';
+        selfEl.disabled = true;
+        try {
+          const r = await fetch(`/api/bots/${encodeURIComponent(appId)}/max-live-workers`, {
+            method: 'PUT',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ maxLiveWorkers: value }),
+          });
+          const body = await r.json().catch(() => ({}));
+          if (r.ok && body.ok) {
+            capStatusEl.textContent = `✓ ${t('botDefaults.cardPrefSaved')}`;
+            capStatusEl.classList.add('hint-ok');
+            const next: number | null = typeof body.maxLiveWorkers === 'number' ? body.maxLiveWorkers : null;
+            const cached = cache.bots.find((bb: any) => bb.larkAppId === appId);
+            if (cached) cached.maxLiveWorkers = next;
+            if (capStateEl) capStateEl.textContent = sessionCapStateLabel(next);
+            if (capInput) capInput.value = next == null ? '' : String(next);
+          } else {
+            capStatusEl.textContent = `✗ ${body.error ?? r.status}`;
+            capStatusEl.classList.add('hint-warn-inline');
+          }
+        } catch (e: any) {
+          capStatusEl.textContent = `✗ ${e?.message ?? e}`;
+          capStatusEl.classList.add('hint-warn-inline');
+        } finally {
+          selfEl.disabled = false;
+        }
+      }
+
+      if (capInput && capSaveBtn) {
+        capSaveBtn.addEventListener('click', () => {
+          const raw = capInput.value.trim();
+          if (raw === '') { putMaxLiveWorkers(null, capSaveBtn); return; } // 空＝清回默认 30
+          // 只认纯正整数 token（拒 1e2 / 1.0 / 01），与额度输入同口径。
+          if (!/^[1-9]\d*$/.test(raw)) {
+            if (capStatusEl) {
+              capStatusEl.textContent = `✗ ${t('botDefaults.maxLiveWorkersInvalid')}`;
+              capStatusEl.className = 'oncall-status hint-warn-inline';
+            }
+            return;
+          }
+          putMaxLiveWorkers(Number(raw), capSaveBtn);
+        });
+      }
+      if (capInput && capOffBtn) {
+        capOffBtn.addEventListener('click', () => {
+          capInput.value = '';
+          putMaxLiveWorkers(null, capOffBtn);
+        });
+      }
+
+      // ── 启动命令 startupCommands（逗号/换行分隔；空＝清除，不发任何命令） ──────────
+      const startupEl = card.querySelector<HTMLTextAreaElement>('textarea[data-input=startupCommands]');
+      const startupSaveBtn = card.querySelector<HTMLButtonElement>('button[data-action=save-startup-commands]');
+      const startupStatusEl = card.querySelector<HTMLSpanElement>('[data-startup-commands-status]');
+      if (startupEl && startupSaveBtn) {
+        startupSaveBtn.addEventListener('click', async () => {
+          if (!startupStatusEl) return;
+          startupStatusEl.textContent = '';
+          startupStatusEl.className = 'oncall-status';
+          startupSaveBtn.disabled = true;
+          try {
+            const r = await fetch(`/api/bots/${encodeURIComponent(appId)}/startup-commands`, {
+              method: 'PUT',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ startupCommands: startupEl.value }),
+            });
+            const body = await r.json().catch(() => ({}));
+            if (r.ok && body.ok) {
+              startupStatusEl.textContent = `✓ ${t('botDefaults.cardPrefSaved')}`;
+              startupStatusEl.classList.add('hint-ok');
+              // Server returns the normalized, newline-joined list — reflect it
+              // back so the textarea shows exactly what was persisted.
+              const next: string = typeof body.startupCommands === 'string' ? body.startupCommands : '';
+              startupEl.value = next;
+              const cached = cache.bots.find((bb: any) => bb.larkAppId === appId);
+              if (cached) cached.startupCommands = next;
+            } else {
+              startupStatusEl.textContent = `✗ ${body.error ?? r.status}`;
+              startupStatusEl.classList.add('hint-warn-inline');
+            }
+          } catch (e: any) {
+            startupStatusEl.textContent = `✗ ${e?.message ?? e}`;
+            startupStatusEl.classList.add('hint-warn-inline');
+          } finally {
+            startupSaveBtn.disabled = false;
+          }
+        });
+      }
+
+      // ── 环境变量 env（JSON 对象；空＝清除） ──────────────────────────────
+      const envEl = card.querySelector<HTMLTextAreaElement>('textarea[data-input=env]');
+      const envSaveBtn = card.querySelector<HTMLButtonElement>('button[data-action=save-env]');
+      const envStatusEl = card.querySelector<HTMLSpanElement>('[data-env-status]');
+      if (envEl && envSaveBtn) {
+        envSaveBtn.addEventListener('click', async () => {
+          if (!envStatusEl) return;
+          envStatusEl.textContent = '';
+          envStatusEl.className = 'oncall-status';
+          envSaveBtn.disabled = true;
+          try {
+            const r = await fetch(`/api/bots/${encodeURIComponent(appId)}/env`, {
+              method: 'PUT',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ env: envEl.value }),
+            });
+            const body = await r.json().catch(() => ({}));
+            if (r.ok && body.ok) {
+              envStatusEl.textContent = `✓ ${t('botDefaults.cardPrefSaved')}`;
+              envStatusEl.classList.add('hint-ok');
+              // Server returns the sanitized, pretty-printed JSON — reflect it
+              // back so the textarea shows exactly what was persisted.
+              const next: string = typeof body.env === 'string' ? body.env : '';
+              envEl.value = next;
+              const cached = cache.bots.find((bb: any) => bb.larkAppId === appId);
+              if (cached) cached.env = next;
+            } else {
+              envStatusEl.textContent = `✗ ${body.error ?? r.status}`;
+              envStatusEl.classList.add('hint-warn-inline');
+            }
+          } catch (e: any) {
+            envStatusEl.textContent = `✗ ${e?.message ?? e}`;
+            envStatusEl.classList.add('hint-warn-inline');
+          } finally {
+            envSaveBtn.disabled = false;
+          }
         });
       }
     });

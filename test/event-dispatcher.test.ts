@@ -27,14 +27,21 @@ vi.mock('node:fs', async (importOriginal) => {
     mkdirSync: vi.fn(),
   };
 });
+// bots-info.json 走原子写 helper；这里直接代理到 mockWriteFileSync，
+// 断言面（最终路径 + 完整内容）与裸 writeFileSync 时代保持一致。
+vi.mock('../src/utils/atomic-write.js', () => ({
+  atomicWriteFileSync: (...args: any[]) => mockWriteFileSync(...args),
+}));
 
 const mockGetBot = vi.fn();
 const mockGetAllBots = vi.fn(() => []);
+const mockGetOwnerOpenId = vi.fn(() => undefined as string | undefined);
 const mockIsChatOncallBoundForAnyBot = vi.fn<(chatId: string) => boolean>(() => false);
 const mockFindOncallChat = vi.fn<(larkAppId: string, chatId: string) => { chatId: string; workingDir: string } | undefined>(() => undefined);
 vi.mock('../src/bot-registry.js', () => ({
   getBot: (...args: any[]) => mockGetBot(...args),
   getAllBots: () => mockGetAllBots(),
+  getOwnerOpenId: (...args: any[]) => mockGetOwnerOpenId(...args),
   findOncallChat: (...args: any[]) => mockFindOncallChat(...(args as [string, string])),
   isChatOncallBoundForAnyBot: (...args: any[]) => mockIsChatOncallBoundForAnyBot(...(args as [string])),
 }));
@@ -94,6 +101,9 @@ vi.mock('@larksuiteoapi/node-sdk', () => {
 
 import { __resetAnchorQueues } from '../src/utils/anchor-serializer.js';
 import { __resetEventClaimsForTest, canOperate, canTalk, decideRouting, ensureBotOpenId, isBotMentioned, startLarkEventDispatcher, writeBotInfoFile, type EventHandlers } from '../src/im/lark/event-dispatcher.js';
+// grant-pending is a real (unmocked) module-level table; reset it per test so the
+// grant-card throttle state never leaks across cases (it backs the @blocked card path).
+import { _resetForTest as _resetGrantPending } from '../src/im/lark/grant-pending.js';
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -112,10 +122,13 @@ function setupBotState(opts?: {
   chatGrants?: Record<string, string[]>;
   globalGrants?: string[];
   allowedUsers?: string[];
+  /** 原始配置里的 allowedUsers（默认镜像 allowedUsers）。用于构造「配了 owner 但解析为空」的场景。 */
+  configAllowedUsers?: string[];
   restrictGrantCommands?: boolean;
   regularGroupReplyMode?: 'chat' | 'new-topic' | 'shared';
   regularGroupMentionMode?: 'always' | 'topic' | 'never';
   autoStartOnNewTopic?: boolean;
+  autoGrantRequestCards?: boolean;
   chatReplyModes?: Record<string, 'chat' | 'new-topic' | 'shared'>;
   p2pMode?: 'thread' | 'chat';
 }) {
@@ -124,12 +137,16 @@ function setupBotState(opts?: {
       larkAppId: MY_APP_ID,
       larkAppSecret: 'secret',
       cliId: 'claude-code',
+      // 生产里 config.allowedUsers 是原始配置（启动后 resolvedAllowedUsers 才是解析结果）。
+      // 默认镜像, 单测可用 configAllowedUsers 单独构造「配了但解析为空」的 fail-closed 场景。
+      allowedUsers: opts?.configAllowedUsers ?? opts?.allowedUsers,
       chatGrants: opts?.chatGrants,
       globalGrants: opts?.globalGrants,
       restrictGrantCommands: opts?.restrictGrantCommands,
       regularGroupReplyMode: opts?.regularGroupReplyMode,
       regularGroupMentionMode: opts?.regularGroupMentionMode,
       autoStartOnNewTopic: opts?.autoStartOnNewTopic,
+      autoGrantRequestCards: opts?.autoGrantRequestCards,
       chatReplyModes: opts?.chatReplyModes,
       p2pMode: opts?.p2pMode,
     },
@@ -316,7 +333,10 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     capturedHandlers = {};
     __resetAnchorQueues();
     __resetEventClaimsForTest();
+    _resetGrantPending();
     mockReplyMessage.mockClear();
+    mockGetOwnerOpenId.mockReset();
+    mockGetOwnerOpenId.mockReturnValue(undefined);
     mockGetCachedChatMode.mockReset();
     mockGetCachedChatMode.mockReturnValue(undefined);
     mockRecordObservedBots.mockClear();
@@ -439,6 +459,131 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
 
     expect(handlers.handleThreadReply).not.toHaveBeenCalled();
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
+  it('sends a grant request card when an unknown external bot is @blocked and the toggle is on', async () => {
+    setupBotState({ allowedUsers: ['ou_owner'] });
+    mockGetOwnerOpenId.mockReturnValue('ou_owner');
+    mockGetChatMode.mockResolvedValueOnce('group');
+    mockReadFileSync.mockReturnValue('{}');
+    const event = makeBotMessageEvent({
+      senderOpenId: OTHER_BOT_OPEN_ID,
+      senderType: 'bot',
+      content: JSON.stringify({
+        zh_cn: { content: [[{ tag: 'at', user_id: MY_OPEN_ID }]] },
+      }),
+      rootId: undefined,
+    });
+    event.message.root_id = undefined as any;
+    handlers.isSessionOwner.mockReturnValue(false);
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(mockReplyMessage).toHaveBeenCalledWith(
+      MY_APP_ID,
+      'msg-001',
+      expect.stringContaining(OTHER_BOT_OPEN_ID),
+      'interactive',
+    );
+  });
+
+  it('keeps the unknown external bot @blocked path silent when auto grant cards are disabled', async () => {
+    setupBotState({ allowedUsers: ['ou_owner'], autoGrantRequestCards: false });
+    mockGetOwnerOpenId.mockReturnValue('ou_owner');
+    mockGetChatMode.mockResolvedValueOnce('group');
+    mockReadFileSync.mockReturnValue('{}');
+    const event = makeBotMessageEvent({
+      senderOpenId: OTHER_BOT_OPEN_ID,
+      senderType: 'bot',
+      content: JSON.stringify({
+        zh_cn: { content: [[{ tag: 'at', user_id: MY_OPEN_ID }]] },
+      }),
+      rootId: undefined,
+    });
+    event.message.root_id = undefined as any;
+    handlers.isSessionOwner.mockReturnValue(false);
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(mockReplyMessage).not.toHaveBeenCalled();
+  });
+
+  it('throttles repeat @blocked mentions from the same bot+chat to a single grant card', async () => {
+    setupBotState({ allowedUsers: ['ou_owner'] });
+    mockGetOwnerOpenId.mockReturnValue('ou_owner');
+    mockGetChatMode.mockResolvedValue('group');
+    mockReadFileSync.mockReturnValue('{}');
+    handlers.isSessionOwner.mockReturnValue(false);
+
+    const makeBlocked = (messageId: string) => {
+      const event = makeBotMessageEvent({
+        senderOpenId: OTHER_BOT_OPEN_ID,
+        senderType: 'bot',
+        messageId,
+        content: JSON.stringify({
+          zh_cn: { content: [[{ tag: 'at', user_id: MY_OPEN_ID }]] },
+        }),
+        rootId: undefined,
+      });
+      event.message.root_id = undefined as any;
+      return event;
+    };
+
+    // Two distinct messages (distinct message_id → both clear event-dedup) from the
+    // SAME bot in the SAME chat. The throttle keys on bot:chat:target, so the second
+    // is suppressed while the first card is still pending.
+    await capturedHandlers['im.message.receive_v1'](makeBlocked('msg-001'));
+    await flushEventWork();
+    await capturedHandlers['im.message.receive_v1'](makeBlocked('msg-002'));
+    await flushEventWork();
+
+    expect(mockReplyMessage).toHaveBeenCalledTimes(1);
+    expect(mockReplyMessage).toHaveBeenCalledWith(
+      MY_APP_ID,
+      'msg-001',
+      expect.stringContaining(OTHER_BOT_OPEN_ID),
+      'interactive',
+    );
+  });
+
+  it('retries the grant card on a later @blocked after a failed send (clears stale pending)', async () => {
+    setupBotState({ allowedUsers: ['ou_owner'] });
+    mockGetOwnerOpenId.mockReturnValue('ou_owner');
+    mockGetChatMode.mockResolvedValue('group');
+    mockReadFileSync.mockReturnValue('{}');
+    handlers.isSessionOwner.mockReturnValue(false);
+    // First send fails (transient Lark error). The pending opened just before the send
+    // must be cleared so a later @ from the same bot re-triggers a card — otherwise the
+    // sender is throttled forever and the owner never sees any grant card.
+    mockReplyMessage.mockRejectedValueOnce(new Error('lark 500'));
+
+    const makeBlocked = (messageId: string) => {
+      const event = makeBotMessageEvent({
+        senderOpenId: OTHER_BOT_OPEN_ID,
+        senderType: 'bot',
+        messageId,
+        content: JSON.stringify({
+          zh_cn: { content: [[{ tag: 'at', user_id: MY_OPEN_ID }]] },
+        }),
+        rootId: undefined,
+      });
+      event.message.root_id = undefined as any;
+      return event;
+    };
+
+    await capturedHandlers['im.message.receive_v1'](makeBlocked('msg-001'));
+    await flushEventWork();
+    await capturedHandlers['im.message.receive_v1'](makeBlocked('msg-002'));
+    await flushEventWork();
+
+    // The failed first send did not poison the throttle: the second @ tried again.
+    expect(mockReplyMessage).toHaveBeenCalledTimes(2);
   });
 
   it('routes cross-bot @mention in chat-scope when sender is a known botmux peer', async () => {
@@ -884,7 +1029,7 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     mockIsChatOncallBoundForAnyBot.mockReturnValue(true);
     mockFindOncallChat.mockReturnValue(undefined);
     mockGetBot.mockReturnValue({
-      config: { larkAppId: MY_APP_ID, larkAppSecret: 'secret', cliId: 'claude-code' },
+      config: { larkAppId: MY_APP_ID, larkAppSecret: 'secret', cliId: 'claude-code', allowedUsers: ['ou_allowed_sibling'] },
       botOpenId: MY_OPEN_ID,
       resolvedAllowedUsers: ['ou_allowed_sibling'],
     });
@@ -932,7 +1077,7 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
 
   it('does not grant sensitive operations from an allowedChatGroups chat', () => {
     mockGetBot.mockReturnValue({
-      config: { larkAppId: MY_APP_ID, larkAppSecret: 'secret', cliId: 'claude-code', allowedChatGroups: ['oc_team'] },
+      config: { larkAppId: MY_APP_ID, larkAppSecret: 'secret', cliId: 'claude-code', allowedChatGroups: ['oc_team'], allowedUsers: ['ou_admin'] },
       botOpenId: MY_OPEN_ID,
       resolvedAllowedUsers: ['ou_admin'],
     });
@@ -950,7 +1095,7 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     mockIsChatOncallBoundForAnyBot.mockReturnValue(false);
     mockReadFileSync.mockReturnValue(JSON.stringify({ 'BotB': OTHER_BOT_OPEN_ID }));
     mockGetBot.mockReturnValue({
-      config: { larkAppId: MY_APP_ID, larkAppSecret: 'secret', cliId: 'claude-code' },
+      config: { larkAppId: MY_APP_ID, larkAppSecret: 'secret', cliId: 'claude-code', allowedUsers: ['ou_allowed_human_only'] },
       botOpenId: MY_OPEN_ID,
       resolvedAllowedUsers: ['ou_allowed_human_only'],
     });
@@ -1106,12 +1251,10 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
   });
 
-  it('honors a real Lark 话题 (root_id + thread_id) in 普通群 even when chat-scope session exists', async () => {
-    // User explicitly opened a 话题 on a message in 普通群 → message carries
-    // both root_id AND thread_id. The bot owns a chat-scope session at this
-    // chat, but the user's intent is a fresh thread, so we must NOT bounce
-    // them back into chat-scope. Routes thread-scope; since no thread session
-    // owns this root, handleNewTopic is invoked (fresh thread session).
+  it('folds an @ inside a regular-group topic into the chat-scope session when no thread session owns it', async () => {
+    // In chat/shared modes, a mentioned reply inside a regular-group topic should
+    // reuse the group chat-scope context and reply in that same topic, rather
+    // than spawning a new thread-scope session per topic.
     const event = makeUserMessageEvent({
       senderOpenId: USER_OPEN_ID,
       content: JSON.stringify({ text: '@BotA new topic please' }),
@@ -1128,12 +1271,13 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     await capturedHandlers['im.message.receive_v1'](event);
     await flushEventWork();
 
-    expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
-      scope: 'thread',
-      anchor: 'real-topic-root',
+    expect(handlers.handleThreadReply).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'chat',
+      anchor: 'chat-fallback-3',
+      replyRootId: 'real-topic-root',
       larkAppId: MY_APP_ID,
     }));
-    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
   });
 
   it('keeps thread-scope when root_id+thread_id are set and a thread session DOES exist', async () => {
@@ -1205,7 +1349,7 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
   });
 
-  it('shared thread-contained @ starts a fresh alias on the current message id', async () => {
+  it('shared thread-contained @ reuses the chat session and replies in the existing topic', async () => {
     setupBotState({ chatReplyModes: { 'chat-reply-mode': 'shared' }, allowedUsers: [USER_OPEN_ID] });
     mockGetChatMode.mockResolvedValue('group');
     const event = makeUserMessageEvent({
@@ -1226,13 +1370,13 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     expect(handlers.handleThreadReply).toHaveBeenCalledWith(event, expect.objectContaining({
       scope: 'chat',
       anchor: 'chat-reply-mode',
-      replyRootId: 'msg-topic-alias-delegate',
+      replyRootId: 'old-discussion-root',
       larkAppId: MY_APP_ID,
     }));
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
   });
 
-  it('shared explicit @ inside an existing alias thread starts a new alias on current message', async () => {
+  it('shared explicit @ inside an existing alias thread replies in that alias topic', async () => {
     setupBotState({ chatReplyModes: { 'chat-reply-mode': 'shared' }, allowedUsers: [USER_OPEN_ID] });
     mockGetChatMode.mockResolvedValue('group');
     handlers.resolveReplyThreadAlias.mockReturnValue({ chatId: 'chat-reply-mode', sessionId: 'sess-chat' });
@@ -1253,13 +1397,13 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     expect(handlers.handleThreadReply).toHaveBeenCalledWith(event, expect.objectContaining({
       scope: 'chat',
       anchor: 'chat-reply-mode',
-      replyRootId: 'msg-new-delegate-in-alias',
+      replyRootId: 'old-alias-root',
       larkAppId: MY_APP_ID,
     }));
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
   });
 
-  it('shared bot-sent post inside a thread starts a fresh alias on current message', async () => {
+  it('shared bot-sent post inside a thread reuses the chat session and replies in the existing topic', async () => {
     setupBotState({ chatReplyModes: { 'chat-reply-mode': 'shared' } });
     mockGetChatMode.mockResolvedValue('group');
     mockReadFileSync.mockReturnValue(JSON.stringify({ BotB: OTHER_BOT_OPEN_ID }));
@@ -1287,7 +1431,60 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     expect(handlers.handleThreadReply).toHaveBeenCalledWith(event, expect.objectContaining({
       scope: 'chat',
       anchor: 'chat-reply-mode',
-      replyRootId: 'msg-bot-delegate',
+      replyRootId: 'old-thread-root',
+      larkAppId: MY_APP_ID,
+    }));
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
+  it('default chat-mode @ inside a regular-group topic reuses the group chat session', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    mockGetChatMode.mockResolvedValue('group');
+    handlers.isSessionOwner.mockImplementation((anchor: string) => anchor === 'chat-default');
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA continue with group context' }),
+      rootId: 'existing-topic-root',
+      threadId: 'existing-topic-root',
+      messageId: 'msg-mentioned-in-topic',
+      chatId: 'chat-default',
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleThreadReply).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'chat',
+      anchor: 'chat-default',
+      replyRootId: 'existing-topic-root',
+      larkAppId: MY_APP_ID,
+    }));
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
+  it('new-topic mode keeps @ inside a regular-group topic as an independent thread session', async () => {
+    setupBotState({ regularGroupReplyMode: 'new-topic', allowedUsers: [USER_OPEN_ID] });
+    mockGetChatMode.mockResolvedValue('group');
+    handlers.isSessionOwner.mockImplementation((anchor: string) => anchor === 'existing-topic-root');
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA use independent topic context' }),
+      rootId: 'existing-topic-root',
+      threadId: 'existing-topic-root',
+      messageId: 'msg-mentioned-in-new-topic-mode',
+      chatId: 'chat-new-topic',
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleThreadReply).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'thread',
+      anchor: 'existing-topic-root',
       larkAppId: MY_APP_ID,
     }));
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
@@ -1563,6 +1760,35 @@ describe('im.message.receive_v1 — regular group reply mode (tri-state: chat | 
     expect(handlers.handleThreadReply).not.toHaveBeenCalled();
   });
 
+  it('bot-sent @ inside a freshly seeded shared topic folds into the receiver chat session', async () => {
+    setupBotState({ regularGroupReplyMode: 'shared' });
+    mockGetChatMode.mockResolvedValue('group');
+    mockReadFileSync.mockReturnValue(JSON.stringify({ BotB: OTHER_BOT_OPEN_ID }));
+    handlers.isSessionOwner.mockImplementation((anchor: string) => anchor === 'chat-reply-mode');
+    const event = makeBotMessageEvent({
+      senderOpenId: OTHER_BOT_OPEN_ID,
+      senderType: 'bot',
+      content: JSON.stringify({ text: '@BotA inherited group-context handoff' }),
+      rootId: 'sender-shared-topic-root',
+      threadId: 'sender-shared-topic-root',
+      messageId: 'msg-bot-shared-handoff',
+      chatId: 'chat-reply-mode',
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleThreadReply).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'chat',
+      anchor: 'chat-reply-mode',
+      replyRootId: 'sender-shared-topic-root',
+      larkAppId: MY_APP_ID,
+    }));
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
   it('per-chat shared overrides a per-bot new-topic default — single mode, no competition', async () => {
     // Per-bot default would fork a new topic; the per-chat shared override
     // must win and keep this turn on the chat-scope session (alias into thread).
@@ -1646,6 +1872,34 @@ describe('globalGrants — global talk-only authorization (canTalk / canOperate)
     setupBotState({ globalGrants: ['ou_talk_only'], allowedUsers: ['ou_admin'] });
     expect(canOperate(MY_APP_ID, 'chat-A', 'ou_admin')).toBe(true);
     expect(canOperate(MY_APP_ID, 'chat-A', 'ou_talk_only')).toBe(false);
+  });
+});
+
+describe('configured-but-unresolved allowlist stays fail-closed (not fail-open)', () => {
+  beforeEach(() => {
+    mockIsChatOncallBoundForAnyBot.mockReturnValue(false);
+    mockReadFileSync.mockReturnValue('{}');  // empty peer cross-ref
+  });
+
+  // 回归：config.allowedUsers 配了 owner，但启动时 email/union 解析失败 → resolvedAllowedUsers
+  // 为空。hasAllowlist 必须用「原始配置」判定，否则会 fall through 成「无白名单=全开放」，
+  // 让任何人 canTalk/canOperate（正是 onboarding 路径可能写出的隐患）。
+  it('canOperate: configured owner that resolves to empty denies everyone (not open)', () => {
+    setupBotState({ configAllowedUsers: ['owner@corp.com'], allowedUsers: [] });
+    expect(canOperate(MY_APP_ID, 'chat-A', 'ou_random_stranger')).toBe(false);
+    expect(canOperate(MY_APP_ID, 'chat-A', USER_OPEN_ID)).toBe(false);
+  });
+
+  it('canTalk: configured owner that resolves to empty blocks ordinary talk (not open)', () => {
+    setupBotState({ configAllowedUsers: ['owner@corp.com'], allowedUsers: [] });
+    expect(canTalk(MY_APP_ID, 'chat-A', 'ou_random_stranger')).toBe(false);
+  });
+
+  it('truly empty config (no allowlist at all) remains open mode', () => {
+    // 对照：完全没配白名单仍是「个人自用全开放」，不被本次收紧误伤。
+    setupBotState({ allowedUsers: [] });
+    expect(canOperate(MY_APP_ID, 'chat-A', 'ou_random_stranger')).toBe(true);
+    expect(canTalk(MY_APP_ID, 'chat-A', 'ou_random_stranger')).toBe(true);
   });
 });
 
@@ -2119,7 +2373,7 @@ describe('im.message.receive_v1 — /t force-topic override', () => {
   it('still ignores when sender is not allowed (permission gate runs first)', async () => {
     // Even with /t, an un-allow-listed user gets the same not_allowed treatment.
     mockGetBot.mockReturnValue({
-      config: { larkAppId: MY_APP_ID, larkAppSecret: 'secret', cliId: 'claude-code' },
+      config: { larkAppId: MY_APP_ID, larkAppSecret: 'secret', cliId: 'claude-code', allowedUsers: ['ou_only_this_user'] },
       botOpenId: MY_OPEN_ID,
       resolvedAllowedUsers: ['ou_only_this_user'],
     });
@@ -2151,6 +2405,7 @@ describe('im.message.receive_v1 — 主动开工 场景② (autoStartOnNewTopic)
         larkAppId: MY_APP_ID,
         larkAppSecret: 'secret',
         cliId: 'claude-code',
+        allowedUsers: ['ou_someone_else'],
         autoStartOnNewTopic: enabled,
         regularGroupReplyMode: regularGroupNewTopic ? 'new-topic' : undefined,
       },
@@ -2477,7 +2732,7 @@ describe('im.message.receive_v1 — /introduce command', () => {
   it('allows /introduce from any user (no auth gate): records + acks, never reaches CLI', async () => {
     // sender NOT in allowedUsers — /introduce should STILL work（只记花名册、不授权）。
     mockGetBot.mockReturnValue({
-      config: { larkAppId: MY_APP_ID, larkAppSecret: 'secret', cliId: 'claude-code' },
+      config: { larkAppId: MY_APP_ID, larkAppSecret: 'secret', cliId: 'claude-code', allowedUsers: ['ou_some_other_human'] },
       botOpenId: MY_OPEN_ID,
       resolvedAllowedUsers: ['ou_some_other_human'],  // USER_OPEN_ID not in list
     });
@@ -2688,6 +2943,349 @@ describe('card.action.trigger — ack-safe slow handlers', () => {
     expect(first).toEqual({ card: { type: 'raw', data: { type: 'toggled' } } });
     expect(second).toEqual({ card: { type: 'raw', data: { type: 'toggled' } } });
     expect(handlers.handleCardAction).toHaveBeenCalledTimes(2);
+  });
+
+  // codex slice-1 blocker #2: dash_sessions_page only differs by `page`. If
+  // `cardActionKey` doesn't include `page`, a rapid prev→next sequence in
+  // the in-flight window would hash to the same key and the second click
+  // would be silently dropped.
+  it('concurrent `dash_sessions_page` clicks at DIFFERENT pages must NOT dedupe', async () => {
+    let release1!: () => void;
+    let release2!: () => void;
+    const pending1 = new Promise(resolve => { release1 = () => resolve({ type: 'card1' }); });
+    const pending2 = new Promise(resolve => { release2 = () => resolve({ type: 'card2' }); });
+    handlers.handleCardAction
+      .mockReturnValueOnce(pending1 as any)
+      .mockReturnValueOnce(pending2 as any);
+
+    const ev = (page: string) => ({
+      action: { value: { action: 'dash_sessions_page', invoker_open_id: USER_OPEN_ID, page } },
+      operator: { open_id: USER_OPEN_ID },
+      context: { open_message_id: 'om_page_card' },
+    });
+
+    const firstP = capturedHandlers['card.action.trigger'](ev('5'));   // user lands on page 5
+    const secondP = capturedHandlers['card.action.trigger'](ev('4'));  // immediately clicks prev → page 4
+
+    // Both handler invocations are in flight; neither was suppressed.
+    expect(handlers.handleCardAction).toHaveBeenCalledTimes(2);
+    release1();
+    release2();
+    await Promise.all([firstP, secondP]);
+  });
+
+  // Settings counterpart guard — dash_settings_toggle on different fields.
+  // Sanity check that the existing settings dedupe key still works.
+  it('concurrent `dash_settings_toggle` clicks on DIFFERENT fields must NOT dedupe', async () => {
+    let release1!: () => void;
+    let release2!: () => void;
+    handlers.handleCardAction
+      .mockReturnValueOnce(new Promise(resolve => { release1 = () => resolve({ type: 'a' }); }) as any)
+      .mockReturnValueOnce(new Promise(resolve => { release2 = () => resolve({ type: 'b' }); }) as any);
+
+    const ev = (field: string, next: string) => ({
+      action: { value: {
+        action: 'dash_settings_toggle', invoker_open_id: USER_OPEN_ID,
+        field, next_value: next,
+      } },
+      operator: { open_id: USER_OPEN_ID },
+      context: { open_message_id: 'om_settings_card' },
+    });
+
+    const a = capturedHandlers['card.action.trigger'](ev('publicReadOnly', 'true'));
+    const b = capturedHandlers['card.action.trigger'](ev('openTerminalInFeishu', 'true'));
+    expect(handlers.handleCardAction).toHaveBeenCalledTimes(2);
+    release1();
+    release2();
+    await Promise.all([a, b]);
+  });
+
+  // PR3 sessions slice 2a — per-row 📂 详情 buttons share `action: dash_sessions_detail`,
+  // only `value.session_id` distinguishes them. The cardActionKey already includes
+  // `sessionId`, but pin it down so a future key refactor can't silently drop it.
+  it('concurrent `dash_sessions_detail` clicks on DIFFERENT session_id values must NOT dedupe', async () => {
+    let release1!: () => void;
+    let release2!: () => void;
+    const pending1 = new Promise(resolve => { release1 = () => resolve({ type: 'detail_a' }); });
+    const pending2 = new Promise(resolve => { release2 = () => resolve({ type: 'detail_b' }); });
+    handlers.handleCardAction
+      .mockReturnValueOnce(pending1 as any)
+      .mockReturnValueOnce(pending2 as any);
+
+    const ev = (sessionId: string) => ({
+      action: { value: { action: 'dash_sessions_detail', invoker_open_id: USER_OPEN_ID, session_id: sessionId } },
+      operator: { open_id: USER_OPEN_ID },
+      context: { open_message_id: 'om_detail_card' },
+    });
+
+    const firstP = capturedHandlers['card.action.trigger'](ev('sess_AAA'));
+    const secondP = capturedHandlers['card.action.trigger'](ev('sess_BBB'));
+
+    // BOTH handler invocations reach the handler — the differing session_id
+    // must NOT collide on the in-flight dedupe key.
+    expect(handlers.handleCardAction).toHaveBeenCalledTimes(2);
+    release1();
+    release2();
+    await Promise.all([firstP, secondP]);
+  });
+
+  // Companion test: same session_id while first is in flight → still deduped.
+  // Preserves the existing in-flight semantics so non-idempotent slice-2a
+  // actions (e.g. close) can't double-fire mid-flight.
+  it('concurrent `dash_sessions_detail` clicks on the SAME session_id WHILE in-flight ARE deduped', async () => {
+    let release!: () => void;
+    const pending = new Promise(resolve => { release = () => resolve({ type: 'detail_only' }); });
+    handlers.handleCardAction.mockReturnValueOnce(pending as any);
+
+    const ev = () => ({
+      action: { value: { action: 'dash_sessions_detail', invoker_open_id: USER_OPEN_ID, session_id: 'sess_SAME' } },
+      operator: { open_id: USER_OPEN_ID },
+      context: { open_message_id: 'om_detail_card' },
+    });
+
+    const first = capturedHandlers['card.action.trigger'](ev());
+    const second = await capturedHandlers['card.action.trigger'](ev());
+
+    // Second click hits the in-flight guard and returns a toast.
+    expect(second).toEqual({ toast: { type: 'info', content: '操作正在处理中，请稍候' } });
+    expect(handlers.handleCardAction).toHaveBeenCalledTimes(1);
+    release();
+    await first;
+  });
+
+  // PR3 schedules slice 2a — per-detail-card pause/resume buttons share
+  // `action: dash_schedules_pause` / `dash_schedules_resume`. Only
+  // `value.schedule_id` distinguishes which schedule the click targets. The
+  // cardActionKey now includes `scheduleId`; pin it down so a future key
+  // refactor can't silently drop it and turn two distinct schedule clicks
+  // into one (e.g. user opens detail A then detail B and pauses B while A
+  // is still in flight).
+  it('concurrent `dash_schedules_pause` clicks on DIFFERENT schedule_id values must NOT dedupe', async () => {
+    let release1!: () => void;
+    let release2!: () => void;
+    const pending1 = new Promise(resolve => { release1 = () => resolve({ type: 'pause_a' }); });
+    const pending2 = new Promise(resolve => { release2 = () => resolve({ type: 'pause_b' }); });
+    handlers.handleCardAction
+      .mockReturnValueOnce(pending1 as any)
+      .mockReturnValueOnce(pending2 as any);
+
+    const ev = (scheduleId: string) => ({
+      action: { value: { action: 'dash_schedules_pause', invoker_open_id: USER_OPEN_ID, schedule_id: scheduleId } },
+      operator: { open_id: USER_OPEN_ID },
+      context: { open_message_id: 'om_schedules_card' },
+    });
+
+    const firstP = capturedHandlers['card.action.trigger'](ev('sch_AAA'));
+    const secondP = capturedHandlers['card.action.trigger'](ev('sch_BBB'));
+
+    // BOTH handler invocations reach the handler — the differing schedule_id
+    // must NOT collide on the in-flight dedupe key.
+    expect(handlers.handleCardAction).toHaveBeenCalledTimes(2);
+    release1();
+    release2();
+    await Promise.all([firstP, secondP]);
+  });
+
+  // Companion: same schedule_id while first is in flight → still deduped.
+  // Preserves the existing in-flight semantics so non-idempotent pause/resume
+  // can't double-fire on a rapid double-click.
+  it('concurrent `dash_schedules_pause` clicks on the SAME schedule_id WHILE in-flight ARE deduped', async () => {
+    let release!: () => void;
+    const pending = new Promise(resolve => { release = () => resolve({ type: 'pause_only' }); });
+    handlers.handleCardAction.mockReturnValueOnce(pending as any);
+
+    const ev = () => ({
+      action: { value: { action: 'dash_schedules_pause', invoker_open_id: USER_OPEN_ID, schedule_id: 'sch_SAME' } },
+      operator: { open_id: USER_OPEN_ID },
+      context: { open_message_id: 'om_schedules_card' },
+    });
+
+    const first = capturedHandlers['card.action.trigger'](ev());
+    const second = await capturedHandlers['card.action.trigger'](ev());
+
+    expect(second).toEqual({ toast: { type: 'info', content: '操作正在处理中，请稍候' } });
+    expect(handlers.handleCardAction).toHaveBeenCalledTimes(1);
+    release();
+    await first;
+  });
+
+  // PR3 workflows slice 2a (codex 2026-06-10) — per-detail-card cancel buttons
+  // share `action: dash_workflows_cancel`. Only `value.run_id` distinguishes
+  // which run the click targets. The cardActionKey now includes `runId`; pin
+  // it down so a future key refactor can't silently drop it and turn two
+  // distinct run cancel clicks into one (e.g. user opens detail A then detail
+  // B and cancels B while A is still in flight).
+  it('concurrent `dash_workflows_cancel` clicks on DIFFERENT run_id values must NOT dedupe', async () => {
+    let release1!: () => void;
+    let release2!: () => void;
+    const pending1 = new Promise(resolve => { release1 = () => resolve({ type: 'cancel_a' }); });
+    const pending2 = new Promise(resolve => { release2 = () => resolve({ type: 'cancel_b' }); });
+    handlers.handleCardAction
+      .mockReturnValueOnce(pending1 as any)
+      .mockReturnValueOnce(pending2 as any);
+
+    const ev = (runId: string) => ({
+      action: { value: { action: 'dash_workflows_cancel', invoker_open_id: USER_OPEN_ID, run_id: runId } },
+      operator: { open_id: USER_OPEN_ID },
+      context: { open_message_id: 'om_workflows_card' },
+    });
+
+    const firstP = capturedHandlers['card.action.trigger'](ev('run_AAA'));
+    const secondP = capturedHandlers['card.action.trigger'](ev('run_BBB'));
+
+    // BOTH handler invocations reach the handler — the differing run_id
+    // must NOT collide on the in-flight dedupe key.
+    expect(handlers.handleCardAction).toHaveBeenCalledTimes(2);
+    release1();
+    release2();
+    await Promise.all([firstP, secondP]);
+  });
+
+  // Companion: same run_id while first is in flight → still deduped.
+  // Preserves the existing in-flight semantics so non-idempotent cancel can't
+  // double-fire on a rapid double-click against the same run.
+  it('concurrent `dash_workflows_cancel` clicks on the SAME run_id WHILE in-flight ARE deduped', async () => {
+    let release!: () => void;
+    const pending = new Promise(resolve => { release = () => resolve({ type: 'cancel_only' }); });
+    handlers.handleCardAction.mockReturnValueOnce(pending as any);
+
+    const ev = () => ({
+      action: { value: { action: 'dash_workflows_cancel', invoker_open_id: USER_OPEN_ID, run_id: 'run_SAME' } },
+      operator: { open_id: USER_OPEN_ID },
+      context: { open_message_id: 'om_workflows_card' },
+    });
+
+    const first = capturedHandlers['card.action.trigger'](ev());
+    const second = await capturedHandlers['card.action.trigger'](ev());
+
+    expect(second).toEqual({ toast: { type: 'info', content: '操作正在处理中，请稍候' } });
+    expect(handlers.handleCardAction).toHaveBeenCalledTimes(1);
+    release();
+    await first;
+  });
+
+  // Dashboard groups detail actions share the same action id across many
+  // cells. `chat_id` + `app_id` must both be in the in-flight dedupe key so
+  // managing bot A in chat X doesn't swallow bot B in chat Y.
+  it('concurrent `dash_groups_oncall_bind` clicks on DIFFERENT chat/app cells must NOT dedupe', async () => {
+    let release1!: () => void;
+    let release2!: () => void;
+    const pending1 = new Promise(resolve => { release1 = () => resolve({ type: 'bind_a' }); });
+    const pending2 = new Promise(resolve => { release2 = () => resolve({ type: 'bind_b' }); });
+    handlers.handleCardAction
+      .mockReturnValueOnce(pending1 as any)
+      .mockReturnValueOnce(pending2 as any);
+
+    const ev = (chatId: string, appId: string) => ({
+      action: {
+        value: {
+          action: 'dash_groups_oncall_bind',
+          invoker_open_id: USER_OPEN_ID,
+          chat_id: chatId,
+          app_id: appId,
+        },
+      },
+      operator: { open_id: USER_OPEN_ID },
+      context: { open_message_id: 'om_groups_card' },
+    });
+
+    const firstP = capturedHandlers['card.action.trigger'](ev('oc_A', 'cli_A'));
+    const secondP = capturedHandlers['card.action.trigger'](ev('oc_B', 'cli_B'));
+
+    expect(handlers.handleCardAction).toHaveBeenCalledTimes(2);
+    release1();
+    release2();
+    await Promise.all([firstP, secondP]);
+  });
+
+  it('concurrent `dash_groups_oncall_bind` clicks on the SAME chat/app cell WHILE in-flight ARE deduped', async () => {
+    let release!: () => void;
+    const pending = new Promise(resolve => { release = () => resolve({ type: 'bind_only' }); });
+    handlers.handleCardAction.mockReturnValueOnce(pending as any);
+
+    const ev = () => ({
+      action: {
+        value: {
+          action: 'dash_groups_oncall_bind',
+          invoker_open_id: USER_OPEN_ID,
+          chat_id: 'oc_SAME',
+          app_id: 'cli_SAME',
+        },
+      },
+      operator: { open_id: USER_OPEN_ID },
+      context: { open_message_id: 'om_groups_card' },
+    });
+
+    const first = capturedHandlers['card.action.trigger'](ev());
+    const second = await capturedHandlers['card.action.trigger'](ev());
+
+    expect(second).toEqual({ toast: { type: 'info', content: '操作正在处理中，请稍候' } });
+    expect(handlers.handleCardAction).toHaveBeenCalledTimes(1);
+    release();
+    await first;
+  });
+
+  // PR3 overview drilldown (2026-06-10): origin/page_size are now part of the
+  // dedupe key so a standalone-shaped click (origin=undefined, page_size=undef)
+  // and an overview-drilldown-shaped click (origin=overview, page_size=5) on
+  // the same page index don't hash-collide. The standalone+drilldown forms can
+  // theoretically reach the same handler from two different open cards within
+  // the dedupe window.
+  it('concurrent `dash_sessions_page` clicks differing ONLY by origin must NOT dedupe', async () => {
+    let release1!: () => void;
+    let release2!: () => void;
+    const pending1 = new Promise(resolve => { release1 = () => resolve({ card: { type: 'raw', data: {} } }); });
+    const pending2 = new Promise(resolve => { release2 = () => resolve({ card: { type: 'raw', data: {} } }); });
+    handlers.handleCardAction
+      .mockReturnValueOnce(pending1 as any)
+      .mockReturnValueOnce(pending2 as any);
+
+    const evStandalone = {
+      action: { value: { action: 'dash_sessions_page', invoker_open_id: USER_OPEN_ID, page: '2' } },
+      operator: { open_id: USER_OPEN_ID },
+      context: { open_message_id: 'om_a' },
+    };
+    const evDrilldown = {
+      action: { value: { action: 'dash_sessions_page', invoker_open_id: USER_OPEN_ID, page: '2', origin: 'overview', page_size: '5' } },
+      operator: { open_id: USER_OPEN_ID },
+      context: { open_message_id: 'om_b' },
+    };
+
+    const first = capturedHandlers['card.action.trigger'](evStandalone);
+    const second = capturedHandlers['card.action.trigger'](evDrilldown);
+    // Both should reach the handler — no dedupe.
+    expect(handlers.handleCardAction).toHaveBeenCalledTimes(2);
+    release1();
+    release2();
+    await Promise.all([first, second]);
+  });
+
+  it('concurrent `dash_sessions_page` clicks at DIFFERENT pages but SAME origin must NOT dedupe (page already in key)', async () => {
+    let release1!: () => void;
+    let release2!: () => void;
+    const pending1 = new Promise(resolve => { release1 = () => resolve({ card: { type: 'raw', data: {} } }); });
+    const pending2 = new Promise(resolve => { release2 = () => resolve({ card: { type: 'raw', data: {} } }); });
+    handlers.handleCardAction
+      .mockReturnValueOnce(pending1 as any)
+      .mockReturnValueOnce(pending2 as any);
+
+    const evPage1 = {
+      action: { value: { action: 'dash_sessions_page', invoker_open_id: USER_OPEN_ID, page: '1', origin: 'overview', page_size: '5' } },
+      operator: { open_id: USER_OPEN_ID },
+      context: { open_message_id: 'om_card' },
+    };
+    const evPage2 = {
+      action: { value: { action: 'dash_sessions_page', invoker_open_id: USER_OPEN_ID, page: '2', origin: 'overview', page_size: '5' } },
+      operator: { open_id: USER_OPEN_ID },
+      context: { open_message_id: 'om_card' },
+    };
+
+    const first = capturedHandlers['card.action.trigger'](evPage1);
+    const second = capturedHandlers['card.action.trigger'](evPage2);
+    expect(handlers.handleCardAction).toHaveBeenCalledTimes(2);
+    release1();
+    release2();
+    await Promise.all([first, second]);
   });
 });
 

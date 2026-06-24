@@ -8,8 +8,20 @@ import { logger } from './utils/logger.js';
 import { isLocale, setBotLookup, type Locale } from './i18n/index.js';
 import type { VoiceConfig } from './services/voice/types.js';
 import { type Brand, sdkDomain, normalizeBrand } from './im/lark/lark-hosts.js';
+import type { BotSkillPolicy, SkillSelector } from './core/skills/types.js';
+import { normalizeStartupCommandList } from './core/startup-commands.js';
+import { sanitizePerBotEnv } from './core/per-bot-env.js';
 
 export type ChatReplyMode = 'chat' | 'new-topic' | 'shared';
+
+function normalizeChatReplyModeConfig(raw: unknown): ChatReplyMode | undefined {
+  if (typeof raw !== 'string') return undefined;
+  const v = raw.trim().toLowerCase();
+  if (v === 'chat') return 'chat';
+  if (v === 'new-topic' || v === 'newtopic' || v === 'thread') return 'new-topic';
+  if (v === 'topic' || v === 'shared' || v === 'share' || v === 'alias' || v === 'topic-alias' || v === 'topic_alias') return 'shared';
+  return undefined;
+}
 
 export interface OncallChat {
   /** Lark chat_id (oc_xxx) the bot was pulled into. */
@@ -52,6 +64,16 @@ export interface BotConfig {
   cliId: CliId;
   cliPathOverride?: string;
   /**
+   * 通用启动前缀（按空格拆 token）：worker spawn 时把启动命令拼成
+   * `<wrapperCli> <CLI 参数>`（首 token 当 bin 走 PATH 解析），无需 wrapper 脚本、跨系统。
+   * 典型值 `"aiden x claude"` / `"aiden x codex"`（内网网关 aiden-aiproxy + SSO），也能
+   * 承载 ccr / claude-w 等任意启动器。`cliId` 仍是底层适配器（claude→claude-code、
+   * codex→codex），所有适配器机制（hook / bridge / resume）照常工作；设了 wrapperCli 后
+   * 它的首 token 取代 cliId 的默认 bin（cliPathOverride 不再生效）。检测到前缀是
+   * `aiden x claude` 时自动剥掉 aiden 拒收的 --settings。见 src/setup/cli-selection.ts。
+   */
+  wrapperCli?: string;
+  /**
    * Optional model name passed to the CLI at spawn time (e.g. `claude --model
    * opus`). Each adapter decides how to inject it — adapters whose CLI has no
    * `--model` flag silently ignore the field. When unset, the CLI uses its own
@@ -73,7 +95,26 @@ export interface BotConfig {
    * forces it on regardless (testing).
    */
   sandbox?: boolean;
+  /**
+   * Per-bot privacy masks for the sandbox: absolute paths blanked inside the
+   * overlay sandbox (dirs → empty tmpfs; files → empty placeholder). OPT-IN with
+   * NO defaults — the agent reads the entire real fs natively unless a path is
+   * listed here. Only meaningful when `sandbox` is true. Linux-only.
+   */
+  sandboxHidePaths?: string[];
   backendType?: BackendType;
+  /**
+   * Max simultaneously-LIVE sessions for this bot. When the bot's live session
+   * count exceeds this, the idle-worker sweeper suspends its longest-idle,
+   * not-currently-busy sessions (resumable backends only) down to the cap — the
+   * worker AND the CLI are killed to reclaim memory, and the session
+   * cold-resumes from its on-disk transcript on the next message. Unset → the
+   * built-in default {@link DEFAULT_MAX_LIVE_WORKERS} (30); an explicit positive
+   * integer overrides it. Pure count-based: there is NO idle-time threshold.
+   * Configured per bot from the dashboard (Groups & Bots → bot card). Adopted
+   * sessions are never suspended. See core/idle-worker-sweeper.ts.
+   */
+  maxLiveWorkers?: number;
   workingDir?: string;
   workingDirs?: string[];
   allowedUsers?: string[];
@@ -137,6 +178,12 @@ export interface BotConfig {
    */
   restrictGrantCommands?: boolean;
   /**
+   * 自动授权申请卡开关。默认开启（undefined = on）：群里有人或外部 bot 明确 @ 本 bot
+   * 但被 talk 权限闸挡住时，给 owner 弹 /grant 申请卡。显式 false 时静默丢弃，
+   * 保留原来的强权限闸但不刷卡。
+   */
+  autoGrantRequestCards?: boolean;
+  /**
    * 用户自定义、额外放行透传给 CLI 的 slash 命令 —— 在固定的 PASSTHROUGH_COMMANDS
    * 之上扩展（例如把 CLI 支持但默认不放行的 `/goal`、`/export` 加进来）。每项必须
    * `/` 开头、小写、仅含 [a-z0-9:_-]；解析时归一化（缺失的 `/` 自动补、转小写、去重、
@@ -145,6 +192,32 @@ export interface BotConfig {
    * 未配置（undefined）→ 仅用内置白名单（保持现状）。
    */
   customPassthroughCommands?: string[];
+  /**
+   * Optional per-bot startup commands: slash-command lines the worker types into
+   * a freshly spawned CLI right after it's ready, BEFORE the user's first prompt
+   * (e.g. `/effort ultracode`, `/model opus`). Sent in order, one submit each,
+   * via the same literal-input path as a passthrough slash command (no prompt
+   * wrapping). Re-applied on every fresh spawn (incl. resume) — so session-only
+   * settings like `/effort ultracode` survive a resume. Skipped in adopt mode
+   * (we observe the user's existing session, not drive a fresh one). Each entry
+   * is trimmed and gets a leading `/` if missing; arguments (spaces) preserved.
+   */
+  startupCommands?: string[];
+  /**
+   * Optional per-bot environment variables, injected into THIS bot's CLI
+   * process (e.g. `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN` to run the bot
+   * on GLM / a third-party Anthropic-compatible provider, an `HTTPS_PROXY`, or
+   * a CLI feature flag). Sanitized at load via {@link sanitizePerBotEnv}
+   * (valid env-var names + string/number/boolean values; botmux-reserved keys
+   * dropped). Delivered per-session as SpawnOpts.injectEnv so it never pollutes
+   * the shared tmux/zellij server env. Missing/empty → undefined.
+   */
+  env?: Record<string, string>;
+  /**
+   * Optional per-bot priority skill policy. Missing means botmux does not alter
+   * the underlying CLI's native skill discovery or spawn arguments.
+   */
+  skills?: BotSkillPolicy;
   /**
    * Custom footer brand label for cards this bot sends. Three states:
    *   • `undefined` (unset)  → default `[botmux](github)` link
@@ -161,6 +234,12 @@ export interface BotConfig {
    * (undefined) keeps the streaming card. For users who find the live card noisy.
    */
   disableStreamingCard?: boolean;
+  /**
+   * When true, suppress the lightweight GoGoGo → DONE message reactions used as
+   * progress markers in card-off sessions. Missing/false preserves the current
+   * card-off reaction behavior.
+   */
+  silentTurnReactions?: boolean;
   /**
    * Conversation mode for 1:1 private chats (DMs) with the bot:
    *   - 'thread' (default, stored as undefined): every top-level DM message
@@ -215,6 +294,13 @@ export interface BotConfig {
    */
   autoStartOnNewTopic?: boolean;
   /**
+   * Worktree picker mode on the repo-select card. When true, the worktree
+   * control renders the multi-repo selector (pick N repos + branch) instead of
+   * the single-select dropdown. Toggled from the card's 「切换多仓库选择器」button;
+   * persists so all of this bot's future sessions default to it. Default false.
+   */
+  worktreeMultiPicker?: boolean;
+  /**
    * Per-bot DEFAULT session mode for regular Lark groups (overridable per-chat
    * via `/reply-mode` → `chatReplyModes`). Resolved by
    * `chat-reply-mode-store.regularGroupDefaultMode`.
@@ -238,6 +324,13 @@ export interface BotConfig {
    * is the mode's defining behavior, not affected by this policy).
    */
   regularGroupMentionMode?: 'always' | 'topic' | 'never';
+  /**
+   * 飞书文档订阅入口（/subscribe-lark-doc）新订阅的默认评论触发范围：
+   *   • 'mention-only'（或 undefined）— 仅评论里 @bot 才触发（默认，防噪声）
+   *   • 'all'                        — 该文档所有新评论都触发
+   * 单条订阅的触发范围之后可在 dashboard 逐文档改（doc-subscriptions 表）。
+   */
+  docSubscribeDefaultMode?: 'mention-only' | 'all';
   /**
    * Per-bot voice-engine override for the voice-summary feature. Merged OVER
    * the global `voice` block in ~/.botmux/config.json (per-bot wins field by
@@ -279,13 +372,64 @@ export function getLoadedConfigPath(): string | undefined {
 // traces, etc.); without DEBUG=1 those become no-ops in the CLI path and
 // stay in daemon.log on the daemon path — pm2's error.log no longer sees
 // "[lark:info] client ready" floods.
+// Cap raw dumps so an unrecognized error shape can never flood the log the way
+// the SDK's full AxiosError blob (stack + config + headers) did — that bloated
+// pm2's error.log past 1GB and, worse, leaked the `Authorization: Bearer t-…`
+// access token on every request failure.
+const MAX_FALLBACK_LEN = 300;
 function safeStringify(v: unknown): string {
   if (typeof v === 'string') return v;
-  try { return JSON.stringify(v); } catch { return String(v); }
+  let s: string;
+  try { s = JSON.stringify(v) ?? String(v); } catch { s = String(v); }
+  return s.length > MAX_FALLBACK_LEN ? `${s.slice(0, MAX_FALLBACK_LEN)}…(+${s.length - MAX_FALLBACK_LEN})` : s;
 }
-const fmtLark = (msg: any[]) => msg.map(safeStringify).join(' ');
+
+// Drop the protocol+host (and `/open-apis/` prefix) so the line shows just the
+// API path that matters for triage, never the bearer token in the URL/headers.
+function shortLarkPath(url: unknown): string {
+  if (typeof url !== 'string' || !url) return '';
+  const path = url.replace(/^https?:\/\/[^/]+/, '').replace(/^\/open-apis\//, '');
+  return path || url;
+}
+
+/**
+ * Condense a Lark SDK error into one readable line, preserving just the fields
+ * needed to triage (HTTP status + business `code`/`msg`/`log_id`). Returns null
+ * when the value isn't an axios-shaped error, so callers fall back to
+ * length-capped stringify. Never serializes `config`/`headers`/`stack`, so the
+ * access token can't leak.
+ */
+export function formatLarkError(v: any): string | null {
+  if (!v || typeof v !== 'object') return null;
+  const isAxios = v.isAxiosError === true || v.name === 'AxiosError' || (v.config && (v.response || v.status != null));
+  if (!isAxios) return null;
+  const method = String(v.config?.method ?? '').toUpperCase();
+  const path = shortLarkPath(v.config?.url);
+  const httpStatus = v.response?.status ?? v.status;
+  // Lark business error lives in the response body; some shapes surface it on
+  // the error object directly.
+  const data = v.response?.data ?? {};
+  const code = data.code ?? v.code;
+  const msg = data.msg ?? v.msg;
+  const logId = data.log_id ?? data.logId;
+  const parts: string[] = [];
+  if (method) parts.push(method);
+  if (path) parts.push(path);
+  if (httpStatus != null || method || path) parts.push(`→ ${httpStatus ?? '?'}`);
+  if (typeof code === 'number') parts.push(`code=${code}`);
+  if (typeof msg === 'string' && msg) parts.push(`"${msg}"`);
+  if (logId) parts.push(`log_id=${logId}`);
+  if (!parts.length) return null;
+  return parts.join(' ');
+}
+
+const fmtLark = (msg: any[]) => msg.map((m) => formatLarkError(m) ?? safeStringify(m)).join(' ');
 const larkLogger = {
-  error: (...msg: any[]) => logger.error(`[lark] ${fmtLark(msg)}`),
+  // SDK request failures arrive here as raw AxiosError objects — condense to a
+  // single triage line (status + lark code/msg/log_id) instead of dumping the
+  // stack/config blob. Demoted to warn: nearly all are environmental and already
+  // handled at the call site (rate limits, bot-not-in-chat, stale threads).
+  error: (...msg: any[]) => logger.warn(`[lark] ${fmtLark(msg)}`),
   warn:  (...msg: any[]) => logger.warn(`[lark] ${fmtLark(msg)}`),
   info:  (...msg: any[]) => logger.info(`[lark] ${fmtLark(msg)}`),
   debug: (...msg: any[]) => logger.debug(`[lark] ${fmtLark(msg)}`),
@@ -326,6 +470,11 @@ export function getBotClient(larkAppId: string): Lark.Client {
 /** Owner = bot 首个已授权 open_id，与「缺权限警告私信对象」同口径（见 admin 解析）。 */
 export function getOwnerOpenId(larkAppId: string): string | undefined {
   return bots.get(larkAppId)?.resolvedAllowedUsers.find(u => u.startsWith('ou_'));
+}
+
+/** Admins = all resolved allowedUsers, matching `/botconfig`'s permission model. */
+export function getDashboardAdminOpenIds(larkAppId: string): string[] {
+  return [...(bots.get(larkAppId)?.resolvedAllowedUsers ?? [])];
 }
 
 /** Bot 自身的 open_id（用于在 mention 解析时排除自己）。 */
@@ -561,7 +710,8 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       const out: { [chatId: string]: ChatReplyMode } = {};
       for (const [cid, mode] of Object.entries(entry.chatReplyModes)) {
         if (typeof cid !== 'string' || !cid.trim()) continue;
-        if (mode === 'chat' || mode === 'new-topic' || mode === 'shared') out[cid] = mode;
+        const normalizedMode = normalizeChatReplyModeConfig(mode);
+        if (normalizedMode) out[cid] = normalizedMode;
       }
       if (Object.keys(out).length > 0) chatReplyModes = out;
     }
@@ -626,6 +776,19 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       if (uniq.length > 0) customPassthroughCommands = uniq;
     }
 
+    // startupCommands：开会话后、首条 prompt 前自动敲进 CLI 的 slash 命令行（可带
+    // 参数，如 `/effort ultracode`）。归一化：去多余空白、补前导 `/`、去重；空 →
+    // undefined（与 customPassthroughCommands 同款"不写空数组保持干净"）。
+    const startupCommandsList = normalizeStartupCommandList(entry.startupCommands);
+    const startupCommands = startupCommandsList.length > 0 ? startupCommandsList : undefined;
+
+    // env：per-bot 环境变量（如代理 / 第三方服务商端点 ANTHROPIC_BASE_URL+AUTH_TOKEN）。
+    // sanitizePerBotEnv 过滤非法/保留键、字符串化基本类型；空 → undefined（保持 bots.json 干净）。
+    const sanitizedEnv = sanitizePerBotEnv(entry.env);
+    const env = Object.keys(sanitizedEnv).length > 0 ? sanitizedEnv : undefined;
+
+    const skills = readBotSkillPolicy(entry.skills);
+
     // voice：per-bot 语音引擎覆盖。结构化保留（engine ∈ sami|openai，sami/openai
     // 为对象，speaker/rate 透传）；非对象或 engine 非法 → undefined。深度校验
     // （凭证是否可用）在 resolveVoiceConfig 做，这里只挡明显垃圾。
@@ -655,12 +818,23 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       name: typeof entry.name === 'string' && entry.name.trim() ? entry.name.trim() : undefined,
       cliId: entry.cliId ?? 'claude-code',
       cliPathOverride: entry.cliPathOverride,
+      wrapperCli: typeof entry.wrapperCli === 'string' && entry.wrapperCli.trim()
+        ? entry.wrapperCli.trim()
+        : undefined,
       model: typeof entry.model === 'string' && entry.model.trim()
         ? entry.model.trim()
         : undefined,
       disableCliBypass: entry.disableCliBypass === true,
       sandbox: entry.sandbox === true,
+      sandboxHidePaths: Array.isArray(entry.sandboxHidePaths)
+        ? entry.sandboxHidePaths.filter((p: unknown): p is string => typeof p === 'string' && !!p.trim())
+        : [],
       backendType: entry.backendType,
+      // Positive integer only; ≤0 / non-int / absent → undefined (= no cap).
+      maxLiveWorkers: typeof entry.maxLiveWorkers === 'number'
+        && Number.isInteger(entry.maxLiveWorkers) && entry.maxLiveWorkers > 0
+        ? entry.maxLiveWorkers
+        : undefined,
       workingDir: workingDirs?.[0] ?? entry.workingDir,
       workingDirs,
       allowedUsers: entry.allowedUsers,
@@ -677,12 +851,18 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       messageQuota,
       quotaState,
       restrictGrantCommands: entry.restrictGrantCommands === true || undefined,
+      // Default is ON, so only explicit false is meaningful/persisted.
+      autoGrantRequestCards: entry.autoGrantRequestCards === false ? false : undefined,
       customPassthroughCommands,
+      startupCommands,
+      env,
+      skills,
       lang: isLocale(entry.lang) ? entry.lang : undefined,
       // Preserve '' distinctly from undefined: '' means "brand off", undefined
       // means "use default botmux brand". Don't trim-to-undefined here.
       brandLabel: typeof entry.brandLabel === 'string' ? entry.brandLabel : undefined,
       disableStreamingCard: entry.disableStreamingCard === true || undefined,
+      silentTurnReactions: entry.silentTurnReactions === true || undefined,
       // Only 'chat' is meaningful; 'thread' (and anything else) normalizes to
       // undefined — the legacy thread-per-message default. Keeps bots.json clean.
       p2pMode: entry.p2pMode === 'chat' ? 'chat' : undefined,
@@ -698,20 +878,49 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         ? entry.autoStartOnGroupJoinPrompt
         : undefined,
       autoStartOnNewTopic: entry.autoStartOnNewTopic === true || undefined,
+      worktreeMultiPicker: entry.worktreeMultiPicker === true || undefined,
       // Per-bot regular-group default mode. Only 'new-topic' | 'shared' are
       // meaningful; 'chat' (the flat default) and anything else normalize to
       // undefined so bots.json stays clean.
-      regularGroupReplyMode: entry.regularGroupReplyMode === 'new-topic' || entry.regularGroupReplyMode === 'shared'
-        ? entry.regularGroupReplyMode
-        : undefined,
+      regularGroupReplyMode: (() => {
+        const mode = normalizeChatReplyModeConfig(entry.regularGroupReplyMode);
+        return mode === 'new-topic' || mode === 'shared' ? mode : undefined;
+      })(),
       // 3-tier @ policy. Only 'topic' | 'never' are meaningful; 'always' (the
       // default) and anything else normalize to undefined so bots.json stays clean.
       regularGroupMentionMode: entry.regularGroupMentionMode === 'topic' || entry.regularGroupMentionMode === 'never'
         ? entry.regularGroupMentionMode
         : undefined,
+      // 文档订阅默认触发范围。只 'all' 有意义；'mention-only'（默认）归一化为
+      // undefined 让 bots.json 保持干净。
+      docSubscribeDefaultMode: entry.docSubscribeDefaultMode === 'all' ? 'all' : undefined,
       voice,
     });
   }
 
   return configs;
+}
+
+function readStringArray(raw: unknown): string[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  const values = raw
+    .map((v) => typeof v === 'string' ? v.trim() : '')
+    .filter(Boolean);
+  return values.length > 0 ? values : undefined;
+}
+
+function readDirectSkillSelectors(raw: unknown): SkillSelector[] | undefined {
+  const values = readStringArray(raw);
+  if (!values) return undefined;
+  const selectors = values.filter((value): value is SkillSelector => /^skill:.+$/.test(value));
+  return selectors.length > 0 ? selectors : undefined;
+}
+
+export function readBotSkillPolicy(raw: unknown): BotSkillPolicy | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const r = raw as Record<string, unknown>;
+  const out: BotSkillPolicy = {};
+  const include = readDirectSkillSelectors(r.include);
+  if (include) out.include = include;
+  return Object.keys(out).length > 0 ? out : undefined;
 }

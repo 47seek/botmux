@@ -55,7 +55,7 @@ export async function handleV3BlockedAction(
   value: V3BlockedActionValue | V3AskAnswerActionValue,
   operatorOpenId: string | undefined,
   deps: V3BlockedCardHandlerDeps,
-  formValue?: Record<string, string>,
+  formValue?: Record<string, unknown>,
 ): Promise<unknown> {
   // 同一张卡两条 action：普通重试 / human-ask 选项答题。后者额外带 selected，
   // 走同一条 requestV3Retry 通道（带 answer），只是冻结卡渲染不同。
@@ -86,7 +86,7 @@ export async function handleV3BlockedAction(
   try {
     const textAnswer =
       isAsk && 'answerKind' in value && value.answerKind === 'text'
-        ? (formValue?.[V3_BLOCKED_ASK_TEXT_FIELD] ?? '').trim()
+        ? String(formValue?.[V3_BLOCKED_ASK_TEXT_FIELD] ?? '').trim()
         : undefined;
     if (isAsk && 'answerKind' in value && value.answerKind === 'text' && !textAnswer) {
       return { toast: { type: 'warning', content: '请先填写答案' } };

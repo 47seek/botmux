@@ -2,7 +2,8 @@ import { existsSync } from 'node:fs';
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import type { CliAdapter, PtyHandle } from './types.js';
-import { traeStateDbPath } from '../../services/traex-paths.js';
+import { traeStateDbPath, traeSessionsRoot } from '../../services/traex-paths.js';
+import { discoverRolloutSessions } from '../../services/resumable-session-discovery.js';
 import { delay } from '../../utils/timing.js';
 
 /**
@@ -147,6 +148,7 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
   let cachedBin: string | undefined;
   return {
     id: 'traex',
+    authPaths: ['~/.trae/cli/auth.json'],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
     buildArgs({ sessionId, resume, resumeSessionId, workingDir, model, disableCliBypass }) {
@@ -167,6 +169,12 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
       const sid = cliSessionId ?? latestTraeSessionForBotmuxSession(sessionId);
       if (!sid) return null;
       return `traex resume ${sid}`;
+    },
+
+    /** Import path: TRAE writes Codex-shaped rollout files under
+     *  `<TRAE_HOME>/cli/sessions` — same parser as Codex. */
+    listResumableSessions({ limit, exclude }) {
+      return discoverRolloutSessions(traeSessionsRoot(), limit, exclude);
     },
 
     async writeInput(pty: PtyHandle, content: string) {
@@ -228,13 +236,20 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
     },
 
     completionPattern: undefined,
-    // TRAE's prompt indicator is identical to Codex's `›`. The status bar
-    // does not currently surface a "% left" counter, so only `›` is needed.
-    readyPattern: /›/,
+    // TRAE has shipped both the Codex-style `›` prompt and the Claude-style
+    // `❯` prompt; v0.200.7 also renders a "Context 100% left" status bar.
+    // Startup advisory / picker screens also use `❯ 1.` as a menu cursor, so
+    // exclude numbered selector rows; otherwise botmux flushes the first prompt
+    // into the advisory instead of TRAE's real composer.
+    readyPattern: /(?:^|[\n\r])\s*[›❯](?!\s*\d+\.)|\d+% left/,
     systemHints: BOTMUX_SHELL_HINTS,
     // TRAE 0.200+ shares Codex's type-ahead behaviour: input submitted while
     // a turn is running is parked and merged into the active turn.
     supportsTypeAhead: true,
+    // TRAE's trust/advisory startup screens can accept stdin before the real
+    // composer exists, so the worker's 15s soft fallback must wait for the
+    // prompt marker. A hard cap in the worker still prevents permanent hangs.
+    deferFirstPromptTimeoutUntilReady: true,
     altScreen: false,
     skillsDir: '~/.trae/skills',
     // Curated subset — the full catalogue has 27 models. `traex debug models`

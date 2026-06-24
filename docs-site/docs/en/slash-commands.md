@@ -14,21 +14,25 @@ Just send these commands directly in a topic, and the daemon intercepts and hand
 | `/restart` | Restart the CLI process (preserving the session context) |
 | `/close` | Close the session and send a recoverable card (including the CLI's own resume command) |
 | `/card` | Manually summon the current session's streaming card (can summon and restore live refresh even when streaming is off; in private-card mode, sends a static snapshot visible only to authorized users instead) |
+| `/insight` | owner-only: instantly posts a "session insight summary" card for the current session (aggregate metrics + rule suggestions; action-span detail / per-turn reconciliation / conversation replay live on the Dashboard "Insights" page) |
 | `/t <prompt>` `/topic <prompt>` | Force a new topic inside a regular group |
 
 ## 🔀 Passthrough to the Underlying CLI
 
 `/compact` `/model` `/clear` `/plugin` `/usage` `/context` `/cost` `/mcp` `/diff` `/code-review` `/security-review` `/review` `/btw` — delivered literally to the underlying CLI and handled by its built-in commands.
 
-To allow more commands through, configure [`customPassthroughCommands`](/en/bots-json) for that bot (e.g. `["/goal", "/export"]`) to extend beyond the allowlist above as needed. Entries that would shadow a botmux daemon command (such as `/status`, `/help`, `/cd`) are automatically dropped — daemon commands always keep their own semantics and cannot be overridden via passthrough.
+Some CLIs also declare adapter-default passthrough commands: Claude Code and Codex default-allow `/goal`, so a new topic whose first message is `/goal ...` will start/select the repository first and then send `/goal ...` to the CLI literally.
+
+To allow more commands through, configure [`customPassthroughCommands`](/en/bots-json) for that bot (e.g. `["/export"]`) to extend beyond the allowlist above as needed. Entries that would shadow a botmux daemon command (such as `/status`, `/help`, `/cd`) are automatically dropped — daemon commands always keep their own semantics and cannot be overridden via passthrough.
 
 ## 🧩 View Available Commands
 
-`/list-slash-command` (alias `/slash`): lists the currently available slash commands in a card, in three sections —
+`/list-slash-command` (alias `/slash`): lists the currently available slash commands in a card, in four sections —
 
 1. botmux's fixed passthrough allowlist;
-2. commands this bot custom-allows via `customPassthroughCommands` in bots.json;
-3. custom commands / skills / plugins auto-discovered from the `.claude` directory (project-level + `~/.claude` + plugin cache), shown in a paginated "command ｜ description" table, with a note of any detected MCP server names.
+2. commands default-allowed by the current CLI adapter;
+3. commands this bot custom-allows via `customPassthroughCommands` in bots.json;
+4. custom commands / skills / plugins auto-discovered from the `.claude` directory (project-level + `~/.claude` + plugin cache), shown in a paginated "command ｜ description" table, with a note of any detected MCP server names.
 
 Permissions are the same as `/help`, and it doesn't occupy a session slot.
 
@@ -56,6 +60,11 @@ Permissions are the same as `/help`, and it doesn't occupy a session slot.
 | `/role delete` | Delete this group's Role |
 | `/role team set <Markdown>` | Set the **default role** (the cross-group default persona; the command name keeps `team`, = dashboard "Bot Config → Default Role") |
 | `/role cap set <one-liner>` / `/role cap clear` | Set/clear the capability tag in the roster |
+| `/role profile list` | List local role profiles |
+| `/role profile show <profile> [--all]` | Show this bot's profile entry, or all local entries known to this daemon |
+| `/role profile set <profile> <Markdown>` | Set this bot's entry in a reusable role profile |
+| `/role profile save <profile>` | Save this bot's current effective role into the profile |
+| `/role profile apply <profile> [--preview] [--force] [--quiet]` | Write this bot's profile entry as this group's Role |
 
 See [Roles & Teams](/en/roles) for details.
 
@@ -81,7 +90,19 @@ See [Session Relay](/en/relay) for details.
 
 ## 🆕 One-Click New Session Group
 
-`/group <group name>` (alias `/g`): automatically creates a new Lark group, invites you in, transfers ownership to you, and runs the entire group as a standalone CLI session. `@botA @botB /g <group name>` can add multiple bots into the new group at once. See [One-Click Session Group](/en/group) for details.
+`/group <group name>` (alias `/g`): automatically creates a new Lark group, invites you in, transfers ownership to you, and runs the entire group as a standalone CLI session. `@botA @botB /g <group name>` can add multiple bots into the new group at once.
+
+Add `--role-profile <profile>` to bootstrap the new group with reusable per-bot roles:
+
+```bash
+@botA @botB /g --role-profile collab-main War Room
+```
+
+See [One-Click Session Group](/en/group) for details.
+
+## 📄 Feishu Doc Comment Entry
+
+`/subscribe-lark-doc <doc link>`: subscribe a Feishu doc — its comments feed into this session and the bot replies back into the comment thread · `/subscribe-lark-doc list` to view subscriptions · `/subscribe-lark-doc off` to unsubscribe. See [Feishu Doc Comment Entry](/en/doc-comment) for details.
 
 ## 👥 Multi-Bot Collaboration
 

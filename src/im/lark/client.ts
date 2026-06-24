@@ -239,6 +239,41 @@ export async function resolveUnionIdFromOpenId(
   }
 }
 
+/** 用户资料（名字+头像）查询缓存：key = appId:idType:id。负结果也缓存——
+ *  不在通讯录可见范围（41050）的用户每次查都会失败，别反复打 API。 */
+const userProfileCache = new Map<string, { name: string; avatarUrl?: string } | null>();
+const USER_PROFILE_CACHE_MAX = 1000;
+
+/**
+ * Best-effort 拉用户资料（名字 + 头像 URL）。拿不到（缺 scope / 不在可见
+ * 范围 / 网络错误）返回 null，调用方自行回退占位。
+ */
+export async function getUserProfile(
+  larkAppId: string,
+  userId: string,
+  idType: 'open_id' | 'union_id' = 'open_id',
+): Promise<{ name: string; avatarUrl?: string } | null> {
+  const key = `${larkAppId}:${idType}:${userId}`;
+  const hit = userProfileCache.get(key);
+  if (hit !== undefined) return hit;
+  let out: { name: string; avatarUrl?: string } | null = null;
+  try {
+    const c = getBotClient(larkAppId);
+    const res = await larkGet(c, `/open-apis/contact/v3/users/${encodeURIComponent(userId)}`, {
+      user_id_type: idType,
+    });
+    const u = res?.code === 0 ? res?.data?.user : null;
+    if (u?.name) {
+      out = { name: String(u.name), avatarUrl: u.avatar?.avatar_72 ?? u.avatar?.avatar_240 ?? undefined };
+    }
+  } catch (err) {
+    logger.debug(`[user-profile] lookup threw for ${userId.substring(0, 12)}: ${err instanceof Error ? err.message : err}`);
+  }
+  if (userProfileCache.size >= USER_PROFILE_CACHE_MAX) userProfileCache.clear();
+  userProfileCache.set(key, out);
+  return out;
+}
+
 /**
  * Best-effort 判断一个 open_id 是否为「真人」（通讯录里查得到 user）。
  *
@@ -759,8 +794,8 @@ export async function resolveAllowedUsersWithMap(
   const unionIds: string[] = [];
   for (const v of raw) {
     if (v.startsWith('ou_')) {
-      openIds.push(v);
       map.set(v, v);
+      openIds.push(v);
     } else if (v.startsWith('on_')) {
       // union_id (跨应用稳定)：运行时权限/私信/卡片全是 open_id 原生的，
       // 启动时用本 app 凭证把 on_ 翻成本 app 的 ou_，下游一律照旧用 open_id。
@@ -769,60 +804,93 @@ export async function resolveAllowedUsersWithMap(
       emails.push(v);
     }
   }
-  if (emails.length === 0 && unionIds.length === 0) return { resolved: openIds, map };
 
-  const c = getBotClient(larkAppId);
+  if (emails.length > 0 || unionIds.length > 0 || openIds.length > 0) {
+    const c = getBotClient(larkAppId);
 
-  // union_id → 本 app open_id（单条查询；失败则丢弃该条，与 email 解析失败同口径）。
-  for (const uid of unionIds) {
-    try {
-      const res = await (c as any).contact.v3.user.get({
-        path: { user_id: uid },
-        params: { user_id_type: 'union_id' },
-      });
-      const oid = res?.data?.user?.open_id as string | undefined;
-      if (res.code === 0 && oid) {
-        openIds.push(oid);
-        map.set(uid, oid);
-        logger.info(`Resolved ${uid} → ${oid}`);
-      } else {
-        logger.warn(`Failed to resolve union_id ${uid} to open_id: ${res?.msg} (code: ${res?.code})`);
+    // Literal open_id is app-scoped. Keep it as-is for compatibility, but
+    // diagnose the common misconfiguration where a different app's ou_ is copied
+    // into this bot's allowedUsers and owner checks silently lock everyone out.
+    for (const oid of openIds) {
+      try {
+        const res = await (c as any).contact.v3.user.get({
+          path: { user_id: oid },
+          params: { user_id_type: 'open_id' },
+        });
+        if (res?.code === 99992361) {
+          logger.warn(`allowedUsers open_id ${oid} belongs to another app for ${larkAppId}; use email or union_id (on_) instead.`);
+        } else if (res?.code && res.code !== 0) {
+          logger.debug(`verify allowedUsers open_id ${oid} non-zero code: ${res.code} ${res.msg ?? ''}`);
+        }
+      } catch (err: any) {
+        logger.debug(`verify allowedUsers open_id ${oid} failed: ${err?.message ?? err}`);
       }
-    } catch (err: any) {
-      logger.warn(`resolve union_id ${uid} failed: ${err?.message ?? err}`);
+    }
+
+    // union_id → 本 app open_id（单条查询；失败则丢弃该条，与 email 解析失败同口径）。
+    for (const uid of unionIds) {
+      try {
+        const res = await (c as any).contact.v3.user.get({
+          path: { user_id: uid },
+          params: { user_id_type: 'union_id' },
+        });
+        const oid = res?.data?.user?.open_id as string | undefined;
+        if (res.code === 0 && oid) {
+          map.set(uid, oid);
+          logger.info(`Resolved ${uid} → ${oid}`);
+        } else {
+          logger.warn(`Failed to resolve union_id ${uid} to open_id: ${res?.msg} (code: ${res?.code})`);
+        }
+      } catch (err: any) {
+        logger.warn(`resolve union_id ${uid} failed: ${err?.message ?? err}`);
+      }
+    }
+
+    if (emails.length > 0) {
+      try {
+        const res = await (c as any).contact.v3.user.batchGetId({
+          params: { user_id_type: 'open_id' },
+          data: { emails, include_resigned: false },
+        });
+        if (res.code !== 0) {
+          logger.warn(`Failed to resolve emails to open_ids: ${res.msg} (code: ${res.code})`);
+        } else {
+          const userList: any[] = res.data?.user_list ?? [];
+          // 先按 normalized(email) → user_id 建查找表，再对原始请求的 raw email 逐个回填 map，
+          // 保证 map 的 key 与 allowedUsers 里的字面值完全一致（防 API 大小写/规范化错配）。
+          const byNorm = new Map<string, string>();
+          for (const item of userList) {
+            if (item.user_id && item.email) byNorm.set(String(item.email).toLowerCase(), item.user_id);
+            else if (!item.user_id) logger.warn(`Could not resolve email: ${item.email}`);
+          }
+          for (const rawEmail of emails) {
+            const uid = byNorm.get(rawEmail.toLowerCase());
+            if (uid) {
+              map.set(rawEmail, uid);
+              logger.info(`Resolved ${rawEmail} → ${uid}`);
+            }
+          }
+        }
+      } catch (err: any) {
+        logger.warn(`resolveAllowedUsers failed: ${err.message}`);
+      }
     }
   }
 
-  if (emails.length === 0) return { resolved: openIds, map };
-  try {
-    const res = await (c as any).contact.v3.user.batchGetId({
-      params: { user_id_type: 'open_id' },
-      data: { emails, include_resigned: false },
-    });
-    if (res.code !== 0) {
-      logger.warn(`Failed to resolve emails to open_ids: ${res.msg} (code: ${res.code})`);
-      return { resolved: openIds, map };
+  // 解析不改变顺序：按 allowedUsers 的「原始配置顺序」回填 open_id，使
+  // 「owner = 第一个 ou_」忠实反映配置里的排位（union/邮箱条目不再被甩到 ou_ 之后）。
+  // 不可解析的条目丢弃；同一 open_id 去重并保留首次出现位置（同一人可能同时以
+  // union/邮箱和字面 ou_ 两种形式登记）。
+  const seen = new Set<string>();
+  const resolved: string[] = [];
+  for (const v of raw) {
+    const oid = map.get(v);
+    if (oid && !seen.has(oid)) {
+      seen.add(oid);
+      resolved.push(oid);
     }
-    const userList: any[] = res.data?.user_list ?? [];
-    // 先按 normalized(email) → user_id 建查找表，再对原始请求的 raw email 逐个回填 map，
-    // 保证 map 的 key 与 allowedUsers 里的字面值完全一致（防 API 大小写/规范化错配）。
-    const byNorm = new Map<string, string>();
-    for (const item of userList) {
-      if (item.user_id && item.email) byNorm.set(String(item.email).toLowerCase(), item.user_id);
-      else if (!item.user_id) logger.warn(`Could not resolve email: ${item.email}`);
-    }
-    for (const rawEmail of emails) {
-      const uid = byNorm.get(rawEmail.toLowerCase());
-      if (uid) {
-        openIds.push(uid);
-        map.set(rawEmail, uid);
-        logger.info(`Resolved ${rawEmail} → ${uid}`);
-      }
-    }
-  } catch (err: any) {
-    logger.warn(`resolveAllowedUsers failed: ${err.message}`);
   }
-  return { resolved: openIds, map };
+  return { resolved, map };
 }
 
 /**
@@ -1083,6 +1151,12 @@ export type ChatBotMember = {
 };
 
 export async function listChatBotMembers(larkAppId: string, chatId: string): Promise<ChatBotMember[]> {
+  // Single name-key normalizer used for EVERY cross-source name match below
+  // (cross-ref ⇄ bots-info ⇄ observed). Trim-only: strips incidental leading/
+  // trailing whitespace but stays case-sensitive, so two genuinely distinct bots
+  // whose names differ only in case ("Claude" vs "claude") never collide.
+  const norm = (s: string) => s.trim();
+
   // Read per-bot cross-reference: other bots' open_ids as seen by larkAppId's app.
   // This is populated from @mention data in Lark events (the only reliable source,
   // since Lark open_id is per-app scoped — a bot's self-reported open_id is
@@ -1093,7 +1167,7 @@ export async function listChatBotMembers(larkAppId: string, chatId: string): Pro
     if (existsSync(crossRefPath)) {
       const data: Record<string, string> = JSON.parse(readFileSync(crossRefPath, 'utf-8'));
       for (const [name, openId] of Object.entries(data)) {
-        crossRef.set(name.toLowerCase(), openId);
+        crossRef.set(norm(name), openId);
       }
     }
   } catch { /* ignore */ }
@@ -1118,7 +1192,7 @@ export async function listChatBotMembers(larkAppId: string, chatId: string): Pro
         if (res.code === 0 && res.data?.is_in_chat) {
           const info = appIdToInfo.get(appId);
           // Prefer cross-reference (correct per-app open_id), fall back to self-seen
-          const crossHit = info?.botName ? crossRef.get(info.botName.toLowerCase()) : undefined;
+          const crossHit = info?.botName ? crossRef.get(norm(info.botName)) : undefined;
           const openId = crossHit ?? info?.botOpenId ?? appId;
           const isSelf = appId === larkAppId;
           // Reliable @-mention only when the per-app open_id was learned via
@@ -1161,13 +1235,13 @@ export async function listChatBotMembers(larkAppId: string, chatId: string): Pro
     const observedList = listObservedBots(config.session.dataDir, larkAppId, chatId);
     const latestObservedByName = new Map<string, (typeof observedList)[number]>();
     for (const o of observedList) {
-      const existing = latestObservedByName.get(o.name);
+      const k = norm(o.name);
+      const existing = latestObservedByName.get(k);
       if (!existing || o.lastSeenAt > existing.lastSeenAt) {
-        latestObservedByName.set(o.name, o);
+        latestObservedByName.set(k, o);
       }
     }
     const seenOpenIds = new Set(configured.map(b => b.openId));
-    const norm = (s: string) => s.trim().toLowerCase();
     const byName = new Map<string, number[]>();
     configured.forEach((b, i) => {
       const k = norm(b.displayName);
@@ -1176,28 +1250,31 @@ export async function listChatBotMembers(larkAppId: string, chatId: string): Pro
     });
 
     for (const o of latestObservedByName.values()) {
-      if (seenOpenIds.has(o.openId)) continue;
+      const crossHit = crossRef.get(norm(o.name));
+      const openId = crossHit ?? o.openId;
+      const mentionSource: ChatBotMember['mentionSource'] = crossHit ? 'cross-ref' : 'observed';
+      if (seenOpenIds.has(openId)) continue;
       const matches = byName.get(norm(o.name)) ?? [];
       if (matches.length === 1) {
         const row = configured[matches[0]];
         // Upgrade only if not already a reliable cross-ref handle.
         if (row.mentionSource !== 'cross-ref') {
-          configured[matches[0]] = { ...row, openId: o.openId, mentionable: true, mentionSource: 'observed' };
-          seenOpenIds.add(o.openId);
+          configured[matches[0]] = { ...row, openId, mentionable: true, mentionSource };
+          seenOpenIds.add(openId);
         }
         continue; // matched → never also append as an external duplicate
       }
       configured.push({
         larkAppId: '',
-        openId: o.openId,
+        openId,
         name: o.name,
         displayName: o.name,
         source: 'introduce',
         hasTeamRole: false,
         mentionable: true,
-        mentionSource: 'observed',
+        mentionSource,
       });
-      seenOpenIds.add(o.openId);
+      seenOpenIds.add(openId);
     }
   } catch (err) {
     logger.debug(`Failed to load observed bots for ${chatId}: ${err}`);

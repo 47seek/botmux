@@ -58,6 +58,7 @@ vi.mock('../src/services/frozen-card-store.js', () => ({
 }));
 
 vi.mock('../src/core/session-manager.js', () => ({
+  ensureSessionWhiteboard: vi.fn(),
   persistStreamCardState: vi.fn(),
 }));
 
@@ -66,7 +67,7 @@ vi.mock('../src/core/dashboard-events.js', () => ({
 }));
 
 vi.mock('../src/core/dashboard-rows.js', () => ({
-  composeRowFromActive: vi.fn(),
+  composeRowFromActive: vi.fn(() => ({ tokenUsage: null })),
 }));
 
 vi.mock('../src/skills/installer.js', () => ({

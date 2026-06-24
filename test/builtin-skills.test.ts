@@ -4,15 +4,17 @@
  * Run: pnpm vitest run test/builtin-skills.test.ts
  */
 import { describe, it, expect } from 'vitest';
-import { BUILTIN_SKILLS, RETIRED_SKILL_NAMES } from '../src/skills/definitions.js';
+import { BUILTIN_SKILLS, RETIRED_SKILL_NAMES, WHITEBOARD_SKILL, WHITEBOARD_SKILL_NAME } from '../src/skills/definitions.js';
 
 describe('built-in botmux-send skill', () => {
-  it('teaches heredoc usage for multiline sends', () => {
+  it('teaches safe multiline sends across Unix and Windows shells', () => {
     const skill = BUILTIN_SKILLS.find(s => s.name === 'botmux-send');
     expect(skill).toBeDefined();
     expect(skill!.content).toContain("botmux send <<'EOF'");
-    expect(skill!.content).toContain('botmux send "第一行\\n第二行"');
-    expect(skill!.content).toContain('字面量');
+    expect(skill!.content).toContain('Windows/PowerShell');
+    expect(skill!.content).toContain('--content-file');
+    expect(skill!.content).toContain('Set-Content -LiteralPath $msg -Encoding utf8');
+    expect(skill!.content).toContain('不要把中文直接通过 here-string');
   });
 
   it('warns that mention-back/no-mention are switches without values', () => {
@@ -150,16 +152,30 @@ describe('built-in botmux-handoff skill', () => {
   });
 });
 
-describe('built-in botmux-worker-budget skill', () => {
-  it('teaches agents to use the CLI command instead of hand-editing JSON', () => {
-    const skill = BUILTIN_SKILLS.find(s => s.name === 'botmux-worker-budget');
-    expect(skill).toBeDefined();
-    expect(skill!.content).toContain('botmux worker-budget status');
-    expect(skill!.content).toContain('botmux worker-budget set --max-live-workers');
-    expect(skill!.content).toContain('botmux worker-budget unset');
-    expect(skill!.content).toContain('不要直接编辑 `~/.botmux/config.json`');
-    expect(skill!.content).toContain('maxLiveWorkers');
-    expect(skill!.content).toContain('idleSuspendMs');
+describe('built-in botmux-whiteboard skill', () => {
+  it('is NOT in BUILTIN_SKILLS — installed conditionally on the whiteboard toggle', () => {
+    // The whiteboard feature is off by default, so its skill must not be written
+    // unconditionally. It is materialised only when enabled, via
+    // ensureWhiteboardSkill (see ensure-whiteboard-skill.test.ts).
+    expect(BUILTIN_SKILLS.find(s => s.name === WHITEBOARD_SKILL_NAME)).toBeUndefined();
+    expect(WHITEBOARD_SKILL_NAME).toBe('botmux-whiteboard');
+  });
+
+  it('teaches disabled/default-safe usage', () => {
+    expect(WHITEBOARD_SKILL).toContain('botmux whiteboard status');
+    expect(WHITEBOARD_SKILL).toContain('默认关闭');
+    expect(WHITEBOARD_SKILL).toContain('botmux whiteboard update');
+    expect(WHITEBOARD_SKILL).not.toContain('botmux whiteboard post');
+    expect(WHITEBOARD_SKILL).toContain('write --yes');
+    expect(WHITEBOARD_SKILL).toContain('不要写');
+    expect(WHITEBOARD_SKILL).toContain('botmux send');
+  });
+});
+
+describe('botmux-worker-budget skill retired (moved to per-bot dashboard field)', () => {
+  it('is no longer a standalone skill and is pruned on upgrade', () => {
+    expect(BUILTIN_SKILLS.find(s => s.name === 'botmux-worker-budget')).toBeUndefined();
+    expect(RETIRED_SKILL_NAMES).toContain('botmux-worker-budget');
   });
 });
 

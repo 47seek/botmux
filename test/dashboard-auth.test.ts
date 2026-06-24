@@ -1,13 +1,13 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { createHmac } from 'node:crypto';
 import {
-  mkdtempSync, rmSync, writeFileSync, existsSync, statSync,
+  mkdirSync, mkdtempSync, rmSync, writeFileSync, existsSync, statSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   verifyHmac, generateToken, parseCookie, decideDashboardAuth,
-  loadPersistedToken, persistToken,
+  loadPersistedToken, persistToken, loadDashboardSecret, loadOrCreateDashboardSecret,
 } from '../src/dashboard/auth.js';
 
 const SECRET = 'a'.repeat(43); // base64url 32 bytes
@@ -121,6 +121,33 @@ describe('token persistence (survives restart, rotates only on `botmux dashboard
   });
 });
 
+describe('dashboard secret persistence', () => {
+  let dir: string;
+  let secretPath: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'botmux-secret-'));
+    secretPath = join(dir, 'nested', '.dashboard-secret');
+  });
+  afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
+
+  it('loadDashboardSecret returns null when file is absent or whitespace-only', () => {
+    expect(loadDashboardSecret(secretPath)).toBeNull();
+    const p = join(dir, 'empty-secret');
+    writeFileSync(p, '   \n');
+    expect(loadDashboardSecret(p)).toBeNull();
+  });
+
+  it('loadOrCreateDashboardSecret overwrites whitespace-only file with a fresh 0600 secret', () => {
+    mkdirSync(join(dir, 'nested'));
+    writeFileSync(secretPath, ' \n');
+    const secret = loadOrCreateDashboardSecret(secretPath);
+    expect(secret).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect(loadDashboardSecret(secretPath)).toBe(secret);
+    expect(statSync(secretPath).mode & 0o777).toBe(0o600);
+  });
+});
+
 describe('parseCookie', () => {
   it('extracts botmux_dashboard_token value', () => {
     const v = parseCookie('foo=bar; botmux_dashboard_token=tk_abc; x=1');
@@ -201,6 +228,40 @@ describe('decideDashboardAuth — public surface', () => {
       activeToken: TOK,
     });
     expect(d.kind).toBe('allow');
+  });
+
+  it('DELETE /api/whiteboards/:id without token → deny401', () => {
+    const d = decideDashboardAuth({
+      method: 'DELETE',
+      pathname: '/api/whiteboards/wb_test',
+      hasTokenParam: false,
+      presentedToken: undefined,
+      activeToken: TOK,
+      publicReadOnly: true,
+    });
+    expect(d.kind).toBe('deny401');
+  });
+
+  it('GET /game/index.html — HD2D office shell allow without any token', () => {
+    const d = decideDashboardAuth({
+      method: 'GET',
+      pathname: '/game/index.html',
+      hasTokenParam: false,
+      presentedToken: undefined,
+      activeToken: TOK,
+    });
+    expect(d.kind).toBe('allow');
+  });
+
+  it('POST /api/game/download without token → deny401 (gated: triggers a ~74MB fetch)', () => {
+    const d = decideDashboardAuth({
+      method: 'POST',
+      pathname: '/api/game/download',
+      hasTokenParam: false,
+      presentedToken: undefined,
+      activeToken: TOK,
+    });
+    expect(d.kind).toBe('deny401');
   });
 });
 
@@ -425,7 +486,11 @@ describe('decideDashboardAuth — publicReadOnly mode', () => {
       // (role/persona content, per-bot oncall config, CLI option metadata).
       '/api/roles/cli_app/oc_chat',
       '/api/bots',
+      '/api/skills',
       '/api/cli-options',
+      // Mints a token-bearing writable terminal URL — never public, even in
+      // publicReadOnly (the daemon IPC behind it is also loopback-HMAC gated).
+      '/api/sessions/sess-1/write-link',
       // A path that doesn't exist yet must also default to private.
       '/api/some-future-read',
     ]) {
