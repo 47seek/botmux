@@ -1999,6 +1999,25 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    // PUT /api/bots/:appId/summary-trigger — proxy to that bot's daemon. Body
+    // `{ enabled, keyword, limit, sinceHours }`; daemon updates the
+    // dashboard-managed content trigger while preserving hand-written triggers.
+    let mBotSummaryTrigger: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mBotSummaryTrigger = url.pathname.match(/^\/api\/bots\/([^/]+)\/summary-trigger$/))) {
+      const appId = decodeURIComponent(mBotSummaryTrigger[1]);
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+      const upstream = await proxyToDaemon(appId, `/api/bot-summary-trigger`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: raw,
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
     // PUT /api/bots/:appId/p2p-mode — proxy to that bot's daemon. Body
     // `{ p2pMode: 'chat' | 'thread' }` ('chat' = flat continuous DM session;
     // anything else clears back to the per-message thread default).
