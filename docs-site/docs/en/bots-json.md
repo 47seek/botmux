@@ -114,7 +114,7 @@ Run one bot on a GLM Coding Plan (or any Anthropic-compatible provider) while an
 
 | Field | Description |
 |------|------|
-| `summaryRange` | History range used by the explicit `@bot /summary` command. `limit` is the latest N messages in a regular group, defaulting to 50; `sinceHours` is the latest N hours in a regular group, defaulting to 24. Set either field to `0` to remove that limit. Topic groups always read the current topic/thread history |
+| `summaryRange` | History range used by the explicit `@bot /summary` command. `limit` is the latest N messages in a regular group, defaulting to 50; `sinceHours` is the latest N hours in a regular group, defaulting to 24. Set either field to `0` to remove that limit. Topic groups always read the current topic/thread history, then apply the summary window |
 
 Example:
 
@@ -129,7 +129,8 @@ Example:
 
 - Only the explicit `@bot /summary` command triggers a summary. Messages that do not mention the bot still follow the existing group/topic routing rules and are not woken up by keywords.
 - The dashboard "/summary Range" controls this `summaryRange` field.
-- In regular groups, `limit` and `sinceHours` are both applied. If both are `0`, botmux reads all retrievable history.
+- If an earlier `@same bot /summary` exists before the current trigger, the summary window includes only messages after that earlier command and up to the current trigger; otherwise botmux falls back to `limit` / `sinceHours`.
+- `limit` and `sinceHours` are also safety caps. If both are `0`, that dimension is not limited.
 
 ## Legacy content trigger config
 
