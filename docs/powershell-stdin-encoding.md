@@ -9,13 +9,11 @@ PowerShell 5.1 stdin 编码问题 · 处理方案
 ### 有问题的操作
 
 ```powershell
-# 直接传入多行中文内容（截断！）
-botmux send --mention-back "测试
-
-第一项 配置机器人
-第二项 多话题协作
-第三项 创建飞书群"
+# 通过管道/heredoc 把多行中文喂给 stdin（GBK 乱码！）
+"测试`n第一项 配置机器人`n第二项 多话题协作" | botmux send --mention-back
 ```
+
+> 注：用**位置参数**直接传多行字符串（`botmux send "第一行`n第二行"`）是另一回事——PS5.1 自己在拼 native 命令行时会把多行参数拆断，与编码无关，最稳妥是改用 `--content-file`。本文与下面的修复针对的是 **stdin（管道/heredoc）** 这条路径。
 
 ### 正常操作
 
@@ -34,7 +32,7 @@ botmux send --mention-back --content-file $msg
 
 ## 问题根源
 
-PowerShell 5.1 在通过管道向原生可执行文件（node.exe）传递数据时，会将 UTF-16LE 内部字符串转为系统活动代码页（中文 Windows = CP936/GBK）。botmux send 的 readStdin() 以 UTF-8 解码这些 GBK 字节，导致乱码。换行符（0x0D 0x0A）之后的 GBK 字节被截断，表现为"只能看到第一行"。
+PowerShell 5.1 在通过管道向原生可执行文件（node.exe）传递数据时，会将 UTF-16LE 内部字符串转为系统活动代码页（中文 Windows = CP936/GBK）。botmux send 的 readStdin() 以 UTF-8 解码这些 GBK 字节，得到乱码（夹带 U+FFFD 替换字符），在飞书卡片上表现为"只能看到第一行/乱码"。注意：字节其实都完整到达了 Node，按 GBK 正确解码即可还原全文——并非真的丢字节。
 
 现有检测 rejectLikelyWindowsStdinMojibake 只捕获中文变 ? 的情况，漏掉了截断场景。
 
@@ -50,8 +48,7 @@ sequenceDiagram
 
     User->>PS51: "测试\n第一项"
     PS51->>Pipe: UTF-16LE → GBK (CP936)
-    Note over Pipe: 换行符 0D 0A 后字节被截断
-    Pipe->>Node: GBK 字节（不完整）
+    Pipe->>Node: GBK 字节（完整到达）
     Node->>Node: toString('utf-8') → 乱码
     Node->>Lark: 发送乱码 JSON
     Lark-->>User: 显示乱码/截断内容
@@ -61,7 +58,8 @@ sequenceDiagram
 
 | 传参方式 | 编码路径 | 结果 |
 |---------|---------|------|
-| 位置参数/stdin | UTF-16LE → GBK → 被 Node 当 UTF-8 读 | 乱码/截断 |
+| stdin（管道/heredoc） | UTF-16LE → GBK → 被 Node 当 UTF-8 读 | 乱码（本文修复的对象） |
+| 位置参数（多行） | PS5.1 拼 native 命令行时拆断参数（与编码无关） | 截断 |
 | --content-file | `readFileSync(path, 'utf-8')` 直接读文件 | 正常（文件已 UTF-8 保存） |
 
 ## 方案对比
@@ -69,7 +67,9 @@ sequenceDiagram
 ### 方案 A：源码自动编码探测（推荐）
 在 readStdin() 中对 Windows 平台自动检测并转换编码：
 
-Node.js v24.12.0 内置 ICU 支持 new TextDecoder('gbk')，无需额外依赖。收集原始字节后，先用 GBK 解码，检查是否包含 CJK 字符——如果是则使用 GBK 结果，否则回退 UTF-8。
+Node.js（官方构建默认带 full-ICU）支持 new TextDecoder('gbk')，无需额外依赖。收集原始字节后，**先按严格 UTF-8 解码（fatal: true）**：合法 UTF-8（绝大多数情况——pwsh7 / cmd 开 UTF-8 代码页 / Git Bash / agent 用 heredoc 发的多行中文）必然解码成功、原样返回；只有当字节不是合法 UTF-8（PS5.1 的 GBK 字节序列几乎不可能凑成合法 UTF-8）时才回退 GBK。
+
+> ⚠️ 不能反过来「先 GBK、含 CJK 就用 GBK」：合法 UTF-8 的中文/emoji 用 GBK 去解照样会产出（乱码的）CJK 字符，分不出真假，会把所有正常 UTF-8 输入误解成乱码（如 UTF-8 `测试` → `娴嬭瘯`）。这是本方案最关键的一点。
 
 优点：用户无感知、零依赖、适配所有 Windows shell（cmd/PowerShell 5.1/PS7）
 缺点：需要改源码并重新 build
