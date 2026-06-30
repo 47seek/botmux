@@ -4,7 +4,7 @@
 import net from 'node:net';
 import { hostname } from 'node:os';
 import { WebSocket, createWebSocketStream } from 'ws';
-import { setPlatformTeams, type PlatformBinding, type PlatformTeam } from './binding.js';
+import { setPlatformTeams, clearPlatformBinding, type PlatformBinding, type PlatformTeam } from './binding.js';
 
 /** 本机一个 botmux bot 的概要（上报给平台，供团队页「人→机器→bot」展示 + 拉群）。 */
 export interface PlatformBotInfo {
@@ -89,6 +89,8 @@ export function startPlatformTunnelClient(opts: TunnelClientOptions): TunnelClie
         joinTeam(msg.teamId, msg.teamName || msg.teamId, sock);
       } else if (msg.type === 'leave-team' && msg.teamId) {
         leaveTeam(msg.teamId, sock);
+      } else if (msg.type === 'unbound') {
+        handleUnbound(sock);
       }
     });
 
@@ -161,6 +163,25 @@ export function startPlatformTunnelClient(opts: TunnelClientOptions): TunnelClie
     persistTeams();
     opts.log('退出团队', { teamId });
     sendHeartbeat(sock);
+  }
+
+  // 平台侧 owner 在「我的机器」点了解绑：清掉本地绑定文件并彻底停止隧道（不再重连）。
+  // 平台同时已吊销该 machine token，故即便这条消息没送达、旧 token 重连也会被握手拒掉（401）。
+  // dashboard 进程本身不退出——本机 bot 照常跑，只是不再对平台暴露；下次 `botmux bind` 即可重新绑定。
+  function handleUnbound(sock: WebSocket): void {
+    opts.log('平台已解绑本机，清除本地绑定并停止隧道');
+    stopped = true; // 必须先置位：下面 close 会触发 scheduleReconnect，stopped 让它早退、不再重连
+    cleanupSock();
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
+    clearPlatformBinding();
+    try {
+      sock.close(4005, 'unbound');
+    } catch {
+      /* ignore */
+    }
   }
 
   function persistTeams(): void {
