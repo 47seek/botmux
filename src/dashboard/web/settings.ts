@@ -6,6 +6,7 @@ interface MaintenanceCfg { autoUpdate?: MaintenanceTaskCfg; autoRestart?: Mainte
 interface DashboardSettings {
   publicReadOnly: boolean;
   openTerminalInFeishu: boolean;
+  chatBotDiscovery: boolean;
   repoPickerMode: 'all' | 'repos';
   maintenance: MaintenanceCfg;
   localDevInstall: boolean;
@@ -26,6 +27,7 @@ function parseSettings(s: any): DashboardSettings {
   return {
     publicReadOnly: s?.publicReadOnly === true,
     openTerminalInFeishu: s?.openTerminalInFeishu === true,
+    chatBotDiscovery: s?.chatBotDiscovery !== false, // default ON
     repoPickerMode: s?.repoPickerMode === 'repos' ? 'repos' : 'all',
     maintenance: (s?.maintenance && typeof s.maintenance === 'object') ? s.maintenance : {},
     localDevInstall: s?.localDevInstall === true,
@@ -116,6 +118,15 @@ function renderSettingsBody(): string {
           <span class="switch" aria-hidden="true"></span>
           <span class="toggle-tx"><strong>${t('settings.openTerminalInFeishu')}</strong>
           <small>${t('settings.openTerminalInFeishuHelp')}</small></span>
+        </label>
+      </section>
+      <section class="bd-section">
+        <h3 class="bd-section-title">${t('settings.sectionCollab')}</h3>
+        <label class="toggle-row">
+          <input type="checkbox" data-setting="chatBotDiscovery" ${settings.chatBotDiscovery ? 'checked' : ''} ${dis}>
+          <span class="switch" aria-hidden="true"></span>
+          <span class="toggle-tx"><strong>${t('settings.chatBotDiscovery')}</strong>
+          <small>${t('settings.chatBotDiscoveryHelp')}</small></span>
         </label>
       </section>
       <section class="bd-section">

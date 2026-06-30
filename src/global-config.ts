@@ -95,6 +95,10 @@ export interface DashboardGlobalConfig {
   /** When true, terminal buttons on Feishu cards use Feishu's sidebar web_url
    *  wrapper. Default false opens the terminal URL directly. */
   openTerminalInFeishu?: boolean;
+  /** Experimental current-chat bot discovery via Lark `/members/bots`. Default
+   *  ON (absent ⇒ enabled); set false to disable from the dashboard. Read live
+   *  by the daemon — see config.ts `resolveChatBotDiscoveryConfig`. */
+  chatBotDiscovery?: boolean;
 }
 
 /** Loosely validate a `voice` block: keep it only if it's an object with a
@@ -191,6 +195,7 @@ function readDashboard(raw: unknown): DashboardGlobalConfig | undefined {
   const out: DashboardGlobalConfig = {};
   if (typeof d.publicReadOnly === 'boolean') out.publicReadOnly = d.publicReadOnly;
   if (typeof d.openTerminalInFeishu === 'boolean') out.openTerminalInFeishu = d.openTerminalInFeishu;
+  if (typeof d.chatBotDiscovery === 'boolean') out.chatBotDiscovery = d.chatBotDiscovery;
   return Object.keys(out).length > 0 ? out : undefined;
 }
 

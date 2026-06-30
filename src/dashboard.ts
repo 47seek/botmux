@@ -218,6 +218,8 @@ const attaching = new Set<string>();   // dedup concurrent attaches per appId
 interface ResolvedDashboardSettings {
   publicReadOnly: boolean;
   openTerminalInFeishu: boolean;
+  /** Experimental current-chat bot discovery via Lark `/members/bots`. Default ON. */
+  chatBotDiscovery: boolean;
   repoPickerMode: RepoPickerMode;
   /** Auto-update / auto-restart schedule (off by default). */
   maintenance: MaintenanceConfig;
@@ -237,6 +239,7 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
   return {
     publicReadOnly: dashboard.publicReadOnly ?? config.dashboard.publicReadOnly,
     openTerminalInFeishu: dashboard.openTerminalInFeishu === true,
+    chatBotDiscovery: dashboard.chatBotDiscovery !== false, // default ON
     repoPickerMode: global.repoPickerMode ?? 'all',
     maintenance: global.maintenance ?? {},
     localDevInstall: isLocalDevInstall(),
