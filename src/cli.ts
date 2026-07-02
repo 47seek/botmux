@@ -11,7 +11,8 @@
  *   botmux restart [--include-pm2] — restart daemon (optionally restart PM2 God too)
  *   botmux logs [--lines] — view daemon logs
  *   botmux status         — show daemon status
- *   botmux upgrade        — upgrade to latest version
+ *   botmux upgrade [--with-app] — upgrade CLI, optionally update Desktop App too
+ *   botmux app install|smoke — install or smoke-check the macOS desktop app
  *   botmux list           — interactive session picker (TUI), attach to tmux
  *   botmux list --plain   — plain table output (for piping / scripts)
  *   botmux delete <id>    — close a session by ID prefix
@@ -67,7 +68,6 @@ import { firstPositional } from './cli/arg-utils.js';
 import { dispatchPrimaryMessage, findStdinAliasAttachment, sendFileAttachments } from './cli/send-dispatch.js';
 import { buildPm2SpawnCommand } from './cli/pm2-command.js';
 import { callDashboard, type DashboardEndpoint, type DashboardResult } from './cli/dashboard-endpoint.js';
-import { npmGlobalUpdateCwd } from './core/maintenance.js';
 import { loadDashboardSecret } from './dashboard/auth.js';
 import { rejectLikelyWindowsStdinMojibake, decodeStdinBytes } from './cli/stdin-encoding.js';
 import {
@@ -97,6 +97,7 @@ import {
 import { buildBridgeSendMarkerContent } from './services/bridge-fallback-gate.js';
 import { writeManualIntentIfAbsentTo } from './services/restart-intent-store.js';
 import { stripLegacyPendingCardFields } from './services/session-store.js';
+import { resolveEffectiveBotmuxVersion } from './utils/version-info.js';
 
 // Resolve the CLI's UI locale once from the global config file, so subsequent
 // CLI output (and any t() callers that don't pass an explicit locale) honour
@@ -2180,17 +2181,6 @@ function cmdStatus(): void {
   runPm2(['status']);
 }
 
-function cmdUpgrade(): void {
-  console.log('🔄 升级中...');
-  try {
-    execSync('npm install -g botmux@latest', { cwd: npmGlobalUpdateCwd(), stdio: 'inherit' });
-    console.log('\n✅ 升级完成。运行 botmux restart 以应用更新。');
-  } catch {
-    console.error('❌ 升级失败，请手动运行: npm install -g botmux@latest');
-    process.exit(1);
-  }
-}
-
 /**
  * Call one of the dashboard's loopback HMAC `/__cli/*` endpoints. Thin wrapper
  * over {@link callDashboard}, which handles 404 disambiguation and self-heals a
@@ -3589,7 +3579,8 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
   restart     重启 daemon（自动恢复活跃会话；--include-pm2 同时重启 PM2 God）
   logs        查看 daemon 日志（--lines N, --bot <0-based-index|pm2-name|appId>）
   status      查看 daemon 状态
-  upgrade     升级到最新版本
+  upgrade     升级到最新版本（--with-app 同步更新桌面 App，--app-url 指定 App zip）
+  app         安装或冒烟检查 macOS App（install / smoke）
   dashboard   打印新的 Web Dashboard 一次性登录 URL（旧 token 同时失效）
   list        列出活跃会话（交互式选择并连接 tmux）
               --plain  纯文本表格输出（管道/脚本场景）
@@ -6379,7 +6370,12 @@ function getVersion(): string {
   const pkgPath = join(PKG_ROOT, 'package.json');
   try {
     const pkg = JSON.parse(readFileSync(pkgPath, 'utf-8'));
-    return pkg.version || 'unknown';
+    // Source checkouts keep package.json at 0.0.0; show the release tag so CLI
+    // and Desktop agree on the user-facing version.
+    return resolveEffectiveBotmuxVersion({
+      rawVersion: typeof pkg.version === 'string' ? pkg.version : null,
+      rootDir: PKG_ROOT,
+    });
   } catch {
     return 'unknown';
   }
@@ -6531,7 +6527,16 @@ switch (command) {
   case 'restart': await cmdRestart(); break;
   case 'logs':    cmdLogs(); break;
   case 'status':  cmdStatus(); break;
-  case 'upgrade': cmdUpgrade(); break;
+  case 'upgrade': {
+    const { createDefaultUpgradeDeps, runUpgradeCommand } = await import('./cli/upgrade.js');
+    process.exitCode = await runUpgradeCommand(process.argv.slice(3), createDefaultUpgradeDeps());
+    break;
+  }
+  case 'app': {
+    const { createDefaultAppInstallDeps, runAppCommand } = await import('./cli/app-install.js');
+    process.exitCode = await runAppCommand(process.argv.slice(3), createDefaultAppInstallDeps(PKG_ROOT));
+    break;
+  }
   case 'dashboard': await cmdDashboard(); break;
   case 'bind': {
     // `botmux bind <code>` — 把本机绑定到中心化平台
