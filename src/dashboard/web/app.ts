@@ -1,6 +1,6 @@
 // Dashboard SPA entry: hash router + bootstrap + online indicator.
 import { bootstrap, store } from './store.js';
-import { wireBotOnboardingButton } from './bot-onboarding.js';
+import { consumeBotOnboardingRouteAction, wireBotOnboardingButton } from './bot-onboarding.js';
 import { attentionReason, attentionWaitSince, botDisplayName, escapeHtml, loadNameMaps, relTime, t, ui } from './ui.js';
 import { initThemeMenu, paintThemeMenu } from './theme-menu.js';
 import { normalizeDashboardLocale, type DashboardLocale } from './i18n.js';
@@ -22,6 +22,25 @@ const root = document.getElementById('root')!;
 // Defaults keep the authed / legacy UX if the probe fails.
 let isAuthed = true;
 let publicReadOnly = false;
+
+function readShellLocale(): DashboardLocale | null {
+  const fromSearch = normalizeDashboardLocale(new URLSearchParams(location.search).get('locale'));
+  if (fromSearch) return fromSearch;
+
+  const queryIndex = location.hash.indexOf('?');
+  if (queryIndex < 0) return null;
+  // Desktop keeps shell flags inside the hash so auth redirects preserve them.
+  return normalizeDashboardLocale(new URLSearchParams(location.hash.slice(queryIndex + 1)).get('locale'));
+}
+
+function applyShellLocaleFromHash(): boolean {
+  const shellLocale = readShellLocale();
+  if (!shellLocale || shellLocale === ui.locale) return false;
+  // Desktop changes locale by rewriting the embedded webview hash. That is an
+  // in-page navigation, so the dashboard must re-apply locale before routing.
+  ui.setLocale(shellLocale);
+  return true;
+}
 
 // Management pages are token-gated end-to-end (no public GET) — a read-only
 // visitor must not reach them. `data-route` values from index.html's nav.
@@ -155,11 +174,9 @@ async function loadAuthState(): Promise<void> {
       // board's writable-terminal segment reads ui.authed at render time).
       ui.authed = isAuthed;
       publicReadOnly = !!(j.settings && j.settings.publicReadOnly);
-      // The global UI locale (`botmux lang`) is the single source of truth: when
-      // set, it wins over the browser-detected / locally-stored locale so the
-      // dashboard always reflects the same language as the Feishu cards. When
-      // unset (null), keep the browser/local default ui.init() already picked.
-      const serverLocale = normalizeDashboardLocale(j.lang);
+      // Desktop can pass an explicit locale through the hash route; otherwise
+      // the global UI locale (`botmux lang`) remains the browser dashboard source.
+      const serverLocale = readShellLocale() ?? normalizeDashboardLocale(j.lang);
       if (serverLocale) ui.setLocale(serverLocale);
     }
   } catch { /* keep defaults */ }
@@ -291,7 +308,13 @@ async function route() {
     routeState.pageDispose = null;
     routeState.rerenderOnUiChange = true;
   } finally {
-    if (seq === routeState.seq) highlightNav(hash);
+    if (seq === routeState.seq) {
+      highlightNav(hash);
+      // Desktop shell topbar actions arrive as hash query commands because the
+      // embedded dashboard topbar is hidden. Consume after route render so the
+      // page is stable before opening a modal.
+      if (isAuthed) consumeBotOnboardingRouteAction();
+    }
   }
 }
 
@@ -389,6 +412,7 @@ function wireCreateSessionButton(): void {
 // Keep bootstrap sequencing explicit even though the dashboard bundle is ESM.
 void (async () => {
   ui.init();
+  applyShellLocaleFromHash();
   wireChromeControls();
   wireBotOnboardingButton();
   wireCreateSessionButton();
@@ -411,6 +435,8 @@ void (async () => {
     console.error('botmux dashboard bootstrap failed', err);
     store.setOnline(false);
   }
-  window.addEventListener('hashchange', () => void route());
+  window.addEventListener('hashchange', () => {
+    if (!applyShellLocaleFromHash()) void route();
+  });
   void route();
 })();

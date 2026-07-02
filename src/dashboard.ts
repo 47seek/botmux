@@ -101,6 +101,7 @@ import { startPlatformTunnelClient, type PlatformBotInfo, type PlatformTeamSyncM
 import { applyPlatformTeamSync, getPlatformTeamSyncRev, listPlatformTeams } from './services/platform-team-store.js';
 import { getBotUnionId } from './services/bot-union-ids-store.js';
 import { cleanupIdleSessions, parseIdleCleanupHours } from './dashboard/session-cleanup.js';
+import { handleDesktopCompat } from './dashboard/compat.js';
 
 const SECRET_PATH = join(homedir(), '.botmux', '.dashboard-secret');
 const TOKEN_PATH = join(homedir(), '.botmux', '.dashboard-token');
@@ -1051,6 +1052,13 @@ const server = createServer(async (req, res) => {
     if (url.pathname === '/__selfcheck') {
       res.writeHead(200, { 'content-type': 'text/plain' });
       return res.end(DASHBOARD_SELF_NONCE);
+    }
+
+    // Desktop shell compatibility probe (read-only, no token required). Keep it
+    // outside the browser auth gate so packaged desktop apps can decide whether
+    // this runtime speaks their dashboard protocol before loading the SPA.
+    if (handleDesktopCompat(req, res, url)) {
+      return;
     }
 
     // Web terminal reverse-proxy: `/s/<sessionId>/*` → the owning bot daemon's

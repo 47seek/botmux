@@ -372,7 +372,7 @@ async function pollJob(id: string): Promise<void> {
   }
 }
 
-async function openBotOnboarding(): Promise<void> {
+export async function openBotOnboarding(): Promise<void> {
   stopPolling();
   const d = ensureDialog();
   // 先出表单 (含 CLI 下拉占位), 再异步填充选项——避免空白等待.
@@ -381,6 +381,28 @@ async function openBotOnboarding(): Promise<void> {
   const options = await fetchCliOptions();
   // 用户可能在 fetch 期间已经提交/关闭; 仅当仍停留在表单时刷新选项.
   if (d.open && d.querySelector('#onboarding-form')) renderForm(options);
+}
+
+function readHashActionParams(): { path: string; params: URLSearchParams } | null {
+  const queryIndex = location.hash.indexOf('?');
+  if (queryIndex < 0) return null;
+  return {
+    path: location.hash.slice(0, queryIndex) || '#/',
+    params: new URLSearchParams(location.hash.slice(queryIndex + 1)),
+  };
+}
+
+export function consumeBotOnboardingRouteAction(): boolean {
+  const action = readHashActionParams();
+  if (!action || action.params.get('open') !== 'bot-onboarding') return false;
+
+  action.params.delete('open');
+  const query = action.params.toString();
+  // Desktop uses this hash action as a one-shot command. Clearing it prevents
+  // route re-renders or locale updates from reopening the same dialog.
+  history.replaceState(null, '', query ? `${action.path}?${query}` : action.path);
+  void openBotOnboarding();
+  return true;
 }
 
 export function wireBotOnboardingButton(): void {
