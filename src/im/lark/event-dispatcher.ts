@@ -20,7 +20,7 @@ import { recordObservedBots, listObservedBots } from '../../services/observed-bo
 import { isTeamBot, recordTeamBot } from '../../services/team-bots-store.js';
 import { isTeamGroupChat } from '../../services/team-groups-store.js';
 import { isPlatformTeamBot } from '../../services/platform-team-store.js';
-import { recordBotUnionId } from '../../services/bot-union-ids-store.js';
+import { recordBotUnionId, recordBotUnionIdFromMentions } from '../../services/bot-union-ids-store.js';
 import { getDocSubscription, listAllDocSubscriptions, type DocSubscription } from '../../services/doc-subs-store.js';
 import { getDocComment, isBotAuthoredReply, hasBotSentinel, commentTriggerAllowed } from './doc-comment.js';
 import { BOTMUX_REQUIRED_SCOPES, DOC_FEATURE_SCOPES, DOC_COMMENT_EVENT, buildScopeDeepLink } from '../../setup/verify-permissions.js';
@@ -1644,6 +1644,13 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         // Lark open_id is per-app: these IDs are correct for our app context.
         if (message.mentions?.length > 0) {
           updateBotOpenIdCrossRef(config.session.dataDir, larkAppId, message.mentions);
+          // Learn our OWN union_id from any @ of ourselves: Lark stamps every
+          // mention with the target's union_id, and mention-driven delivery
+          // works even where the self-message echo never arrives（无 receive-all
+          // scope 的应用收不到自己发的消息；bot-only 大厅实测完全不推事件）。
+          if (recordBotUnionIdFromMentions(config.session.dataDir, larkAppId, getBot(larkAppId).botOpenId, message.mentions)) {
+            logger.info(`[${larkAppId}] learned own bot union_id from @mention`);
+          }
         }
 
         const chatId = message.chat_id;
