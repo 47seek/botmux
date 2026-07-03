@@ -250,6 +250,19 @@ export function terminalMultiUrl(url: string): Record<string, string> {
     : directMultiUrl(url);
 }
 
+function localCliLabel(cliName: string): string {
+  return cliName.replace(/\s+(App|CLI)$/i, '');
+}
+
+function openLocalTerminalButton(actionBase: Record<string, string>, cliName: string, locale?: Locale): any {
+  return {
+    tag: 'button',
+    text: { tag: 'plain_text', content: t('card.btn.open_local_cli', { cliName: localCliLabel(cliName) }, locale) },
+    type: 'default',
+    value: { action: 'open_local_terminal', ...actionBase },
+  };
+}
+
 /**
  * Build a Feishu interactive card with terminal button + action buttons.
  * @param showManageButtons - When true, include restart & close buttons (used in the private write-link card — delivered as a "visible-to-you" ephemeral card in plain groups, or DM'd as fallback).
@@ -274,6 +287,7 @@ export function buildSessionCard(
       type: 'primary',
       multi_url: terminalMultiUrl(terminalUrl),
     },
+    openLocalTerminalButton(actionBase, cliName, locale),
   ];
   if (!showManageButtons) {
     actions.push({
@@ -718,6 +732,7 @@ export function buildStreamingCard(
     type: 'primary',
     multi_url: terminalMultiUrl(terminalUrl),
   });
+  headerActions.push(openLocalTerminalButton(actionBase, cliName, locale));
   if (status === 'limited' && usageLimit?.retryReady) {
     headerActions.push({
       tag: 'button',
@@ -882,6 +897,7 @@ export function buildPrivateSnapshotCard(
         type: 'primary',
         multi_url: terminalMultiUrl(terminalUrl),
       },
+      openLocalTerminalButton(actionBase, cliName, locale),
       {
         tag: 'button',
         text: { tag: 'plain_text', content: t('card.btn.get_write_link', undefined, locale) },

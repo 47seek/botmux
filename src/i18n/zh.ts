@@ -4,8 +4,9 @@
  */
 export const messages: Record<string, string> = {
   // ─── Card buttons ────────────────────────────────────────────────────────
-  'card.btn.open_terminal': '🖥️ 打开终端',
-  'card.btn.open_writable_terminal': '🖥️ 打开可操作终端',
+  'card.btn.open_terminal': '🖥️ 打开 Web 终端',
+  'card.btn.open_writable_terminal': '🖥️ 打开可操作 Web 终端',
+  'card.btn.open_local_cli': '💻 打开 {cliName}',
   'card.btn.get_write_link': '🔑 获取操作链接',
   'card.writable_terminal_link': '🔑 可操作终端（群内可见，任何人可直接操控）：[{url}]({url})',
   'card.btn.restart_cli': '🔄 重启 {cliName}',
@@ -54,7 +55,7 @@ export const messages: Record<string, string> = {
   'card.body.choose_label': '选择:',
   'card.usage_limit.retry_at': '⚠️ 当前已达到 {cliName} 使用限额。请在 {retryLabel} 后再试。',
   'card.usage_limit.retry_ready': '✅ {cliName} 限额预计已刷新。你可以重发上一条任务，或直接发送新消息。',
-  'card.private.snapshot_note': '🔒 仅你可见的静态快照（不会实时刷新）。点「打开终端」查看实时画面。',
+  'card.private.snapshot_note': '🔒 仅你可见的静态快照（不会实时刷新）。点「打开 Web 终端」查看实时画面。',
 
   // ─── Repo select card ────────────────────────────────────────────────────
   'card.repo.title': '📁 项目仓库管理',
@@ -622,6 +623,11 @@ export const messages: Record<string, string> = {
   'card.voice.toast_need_auth': '🔒 你没有该机器人的使用权限，无法生成语音总结，请联系管理员授权',
   'card.action.takeover_retired': '⚠️ 旧版"接管"按钮已停用。bridge 模式下原 CLI 由 botmux 桥接，无需接管即可在飞书中收到回答。如需 /resume 完整接管能力，请等待 /adopt --takeover 命令上线。',
   'card.action.terminal_not_ready': '⚠️ 终端尚未就绪，请稍后再试。',
+  'card.action.local_terminal_opened': '💻 已请求打开本机 {cliName}',
+  'card.action.local_terminal_unsupported': '⚠️ 当前 {cliName} 会话暂不支持本机直开，请使用 Web 终端。',
+  'card.action.local_cli_missing': '⚠️ 本机未找到 {cliName} 可执行文件（{executable}），请先安装或配置 PATH / cliPathOverride。',
+  'card.action.local_terminal_failed': '⚠️ 打开本机 CLI 失败：{reason}',
+  'card.action.local_terminal_no_permission': '🔒 没有操作权限，无法打开本机 CLI',
   'card.action.write_link_sent': '🔑 操作链接已私密发送，请查收',
   'card.action.write_link_no_permission': '🔒 没有操作权限，无法获取操作链接',
   'card.action.session_gone': '⚠️ 会话已不在线，操作未完成',
@@ -967,7 +973,7 @@ export const messages: Record<string, string> = {
   'settings.sectionMaintenance': '维护',
   'settings.publicReadOnly': '公开只读模式',
   'settings.publicReadOnlyHelp': '允许无 token 访问只读 API。',
-  'settings.openTerminalInFeishu': '飞书内打开终端',
+  'settings.openTerminalInFeishu': '飞书内打开 Web 终端',
   'settings.openTerminalInFeishuHelp': '终端链接默认在飞书 webview 打开。',
   'settings.autoUpdate': '每日自动更新',
   'settings.autoUpdateHelp': '在每天指定时间自动拉取最新版本。',

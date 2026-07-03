@@ -1,8 +1,9 @@
 /** English translations — mirrors the keys defined in `zh.ts`. */
 export const messages: Record<string, string> = {
   // ─── Card buttons ────────────────────────────────────────────────────────
-  'card.btn.open_terminal': '🖥️ Open Terminal',
-  'card.btn.open_writable_terminal': '🖥️ Open Writable Terminal',
+  'card.btn.open_terminal': '🖥️ Open Web Terminal',
+  'card.btn.open_writable_terminal': '🖥️ Open Writable Web Terminal',
+  'card.btn.open_local_cli': '💻 Open {cliName}',
   'card.btn.get_write_link': '🔑 Get Write Link',
   'card.writable_terminal_link': '🔑 Writable terminal (visible to everyone here — anyone can drive it): [{url}]({url})',
   'card.btn.restart_cli': '🔄 Restart {cliName}',
@@ -51,7 +52,7 @@ export const messages: Record<string, string> = {
   'card.body.choose_label': 'Choice:',
   'card.usage_limit.retry_at': '⚠️ {cliName} usage limit has been reached. Try again after {retryLabel}.',
   'card.usage_limit.retry_ready': '✅ {cliName} usage limit should have reset. Retry the last task, or send a new message.',
-  'card.private.snapshot_note': '🔒 Private static snapshot (visible only to you, not live-updating). Tap Open Terminal for the live view.',
+  'card.private.snapshot_note': '🔒 Private static snapshot (visible only to you, not live-updating). Tap Open Web Terminal for the live view.',
 
   // ─── Repo select card ────────────────────────────────────────────────────
   'card.repo.title': '📁 Project Repository',
@@ -619,6 +620,11 @@ export const messages: Record<string, string> = {
   'card.voice.toast_need_auth': '🔒 You are not authorized to use this bot, so you cannot generate a voice summary. Ask an admin for access.',
   'card.action.takeover_retired': '⚠️ The old "Take Over" button is retired. In bridge mode, botmux bridges the original CLI so replies still come back to Lark — no takeover needed. Full takeover (`/adopt --takeover`) is on the roadmap.',
   'card.action.terminal_not_ready': '⚠️ Terminal is not ready yet, please try again shortly.',
+  'card.action.local_terminal_opened': '💻 Requested opening local {cliName}.',
+  'card.action.local_terminal_unsupported': '⚠️ This {cliName} session cannot be opened locally yet. Use Web Terminal instead.',
+  'card.action.local_cli_missing': '⚠️ Could not find the local {cliName} executable ({executable}). Install it or configure PATH / cliPathOverride.',
+  'card.action.local_terminal_failed': '⚠️ Failed to open local CLI: {reason}',
+  'card.action.local_terminal_no_permission': '🔒 You do not have operate permission, so you cannot open the local CLI.',
   'card.action.write_link_sent': '🔑 The action link has been sent to you privately — please check your messages.',
   'card.action.write_link_no_permission': '🔒 You do not have operate permission, so you cannot get the action link.',
   'card.action.session_gone': '⚠️ This session is no longer active; the action was not completed.',
@@ -964,7 +970,7 @@ export const messages: Record<string, string> = {
   'settings.sectionMaintenance': 'Maintenance',
   'settings.publicReadOnly': 'Public read-only',
   'settings.publicReadOnlyHelp': 'Allow tokenless access to read-only APIs.',
-  'settings.openTerminalInFeishu': 'Open terminal in Feishu',
+  'settings.openTerminalInFeishu': 'Open Web Terminal in Feishu',
   'settings.openTerminalInFeishuHelp': 'Terminal links open in the Feishu in-app webview by default.',
   'settings.autoUpdate': 'Daily auto-update',
   'settings.autoUpdateHelp': 'Auto-pull the latest version at the scheduled time.',
