@@ -2776,10 +2776,12 @@ const hallAnnounceStatePath = () => join(config.session.dataDir, 'hall-announce-
 function readHallAnnounceState(): Record<string, { lastAt: number; tries: number }> {
   try { return JSON.parse(readFileSync(hallAnnounceStatePath(), 'utf-8')); } catch { return {}; }
 }
-function bumpHallAnnounceState(key: string): void {
+/** 记录一次打卡尝试。consumeTry=false 只刷新 lastAt（发送失败：保住 10 分钟退避
+ *  但不烧预算——否则 daemon 掉线期间就把 6 次上限烧光、恢复后永久跳过，Codex review）。 */
+function bumpHallAnnounceState(key: string, consumeTry: boolean): void {
   const all = readHallAnnounceState();
   const cur = all[key];
-  all[key] = { lastAt: Date.now(), tries: (cur?.tries ?? 0) + 1 };
+  all[key] = { lastAt: Date.now(), tries: (cur?.tries ?? 0) + (consumeTry ? 1 : 0) };
   try { atomicWriteFileSync(hallAnnounceStatePath(), JSON.stringify(all, null, 2) + '\n'); } catch { /* 尽力而为 */ }
 }
 /** 发送方 daemon 的 mention cross-ref（name → 本 app 视角 open_id）。 */
@@ -2830,8 +2832,8 @@ async function maybeAnnounceHallPresence(): Promise<void> {
         // 没有可教的目标：已入册 → 无事可做；未入册 → 仅首次发裸打卡碰回声运气，
         // 之后静默等别人教（不发不计次，cross-ref 或 roster 变化后自然恢复）。
         if (targets.length === 0 && (selfLearned || (st?.tries ?? 0) > 0)) continue;
-        bumpHallAnnounceState(throttleKey);
-        state[throttleKey] = { lastAt: now, tries: (st?.tries ?? 0) + 1 };
+        // 成功发出才消耗预算；失败只刷新 lastAt 保住退避间隔（见 bumpHallAnnounceState）。
+        let sent = false;
         try {
           const r = await proxyToDaemon(bot.appId, '/api/platform/hall-announce', {
             method: 'POST',
@@ -2842,13 +2844,16 @@ async function maybeAnnounceHallPresence(): Promise<void> {
           if (!r.ok || !(j as { ok?: boolean }).ok) {
             logger.warn(`[platform-tunnel] 大厅打卡失败 bot=${bot.appId} chat=${hallChatId.substring(0, 12)}: ${(j as { error?: string }).error ?? r.status}`);
           } else {
+            sent = !(j as { skipped?: string }).skipped;
             const mentioned = (j as { mentioned?: string[] }).mentioned ?? [];
             const unresolved = (j as { unresolved?: string[] }).unresolved ?? [];
-            logger.info(`[platform-tunnel] 大厅打卡已发 bot=${bot.appId} chat=${hallChatId.substring(0, 12)}${mentioned.length ? ` 点名=[${mentioned.join(',')}]` : ''}${unresolved.length ? ` 未解析=[${unresolved.join(',')}]` : ''}`);
+            if (sent) logger.info(`[platform-tunnel] 大厅打卡已发 bot=${bot.appId} chat=${hallChatId.substring(0, 12)}${mentioned.length ? ` 点名=[${mentioned.join(',')}]` : ''}${unresolved.length ? ` 未解析=[${unresolved.join(',')}]` : ''}`);
           }
         } catch (e) {
           logger.warn(`[platform-tunnel] 大厅打卡请求异常 bot=${bot.appId}: ${(e as Error).message}`);
         }
+        bumpHallAnnounceState(throttleKey, sent);
+        state[throttleKey] = { lastAt: now, tries: (st?.tries ?? 0) + (sent ? 1 : 0) };
       }
     }
   } catch (e) {
