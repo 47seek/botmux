@@ -117,9 +117,9 @@ describe.skipIf(process.platform !== 'linux')('localTerminalCapable (linux)', ()
   });
 
   it('is true with a GUI session or an explicit terminal override', () => {
-    for (const key of ['DISPLAY', 'WAYLAND_DISPLAY', 'BOTMUX_TERMINAL']) {
+    for (const key of ['DISPLAY', 'WAYLAND_DISPLAY', 'BOTMUX_TERMINAL', 'TERMINAL']) {
       clearGuiEnv();
-      vi.stubEnv(key, key === 'BOTMUX_TERMINAL' ? 'kitty' : ':0');
+      vi.stubEnv(key, key.endsWith('TERMINAL') ? 'kitty' : ':0');
       expect(localTerminalCapable()).toBe(true);
     }
   });
