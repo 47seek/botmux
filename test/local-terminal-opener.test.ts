@@ -1,5 +1,5 @@
-import { describe, expect, it } from 'vitest';
-import { localCliCommandForSession } from '../src/core/local-terminal-opener.js';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { localCliCommandForSession, localTerminalCapable, terminalLaunchArgs } from '../src/core/local-terminal-opener.js';
 import type { DaemonSession } from '../src/core/types.js';
 
 function session(overrides: Partial<DaemonSession> = {}): DaemonSession {
@@ -80,5 +80,47 @@ describe('localCliCommandForSession', () => {
       cliId: 'traex',
       executable: '/definitely/missing/traex',
     });
+  });
+});
+
+describe('terminalLaunchArgs', () => {
+  it('forwards via -e for the xterm lineage (konsole/alacritty/xterm) and unknown emulators', () => {
+    for (const term of ['konsole', 'alacritty', 'xterm', 'foot']) {
+      expect(terminalLaunchArgs(term, 'zsh', 'echo hi')).toEqual(['-e', 'zsh', '-lc', 'echo hi']);
+    }
+  });
+
+  it('uses -- for gnome-terminal and -x for xfce4-terminal', () => {
+    expect(terminalLaunchArgs('gnome-terminal', 'zsh', 'echo hi')).toEqual(['--', 'zsh', '-lc', 'echo hi']);
+    expect(terminalLaunchArgs('xfce4-terminal', 'zsh', 'echo hi')).toEqual(['-x', 'zsh', '-lc', 'echo hi']);
+  });
+
+  it('passes the command positionally for kitty and xdg-terminal-exec', () => {
+    expect(terminalLaunchArgs('kitty', 'zsh', 'echo hi')).toEqual(['zsh', '-lc', 'echo hi']);
+    expect(terminalLaunchArgs('xdg-terminal-exec', 'zsh', 'echo hi')).toEqual(['zsh', '-lc', 'echo hi']);
+  });
+});
+
+// macOS is unconditionally capable, so the env-driven cases only run on Linux.
+describe.skipIf(process.platform !== 'linux')('localTerminalCapable (linux)', () => {
+  afterEach(() => vi.unstubAllEnvs());
+
+  function clearGuiEnv() {
+    for (const key of ['DISPLAY', 'WAYLAND_DISPLAY', 'BOTMUX_TERMINAL', 'TERMINAL']) {
+      vi.stubEnv(key, undefined);
+    }
+  }
+
+  it('is false on headless hosts', () => {
+    clearGuiEnv();
+    expect(localTerminalCapable()).toBe(false);
+  });
+
+  it('is true with a GUI session or an explicit terminal override', () => {
+    for (const key of ['DISPLAY', 'WAYLAND_DISPLAY', 'BOTMUX_TERMINAL']) {
+      clearGuiEnv();
+      vi.stubEnv(key, key === 'BOTMUX_TERMINAL' ? 'kitty' : ':0');
+      expect(localTerminalCapable()).toBe(true);
+    }
   });
 });

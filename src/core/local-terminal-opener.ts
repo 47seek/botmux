@@ -184,6 +184,17 @@ function openCodexApp(): LocalTerminalOpenResult {
   };
 }
 
+/** Per-emulator command forwarding: gnome-terminal wants `--`, xfce4-terminal
+ *  `-x`, kitty / xdg-terminal-exec take the command as positional args, and the
+ *  xterm lineage (konsole / alacritty / xterm and most others, including
+ *  whatever BOTMUX_TERMINAL points at) wants `-e`. */
+export function terminalLaunchArgs(terminalBase: string, shell: string, command: string): string[] {
+  if (terminalBase === 'gnome-terminal') return ['--', shell, '-lc', command];
+  if (terminalBase === 'xfce4-terminal') return ['-x', shell, '-lc', command];
+  if (terminalBase === 'kitty' || terminalBase === 'xdg-terminal-exec') return [shell, '-lc', command];
+  return ['-e', shell, '-lc', command];
+}
+
 function openOnLinux(command: string): LocalTerminalOpenResult {
   const shell = process.env.SHELL || 'bash';
   const preferred = process.env.BOTMUX_TERMINAL || process.env.TERMINAL;
@@ -200,12 +211,22 @@ function openOnLinux(command: string): LocalTerminalOpenResult {
   const terminal = candidates.find(onPath);
   if (!terminal) return { ok: false, error: 'launcher_unavailable', detail: 'no terminal launcher found', command };
   const base = terminal.split('/').pop() || terminal;
-  const args = base === 'gnome-terminal' || base === 'xfce4-terminal'
-    ? ['--', shell, '-lc', command]
-    : [shell, '-lc', command];
-  const launched = spawnDetached(terminal, args);
+  const launched = spawnDetached(terminal, terminalLaunchArgs(base, shell, command));
   if (!launched.ok) return { ok: false, error: 'spawn_failed', detail: launched.error, command };
   return { ok: true, backend: 'cli', command, launcher: terminal };
+}
+
+/** Whether the daemon host can plausibly pop a native terminal window at all.
+ *  Gates the card button so headless/server deployments don't carry a button
+ *  that can only ever fail: macOS always qualifies (osascript + Terminal.app
+ *  ship with the OS); Linux only with a GUI session (DISPLAY/WAYLAND_DISPLAY)
+ *  or an explicit BOTMUX_TERMINAL/TERMINAL override. */
+export function localTerminalCapable(): boolean {
+  if (process.platform === 'darwin') return true;
+  if (process.platform === 'linux') {
+    return Boolean(process.env.DISPLAY || process.env.WAYLAND_DISPLAY || process.env.BOTMUX_TERMINAL || process.env.TERMINAL);
+  }
+  return false;
 }
 
 export function openLocalTerminalForSession(ds: DaemonSession): LocalTerminalOpenResult {

@@ -33,6 +33,10 @@ let cardTestHome: string;
 beforeEach(() => {
   cardTestHome = mkdtempSync(join(tmpdir(), 'botmux-card-builder-'));
   vi.stubEnv('HOME', cardTestHome);
+  // The local-CLI button is gated on localTerminalCapable() (headless hosts
+  // hide it) — pin a GUI-looking env so the button assertions below are
+  // deterministic on headless CI runners.
+  vi.stubEnv('DISPLAY', ':0');
   mkdirSync(dirname(globalConfigPath()), { recursive: true });
 });
 afterEach(() => {
@@ -261,6 +265,18 @@ describe('buildSessionCard', () => {
       const localBtn = actions.find((a: any) => a.value?.action === 'open_local_terminal');
       expect(localBtn.text.content).toContain('打开 Codex');
       expect(localBtn.text.content).not.toContain('App');
+    });
+
+    // On macOS the host is always terminal-capable, so the hidden state is untestable there.
+    it.skipIf(process.platform === 'darwin')('hides the local terminal button on headless hosts', () => {
+      vi.stubEnv('DISPLAY', undefined);
+      vi.stubEnv('WAYLAND_DISPLAY', undefined);
+      vi.stubEnv('BOTMUX_TERMINAL', undefined);
+      vi.stubEnv('TERMINAL', undefined);
+      const card = parse(buildSessionCard(SID, ROOT, URL, TITLE));
+      const actions = findActions(card);
+      expect(actions.some((a: any) => a.value?.action === 'open_local_terminal')).toBe(false);
+      expect(actions).toHaveLength(3);
     });
 
     it('should NOT include restart button', () => {
