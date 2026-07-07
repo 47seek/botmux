@@ -17,8 +17,11 @@ interface DashboardSettings {
   remoteAccess: boolean;
   /** Configured schedule-task timezone override (IANA), or '' when unset ⇒ follow host. */
   scheduleTimeZone: string;
-  /** Host's auto-detected local zone — the effective fallback when override is ''. */
+  /** Host's auto-detected local zone. */
   hostTimeZone: string;
+  /** TRUE effective zone (env → config → host) from scheduleTimeZone(). Use this
+   *  for "currently effective" / store sync — never reconstruct configured||host. */
+  effectiveScheduleTimeZone: string;
 }
 
 /** A handful of common IANA zones offered as a datalist for the timezone field. */
@@ -54,6 +57,14 @@ function parseSettings(s: any): DashboardSettings {
     remoteAccess: s?.remoteAccess === true,
     scheduleTimeZone: typeof s?.scheduleTimeZone === 'string' ? s.scheduleTimeZone : '',
     hostTimeZone: typeof s?.hostTimeZone === 'string' && s.hostTimeZone ? s.hostTimeZone : 'UTC',
+    // Prefer the backend's true effective zone (includes env override); fall back
+    // to configured||host only if an older backend didn't send it.
+    effectiveScheduleTimeZone:
+      typeof s?.effectiveScheduleTimeZone === 'string' && s.effectiveScheduleTimeZone
+        ? s.effectiveScheduleTimeZone
+        : (typeof s?.scheduleTimeZone === 'string' && s.scheduleTimeZone
+            ? s.scheduleTimeZone
+            : (typeof s?.hostTimeZone === 'string' && s.hostTimeZone ? s.hostTimeZone : 'UTC')),
   };
 }
 
@@ -185,10 +196,11 @@ function SettingsPage() {
       if (!r.ok || body.ok === false) throw new Error(body?.error ?? `HTTP ${r.status}`);
       const saved = parseSettings(body.settings);
       setSettings(saved);
-      // Keep the shared store's effective schedule zone in sync so the
-      // schedules/overview pages of THIS SPA session re-render immediately
-      // (other browsers pick it up via the schedule.timezone SSE event).
-      store.setScheduleTimeZone(saved.scheduleTimeZone || saved.hostTimeZone);
+      // Sync the shared store to the TRUE effective zone (env → config → host,
+      // as computed by the backend) so this SPA's schedules/overview re-render
+      // correctly — reconstructing configured||host here would drop an env
+      // override. Other browsers pick it up via the schedule.timezone SSE event.
+      store.setScheduleTimeZone(saved.effectiveScheduleTimeZone);
       setSettingsMsg({ text: tr('settings.saved'), cls: 'hint-ok' });
     } catch (e) {
       if (!mountedRef.current) return;
@@ -462,6 +474,7 @@ function SettingsBody(props: {
           <TimeZoneRow
             value={settings.scheduleTimeZone}
             host={settings.hostTimeZone}
+            effective={settings.effectiveScheduleTimeZone}
             disabled={dis || savingKey === 'scheduleTimeZone'}
             onSave={tz => {
               void props.onSave(
@@ -530,6 +543,9 @@ function SettingsBody(props: {
 export function TimeZoneRow(props: {
   value: string;
   host: string;
+  /** TRUE effective zone (env → config → host) for the "currently effective"
+   *  hint. Must come from the backend, not be reconstructed as value||host. */
+  effective: string;
   disabled: boolean;
   onSave(tz: string | null): void;
 }) {
@@ -544,7 +560,7 @@ export function TimeZoneRow(props: {
     props.onSave(next === '' ? null : next); // empty ⇒ clear override, follow host
   };
 
-  const effective = props.value.trim() || props.host;
+  const effective = props.effective || props.value.trim() || props.host;
   return (
     <label className="form-row">
       <span>{tr('settings.scheduleTimeZone')}</span>

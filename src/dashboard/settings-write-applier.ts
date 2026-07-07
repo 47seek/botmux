@@ -43,9 +43,11 @@ export interface ResolvedDashboardSettingsView {
   /** Configured schedule-task timezone override (IANA), or null/absent when
    *  unset ⇒ the scheduler follows `hostTimeZone`. */
   scheduleTimeZone?: string | null;
-  /** Host's auto-detected local zone — shown in the UI as the effective
-   *  fallback when no override is set. */
+  /** Host's auto-detected local zone. */
   hostTimeZone?: string;
+  /** The TRUE effective zone (scheduleTimeZone(): env → config → host). The UI
+   *  must use this for "currently effective", not configured||host. */
+  effectiveScheduleTimeZone?: string;
 }
 
 export type ParseMaintenanceResult =

@@ -299,9 +299,13 @@ interface ResolvedDashboardSettings {
   /** Configured schedule-task timezone override (IANA), or null when unset
    *  ⇒ the scheduler follows `hostTimeZone`. */
   scheduleTimeZone: string | null;
-  /** Host's auto-detected local zone — the effective fallback shown in the UI
-   *  when no override is set (e.g. 'America/Los_Angeles'). */
+  /** Host's auto-detected local zone (e.g. 'America/Los_Angeles'). */
   hostTimeZone: string;
+  /** The TRUE effective zone the scheduler fires/displays in = scheduleTimeZone()
+   *  (env `BOTMUX_SCHEDULE_TIMEZONE` → config → host). The UI must use THIS for
+   *  "currently effective" — never reconstruct it from configured||host, which
+   *  ignores the env override. */
+  effectiveScheduleTimeZone: string;
 }
 
 function resolveDashboardSettings(): ResolvedDashboardSettings {
@@ -318,6 +322,7 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
     remoteAccess: global.remoteAccess === true,
     scheduleTimeZone: global.scheduleTimeZone ?? null,
     hostTimeZone: hostLocalTimeZone(),
+    effectiveScheduleTimeZone: scheduleTimeZone(),
   };
 }
 
