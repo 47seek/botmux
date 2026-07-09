@@ -63,6 +63,13 @@ function allActions(card: any): any[] {
     .flatMap((e: any) => e.actions ?? []);
 }
 
+function expectLocalCliButtonNoUrls(btn: any): void {
+  expect(btn.multi_url).toBeUndefined();
+  expect(btn.url).toBeUndefined();
+  expect(btn.pc_url).toBeUndefined();
+  expect(JSON.stringify(btn)).not.toMatch(/\b(?:codex|trae|traex):\/\//);
+}
+
 function expectSidebarUrl(actual: string, targetUrl: string): void {
   const u = new URL(actual);
   expect(`${u.origin}${u.pathname}`).toBe('https://applink.feishu.cn/client/web_url/open');
@@ -242,6 +249,38 @@ describe('buildSessionCard', () => {
       expect(linkBtn.text.content).toContain('获取操作链接');
       expect(linkBtn.value.root_id).toBe(ROOT);
       expect(linkBtn.value.session_id).toBe(SID);
+    });
+
+    it('adds an open_local_cli button for Codex while keeping the Web Terminal button', () => {
+      const card = parse(buildSessionCard(SID, ROOT, URL, TITLE, 'codex'));
+      const actions = findActions(card);
+      const terminalBtn = actions.find((a: any) => a.multi_url);
+      const localBtn = actions.find((a: any) => a.value?.action === 'open_local_cli');
+
+      expect(terminalBtn).toBeDefined();
+      expectDirectUrl(terminalBtn.multi_url.url, URL);
+      expect(localBtn).toBeDefined();
+      expect(localBtn.text.content).toBe('iTerm 打开 Codex');
+      expectLocalCliButtonNoUrls(localBtn);
+      expect(localBtn.value).toMatchObject({ root_id: ROOT, session_id: SID, cli_id: 'codex' });
+      expect(actions).toHaveLength(4);
+    });
+
+    it('adds an open_local_cli button for TRAE only, not unrelated CLIs', () => {
+      const traeCard = parse(buildSessionCard(SID, ROOT, URL, TITLE, 'traex'));
+      const traeBtn = findActions(traeCard).find((a: any) => a.value?.action === 'open_local_cli');
+      expect(traeBtn?.text.content).toBe('iTerm 打开 TRAE');
+      expectLocalCliButtonNoUrls(traeBtn);
+      expect(traeBtn?.value.cli_id).toBe('traex');
+
+      const geminiCard = parse(buildSessionCard(SID, ROOT, URL, TITLE, 'gemini'));
+      expect(findActions(geminiCard).find((a: any) => a.value?.action === 'open_local_cli')).toBeUndefined();
+    });
+
+    it('uses the English local CLI button label when locale is en', () => {
+      const card = parse(buildSessionCard(SID, ROOT, URL, TITLE, 'codex', false, false, 'en'));
+      const localBtn = findActions(card).find((a: any) => a.value?.action === 'open_local_cli');
+      expect(localBtn?.text.content).toBe('Open Codex in iTerm');
     });
 
     it('should NOT include restart button', () => {
@@ -578,6 +617,31 @@ describe('buildStreamingCard', () => {
       expect(termBtn.multi_url.android_url).toBe(URL);
       expect(termBtn.multi_url.ios_url).toBe(URL);
       expect(termBtn.type).toBe('primary');
+    });
+
+    it('adds an open_local_cli button for Codex and keeps the Web Terminal multi_url', () => {
+      const card = parse(buildStreamingCard(SID, ROOT, URL, TITLE, '', 'idle', 'codex'));
+      const actions = findActions(card);
+      const termBtn = actions.find((a: any) => a.multi_url);
+      const localBtn = actions.find((a: any) => a.value?.action === 'open_local_cli');
+
+      expect(termBtn).toBeDefined();
+      expectDirectUrl(termBtn.multi_url.url, URL);
+      expect(localBtn).toBeDefined();
+      expect(localBtn.text.content).toBe('iTerm 打开 Codex');
+      expectLocalCliButtonNoUrls(localBtn);
+      expect(localBtn.value).toMatchObject({ root_id: ROOT, session_id: SID, cli_id: 'codex' });
+      expect(actions).toHaveLength(5);
+    });
+
+    it('adds a TRAE local button on streaming cards but not for other CLIs', () => {
+      const traeCard = parse(buildStreamingCard(SID, ROOT, URL, TITLE, '', 'idle', 'traex'));
+      const traeBtn = findActions(traeCard).find((a: any) => a.value?.action === 'open_local_cli');
+      expect(traeBtn?.text.content).toBe('iTerm 打开 TRAE');
+      expectLocalCliButtonNoUrls(traeBtn);
+
+      const geminiCard = parse(buildStreamingCard(SID, ROOT, URL, TITLE, '', 'idle', 'gemini'));
+      expect(findActions(geminiCard).find((a: any) => a.value?.action === 'open_local_cli')).toBeUndefined();
     });
 
     it('should include get_write_link button', () => {

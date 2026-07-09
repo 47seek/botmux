@@ -250,6 +250,16 @@ export function terminalMultiUrl(url: string): Record<string, string> {
     : directMultiUrl(url);
 }
 
+function localCliButton(cliId: CliId, actionBase: Record<string, string>, locale?: Locale): any | undefined {
+  if (cliId !== 'codex' && cliId !== 'traex') return undefined;
+  return {
+    tag: 'button',
+    text: { tag: 'plain_text', content: t(cliId === 'codex' ? 'card.btn.open_local_codex' : 'card.btn.open_local_trae', undefined, locale) },
+    type: 'default',
+    value: { action: 'open_local_cli', ...actionBase },
+  };
+}
+
 /**
  * Build a Feishu interactive card with terminal button + action buttons.
  * @param showManageButtons - When true, include restart & close buttons (used in the private write-link card — delivered as a "visible-to-you" ephemeral card in plain groups, or DM'd as fallback).
@@ -275,6 +285,8 @@ export function buildSessionCard(
       multi_url: terminalMultiUrl(terminalUrl),
     },
   ];
+  const localBtn = localCliButton(cliId ?? 'claude-code', actionBase, locale);
+  if (localBtn) actions.push(localBtn);
   if (!showManageButtons) {
     actions.push({
       tag: 'button',
@@ -718,6 +730,8 @@ export function buildStreamingCard(
     type: 'primary',
     multi_url: terminalMultiUrl(terminalUrl),
   });
+  const localBtn = localCliButton(effectiveCliId, actionBase, locale);
+  if (localBtn) headerActions.push(localBtn);
   if (status === 'limited' && usageLimit?.retryReady) {
     headerActions.push({
       tag: 'button',
