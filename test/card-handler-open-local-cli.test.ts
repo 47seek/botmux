@@ -143,8 +143,8 @@ describe('card-handler open_local_cli', () => {
     deps.activeSessions.set(types.sessionKey('om_root', 'h1'), ds);
     vi.mocked(opener.openLocalCliInIterm).mockResolvedValueOnce({
       ok: false,
-      error: 'terminal_unavailable',
-      message: 'No local terminal is available',
+      error: 'iterm_unavailable',
+      message: 'iTerm is not available',
     });
 
     const res = await handler.handleCardAction(action('ou_owner', 'traex'), deps, 'h1');
@@ -155,7 +155,27 @@ describe('card-handler open_local_cli', () => {
     await Promise.resolve();
     expect(deps.sessionReply).toHaveBeenCalledWith(
       'om_root',
-      expect.stringContaining('No local terminal is available'),
+      expect.stringContaining('iTerm is not available'),
+      undefined,
+      'h1',
+    );
+  });
+
+  it('unexpected opener rejection is reported asynchronously after an immediate ack', async () => {
+    const { types, opener, handler } = await fresh();
+    const ds = makeDs('codex');
+    deps.activeSessions.set(types.sessionKey('om_root', 'h1'), ds);
+    vi.mocked(opener.openLocalCliInIterm).mockRejectedValueOnce(new Error('osascript crashed'));
+
+    const res = await handler.handleCardAction(action('ou_owner', 'codex'), deps, 'h1');
+
+    expect(res?.toast?.type).toBe('success');
+    expect(opener.openLocalCliInIterm).toHaveBeenCalledWith(ds, { cliId: 'codex' });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(deps.sessionReply).toHaveBeenCalledWith(
+      'om_root',
+      expect.stringContaining('osascript crashed'),
       undefined,
       'h1',
     );

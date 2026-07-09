@@ -71,4 +71,27 @@ describe('DaemonRegistry', () => {
     expect(reg.getByAppId('appA')?.ipcPort).toBe(7892);
     reg.stop();
   });
+
+  it('falls back to polling when fs.watch emits an async error', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_000);
+    writeDesc('appA', 7892);
+
+    const reg = new DaemonRegistry(dir, { refreshIntervalMs: 1_000 });
+    await reg.start();
+
+    const watcher = (reg as unknown as { watcher?: { emit(event: string, err: Error): void } }).watcher;
+    expect(watcher).toBeTruthy();
+    watcher?.emit('error', Object.assign(new Error('too many open files'), { code: 'EMFILE' }));
+    expect((reg as unknown as { watcher?: unknown }).watcher).toBeUndefined();
+
+    vi.setSystemTime(95_000);
+    expect(reg.list()).toEqual([]);
+
+    writeDesc('appA', 7894);
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    expect(reg.getByAppId('appA')?.ipcPort).toBe(7894);
+    reg.stop();
+  });
 });

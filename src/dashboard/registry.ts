@@ -54,6 +54,10 @@ export class DaemonRegistry {
     }
     try {
       this.watcher = watch(this.dir, { persistent: true }, () => this.refresh());
+      this.watcher.on('error', () => {
+        this.watcher?.close();
+        this.watcher = undefined;
+      });
     } catch {
       // Directory may not exist yet — caller is expected to ensure it exists
       // or the dashboard runs with an empty registry until the daemon writes.

@@ -1239,7 +1239,10 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           logger.info(`[${tag(ds)}] open_local_cli launched local terminal for ${cliId}`);
         })
         .catch((err) => {
-          logger.warn(`[${tag(ds)}] open_local_cli crashed: ${err instanceof Error ? err.message : String(err)}`);
+          const reason = err instanceof Error ? err.message : String(err);
+          logger.warn(`[${tag(ds)}] open_local_cli crashed: ${reason}`);
+          void sessionReply(rootId, t('card.action.local_cli_failed', { reason }, locDs))
+            .catch((replyErr) => logger.warn(`[${tag(ds)}] open_local_cli crash reply failed: ${replyErr instanceof Error ? replyErr.message : String(replyErr)}`));
         });
       return {
         toast: {

@@ -10,12 +10,10 @@ export type LocalCliOpenError =
   | 'unsupported_cli'
   | 'unsupported_platform'
   | 'iterm_unavailable'
-  | 'terminal_unavailable'
   | 'unsupported_adopt_backend'
   | 'invalid_tmux_target'
   | 'missing_working_dir'
-  | 'missing_resume_id'
-  | 'launch_failed';
+  | 'missing_resume_id';
 
 export type LocalCliOpenResult =
   | { ok: true; command: string }
@@ -28,6 +26,16 @@ export interface LocalCliOpenerDeps {
 }
 
 const OSASCRIPT = '/usr/bin/osascript';
+const ITERM_APPLICATIONS = [
+  {
+    probeScript: 'id of application id "com.googlecode.iterm2"',
+    tellTarget: 'application id "com.googlecode.iterm2"',
+  },
+  {
+    probeScript: 'id of application "iTerm"',
+    tellTarget: 'application "iTerm"',
+  },
+] as const;
 
 function fail(error: LocalCliOpenError, message: string): LocalCliOpenResult {
   return { ok: false, error, message };
@@ -89,23 +97,14 @@ export function buildTmuxAttachCommand(tmuxTarget: string): string | null {
   ].join(' ');
 }
 
-export function buildItermAppleScript(command: string): string {
+export function buildItermAppleScript(command: string, tellTarget: string = ITERM_APPLICATIONS[0].tellTarget): string {
   return [
-    'tell application "iTerm"',
+    `tell ${tellTarget}`,
     '  activate',
     '  set newWindow to (create window with default profile)',
     '  tell current session of newWindow',
     `    write text ${appleScriptQuote(command)}`,
     '  end tell',
-    'end tell',
-  ].join('\n');
-}
-
-export function buildTerminalAppleScript(command: string): string {
-  return [
-    'tell application "Terminal"',
-    '  activate',
-    `  do script ${appleScriptQuote(command)}`,
     'end tell',
   ].join('\n');
 }
@@ -164,6 +163,14 @@ function defaultRunOsascript(args: string[]): Promise<{ ok: boolean; stderr?: st
   });
 }
 
+function itermUnavailableMessage(errors: string[]): string {
+  const detail = [...errors].reverse().find((e) => e.trim().length > 0);
+  const base = 'iTerm is not available or could not be opened with AppleScript.';
+  return detail
+    ? `${base} Install iTerm or allow Automation access, then retry. Last error: ${detail}`
+    : `${base} Install iTerm or allow Automation access, then retry.`;
+}
+
 export async function openLocalCliInIterm(
   ds: DaemonSession,
   deps: LocalCliOpenerDeps & { cliId?: CliId } = {},
@@ -177,21 +184,17 @@ export async function openLocalCliInIterm(
   }
 
   const runOsascript = deps.runOsascript ?? defaultRunOsascript;
-  const itermProbe = await runOsascript(['-e', 'id of application "iTerm"']);
-  if (itermProbe.ok) {
-    const launched = await runOsascript(['-e', buildItermAppleScript(built.command)]);
+  const errors: string[] = [];
+  for (const app of ITERM_APPLICATIONS) {
+    const probe = await runOsascript(['-e', app.probeScript]);
+    if (!probe.ok) {
+      if (probe.stderr) errors.push(probe.stderr);
+      continue;
+    }
+    const launched = await runOsascript(['-e', buildItermAppleScript(built.command, app.tellTarget)]);
     if (launched.ok) return built;
+    if (launched.stderr) errors.push(launched.stderr);
   }
 
-  const terminalProbe = await runOsascript(['-e', 'id of application "Terminal"']);
-  if (!terminalProbe.ok) {
-    const reason = terminalProbe.stderr || itermProbe.stderr || 'Terminal.app is not available to AppleScript.';
-    return fail('terminal_unavailable', reason);
-  }
-
-  const terminalLaunched = await runOsascript(['-e', buildTerminalAppleScript(built.command)]);
-  if (!terminalLaunched.ok) {
-    return fail('launch_failed', terminalLaunched.stderr || 'Failed to launch Terminal.app via AppleScript.');
-  }
-  return built;
+  return fail('iterm_unavailable', itermUnavailableMessage(errors));
 }
