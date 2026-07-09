@@ -1,6 +1,6 @@
 /**
  * card-handler open_local_cli action: permission gate, active-session lookup,
- * CLI binding validation, and opener result toast.
+ * CLI binding validation, and immediate opener ack.
  * Run: pnpm vitest run test/card-handler-open-local-cli.test.ts
  */
 import { mkdtempSync, writeFileSync } from 'node:fs';
@@ -94,12 +94,12 @@ describe('card-handler open_local_cli', () => {
     const { types, opener, handler } = await fresh();
     const ds = makeDs('codex');
     deps.activeSessions.set(types.sessionKey('om_root', 'h1'), ds);
-    vi.mocked(opener.openLocalCliInIterm).mockResolvedValueOnce({ ok: true, command: 'cd /repo && codex resume native1' });
+    vi.mocked(opener.openLocalCliInIterm).mockReturnValueOnce(new Promise(() => {}) as any);
 
     const res = await handler.handleCardAction(action('ou_owner', 'codex'), deps, 'h1');
 
     expect(res?.toast?.type).toBe('success');
-    expect(res.toast.content).toContain('iTerm');
+    expect(res.toast.content).toContain('正在打开');
     expect(opener.openLocalCliInIterm).toHaveBeenCalledTimes(1);
     expect(opener.openLocalCliInIterm).toHaveBeenCalledWith(ds, { cliId: 'codex' });
   });
@@ -137,21 +137,28 @@ describe('card-handler open_local_cli', () => {
     expect(opener.openLocalCliInIterm).not.toHaveBeenCalled();
   });
 
-  it('opener failure returns an explicit error toast', async () => {
+  it('opener failure is handled asynchronously after an immediate ack', async () => {
     const { types, opener, handler } = await fresh();
     const ds = makeDs('traex');
     deps.activeSessions.set(types.sessionKey('om_root', 'h1'), ds);
     vi.mocked(opener.openLocalCliInIterm).mockResolvedValueOnce({
       ok: false,
-      error: 'iterm_unavailable',
-      message: 'iTerm is not installed',
+      error: 'terminal_unavailable',
+      message: 'No local terminal is available',
     });
 
     const res = await handler.handleCardAction(action('ou_owner', 'traex'), deps, 'h1');
 
-    expect(res?.toast?.type).toBe('error');
-    expect(res.toast.content).toContain('iTerm is not installed');
+    expect(res?.toast?.type).toBe('success');
+    expect(res.toast.content).toContain('正在打开');
     expect(opener.openLocalCliInIterm).toHaveBeenCalledWith(ds, { cliId: 'traex' });
+    await Promise.resolve();
+    expect(deps.sessionReply).toHaveBeenCalledWith(
+      'om_root',
+      expect.stringContaining('No local terminal is available'),
+      undefined,
+      'h1',
+    );
   });
 
   it('missing active session returns session_gone and does not trust card cwd/command', async () => {

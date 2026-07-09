@@ -1228,12 +1228,19 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         return { toast: { type: 'warning', content: t('card.action.session_gone', undefined, locDs) } };
       }
       const cliId = sessionCliId(ds);
-      const result = await openLocalCliInIterm(ds, { cliId });
-      if (!result.ok) {
-        logger.warn(`[${tag(ds)}] open_local_cli failed: ${result.error}: ${result.message}`);
-        return { toast: { type: 'error', content: t('card.action.local_cli_failed', { reason: result.message }, locDs) } };
-      }
-      logger.info(`[${tag(ds)}] open_local_cli launched iTerm for ${cliId}`);
+      void openLocalCliInIterm(ds, { cliId })
+        .then((result) => {
+          if (!result.ok) {
+            logger.warn(`[${tag(ds)}] open_local_cli failed: ${result.error}: ${result.message}`);
+            void sessionReply(rootId, t('card.action.local_cli_failed', { reason: result.message }, locDs))
+              .catch((err) => logger.warn(`[${tag(ds)}] open_local_cli failure reply failed: ${err instanceof Error ? err.message : String(err)}`));
+            return;
+          }
+          logger.info(`[${tag(ds)}] open_local_cli launched local terminal for ${cliId}`);
+        })
+        .catch((err) => {
+          logger.warn(`[${tag(ds)}] open_local_cli crashed: ${err instanceof Error ? err.message : String(err)}`);
+        });
       return {
         toast: {
           type: 'success',

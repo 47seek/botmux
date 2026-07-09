@@ -260,7 +260,7 @@ describe('buildSessionCard', () => {
       expect(terminalBtn).toBeDefined();
       expectDirectUrl(terminalBtn.multi_url.url, URL);
       expect(localBtn).toBeDefined();
-      expect(localBtn.text.content).toBe('iTerm 打开 Codex');
+      expect(localBtn.text.content).toBe('打开 Codex');
       expectLocalCliButtonNoUrls(localBtn);
       expect(localBtn.value).toMatchObject({ root_id: ROOT, session_id: SID, cli_id: 'codex' });
       expect(actions).toHaveLength(4);
@@ -269,7 +269,7 @@ describe('buildSessionCard', () => {
     it('adds an open_local_cli button for TRAE only, not unrelated CLIs', () => {
       const traeCard = parse(buildSessionCard(SID, ROOT, URL, TITLE, 'traex'));
       const traeBtn = findActions(traeCard).find((a: any) => a.value?.action === 'open_local_cli');
-      expect(traeBtn?.text.content).toBe('iTerm 打开 TRAE');
+      expect(traeBtn?.text.content).toBe('打开 TRAE');
       expectLocalCliButtonNoUrls(traeBtn);
       expect(traeBtn?.value.cli_id).toBe('traex');
 
@@ -280,7 +280,7 @@ describe('buildSessionCard', () => {
     it('uses the English local CLI button label when locale is en', () => {
       const card = parse(buildSessionCard(SID, ROOT, URL, TITLE, 'codex', false, false, 'en'));
       const localBtn = findActions(card).find((a: any) => a.value?.action === 'open_local_cli');
-      expect(localBtn?.text.content).toBe('Open Codex in iTerm');
+      expect(localBtn?.text.content).toBe('Open Codex');
     });
 
     it('should NOT include restart button', () => {
@@ -628,7 +628,7 @@ describe('buildStreamingCard', () => {
       expect(termBtn).toBeDefined();
       expectDirectUrl(termBtn.multi_url.url, URL);
       expect(localBtn).toBeDefined();
-      expect(localBtn.text.content).toBe('iTerm 打开 Codex');
+      expect(localBtn.text.content).toBe('打开 Codex');
       expectLocalCliButtonNoUrls(localBtn);
       expect(localBtn.value).toMatchObject({ root_id: ROOT, session_id: SID, cli_id: 'codex' });
       expect(actions).toHaveLength(5);
@@ -637,7 +637,7 @@ describe('buildStreamingCard', () => {
     it('adds a TRAE local button on streaming cards but not for other CLIs', () => {
       const traeCard = parse(buildStreamingCard(SID, ROOT, URL, TITLE, '', 'idle', 'traex'));
       const traeBtn = findActions(traeCard).find((a: any) => a.value?.action === 'open_local_cli');
-      expect(traeBtn?.text.content).toBe('iTerm 打开 TRAE');
+      expect(traeBtn?.text.content).toBe('打开 TRAE');
       expectLocalCliButtonNoUrls(traeBtn);
 
       const geminiCard = parse(buildStreamingCard(SID, ROOT, URL, TITLE, '', 'idle', 'gemini'));

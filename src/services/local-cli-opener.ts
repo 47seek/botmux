@@ -10,6 +10,7 @@ export type LocalCliOpenError =
   | 'unsupported_cli'
   | 'unsupported_platform'
   | 'iterm_unavailable'
+  | 'terminal_unavailable'
   | 'unsupported_adopt_backend'
   | 'invalid_tmux_target'
   | 'missing_working_dir'
@@ -100,12 +101,21 @@ export function buildItermAppleScript(command: string): string {
   ].join('\n');
 }
 
+export function buildTerminalAppleScript(command: string): string {
+  return [
+    'tell application "Terminal"',
+    '  activate',
+    `  do script ${appleScriptQuote(command)}`,
+    'end tell',
+  ].join('\n');
+}
+
 export function buildLocalCliOpenCommand(
   ds: DaemonSession,
   opts: { cliId?: CliId; adapterFactory?: LocalCliOpenerDeps['adapterFactory'] } = {},
 ): LocalCliOpenResult {
   const cliId = localCliId(opts.cliId ?? ds.session.cliId ?? ds.adoptedFrom?.cliId ?? ds.session.adoptedFrom?.cliId);
-  if (!cliId) return fail('unsupported_cli', 'Only Codex and TRAE can be opened locally in iTerm.');
+  if (!cliId) return fail('unsupported_cli', 'Only Codex and TRAE can be opened locally.');
 
   const adopted = ds.adoptedFrom ?? ds.session.adoptedFrom;
   if (adopted) {
@@ -116,7 +126,7 @@ export function buildLocalCliOpenCommand(
         : fail('invalid_tmux_target', `Invalid tmux target: ${adopted.tmuxTarget}`);
     }
     const source = adopted.source ?? (adopted.zellijPaneId ? 'zellij' : adopted.herdrTarget ? 'herdr' : 'unknown');
-    return fail('unsupported_adopt_backend', `${source} adopt sessions cannot be opened in iTerm yet.`);
+    return fail('unsupported_adopt_backend', `${source} adopt sessions cannot be opened locally yet.`);
   }
 
   const backendType = getSessionPersistentBackendType(ds);
@@ -127,7 +137,7 @@ export function buildLocalCliOpenCommand(
     };
   }
   if (backendType === 'zellij' || backendType === 'herdr') {
-    return fail('unsupported_adopt_backend', `${backendType} active sessions cannot be opened in iTerm yet.`);
+    return fail('unsupported_adopt_backend', `${backendType} active sessions cannot be opened locally yet.`);
   }
 
   const workingDir = sessionWorkingDir(ds);
@@ -163,18 +173,25 @@ export async function openLocalCliInIterm(
 
   const platform = deps.platform ?? process.platform;
   if (platform !== 'darwin') {
-    return fail('unsupported_platform', 'Opening a local CLI in iTerm is only supported on macOS.');
+    return fail('unsupported_platform', 'Opening a local CLI is only supported on macOS.');
   }
 
   const runOsascript = deps.runOsascript ?? defaultRunOsascript;
-  const probe = await runOsascript(['-e', 'id of application "iTerm"']);
-  if (!probe.ok) {
-    return fail('iterm_unavailable', probe.stderr || 'iTerm is not installed or is not available to AppleScript.');
+  const itermProbe = await runOsascript(['-e', 'id of application "iTerm"']);
+  if (itermProbe.ok) {
+    const launched = await runOsascript(['-e', buildItermAppleScript(built.command)]);
+    if (launched.ok) return built;
   }
 
-  const launched = await runOsascript(['-e', buildItermAppleScript(built.command)]);
-  if (!launched.ok) {
-    return fail('launch_failed', launched.stderr || 'Failed to launch iTerm via AppleScript.');
+  const terminalProbe = await runOsascript(['-e', 'id of application "Terminal"']);
+  if (!terminalProbe.ok) {
+    const reason = terminalProbe.stderr || itermProbe.stderr || 'Terminal.app is not available to AppleScript.';
+    return fail('terminal_unavailable', reason);
+  }
+
+  const terminalLaunched = await runOsascript(['-e', buildTerminalAppleScript(built.command)]);
+  if (!terminalLaunched.ok) {
+    return fail('launch_failed', terminalLaunched.stderr || 'Failed to launch Terminal.app via AppleScript.');
   }
   return built;
 }

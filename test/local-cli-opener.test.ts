@@ -1,5 +1,5 @@
 /**
- * local-cli-opener: iTerm command construction and launch guards.
+ * local-cli-opener: local terminal command construction and launch guards.
  * Run: pnpm vitest run test/local-cli-opener.test.ts
  */
 import { describe, it, expect, vi } from 'vitest';
@@ -7,6 +7,7 @@ import {
   appleScriptQuote,
   buildItermAppleScript,
   buildLocalCliOpenCommand,
+  buildTerminalAppleScript,
   buildTmuxAttachCommand,
   openLocalCliInIterm,
   shellQuote,
@@ -158,12 +159,13 @@ describe('local-cli-opener', () => {
     expect(!scheme.ok && scheme.message).toContain('unsupported resume command');
   });
 
-  it('escapes AppleScript string literals used by the iTerm launch script', () => {
+  it('escapes AppleScript string literals used by terminal launch scripts', () => {
     expect(appleScriptQuote('echo "x" \\ done')).toBe('"echo \\"x\\" \\\\ done"');
     expect(buildItermAppleScript('echo "x"')).toContain('write text "echo \\"x\\""');
+    expect(buildTerminalAppleScript('echo "x"')).toContain('do script "echo \\"x\\""');
   });
 
-  it('rejects non-macOS before probing iTerm', async () => {
+  it('rejects non-macOS before probing local terminal apps', async () => {
     const runOsascript = vi.fn(async () => ({ ok: true }));
     const result = await openLocalCliInIterm(ds(), {
       platform: 'linux',
@@ -189,6 +191,26 @@ describe('local-cli-opener', () => {
     expect(runOsascript.mock.calls[1][0][0]).toBe('-e');
     expect(runOsascript.mock.calls[1][0][1]).toContain('tell application "iTerm"');
     expect(runOsascript.mock.calls[1][0][1]).toContain("codex resume 'sid'");
+  });
+
+  it('falls back to Terminal.app when iTerm is unavailable', async () => {
+    const runOsascript = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: false, stderr: 'iTerm not found' })
+      .mockResolvedValueOnce({ ok: true })
+      .mockResolvedValueOnce({ ok: true });
+    const result = await openLocalCliInIterm(ds(), {
+      platform: 'darwin',
+      runOsascript,
+      adapterFactory: () => ({ buildResumeCommand: () => 'codex resume sid' }),
+    });
+
+    expect(result.ok).toBe(true);
+    expect(runOsascript).toHaveBeenNthCalledWith(1, ['-e', 'id of application "iTerm"']);
+    expect(runOsascript).toHaveBeenNthCalledWith(2, ['-e', 'id of application "Terminal"']);
+    const script = runOsascript.mock.calls[2][0][1];
+    expect(script).toContain('tell application "Terminal"');
+    expect(script).toContain("codex resume 'sid'");
   });
 
   it('launches TRAE in iTerm with traex resume instead of Trae app or URL schemes', async () => {
