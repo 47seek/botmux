@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 import React from 'react';
 import TestRenderer, { act } from 'react-test-renderer';
 import { describe, expect, it, vi } from 'vitest';
@@ -47,6 +48,37 @@ describe('dashboard skills React hook safety', () => {
     }).not.toThrow();
 
     expect(renderer.toJSON()).toMatchObject({ props: { 'data-appid': 'app-a' } });
+  });
+
+  it('keeps the configured skill detach action available', () => {
+    const onUpdate = vi.fn().mockResolvedValue(undefined);
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => {
+      renderer = TestRenderer.create(React.createElement(BotPolicyCard, {
+        bot: { larkAppId: 'app-a', botName: 'Codex Bot', skills: { include: ['skill:deploy'] } },
+        installedNames: new Set(['deploy', 'review']),
+        skills: [{ name: 'deploy' }, { name: 'review' }],
+        status: null,
+        busyKey: null,
+        onUpdate,
+      }));
+    });
+
+    const detach = renderer.root.findByProps({ 'data-action': 'detach-skill' });
+    act(() => detach.props.onClick());
+
+    expect(detach.props['aria-label']).toContain('deploy');
+    expect(onUpdate).toHaveBeenCalledWith('app-a', 'detach', 'deploy');
+  });
+
+  it('constrains every bot card child to the card grid column', () => {
+    const css = readFileSync(new URL('../src/dashboard/web/style.css', import.meta.url), 'utf8');
+
+    expect(css).toMatch(/\.skills-bot-card\s*\{[^}]*grid-template-columns:\s*minmax\(0,\s*1fr\)/s);
+    expect(css).toMatch(/\.skills-policy-panel\s*\{[^}]*min-width:\s*0/s);
+    expect(css).toMatch(/\.skills-bot-head\s*\{[^}]*min-width:\s*0/s);
+    expect(css).toMatch(/\.skills-chip-list\s*\{[^}]*min-width:\s*0/s);
+    expect(css).toMatch(/\.skills-attach-row,[^{]*\{[^}]*min-width:\s*0/s);
   });
 });
 

@@ -8743,6 +8743,7 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
 
 .skills-bot-card {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   grid-template-rows: auto minmax(0, 1fr) auto;
   align-content: stretch;
   gap: 10px;
@@ -8759,6 +8760,7 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
   display: grid;
   grid-template-rows: auto minmax(0, 1fr) auto;
   gap: 9px;
+  min-width: 0;
   min-height: 0;
   overflow: visible;
 }
@@ -8769,6 +8771,7 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
   column-gap: 10px;
   row-gap: 2px;
   align-items: center;
+  min-width: 0;
 }
 
 .skills-bot-head > .orb-avatar {
@@ -8843,6 +8846,7 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
   display: grid;
   align-content: start;
   gap: 7px;
+  min-width: 0;
   max-height: 118px;
   overflow-y: auto;
   overscroll-behavior: contain;
@@ -8951,6 +8955,7 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
   grid-template-columns: minmax(0, 1fr) auto;
   gap: 8px;
   align-items: end;
+  min-width: 0;
 }
 
 .skills-bot-card .skills-attach-row {
