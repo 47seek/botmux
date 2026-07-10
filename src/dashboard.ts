@@ -2825,6 +2825,24 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    // POST /api/bots/:appId/substitute-targets/resolve — preview resolution for a
+    // single target without persisting; used for dashboard auto-fill.
+    let mBotSubstituteResolve: RegExpMatchArray | null;
+    if (req.method === 'POST' && (mBotSubstituteResolve = url.pathname.match(/^\/api\/bots\/([^/]+)\/substitute-targets\/resolve$/))) {
+      const appId = decodeURIComponent(mBotSubstituteResolve[1]);
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+      const upstream = await proxyToDaemon(appId, `/api/bot-substitute-targets/resolve`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: raw,
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
     // PUT /api/bots/:appId/summary-range — proxy to that bot's daemon. Body
     // `{ limit, sinceHours }`; daemon updates the explicit /summary range.
     let mBotSummaryRange: RegExpMatchArray | null;

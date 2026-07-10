@@ -48,6 +48,8 @@ export interface SubstituteTargetResolution {
   openId?: string;
   name?: string;
   avatarUrl?: string;
+  /** Machine-readable failure reason when ok=false. */
+  reason?: 'cross_app_open_id' | 'resolve_failed' | 'unresolvable';
 }
 
 /** Injected Lark resolvers (real impls live in `im/lark/client`; tests mock). */
@@ -88,9 +90,10 @@ export async function resolveSubstituteTargets(
 
   const rawList = inputs.map(i => i.raw).filter(Boolean);
   let map = new Map<string, string>();
+  let resolveErrored = false;
   if (rawList.length) {
     try { ({ map } = await deps.resolveRaw(larkAppId, rawList)); }
-    catch { map = new Map(); }
+    catch { resolveErrored = true; map = new Map(); }
   }
 
   const targets: SubstituteTarget[] = [];
@@ -99,20 +102,33 @@ export async function resolveSubstituteTargets(
 
   for (const { t, raw } of inputs) {
     if (!raw) continue;
+    const isRawOpenId = !!t.openId;
     const openId = map.get(raw) ?? (t.openId && map.has(t.openId) ? map.get(t.openId) : undefined);
 
     if (openId) {
       let name = t.name;
       let avatarUrl: string | undefined;
+      let profileReachable = true;
       try {
         const p = await deps.getProfile(larkAppId, openId);
         if (p?.name) { name = p.name; avatarUrl = p.avatarUrl; }
-      } catch { /* keep the caller-supplied name */ }
+        // A hand-typed open_id must be reachable by this app to be matchable at
+        // runtime. Email/union_id resolved open_ids are already app-scoped, so a
+        // transient profile lookup failure is not fatal.
+        else if (isRawOpenId) { profileReachable = false; }
+      } catch {
+        if (isRawOpenId) profileReachable = false;
+      }
+      if (!profileReachable) {
+        resolution.push({ input: raw, ok: false, reason: 'cross_app_open_id' });
+        continue;
+      }
       resolution.push({ input: raw, ok: true, openId, name, avatarUrl });
       if (seen.has(openId)) continue; // dedupe duplicate people, keep both chips
       seen.add(openId);
       const out: SubstituteTarget = { openId };
       if (name) out.name = name;
+      if (avatarUrl) out.avatarUrl = avatarUrl;
       if (t.email) out.email = t.email;
       targets.push(out);
     } else if (t.userId) {
@@ -123,7 +139,7 @@ export async function resolveSubstituteTargets(
       if (t.email) out.email = t.email;
       targets.push(out);
     } else {
-      resolution.push({ input: raw, ok: false });
+      resolution.push({ input: raw, ok: false, reason: resolveErrored ? 'resolve_failed' : 'unresolvable' });
     }
   }
 

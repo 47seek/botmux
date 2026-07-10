@@ -1556,6 +1556,23 @@ ipcRoute('PUT', '/api/bot-substitute-mode', async (req, res) => {
   jsonRes(res, 200, { ok: true, substituteMode: r.substituteMode, resolution });
 });
 
+// Preview resolution for a single substitute target without persisting anything.
+// Used by the dashboard to auto-fill name/avatar while the user is typing.
+ipcRoute('POST', '/api/bot-substitute-targets/resolve', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  let body: unknown;
+  try { body = await readJsonBody(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  const rec = body && typeof body === 'object' && !Array.isArray(body) ? body as Record<string, unknown> : {};
+  const target = rec.target && typeof rec.target === 'object' && !Array.isArray(rec.target) ? rec.target : {};
+  const { resolution } = await substituteModeStore.resolveSubstituteTargets(
+    cachedLarkAppId,
+    [target],
+    { resolveRaw: resolveAllowedUsersWithMap, getProfile: getUserProfile },
+  );
+  jsonRes(res, 200, { ok: true, resolution: resolution[0] ?? null });
+});
+
 // Per-bot explicit `/summary` history range. Body `{ limit, sinceHours }`.
 ipcRoute('PUT', '/api/bot-summary-range', async (req, res) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });

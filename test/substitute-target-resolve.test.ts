@@ -42,7 +42,10 @@ describe('resolveSubstituteTargets', () => {
       { email: 'ghost@x.com' },
     ], deps);
     expect(targets).toEqual([{ openId: 'ou_alice', name: 'Alice', email: 'alice@x.com' }]);
-    expect(resolution.map(r => [r.input, r.ok])).toEqual([['alice@x.com', true], ['ghost@x.com', false]]);
+    expect(resolution.map(r => [r.input, r.ok, r.reason])).toEqual([
+      ['alice@x.com', true, undefined],
+      ['ghost@x.com', false, 'unresolvable'],
+    ]);
   });
 
   it('dedupes the same person while keeping a chip per input line', async () => {
@@ -65,6 +68,12 @@ describe('resolveSubstituteTargets', () => {
     const boom: SubstituteResolveDeps = { resolveRaw: async () => { throw new Error('no creds'); }, getProfile: deps.getProfile };
     const { targets, resolution } = await resolveSubstituteTargets('app', [{ email: 'alice@x.com' }], boom);
     expect(targets).toEqual([]);
-    expect(resolution).toEqual([{ input: 'alice@x.com', ok: false }]);
+    expect(resolution).toEqual([{ input: 'alice@x.com', ok: false, reason: 'resolve_failed' }]);
+  });
+
+  it('rejects a cross-app or unknown open_id so it cannot silently fail at runtime', async () => {
+    const { targets, resolution } = await resolveSubstituteTargets('app', [{ openId: 'ou_other_app' }], deps);
+    expect(targets).toEqual([]);
+    expect(resolution).toEqual([{ input: 'ou_other_app', ok: false, reason: 'cross_app_open_id' }]);
   });
 });

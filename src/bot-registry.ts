@@ -370,6 +370,8 @@ export interface SubstituteTarget {
   email?: string;
   /** Human-readable label for prompt disclosure. */
   name?: string;
+  /** Cached avatar URL so the dashboard can show the resolved person's picture. */
+  avatarUrl?: string;
 }
 
 export interface SubstituteModeConfig {

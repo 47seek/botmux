@@ -19,6 +19,7 @@ export type BotSubstituteTarget = {
   unionId?: string;
   email?: string;
   name?: string;
+  avatarUrl?: string;
 };
 
 export type BotSubstituteMode = {
@@ -134,6 +135,35 @@ export async function fetchBotDefaults(): Promise<LoadBotsResult> {
     return { bots: body.bots as BotDefaultsRow[], error: null };
   } catch (e: any) {
     return { bots: [], error: e?.message ?? String(e) };
+  }
+}
+
+export type SubstituteTargetResolution = {
+  input?: string;
+  ok?: boolean;
+  openId?: string;
+  name?: string;
+  avatarUrl?: string;
+  reason?: 'cross_app_open_id' | 'resolve_failed' | 'unresolvable';
+};
+
+export async function resolveSubstituteTarget(
+  larkAppId: string,
+  target: BotSubstituteTarget,
+): Promise<{ ok: false; error: string } | { ok: true; resolution: SubstituteTargetResolution }> {
+  try {
+    const r = await fetch(`/api/bots/${encodeURIComponent(larkAppId)}/substitute-targets/resolve`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ target }),
+    });
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      return { ok: false, error: body?.error ? `HTTP ${r.status}: ${body.error}` : `HTTP ${r.status}` };
+    }
+    return { ok: true, resolution: body?.resolution ?? {} };
+  } catch (e: any) {
+    return { ok: false, error: e?.message ?? String(e) };
   }
 }
 

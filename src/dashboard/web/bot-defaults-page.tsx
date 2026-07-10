@@ -9,11 +9,13 @@ import {
   fetchCliOptions,
   fmtSince,
   modelSuggestionsForOption,
+  resolveSubstituteTarget,
   selectedCliOption,
   type BotDefaultsRow,
   type BotSubstituteMode,
   type BotSubstituteTarget,
   type CliOptionsState,
+  type SubstituteTargetResolution,
 } from './bot-defaults.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
 import { useT } from './react-hooks.js';
@@ -167,13 +169,6 @@ function nonNegativeInteger(raw: string, fallback: number): number | null {
 
 type SubstituteTargetIdField = 'email' | 'openId' | 'userId' | 'unionId';
 
-type SubstituteTargetResolution = {
-  input?: string;
-  ok?: boolean;
-  openId?: string;
-  name?: string;
-};
-
 type SubstituteTargetDraft = {
   key: number;
   idField: SubstituteTargetIdField;
@@ -181,6 +176,13 @@ type SubstituteTargetDraft = {
   name: string;
   persisted: BotSubstituteTarget;
   originalIdField?: SubstituteTargetIdField;
+  resolving?: boolean;
+  resolution?: {
+    ok: boolean;
+    name?: string;
+    avatarUrl?: string;
+    reason?: SubstituteTargetResolution['reason'];
+  };
 };
 
 const substituteTargetIdFields: SubstituteTargetIdField[] = ['email', 'openId', 'userId', 'unionId'];
@@ -1703,6 +1705,14 @@ function SubstituteModeSection(props: { bot: BotDefaultsRow; patchBot: PatchBot 
   const tr = useT();
   const initial = props.bot.substituteMode ?? null;
   const [enabled, setEnabled] = useState(initial?.enabled === true);
+  function substituteReasonText(reason?: SubstituteTargetResolution['reason']): string {
+    switch (reason) {
+      case 'cross_app_open_id': return tr('botDefaults.substituteReasonCrossAppOpenId');
+      case 'resolve_failed': return tr('botDefaults.substituteReasonResolveFailed');
+      case 'unresolvable': return tr('botDefaults.substituteReasonUnresolvable');
+      default: return tr('botDefaults.substituteUnresolved');
+    }
+  }
   const [disclosure, setDisclosure] = useState<'prefix' | 'none'>(initial?.disclosure === 'none' ? 'none' : 'prefix');
   const [status, setStatus] = useState<StatusMessage>(null);
   const [busy, setBusy] = useState(false);
@@ -1718,7 +1728,51 @@ function SubstituteModeSection(props: { bot: BotDefaultsRow; patchBot: PatchBot 
       name: target?.name ?? '',
       persisted: target ? { ...target } : {},
       originalIdField: target ? idField : undefined,
+      resolution: target?.name || target?.avatarUrl
+        ? { ok: true, name: target.name, avatarUrl: target.avatarUrl }
+        : undefined,
     };
+  }
+
+  async function resolveTargetRow(key: number): Promise<void> {
+    setTargetRows(rows => rows.map(row => row.key === key ? { ...row, resolving: true } : row));
+    try {
+      const row = targetRows.find(r => r.key === key);
+      if (!row) return;
+      const idValue = row.idValue.trim();
+      if (!idValue) {
+        setTargetRows(rows => rows.map(r => r.key === key ? { ...r, resolving: false, resolution: undefined } : r));
+        return;
+      }
+      const target: BotSubstituteTarget = { [row.idField]: idValue };
+      if (row.name.trim()) target.name = row.name.trim();
+      const res = await resolveSubstituteTarget(props.bot.larkAppId, target);
+      setTargetRows(rows => rows.map(r => {
+        if (r.key !== key) return r;
+        if (!res.ok) return { ...r, resolving: false, resolution: { ok: false } };
+        const entry = res.resolution;
+        if (entry?.ok === true) {
+          const persisted: BotSubstituteTarget = { ...r.persisted };
+          if (entry.openId) persisted.openId = entry.openId;
+          if (entry.name) persisted.name = entry.name;
+          if (entry.avatarUrl) persisted.avatarUrl = entry.avatarUrl;
+          return {
+            ...r,
+            name: entry.name ?? r.name,
+            persisted,
+            resolving: false,
+            resolution: { ok: true, name: entry.name, avatarUrl: entry.avatarUrl },
+          };
+        }
+        return {
+          ...r,
+          resolving: false,
+          resolution: { ok: false, reason: entry?.reason },
+        };
+      }));
+    } catch {
+      setTargetRows(rows => rows.map(r => r.key === key ? { ...r, resolving: false, resolution: { ok: false } } : r));
+    }
   }
 
   const [targetRows, setTargetRows] = useState<SubstituteTargetDraft[]>(() => {
@@ -1765,12 +1819,23 @@ function SubstituteModeSection(props: { bot: BotDefaultsRow; patchBot: PatchBot 
               const index = pending.findIndex(entry => String(entry.input ?? '').trim() === input);
               if (index < 0) return row;
               const entry = pending.splice(index, 1)[0];
-              if (entry?.ok !== true) return row;
-              const persisted: BotSubstituteTarget = { ...row.persisted };
-              if (entry.openId) persisted.openId = entry.openId;
-              if (row.idField === 'email') persisted.email = input;
-              if (entry.name) persisted.name = entry.name;
-              return { ...row, name: entry.name ?? row.name, persisted };
+              if (entry?.ok === true) {
+                const persisted: BotSubstituteTarget = { ...row.persisted };
+                if (entry.openId) persisted.openId = entry.openId;
+                if (row.idField === 'email') persisted.email = input;
+                if (entry.name) persisted.name = entry.name;
+                if (entry.avatarUrl) persisted.avatarUrl = entry.avatarUrl;
+                return {
+                  ...row,
+                  name: entry.name ?? row.name,
+                  persisted,
+                  resolution: { ok: true, name: entry.name, avatarUrl: entry.avatarUrl },
+                };
+              }
+              return {
+                ...row,
+                resolution: { ok: false, reason: entry?.reason },
+              };
             });
           });
         } else {
@@ -1864,7 +1929,7 @@ function SubstituteModeSection(props: { bot: BotDefaultsRow; patchBot: PatchBot 
                 }))}
                 onChange={idField => {
                   setTargetRows(rows => rows.map(row => row.key === target.key
-                    ? { ...row, idField, idValue: row.persisted[idField] ?? '' }
+                    ? { ...row, idField, idValue: row.persisted[idField] ?? '', resolution: undefined }
                     : row));
                 }}
               />
@@ -1878,22 +1943,46 @@ function SubstituteModeSection(props: { bot: BotDefaultsRow; patchBot: PatchBot 
                 disabled={busy}
                 onChange={event => {
                   const idValue = event.currentTarget.value;
-                  setTargetRows(rows => rows.map(row => row.key === target.key ? { ...row, idValue } : row));
+                  setTargetRows(rows => rows.map(row => row.key === target.key ? { ...row, idValue, resolution: undefined } : row));
+                }}
+                onBlur={() => {
+                  if (target.idValue.trim()) void resolveTargetRow(target.key);
                 }}
               />
-              <input
-                className="bd-substitute-target-name"
-                type="text"
-                data-input={`substituteTargetName-${target.key}`}
-                aria-label={`${tr('botDefaults.substituteTargetName')} ${index + 1}`}
-                placeholder={tr('botDefaults.substituteTargetNamePlaceholder')}
-                value={target.name}
-                disabled={busy}
-                onChange={event => {
-                  const name = event.currentTarget.value;
-                  setTargetRows(rows => rows.map(row => row.key === target.key ? { ...row, name } : row));
-                }}
-              />
+              <div className="bd-substitute-target-name">
+                {target.resolving ? (
+                  <span className="bd-substitute-target-resolving">{tr('botDefaults.substituteResolving')}</span>
+                ) : target.resolution?.ok === true ? (
+                  <>
+                    {target.resolution.avatarUrl ? (
+                      <Html html={botAvatarHtml({ name: target.resolution.name, avatarUrl: target.resolution.avatarUrl, size: 'sm' })} />
+                    ) : null}
+                    <input
+                      type="text"
+                      data-input={`substituteTargetName-${target.key}`}
+                      aria-label={`${tr('botDefaults.substituteTargetName')} ${index + 1}`}
+                      value={target.name}
+                      disabled
+                      readOnly
+                    />
+                  </>
+                ) : target.resolution?.ok === false ? (
+                  <span className="bd-substitute-target-resolution-badge">{substituteReasonText(target.resolution.reason)}</span>
+                ) : (
+                  <input
+                    type="text"
+                    data-input={`substituteTargetName-${target.key}`}
+                    aria-label={`${tr('botDefaults.substituteTargetName')} ${index + 1}`}
+                    placeholder={tr('botDefaults.substituteTargetNamePlaceholder')}
+                    value={target.name}
+                    disabled={busy}
+                    onChange={event => {
+                      const name = event.currentTarget.value;
+                      setTargetRows(rows => rows.map(row => row.key === target.key ? { ...row, name } : row));
+                    }}
+                  />
+                )}
+              </div>
               <button
                 type="button"
                 className="bd-substitute-target-remove"

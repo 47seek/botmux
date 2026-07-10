@@ -32,6 +32,7 @@ export function normalizeSubstituteMode(raw: unknown): SubstituteModeConfig | un
         if (typeof src.unionId === 'string' && src.unionId.trim()) target.unionId = src.unionId.trim();
         if (typeof src.email === 'string' && src.email.trim()) target.email = src.email.trim();
         if (typeof src.name === 'string' && src.name.trim()) target.name = src.name.trim();
+        if (typeof src.avatarUrl === 'string' && src.avatarUrl.trim()) target.avatarUrl = src.avatarUrl.trim();
         return target.openId || target.userId || target.unionId || target.email ? [target] : [];
       })
     : [];

@@ -19047,7 +19047,7 @@ dialog select[multiple]:hover:not(:disabled) {
   min-width: 0;
 }
 
-.bot-defaults-page .bd-substitute-target-row > :where(.bd-field-menu, input) {
+.bot-defaults-page .bd-substitute-target-row > :where(.bd-field-menu, input, .bd-substitute-target-name) {
   min-width: 0;
 }
 
@@ -19146,6 +19146,44 @@ dialog select[multiple]:hover:not(:disabled) {
   .bot-defaults-page .bd-substitute-target-id { grid-area: id; }
   .bot-defaults-page .bd-substitute-target-name { grid-area: name; }
   .bot-defaults-page .bd-substitute-target-remove { grid-area: remove; }
+}
+
+.bot-defaults-page .bd-substitute-target-name {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.bot-defaults-page .bd-substitute-target-name > input {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.bot-defaults-page .bd-substitute-target-name > input:disabled {
+  background: transparent;
+  color: var(--text);
+  opacity: 1;
+  cursor: default;
+}
+
+.bot-defaults-page .bd-substitute-target-resolving {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.bot-defaults-page .bd-substitute-target-resolution-badge {
+  display: inline-flex;
+  align-items: center;
+  min-height: 22px;
+  padding: 0 8px;
+  border-radius: var(--radius-sm);
+  border: 1px solid color-mix(in srgb, var(--danger) 40%, var(--border-soft));
+  background: color-mix(in srgb, var(--danger) 10%, var(--surface-muted));
+  color: var(--danger);
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
 }
 
 .bot-defaults-page .bd-field-menu {
