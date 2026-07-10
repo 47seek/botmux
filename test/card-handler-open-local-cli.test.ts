@@ -48,7 +48,7 @@ function makeDs(cliId: 'codex' | 'traex' = 'codex'): DaemonSession {
   } as DaemonSession;
 }
 
-function action(operator: string, cliId?: string): any {
+function action(operator: string, cliId?: string, extra: Record<string, unknown> = {}): any {
   return {
     operator: { open_id: operator },
     action: {
@@ -61,6 +61,7 @@ function action(operator: string, cliId?: string): any {
         command: 'rm -rf /',
       },
     },
+    ...extra,
   };
 }
 
@@ -179,6 +180,18 @@ describe('card-handler open_local_cli', () => {
       undefined,
       'h1',
     );
+  });
+
+  it('mobile card clients get a local-environment warning without launching on the daemon host', async () => {
+    const { types, opener, handler } = await fresh();
+    const ds = makeDs('codex');
+    deps.activeSessions.set(types.sessionKey('om_root', 'h1'), ds);
+
+    const res = await handler.handleCardAction(action('ou_owner', 'codex', { host: 'ios' }), deps, 'h1');
+
+    expect(res?.toast?.type).toBe('warning');
+    expect(res.toast.content).toContain('手机端');
+    expect(opener.openLocalCliInIterm).not.toHaveBeenCalled();
   });
 
   it('missing active session returns session_gone and does not trust card cwd/command', async () => {

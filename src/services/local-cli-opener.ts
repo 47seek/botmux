@@ -10,6 +10,7 @@ export type LocalCliOpenError =
   | 'unsupported_cli'
   | 'unsupported_platform'
   | 'iterm_unavailable'
+  | 'terminal_unavailable'
   | 'unsupported_adopt_backend'
   | 'invalid_tmux_target'
   | 'missing_working_dir'
@@ -36,6 +37,10 @@ const ITERM_APPLICATIONS = [
     tellTarget: 'application "iTerm"',
   },
 ] as const;
+const TERMINAL_APPLICATION = {
+  probeScript: 'id of application id "com.apple.Terminal"',
+  tellTarget: 'application id "com.apple.Terminal"',
+} as const;
 
 function fail(error: LocalCliOpenError, message: string): LocalCliOpenResult {
   return { ok: false, error, message };
@@ -109,6 +114,15 @@ export function buildItermAppleScript(command: string, tellTarget: string = ITER
   ].join('\n');
 }
 
+export function buildTerminalAppleScript(command: string, tellTarget: string = TERMINAL_APPLICATION.tellTarget): string {
+  return [
+    `tell ${tellTarget}`,
+    '  activate',
+    `  do script ${appleScriptQuote(command)}`,
+    'end tell',
+  ].join('\n');
+}
+
 export function buildLocalCliOpenCommand(
   ds: DaemonSession,
   opts: { cliId?: CliId; adapterFactory?: LocalCliOpenerDeps['adapterFactory'] } = {},
@@ -163,9 +177,9 @@ function defaultRunOsascript(args: string[]): Promise<{ ok: boolean; stderr?: st
   });
 }
 
-function itermUnavailableMessage(errors: string[]): string {
+function terminalUnavailableMessage(errors: string[]): string {
   const detail = [...errors].reverse().find((e) => e.trim().length > 0);
-  const base = 'iTerm is not available or could not be opened with AppleScript.';
+  const base = 'Neither iTerm nor Terminal.app could be opened with AppleScript.';
   return detail
     ? `${base} Install iTerm or allow Automation access, then retry. Last error: ${detail}`
     : `${base} Install iTerm or allow Automation access, then retry.`;
@@ -196,5 +210,14 @@ export async function openLocalCliInIterm(
     if (launched.stderr) errors.push(launched.stderr);
   }
 
-  return fail('iterm_unavailable', itermUnavailableMessage(errors));
+  const terminalProbe = await runOsascript(['-e', TERMINAL_APPLICATION.probeScript]);
+  if (terminalProbe.ok) {
+    const launched = await runOsascript(['-e', buildTerminalAppleScript(built.command)]);
+    if (launched.ok) return built;
+    if (launched.stderr) errors.push(launched.stderr);
+  } else if (terminalProbe.stderr) {
+    errors.push(terminalProbe.stderr);
+  }
+
+  return fail('terminal_unavailable', terminalUnavailableMessage(errors));
 }

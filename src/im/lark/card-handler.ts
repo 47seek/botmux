@@ -113,7 +113,9 @@ export interface CardActionData {
     options?: unknown;
     form_value?: Record<string, unknown>;  // V2 form input values
   };
-  context?: { open_message_id?: string };
+  /** Client host reported by Lark card callbacks, e.g. pc/web/ios/android. */
+  host?: string;
+  context?: { open_message_id?: string; host?: string; platform?: string; device_type?: string };
   open_message_id?: string;
 }
 
@@ -130,6 +132,16 @@ export interface CardOperatorIdentity {
  *  inject a fake `resolveUserUnionId` to avoid hitting the Lark contact API. */
 export interface ResolveCardOperatorUnionIdDeps {
   resolveUserUnionId?: (larkAppId: string, openId: string) => Promise<{ unionId?: string; name?: string }>;
+}
+
+function localCliClientHost(data: CardActionData): string | undefined {
+  const candidates = [data.host, data.context?.host, data.context?.platform, data.context?.device_type];
+  return candidates.find((v): v is string => typeof v === 'string' && v.trim().length > 0)?.toLowerCase();
+}
+
+function isMobileLocalCliClient(data: CardActionData): boolean {
+  const host = localCliClientHost(data);
+  return !!host && (host.includes('ios') || host.includes('android') || host.includes('mobile'));
 }
 
 /**
@@ -1226,6 +1238,9 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       const locDs = localeForBot(ds?.larkAppId ?? larkAppId);
       if (!ds) {
         return { toast: { type: 'warning', content: t('card.action.session_gone', undefined, locDs) } };
+      }
+      if (isMobileLocalCliClient(data)) {
+        return { toast: { type: 'warning', content: t('card.action.local_cli_mobile_unsupported', undefined, locDs) } };
       }
       const cliId = sessionCliId(ds);
       void openLocalCliInIterm(ds, { cliId })

@@ -627,6 +627,7 @@ export const messages: Record<string, string> = {
   'card.action.local_cli_no_permission': '🔒 You do not have operate permission, so you cannot open a local CLI.',
   'card.action.local_cli_missing_cli_id': '⚠️ This card is missing its CLI binding, so the local CLI was not opened.',
   'card.action.local_cli_cli_mismatch': '⚠️ This card no longer matches the active session CLI; local open was rejected.',
+  'card.action.local_cli_mobile_unsupported': '⚠️ Mobile clients cannot open a local CLI. Tap from desktop, or use Web Terminal.',
   'card.action.local_cli_failed': '⚠️ Could not open the local CLI: {reason}',
   'card.action.session_gone': '⚠️ This session is no longer active; the action was not completed.',
   'card.action.no_output': '(no output yet)',

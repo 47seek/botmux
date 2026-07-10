@@ -7,6 +7,7 @@ import {
   appleScriptQuote,
   buildItermAppleScript,
   buildLocalCliOpenCommand,
+  buildTerminalAppleScript,
   buildTmuxAttachCommand,
   openLocalCliInIterm,
   shellQuote,
@@ -161,6 +162,7 @@ describe('local-cli-opener', () => {
   it('escapes AppleScript string literals used by terminal launch scripts', () => {
     expect(appleScriptQuote('echo "x" \\ done')).toBe('"echo \\"x\\" \\\\ done"');
     expect(buildItermAppleScript('echo "x"')).toContain('write text "echo \\"x\\""');
+    expect(buildTerminalAppleScript('echo "x"')).toContain('do script "echo \\"x\\""');
   });
 
   it('rejects non-macOS before probing local terminal apps', async () => {
@@ -211,7 +213,7 @@ describe('local-cli-opener', () => {
     expect(script).toContain("codex resume 'sid'");
   });
 
-  it('tries the iTerm app name after bundle-id launch fails without falling back to Terminal.app', async () => {
+  it('tries the iTerm app name after bundle-id launch fails before Terminal.app fallback', async () => {
     const runOsascript = vi
       .fn()
       .mockResolvedValueOnce({ ok: true })
@@ -233,11 +235,32 @@ describe('local-cli-opener', () => {
     expect(runOsascript.mock.calls.some((call) => String(call[0][1]).includes('Terminal'))).toBe(false);
   });
 
-  it('does not fall back to Terminal.app when iTerm cannot be opened', async () => {
+  it('falls back to Terminal.app when iTerm cannot be opened', async () => {
     const runOsascript = vi
       .fn()
       .mockResolvedValueOnce({ ok: false, stderr: 'bundle id unavailable' })
-      .mockResolvedValueOnce({ ok: false, stderr: 'iTerm not found' });
+      .mockResolvedValueOnce({ ok: false, stderr: 'iTerm not found' })
+      .mockResolvedValueOnce({ ok: true })
+      .mockResolvedValueOnce({ ok: true });
+    const result = await openLocalCliInIterm(ds(), {
+      platform: 'darwin',
+      runOsascript,
+      adapterFactory: () => ({ buildResumeCommand: () => 'codex resume sid' }),
+    });
+
+    expect(result.ok).toBe(true);
+    expect(runOsascript).toHaveBeenNthCalledWith(3, ['-e', 'id of application id "com.apple.Terminal"']);
+    const script = runOsascript.mock.calls[3][0][1];
+    expect(script).toContain('tell application id "com.apple.Terminal"');
+    expect(script).toContain("codex resume 'sid'");
+  });
+
+  it('reports a local terminal error when neither iTerm nor Terminal.app can be opened', async () => {
+    const runOsascript = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: false, stderr: 'bundle id unavailable' })
+      .mockResolvedValueOnce({ ok: false, stderr: 'iTerm not found' })
+      .mockResolvedValueOnce({ ok: false, stderr: 'Terminal not found' });
     const result = await openLocalCliInIterm(ds(), {
       platform: 'darwin',
       runOsascript,
@@ -245,10 +268,9 @@ describe('local-cli-opener', () => {
     });
 
     expect(result.ok).toBe(false);
-    expect(!result.ok && result.error).toBe('iterm_unavailable');
-    expect(!result.ok && result.message).toContain('iTerm');
-    expect(runOsascript).toHaveBeenCalledTimes(2);
-    expect(runOsascript.mock.calls.some((call) => String(call[0][1]).includes('Terminal'))).toBe(false);
+    expect(!result.ok && result.error).toBe('terminal_unavailable');
+    expect(!result.ok && result.message).toContain('Terminal.app');
+    expect(runOsascript).toHaveBeenCalledTimes(3);
   });
 
   it('launches TRAE in iTerm with traex resume instead of Trae app or URL schemes', async () => {

@@ -630,6 +630,7 @@ export const messages: Record<string, string> = {
   'card.action.local_cli_no_permission': '🔒 没有操作权限，无法在本机打开 CLI',
   'card.action.local_cli_missing_cli_id': '⚠️ 卡片缺少 CLI 绑定，无法打开本机 CLI',
   'card.action.local_cli_cli_mismatch': '⚠️ 卡片 CLI 与当前会话不一致，已拒绝打开本机 CLI',
+  'card.action.local_cli_mobile_unsupported': '⚠️ 手机端无法打开本机 CLI，请在电脑端点击，或使用 Web Terminal。',
   'card.action.local_cli_failed': '⚠️ 无法打开本机 CLI：{reason}',
   'card.action.session_gone': '⚠️ 会话已不在线，操作未完成',
   'card.action.no_output': '(当前无输出内容)',
