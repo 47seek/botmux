@@ -402,12 +402,14 @@ main:has(.sessions-page) {
 main:has(.sessions-page) .sessions-page {
   height: 100%;
   min-height: 0;
-  grid-template-rows: auto auto auto minmax(0, 1fr);
+  /* rows: 标题 / 运行时统计 / 筛选栏 / 批量操作栏 / 视图舞台(占满剩余) */
+  grid-template-rows: auto auto auto auto minmax(0, 1fr);
   overflow: hidden;
 }
 
 main:has(.sessions-page) .sessions-page:not(:has(#bulk-bar:not([hidden]))) {
-  grid-template-rows: auto auto minmax(0, 1fr);
+  /* 批量操作栏隐藏(display:none 退出 grid)时少一行 */
+  grid-template-rows: auto auto auto minmax(0, 1fr);
 }
 
 main:has(.sessions-page) .sessions-view-stage {
@@ -2250,10 +2252,12 @@ button.primary {
 }
 
 .session-board-count {
-  width: 26px;
+  width: auto;
   height: 26px;
   min-width: 26px;
   min-height: 26px;
+  padding: 0 7px;
+  box-sizing: border-box;
   display: inline-flex;
   align-items: center;
   justify-content: center;
