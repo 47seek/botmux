@@ -14,7 +14,15 @@
 ## 2. 建角色库骨架
 
 ```bash
-mkdir -p ~/botmux-roles/<bot>/shared/默认助理/knowledge
+mkdir -p ~/botmux-roles/<bot>/shared/default/knowledge
+```
+
+⚠️ **角色目录名必须是 ASCII slug**（`default` / `pm` / `after-sales`），中文名写在该目录
+`.botmux-dir.json` 的 `name` 字段：Claude Code 的记忆桶按 cwd 路径 slug 分桶且把非 ASCII 字符
+统一替换成 `-`，两个同长度的中文目录名会 slug 成同一个桶导致**记忆串台**。默认角色：
+
+```bash
+echo '{"name": "默认助理"}' > ~/botmux-roles/<bot>/shared/default/.botmux-dir.json
 ```
 
 - 按 `docs/roles/role-protocol-template.md` 写 `~/botmux-roles/<bot>/_role-protocol.md`

@@ -7,12 +7,17 @@
 
 - 你当前扮演的角色 = 本工作目录的角色（人设见本目录 CLAUDE.md 首段）。
 - 角色库：`<ROLES_ROOT>/shared/`（全员共享）与 `<ROLES_ROOT>/users/<open_id>/`（用户私有）。
+- **角色目录名必须是 ASCII slug**（`[a-z0-9-]`，如 `default` / `pm` / `after-sales`），**中文显示名写在该目录
+  `.botmux-dir.json` 的 `name` 字段**。原因：Claude Code 的记忆桶按 cwd 路径 slug 分桶，会把非 ASCII 字符
+  统一替换成 `-`——两个同长度的中文目录名（如「产品经理」「售后客服」）会 slug 成同一个桶，**记忆串台**。
+  对用户展示、匹配「切到XX」时一律用 `name`（中文），目录名只是内部标识。
 - 每条用户消息带 `<sender open_id="...">` 标签——这是判断「说话的是谁」的唯一依据。
 
 ## 触发词与处理流程（语义等价的说法都算，不做字面匹配）
 
 ### 「切换角色」/「有哪些角色」
-1. 列出 `shared/*` 与 `users/<发送者open_id>/*` 下的角色目录名，编号展示（标注共享/我的角色）。
+1. 扫 `shared/*` 与 `users/<发送者open_id>/*` 下的角色目录，读各自 `.botmux-dir.json` 的 `name` 作为显示名
+   （缺失则退回目录名），编号展示（标注共享/我的角色）。
 2. 用户回复编号或角色名后执行「切到XX」流程。
 3. 其他用户的私有角色不展示、不可切换；被点名要求切换他人角色时明确拒绝。
 
@@ -25,11 +30,13 @@
 
 ### 「新建角色：<一句话描述>」
 1. 按 role-claude-md-template.md 起草人设，预览给用户确认。
-2. 确认后在 `users/<发送者open_id>/<角色名>/` 创建两个文件：
+2. 起一个 **ASCII slug 目录名**（`[a-z0-9-]`，≤32 字符，如「小红书运营专家」→ `xhs-ops`），确认后在
+   `users/<发送者open_id>/<slug>/` 创建三个文件：
+   - `.botmux-dir.json`：`{"name": "<中文角色名>"}`（**必须先建**——它是角色的显示名来源；`url` 待首次沉淀时补）
    - `CLAUDE.md`（按模板，人设段替换为起草内容）
    - `_role-protocol.md`（**从角色库根 `<ROLES_ROOT>/_role-protocol.md` 复制一份**——
      协议必须是角色目录内的本地文件，否则 `@import` 会被判为外部 include 弹交互式批准框卡住会话）
-3. 然后走「切到XX」流程。角色名即目录名，限 32 字符内、不含 `/` 与空格。
+3. 然后走「切到XX」流程。
 
 ### 「沉淀知识」
 按以下顺序执行（pull → merge → distill → push）：
@@ -43,10 +50,12 @@
 
    ```json
    {
-     "name": "<角色名>",
+     "name": "<中文角色名>",
      "url": "https://<domain>/docx/<token>"
    }
    ```
+
+   `name` 有双重职责：卡片脚注显示的角色名 + 角色列表/「切到XX」匹配的显示名（目录名是 ASCII slug，不直接示人）。
 
    写错结构（如把 url 嵌进 `knowledgeDoc.url`）不会报错，但脚注上的角色名会**静默失去
    链接**，退化成纯文本。写完自检：`python3 -c "import json;d=json.load(open('.botmux-dir.json'));print(d['name'],d['url'])"` 应打印出角色名与文档链接。

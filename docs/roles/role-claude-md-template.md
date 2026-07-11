@@ -1,6 +1,7 @@
 # 角色目录 CLAUDE.md 模板
 
-> 复制到 `<角色目录>/CLAUDE.md`，替换「人设」段。
+> 复制到 `<角色目录>/CLAUDE.md`，替换「人设」段。角色**目录名是 ASCII slug**（如 `pm`），
+> 中文名写在同目录 `.botmux-dir.json` 的 `name` 字段（记忆桶按路径 slug 分桶，中文目录名会撞桶）。
 > **同时把角色库根的 `_role-protocol.md` 复制一份进该角色目录**——协议必须是角色目录内的
 > 本地文件，`@import` 才不会被 Claude Code 判为「外部 include」而弹出交互式批准框
 > （botmux 只自动种 `hasTrustDialogAccepted`，不种 `hasClaudeMdExternalIncludesApproved`）。
