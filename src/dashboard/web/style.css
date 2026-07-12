@@ -5458,12 +5458,14 @@ dialog.onboarding-dialog::backdrop {
 .roles-group-name {
   font-weight: 600;
   font-size: 13px;
+  line-height: 1.35;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 .roles-group-meta {
   font-size: 11px;
+  line-height: 1.35;
   color: var(--muted);
   margin-top: 1px;
 }
@@ -5501,12 +5503,14 @@ dialog.onboarding-dialog::backdrop {
 .roles-bot-name {
   font-size: 13px;
   font-weight: 500;
+  line-height: 1.35;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 .roles-bot-id {
   font-size: 10px;
+  line-height: 1.35;
   color: var(--muted);
   white-space: nowrap;
   overflow: hidden;
@@ -12182,6 +12186,7 @@ main:has(.whiteboards-page) {
 
 .roles-tree {
   display: grid;
+  grid-auto-rows: max-content;
   align-content: start;
   gap: 8px;
   padding: 8px;
@@ -13067,7 +13072,7 @@ form.dashboard-toolbar > input[type="text"]:focus {
   border: 1px solid color-mix(in srgb, var(--accent) 12%, var(--border-soft));
   border-radius: var(--radius-lg);
   background: color-mix(in srgb, var(--surface-muted) 42%, var(--surface));
-  overflow: hidden;
+  overflow: visible;
 }
 
 .roles-page .roles-group-row,
@@ -13085,8 +13090,9 @@ form.dashboard-toolbar > input[type="text"]:focus {
   display: grid;
   grid-template-columns: auto auto minmax(0, 1fr) auto;
   gap: 8px;
-  min-height: 30px;
-  padding: 0 2px;
+  align-items: center;
+  min-height: 48px;
+  padding: 6px 2px;
   border: 0;
   border-radius: 0;
   background: transparent;
@@ -13114,6 +13120,10 @@ form.dashboard-toolbar > input[type="text"]:focus {
 
 .roles-page .roles-group-row .roles-group-info {
   grid-column: 3;
+  display: grid;
+  align-content: center;
+  gap: 2px;
+  min-width: 0;
 }
 
 .roles-page .roles-group-row .roles-group-chevron {
@@ -13136,6 +13146,7 @@ form.dashboard-toolbar > input[type="text"]:focus {
 }
 
 .roles-page .roles-bot-row {
+  min-height: 48px;
   padding: 8px 10px;
 }
 
@@ -13859,7 +13870,11 @@ form.dashboard-toolbar > input[type="text"]:focus {
   bottom: auto;
   z-index: 2147483647;
   opacity: 1;
-  pointer-events: none;
+  /* Interactive: let the pointer reach the popover so its text is selectable /
+     copyable (JS keeps it open while hovered). */
+  pointer-events: auto;
+  user-select: text;
+  cursor: text;
   transform: translate(-50%, -100%);
 }
 
