@@ -67,6 +67,7 @@ import type { ProjectInfo } from '../../services/project-scanner.js';
 import { createRepoWorktree, removeRepoWorktree, dirSuffixForBranch } from '../../services/git-worktree.js';
 import { worktreeSlugFromContextAI } from '../../services/worktree-slug-ai.js';
 import { t, localeForBot, isLocale, type Locale } from '../../i18n/index.js';
+import { openLocalCliInIterm } from '../../services/local-cli-opener.js';
 
 // ─── Types ────────────────────────────────────────────────────────────────
 
@@ -1193,7 +1194,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     return await handleV3LoopGrantAction(value as unknown as V3LoopGrantActionValue, operatorOpenId, deps.v3LoopGrantDeps);
   }
 
-  const isSensitive = value?.action && ['restart', 'close', 'resume', 'skip_repo', 'repo_manual_submit', 'repo_worktree_submit', 'worktree_toggle_mode', 'retry_last_task', 'get_write_link', 'open_local_terminal', 'toggle_stream', 'toggle_display', 'export_text', 'term_action', 'refresh_screenshot', 'takeover', 'disconnect', 'tui_keys', 'tui_text_input', 'wf_approve', 'wf_reject', 'wf_cancel'].includes(value.action);
+  const isSensitive = value?.action && ['restart', 'close', 'resume', 'skip_repo', 'repo_manual_submit', 'repo_worktree_submit', 'worktree_toggle_mode', 'retry_last_task', 'get_write_link', 'open_local_terminal', 'open_local_cli', 'toggle_stream', 'toggle_display', 'export_text', 'term_action', 'refresh_screenshot', 'takeover', 'disconnect', 'tui_keys', 'tui_text_input', 'wf_approve', 'wf_reject', 'wf_cancel'].includes(value.action);
   if (isSensitive) {
     const rootId = value?.root_id;
     // activeSessions is keyed by sessionKey(anchor, larkAppId) — `${anchor}::${larkAppId}`
@@ -1228,10 +1229,12 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         // get_write_link 显式破例：其余敏感动作沿用「静默 block（仅日志）」的既有设计
         // （test/card-handler-repo-select.test.ts 把这点 pin 住了），但「获取操作链接」是
         // 用户主动点的取权动作，静默会让人以为按钮坏了——给一条明确的「无操作权限」toast。
-        if (value.action === 'get_write_link' || value.action === 'open_local_terminal') {
+        if (value.action === 'get_write_link' || value.action === 'open_local_terminal' || value.action === 'open_local_cli') {
           const key = value.action === 'open_local_terminal'
             ? 'card.action.local_terminal_no_permission'
-            : 'card.action.write_link_no_permission';
+            : value.action === 'open_local_cli'
+              ? 'card.action.local_cli_no_permission'
+              : 'card.action.write_link_no_permission';
           return { toast: { type: 'warning', content: t(key, undefined, localeForBot(effectiveAppId)) } };
         }
         return;
@@ -1248,10 +1251,12 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       if (hasAllowlist && (!operatorOpenId || !allowedUsers.includes(operatorOpenId))) {
         logger.info(`Card action "${value.action}" blocked for non-allowed user: ${operatorOpenId}`);
         // 与上面 non-operator 分支同理：仅 get_write_link 破例给 toast，其余保持静默。
-        if (value.action === 'get_write_link' || value.action === 'open_local_terminal') {
+        if (value.action === 'get_write_link' || value.action === 'open_local_terminal' || value.action === 'open_local_cli') {
           const key = value.action === 'open_local_terminal'
             ? 'card.action.local_terminal_no_permission'
-            : 'card.action.write_link_no_permission';
+            : value.action === 'open_local_cli'
+              ? 'card.action.local_cli_no_permission'
+              : 'card.action.write_link_no_permission';
           return { toast: { type: 'warning', content: t(key, undefined, localeForBot(larkAppId)) } };
         }
         return;
@@ -1294,7 +1299,59 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       ? getSessionByActionValue(activeSessions, rootId, larkAppId, value.session_id, actionType)
       : activeSessions.get(rootId);
 
-    if (ds && !validateCardCliBinding(ds, value)) return;
+    if (ds && actionType === 'open_local_cli') {
+      const actualCliId = sessionCliId(ds);
+      const locDs = localeForBot(ds.larkAppId);
+      if (!value?.cli_id) {
+        return { toast: { type: 'error', content: t('card.action.local_cli_missing_cli_id', undefined, locDs) } };
+      }
+      if (value.cli_id !== actualCliId) {
+        logger.warn(
+          `[${tag(ds)}] Rejected open_local_cli from mismatched CLI card: expected=${value.cli_id} actual=${actualCliId}`,
+        );
+        return { toast: { type: 'error', content: t('card.action.local_cli_cli_mismatch', undefined, locDs) } };
+      }
+    } else if (ds && !validateCardCliBinding(ds, value)) return;
+
+    if (actionType === 'open_local_cli') {
+      const locDs = localeForBot(ds?.larkAppId ?? larkAppId);
+      if (!ds) {
+        return { toast: { type: 'warning', content: t('card.action.session_gone', undefined, locDs) } };
+      }
+      const cliId = sessionCliId(ds);
+      if (cliId !== 'codex' && cliId !== 'traex') {
+        logger.warn(`[${tag(ds)}] Rejected open_local_cli for unsupported active CLI: ${cliId}`);
+        return { toast: { type: 'warning', content: t('card.action.local_terminal_unsupported', { cliName: getCliDisplayName(cliId) }, locDs) } };
+      }
+      const reportOpenLocalCliFailure = (reason: string) => {
+        if (value.visibility === 'private') {
+          logger.warn(`[${tag(ds)}] open_local_cli failed for private card; suppressing public fallback: ${reason}`);
+          return;
+        }
+        void sessionReply(rootId, t('card.action.local_cli_failed', { reason }, locDs))
+          .catch((err) => logger.warn(`[${tag(ds)}] open_local_cli failure reply failed: ${err instanceof Error ? err.message : String(err)}`));
+      };
+      void openLocalCliInIterm(ds, { cliId })
+        .then((result) => {
+          if (!result.ok) {
+            logger.warn(`[${tag(ds)}] open_local_cli failed: ${result.error}: ${result.message}`);
+            reportOpenLocalCliFailure(result.message);
+            return;
+          }
+          logger.info(`[${tag(ds)}] open_local_cli launched local terminal for ${cliId}`);
+        })
+        .catch((err) => {
+          const reason = err instanceof Error ? err.message : String(err);
+          logger.warn(`[${tag(ds)}] open_local_cli crashed: ${reason}`);
+          reportOpenLocalCliFailure(reason);
+        });
+      return {
+        toast: {
+          type: 'success',
+          content: t('card.action.local_cli_opened', { cliName: getCliDisplayName(cliId) }, locDs),
+        },
+      };
+    }
 
     // 🔊 语音总结 — no permission gate (任意人可点). Inject a condense-and-speak
     // instruction into the session; the model emits the voice via
