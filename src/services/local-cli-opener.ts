@@ -3,7 +3,48 @@ import type { CliAdapter, CliId } from '../adapters/cli/types.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import type { DaemonSession } from '../core/types.js';
 
-export type LocalCliId = Extract<CliId, 'codex' | 'traex'>;
+export const LOCAL_CLI_IDS = [
+  'claude-code',
+  'seed',
+  'relay',
+  'aiden',
+  'coco',
+  'codex',
+  'cursor',
+  'genius',
+  'opencode',
+  'antigravity',
+  'mtr',
+  'hermes',
+  'traex',
+  'pi',
+  'copilot',
+  'oh-my-pi',
+  'kimi',
+] as const satisfies readonly CliId[];
+
+export type LocalCliId = typeof LOCAL_CLI_IDS[number];
+
+const LOCAL_CLI_ID_SET = new Set<CliId>(LOCAL_CLI_IDS);
+
+const RESUME_COMMAND_PREFIXES: Record<Exclude<LocalCliId, 'oh-my-pi'>, string> = {
+  'claude-code': 'claude --resume',
+  'seed': 'seed --resume',
+  'relay': 'relay --resume',
+  'aiden': 'aiden --resume',
+  'coco': 'coco --resume',
+  'codex': 'codex resume',
+  'cursor': 'cursor-agent --resume',
+  'genius': 'genius --resume',
+  'opencode': 'opencode -s',
+  'antigravity': 'agy --conversation',
+  'mtr': 'mtr --session',
+  'hermes': 'hermes --resume',
+  'traex': 'traex resume',
+  'pi': 'pi --session-id',
+  'copilot': 'copilot --resume',
+  'kimi': 'kimi --resume',
+};
 
 export type LocalCliOpenError =
   | 'unsupported_cli'
@@ -37,8 +78,12 @@ function fail(error: LocalCliOpenError, message: string): LocalCliOpenResult {
   return { ok: false, error, message };
 }
 
+export function supportsLocalCliOpen(cliId: string | undefined): cliId is LocalCliId {
+  return !!cliId && LOCAL_CLI_ID_SET.has(cliId as CliId);
+}
+
 function localCliId(cliId: string | undefined): LocalCliId | undefined {
-  return cliId === 'codex' || cliId === 'traex' ? cliId : undefined;
+  return supportsLocalCliOpen(cliId) ? cliId : undefined;
 }
 
 export function shellQuote(value: string): string {
@@ -61,16 +106,13 @@ function nativeResumeId(ds: DaemonSession): string | undefined {
   return ds.adoptedFrom?.sessionId ?? ds.session.adoptedFrom?.sessionId ?? ds.session.cliSessionId;
 }
 
-function resumeBin(cliId: LocalCliId): string {
-  return cliId === 'codex' ? 'codex' : 'traex';
-}
-
 function quoteKnownResumeCommand(cliId: LocalCliId, raw: string): string | null {
-  const prefix = `${resumeBin(cliId)} resume `;
+  if (cliId === 'oh-my-pi') return raw === 'omp --continue' ? raw : null;
+  const prefix = `${RESUME_COMMAND_PREFIXES[cliId]} `;
   if (!raw.startsWith(prefix)) return null;
   const sid = raw.slice(prefix.length).trim();
   if (!sid) return null;
-  return `${resumeBin(cliId)} resume ${shellQuote(sid)}`;
+  return `${RESUME_COMMAND_PREFIXES[cliId]} ${shellQuote(sid)}`;
 }
 
 export function buildItermAppleScript(command: string, tellTarget: string = ITERM_TARGETS[0]): string {
@@ -99,7 +141,7 @@ export function buildLocalCliOpenCommand(
   opts: { cliId?: CliId; adapterFactory?: LocalCliOpenerDeps['adapterFactory'] } = {},
 ): LocalCliOpenResult {
   const cliId = localCliId(opts.cliId ?? ds.session.cliId ?? ds.adoptedFrom?.cliId ?? ds.session.adoptedFrom?.cliId);
-  if (!cliId) return fail('unsupported_cli', 'Only Codex and TRAE can be opened locally.');
+  if (!cliId) return fail('unsupported_cli', 'This CLI does not provide a supported local resume command.');
 
   const workingDir = sessionWorkingDir(ds);
   if (!workingDir) return fail('missing_working_dir', 'Session working directory is missing.');
@@ -109,10 +151,10 @@ export function buildLocalCliOpenCommand(
     sessionId: ds.session.sessionId,
     cliSessionId: nativeResumeId(ds),
   });
-  if (!rawResume) return fail('missing_resume_id', `${resumeBin(cliId)} does not have a resumable session id yet.`);
+  if (!rawResume) return fail('missing_resume_id', `${cliId} does not have a resumable session id yet.`);
 
   const resumeCommand = quoteKnownResumeCommand(cliId, rawResume);
-  if (!resumeCommand) return fail('missing_resume_id', `${resumeBin(cliId)} returned an unsupported resume command.`);
+  if (!resumeCommand) return fail('missing_resume_id', `${cliId} returned an unsupported resume command.`);
 
   return { ok: true, command: `cd ${shellQuote(workingDir)} && ${resumeCommand}` };
 }

@@ -67,7 +67,7 @@ import type { ProjectInfo } from '../../services/project-scanner.js';
 import { createRepoWorktree, removeRepoWorktree, dirSuffixForBranch } from '../../services/git-worktree.js';
 import { worktreeSlugFromContextAI } from '../../services/worktree-slug-ai.js';
 import { t, localeForBot, isLocale, type Locale } from '../../i18n/index.js';
-import { openLocalCliInIterm } from '../../services/local-cli-opener.js';
+import { openLocalCliInIterm, supportsLocalCliOpen, type LocalCliId } from '../../services/local-cli-opener.js';
 
 // ─── Types ────────────────────────────────────────────────────────────────
 
@@ -1299,6 +1299,37 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       ? getSessionByActionValue(activeSessions, rootId, larkAppId, value.session_id, actionType)
       : activeSessions.get(rootId);
 
+    const launchLocalCli = (target: DaemonSession, cliId: LocalCliId, locDs: Locale) => {
+      const reportFailure = (reason: string) => {
+        if (value.visibility === 'private') {
+          logger.warn(`[${tag(target)}] ${actionType} failed for private card; suppressing public fallback: ${reason}`);
+          return;
+        }
+        void sessionReply(rootId, t('card.action.local_cli_failed', { reason }, locDs))
+          .catch((err) => logger.warn(`[${tag(target)}] ${actionType} failure reply failed: ${err instanceof Error ? err.message : String(err)}`));
+      };
+      void openLocalCliInIterm(target, { cliId })
+        .then((result) => {
+          if (!result.ok) {
+            logger.warn(`[${tag(target)}] ${actionType} failed: ${result.error}: ${result.message}`);
+            reportFailure(result.message);
+            return;
+          }
+          logger.info(`[${tag(target)}] ${actionType} launched local terminal for ${cliId}`);
+        })
+        .catch((err) => {
+          const reason = err instanceof Error ? err.message : String(err);
+          logger.warn(`[${tag(target)}] ${actionType} crashed: ${reason}`);
+          reportFailure(reason);
+        });
+      return {
+        toast: {
+          type: 'success',
+          content: t('card.action.local_cli_opened', { cliName: getCliDisplayName(cliId) }, locDs),
+        },
+      };
+    };
+
     if (ds && actionType === 'open_local_cli') {
       const actualCliId = sessionCliId(ds);
       const locDs = localeForBot(ds.larkAppId);
@@ -1319,38 +1350,11 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         return { toast: { type: 'warning', content: t('card.action.session_gone', undefined, locDs) } };
       }
       const cliId = sessionCliId(ds);
-      if (cliId !== 'codex' && cliId !== 'traex') {
+      if (!supportsLocalCliOpen(cliId)) {
         logger.warn(`[${tag(ds)}] Rejected open_local_cli for unsupported active CLI: ${cliId}`);
         return { toast: { type: 'warning', content: t('card.action.local_terminal_unsupported', { cliName: getCliDisplayName(cliId) }, locDs) } };
       }
-      const reportOpenLocalCliFailure = (reason: string) => {
-        if (value.visibility === 'private') {
-          logger.warn(`[${tag(ds)}] open_local_cli failed for private card; suppressing public fallback: ${reason}`);
-          return;
-        }
-        void sessionReply(rootId, t('card.action.local_cli_failed', { reason }, locDs))
-          .catch((err) => logger.warn(`[${tag(ds)}] open_local_cli failure reply failed: ${err instanceof Error ? err.message : String(err)}`));
-      };
-      void openLocalCliInIterm(ds, { cliId })
-        .then((result) => {
-          if (!result.ok) {
-            logger.warn(`[${tag(ds)}] open_local_cli failed: ${result.error}: ${result.message}`);
-            reportOpenLocalCliFailure(result.message);
-            return;
-          }
-          logger.info(`[${tag(ds)}] open_local_cli launched local terminal for ${cliId}`);
-        })
-        .catch((err) => {
-          const reason = err instanceof Error ? err.message : String(err);
-          logger.warn(`[${tag(ds)}] open_local_cli crashed: ${reason}`);
-          reportOpenLocalCliFailure(reason);
-        });
-      return {
-        toast: {
-          type: 'success',
-          content: t('card.action.local_cli_opened', { cliName: getCliDisplayName(cliId) }, locDs),
-        },
-      };
+      return launchLocalCli(ds, cliId, locDs);
     }
 
     // 🔊 语音总结 — no permission gate (任意人可点). Inject a condense-and-speak
@@ -1657,14 +1661,16 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       } catch { /* fall through */ }
     }
 
-    // ⚠️ 生成「💻 打开 <CLI>」按钮的入口已在 card-builder 的 HIDE_OPEN_LOCAL_CLI_BUTTON
-    //    处暂时隐藏（会破坏飞书对话连续性，打磨好前不放出来）。此处理保留：一是兼容用户
-    //    点到隐藏前已发出的旧卡片，二是重新启用按钮时无需再改这里。
+    // Compatibility path for cards emitted before open_local_cli was introduced.
+    // Resumable CLIs use the same iTerm-first opener; other legacy cards retain
+    // the upstream generic terminal behavior.
     if (actionType === 'open_local_terminal') {
       const locDs = localeForBot(ds?.larkAppId ?? larkAppId);
       if (!ds) {
         return { toast: { type: 'warning', content: t('card.action.session_gone', undefined, locDs) } };
       }
+      const cliId = sessionCliId(ds);
+      if (supportsLocalCliOpen(cliId)) return launchLocalCli(ds, cliId, locDs);
       const result = openLocalTerminalForSession(ds);
       if (result.ok) {
         logger.info(`[${tag(ds)}] Local terminal open requested via card (${result.launcher}, ${result.backend})`);

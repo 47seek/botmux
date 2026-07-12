@@ -22,6 +22,7 @@ import {
 } from '../src/im/lark/card-builder.js';
 import type { RelayPickerEntry } from '../src/im/lark/card-builder.js';
 import type { ProjectInfo } from '../src/services/project-scanner.js';
+import { LOCAL_CLI_IDS } from '../src/services/local-cli-opener.js';
 import { globalConfigPath } from '../src/global-config.js';
 
 // The terminal button's URL wrapping now depends on the global dashboard
@@ -264,8 +265,16 @@ describe('buildSessionCard', () => {
       expect(actions.find((a: any) => a.text.content === 'Open TRAE')?.value.action).toBe('open_local_cli');
     });
 
-    it('does not include local-CLI open buttons for other CLIs', () => {
-      for (const cli of ['claude-code', 'codex-app', undefined] as const) {
+    it('includes a local-CLI open button for every adapter with a portable resume command', () => {
+      for (const cli of LOCAL_CLI_IDS) {
+        const card = parse(buildSessionCard(SID, ROOT, URL, TITLE, cli));
+        const actions = findActions(card);
+        expect(actions.find((a: any) => a.value?.action === 'open_local_cli')?.value.cli_id).toBe(cli);
+      }
+    });
+
+    it('does not include local-CLI open buttons when precise local resume is unavailable', () => {
+      for (const cli of ['codex-app', 'gemini', 'mira', 'mir', undefined] as const) {
         const card = parse(buildSessionCard(SID, ROOT, URL, TITLE, cli));
         const actions = findActions(card);
         expect(actions.some((a: any) => a.value?.action === 'open_local_cli')).toBe(false);

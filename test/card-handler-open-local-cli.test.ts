@@ -15,9 +15,10 @@ vi.mock('@larksuiteoapi/node-sdk', () => {
   return { Client: FakeClient };
 });
 
-vi.mock('../src/services/local-cli-opener.js', () => ({
-  openLocalCliInIterm: vi.fn(),
-}));
+vi.mock('../src/services/local-cli-opener.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/services/local-cli-opener.js')>();
+  return { ...actual, openLocalCliInIterm: vi.fn() };
+});
 
 vi.mock('../src/core/local-terminal-opener.js', () => ({
   openLocalTerminalForSession: vi.fn(() => ({ ok: true, launcher: 'iterm', backend: 'pty' })),
@@ -84,7 +85,7 @@ async function fresh() {
   const terminal = await import('../src/core/local-terminal-opener.js');
   const handler = await import('../src/im/lark/card-handler.js');
   registry.loadBotConfigs().forEach(c => registry.registerBot(c));
-  vi.mocked(opener.openLocalCliInIterm).mockReset();
+  vi.mocked(opener.openLocalCliInIterm).mockReset().mockResolvedValue({ ok: true, command: 'resume' });
   vi.mocked(terminal.openLocalTerminalForSession).mockClear();
   return { types, opener, terminal, handler };
 }
@@ -145,19 +146,38 @@ describe('card-handler open_local_cli', () => {
     expect(terminal.openLocalTerminalForSession).not.toHaveBeenCalled();
   });
 
-  it('legacy open_local_terminal authorized operator still uses the upstream opener', async () => {
+  it.each(['traex', 'claude-code'] as const)(
+    'legacy open_local_terminal for %s uses the iTerm-first resume opener',
+    async (cliId) => {
+      const { types, opener, terminal, handler } = await fresh();
+      const ds = makeDs(cliId);
+      deps.activeSessions.set(types.sessionKey('om_root', 'h1'), ds);
+
+      const res = await handler.handleCardAction(
+        action('ou_owner', cliId, {}, { action: 'open_local_terminal' }),
+        deps,
+        'h1',
+      );
+
+      expect(res?.toast?.type).toBe('success');
+      expect(opener.openLocalCliInIterm).toHaveBeenCalledWith(ds, { cliId });
+      expect(terminal.openLocalTerminalForSession).not.toHaveBeenCalled();
+    },
+  );
+
+  it('legacy open_local_terminal keeps the upstream opener for CLIs without precise local resume', async () => {
     const { types, opener, terminal, handler } = await fresh();
-    const ds = makeDs('codex');
+    const ds = makeDs('gemini');
     deps.activeSessions.set(types.sessionKey('om_root', 'h1'), ds);
 
     const res = await handler.handleCardAction(
-      action('ou_owner', 'codex', {}, { action: 'open_local_terminal' }),
+      action('ou_owner', 'gemini', {}, { action: 'open_local_terminal' }),
       deps,
       'h1',
     );
 
     expect(res?.toast?.type).toBe('success');
-    expect(res.toast.content).toContain('Requested opening local Codex');
+    expect(res.toast.content).toContain('Requested opening local Gemini');
     expect(terminal.openLocalTerminalForSession).toHaveBeenCalledWith(ds);
     expect(opener.openLocalCliInIterm).not.toHaveBeenCalled();
   });
@@ -184,11 +204,11 @@ describe('card-handler open_local_cli', () => {
     expect(opener.openLocalCliInIterm).not.toHaveBeenCalled();
   });
 
-  it('active sessions whose actual CLI is not Codex or TRAE are rejected before optimistic success', async () => {
+  it('active sessions without a precise local resume command are rejected before optimistic success', async () => {
     const { types, opener, handler } = await fresh();
-    deps.activeSessions.set(types.sessionKey('om_root', 'h1'), makeDs('claude-code'));
+    deps.activeSessions.set(types.sessionKey('om_root', 'h1'), makeDs('codex-app'));
 
-    const res = await handler.handleCardAction(action('ou_owner', 'claude-code'), deps, 'h1');
+    const res = await handler.handleCardAction(action('ou_owner', 'codex-app'), deps, 'h1');
 
     expect(res?.toast?.type).toBe('warning');
     expect(res.toast.content).toContain('cannot be opened locally');

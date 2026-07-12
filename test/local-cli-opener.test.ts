@@ -8,9 +8,12 @@ import {
   buildItermAppleScript,
   buildLocalCliOpenCommand,
   buildTerminalAppleScript,
+  LOCAL_CLI_IDS,
   openLocalCliInIterm,
   shellQuote,
+  supportsLocalCliOpen,
 } from '../src/services/local-cli-opener.js';
+import { createCliAdapterSync } from '../src/adapters/cli/registry.js';
 import type { DaemonSession } from '../src/core/types.js';
 
 function ds(overrides: Partial<DaemonSession> = {}): DaemonSession {
@@ -43,6 +46,25 @@ function ds(overrides: Partial<DaemonSession> = {}): DaemonSession {
 }
 
 describe('local-cli-opener', () => {
+  it('supports every adapter with a portable local resume command', () => {
+    for (const cliId of LOCAL_CLI_IDS) {
+      const result = buildLocalCliOpenCommand(ds({
+        session: { ...ds().session, cliId, cliSessionId: 'ses_nativeid' },
+      }), {
+        adapterFactory: (id) => createCliAdapterSync(id, '/bin/echo'),
+      });
+
+      expect(supportsLocalCliOpen(cliId)).toBe(true);
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.command).not.toContain('attach-session');
+      }
+    }
+    for (const cliId of ['codex-app', 'gemini', 'mira', 'mir']) {
+      expect(supportsLocalCliOpen(cliId)).toBe(false);
+    }
+  });
+
   it('quotes shell arguments for cwd and resume id', () => {
     expect(shellQuote("a'b c")).toBe("'a'\\''b c'");
 

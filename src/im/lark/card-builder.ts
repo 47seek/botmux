@@ -8,6 +8,7 @@ import type { CliUsageLimitState } from '../../utils/cli-usage-limit.js';
 import { t, type Locale } from '../../i18n/index.js';
 import { readGlobalConfig } from '../../global-config.js';
 import type { ConfigCardData } from '../../services/bot-config-store.js';
+import { supportsLocalCliOpen } from '../../services/local-cli-opener.js';
 
 /** select_static 里代表「清回默认 / 未设置」的哨兵值（model / lang 下拉用）。 */
 export const CONFIG_UNSET = '__unset__';
@@ -251,10 +252,15 @@ export function terminalMultiUrl(url: string): Record<string, string> {
 }
 
 function localCliButton(cliId: CliId, actionBase: Record<string, string>, locale?: Locale): any | undefined {
-  if (cliId !== 'codex' && cliId !== 'traex') return undefined;
+  if (!supportsLocalCliOpen(cliId)) return undefined;
+  const labelKey = cliId === 'codex'
+    ? 'card.btn.open_local_codex'
+    : cliId === 'traex'
+      ? 'card.btn.open_local_trae'
+      : 'card.btn.open_local_cli';
   return {
     tag: 'button',
-    text: { tag: 'plain_text', content: t(cliId === 'codex' ? 'card.btn.open_local_codex' : 'card.btn.open_local_trae', undefined, locale) },
+    text: { tag: 'plain_text', content: t(labelKey, { cliName: getCliDisplayName(cliId) }, locale) },
     type: 'default',
     value: { action: 'open_local_cli', ...actionBase },
   };
@@ -287,7 +293,7 @@ export function buildSessionCard(
     },
   ];
   if (!showManageButtons) {
-    const localBtn = localCliButton(effectiveCliId, actionBase, locale);
+    const localBtn = cliId ? localCliButton(effectiveCliId, actionBase, locale) : undefined;
     if (localBtn) actions.push(localBtn);
     actions.push({
       tag: 'button',
@@ -731,7 +737,7 @@ export function buildStreamingCard(
     type: 'primary',
     multi_url: terminalMultiUrl(terminalUrl),
   });
-  const localBtn = localCliButton(effectiveCliId, actionBase, locale);
+  const localBtn = cliId ? localCliButton(effectiveCliId, actionBase, locale) : undefined;
   if (localBtn) headerActions.push(localBtn);
   if (status === 'limited' && usageLimit?.retryReady) {
     headerActions.push({
