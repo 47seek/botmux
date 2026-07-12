@@ -59,11 +59,12 @@ describe('local-cli-opener', () => {
     vi.unstubAllEnvs();
   });
 
-  it('supports every adapter with a portable local resume command', () => {
+  it('resume mode supports every adapter with a portable local resume command', () => {
     for (const cliId of LOCAL_CLI_IDS) {
       const result = buildLocalCliOpenCommand(ds({
         session: { ...ds().session, cliId, cliSessionId: 'ses_nativeid' },
       }), {
+        mode: 'resume',
         adapterFactory: (id) => createCliAdapterSync(id, '/bin/echo'),
       });
 
@@ -82,6 +83,7 @@ describe('local-cli-opener', () => {
     expect(shellQuote("a'b c")).toBe("'a'\\''b c'");
 
     const result = buildLocalCliOpenCommand(ds(), {
+      mode: 'resume',
       adapterFactory: () => ({
         buildResumeCommand: () => "codex resume native'id",
       }),
@@ -93,11 +95,101 @@ describe('local-cli-opener', () => {
     });
   });
 
-  it('uses adapter resume for managed tmux sessions instead of tmux attach', () => {
+  it('attach mode opens a managed tmux session with exact target syntax', () => {
+    const adapterFactory = vi.fn(() => ({ buildResumeCommand: () => 'codex resume should-not-run' }));
+    const result = buildLocalCliOpenCommand(ds({
+      session: { ...ds().session, sessionId: 'abcdef123456', backendType: 'tmux', cliSessionId: undefined },
+    }), { mode: 'attach', adapterFactory });
+
+    expect(result).toEqual({
+      ok: true,
+      command: "tmux attach-session -t '=bmx-abcdef12'",
+    });
+    expect(result.ok && result.command).not.toContain("-t 'bmx-abcdef12'");
+    expect(adapterFactory).not.toHaveBeenCalled();
+    expect(isLocalCliOpenReady(ds({
+      session: { ...ds().session, sessionId: 'abcdef123456', backendType: 'tmux', cliSessionId: undefined },
+    }), { mode: 'attach', adapterFactory })).toBe(true);
+  });
+
+  it('attach mode opens a managed Herdr session with official session attach', () => {
+    const adapterFactory = vi.fn(() => ({ buildResumeCommand: () => 'codex resume should-not-run' }));
+    const result = buildLocalCliOpenCommand(ds({
+      session: { ...ds().session, sessionId: 'abcdef123456', backendType: 'herdr', cliSessionId: undefined },
+    }), { mode: 'attach', adapterFactory });
+
+    expect(result).toEqual({
+      ok: true,
+      command: "herdr session attach 'bmx-abcdef12'",
+    });
+    expect(adapterFactory).not.toHaveBeenCalled();
+  });
+
+  it('attach mode opens adopted Herdr by exact scoped terminal id when available', () => {
+    const result = buildLocalCliOpenCommand(ds({
+      adoptedFrom: { source: 'herdr', herdrSessionName: 'dev', herdrTerminalId: 'terminal_1', cwd: '/repo' },
+      session: { ...ds().session, backendType: 'herdr', cliSessionId: undefined },
+    }), { mode: 'attach' });
+
+    expect(result).toEqual({
+      ok: true,
+      command: "herdr --session 'dev' terminal attach 'terminal_1'",
+    });
+  });
+
+  it('attach mode fails closed for adopted Herdr session-only or pane-only metadata', () => {
+    const sessionOnly = buildLocalCliOpenCommand(ds({
+      adoptedFrom: { source: 'herdr', herdrSessionName: 'dev-session', cwd: '/repo' },
+      session: { ...ds().session, backendType: 'herdr', cliSessionId: undefined },
+    }), { mode: 'attach' });
+
+    expect(sessionOnly).toMatchObject({ ok: false, error: 'missing_attach_target' });
+    expect(!sessionOnly.ok && sessionOnly.message).toContain('scoped session and terminal');
+
+    const paneOnly = buildLocalCliOpenCommand(ds({
+      adoptedFrom: { source: 'herdr', herdrPaneId: 'pane_1', cwd: '/repo' },
+      session: { ...ds().session, backendType: 'herdr', cliSessionId: undefined },
+    }), { mode: 'attach' });
+
+    expect(paneOnly).toMatchObject({ ok: false, error: 'missing_attach_target' });
+    expect(!paneOnly.ok && paneOnly.message).toContain('scoped session and terminal');
+  });
+
+  it('attach mode fails closed for adopted tmux instead of trusting stale pane metadata', () => {
+    const result = buildLocalCliOpenCommand(ds({
+      adoptedFrom: { source: 'tmux', tmuxTarget: 'dev:1.2', originalCliPid: 1234, cliId: 'codex', cwd: '/repo' },
+      session: { ...ds().session, backendType: 'tmux', cliSessionId: undefined },
+    }), { mode: 'attach' });
+
+    expect(result).toMatchObject({ ok: false, error: 'missing_attach_target' });
+    expect(!result.ok && result.message).toContain('stale or reused');
+  });
+
+  it('attach mode fails closed for unsupported or unreliable targets without resume fallback', () => {
+    const adapterFactory = vi.fn(() => ({ buildResumeCommand: () => 'codex resume should-not-run' }));
+    const zellij = buildLocalCliOpenCommand(ds({
+      session: { ...ds().session, backendType: 'zellij', cliSessionId: 'native-ready' },
+    }), { mode: 'attach', adapterFactory });
+    expect(zellij).toMatchObject({ ok: false, error: 'unsupported_backend' });
+
+    const pty = buildLocalCliOpenCommand(ds({
+      session: { ...ds().session, backendType: 'pty', cliSessionId: 'native-ready' },
+    }), { mode: 'attach', adapterFactory });
+    expect(pty).toMatchObject({ ok: false, error: 'unsupported_backend' });
+
+    const adoptedTmux = buildLocalCliOpenCommand(ds({
+      adoptedFrom: { source: 'tmux', tmuxTarget: 'dev:1.2', cliId: 'codex', cwd: '/repo' },
+      session: { ...ds().session, backendType: 'tmux', cliSessionId: 'native-ready' },
+    }), { mode: 'attach', adapterFactory });
+    expect(adoptedTmux).toMatchObject({ ok: false, error: 'missing_attach_target' });
+    expect(adapterFactory).not.toHaveBeenCalled();
+  });
+
+  it('resume mode uses adapter resume for managed tmux sessions instead of attach', () => {
     const adapterFactory = vi.fn(() => ({ buildResumeCommand: () => 'codex resume native-managed' }));
     const result = buildLocalCliOpenCommand(ds({
       session: { ...ds().session, backendType: 'tmux', cliSessionId: 'native-managed' },
-    }), { adapterFactory });
+    }), { mode: 'resume', adapterFactory });
 
     expect(result).toEqual({
       ok: true,
@@ -116,7 +208,7 @@ describe('local-cli-opener', () => {
       adoptedFrom: { source: 'tmux', tmuxTarget: 'dev:1.2', cliId: 'traex', cwd: '/repo', sessionId: 'adopt-native' },
       workingDir: undefined,
       session: { ...ds().session, cliId: 'traex', cliSessionId: undefined, workingDir: undefined },
-    }), { adapterFactory });
+    }), { mode: 'resume', adapterFactory });
 
     expect(result).toEqual({
       ok: true,
@@ -138,6 +230,7 @@ describe('local-cli-opener', () => {
         workingDir: undefined,
       },
     }), {
+      mode: 'resume',
       adapterFactory: () => ({ buildResumeCommand: ({ cliSessionId }) => `codex resume ${cliSessionId}` }),
     });
 
@@ -161,6 +254,7 @@ describe('local-cli-opener', () => {
         adoptedFrom: { source: 'tmux', tmuxTarget: 'dev:1.2', cliId: 'codex', cwd: '/persisted', sessionId: 'persisted-native' },
       },
     }), {
+      mode: 'resume',
       adapterFactory: () => ({ buildResumeCommand: ({ cliSessionId }) => `codex resume ${cliSessionId}` }),
     });
 
@@ -172,6 +266,7 @@ describe('local-cli-opener', () => {
 
   it('returns a clear error when adapter cannot resolve a resume id', () => {
     const result = buildLocalCliOpenCommand(ds(), {
+      mode: 'resume',
       adapterFactory: () => ({ buildResumeCommand: () => null }),
     });
 
@@ -186,14 +281,14 @@ describe('local-cli-opener', () => {
         cliSessionId ? `codex resume ${cliSessionId}` : null,
     });
 
-    expect(isLocalCliOpenReady(pending, { adapterFactory })).toBe(false);
-    expect(preflightLocalCliOpen(pending, { adapterFactory })).toMatchObject({
+    expect(isLocalCliOpenReady(pending, { mode: 'resume', adapterFactory })).toBe(false);
+    expect(preflightLocalCliOpen(pending, { mode: 'resume', adapterFactory })).toMatchObject({
       ok: false,
       error: 'missing_resume_id',
     });
 
     pending.session.cliSessionId = 'native-ready';
-    expect(isLocalCliOpenReady(pending, { adapterFactory })).toBe(true);
+    expect(isLocalCliOpenReady(pending, { mode: 'resume', adapterFactory })).toBe(true);
   });
 
   it('treats adopted ids and oh-my-pi continue as ready resume targets', () => {
@@ -203,6 +298,7 @@ describe('local-cli-opener', () => {
       session: { ...ds().session, cliId: 'traex', cliSessionId: undefined, workingDir: undefined },
     });
     expect(isLocalCliOpenReady(adopted, {
+      mode: 'resume',
       adapterFactory: () => ({ buildResumeCommand: ({ cliSessionId }) => `traex resume ${cliSessionId}` }),
     })).toBe(true);
 
@@ -210,12 +306,14 @@ describe('local-cli-opener', () => {
       session: { ...ds().session, cliId: 'oh-my-pi', cliSessionId: undefined },
     });
     expect(isLocalCliOpenReady(ohMyPi, {
+      mode: 'resume',
       adapterFactory: () => ({ buildResumeCommand: () => 'omp --continue' }),
     })).toBe(true);
   });
 
   it('rejects unsupported adapter resume commands, including URL schemes', () => {
     const unsupported = buildLocalCliOpenCommand(ds(), {
+      mode: 'resume',
       adapterFactory: () => ({ buildResumeCommand: () => 'codex --resume sid' }),
     });
     expect(unsupported.ok).toBe(false);
@@ -225,6 +323,7 @@ describe('local-cli-opener', () => {
     const scheme = buildLocalCliOpenCommand(ds({
       session: { ...ds().session, cliId: 'traex', cliSessionId: 'native1' },
     }), {
+      mode: 'resume',
       adapterFactory: () => ({ buildResumeCommand: () => 'traex://resume/native1' }),
     });
     expect(scheme.ok).toBe(false);
@@ -257,6 +356,7 @@ describe('local-cli-opener', () => {
     const runOsascript = vi.fn(async () => ({ ok: true }));
     const result = await openLocalCliInIterm(ds(), {
       platform: 'darwin',
+      mode: 'resume',
       runOsascript,
       adapterFactory: () => ({ buildResumeCommand: () => 'codex resume sid' }),
     });
@@ -278,6 +378,7 @@ describe('local-cli-opener', () => {
       .mockResolvedValueOnce({ ok: true });
     const result = await openLocalCliInIterm(ds(), {
       platform: 'darwin',
+      mode: 'resume',
       runOsascript,
       adapterFactory: () => ({ buildResumeCommand: () => 'codex resume sid' }),
     });
@@ -299,6 +400,7 @@ describe('local-cli-opener', () => {
       .mockResolvedValueOnce({ ok: true });
     const result = await openLocalCliInIterm(ds(), {
       platform: 'darwin',
+      mode: 'resume',
       runOsascript,
       adapterFactory: () => ({ buildResumeCommand: () => 'codex resume sid' }),
     });
@@ -311,6 +413,7 @@ describe('local-cli-opener', () => {
     const runOsascript = vi.fn(async () => ({ ok: false, stderr: 'automation denied' }));
     const result = await openLocalCliInIterm(ds(), {
       platform: 'darwin',
+      mode: 'resume',
       runOsascript,
       adapterFactory: () => ({ buildResumeCommand: () => 'codex resume sid' }),
     });
@@ -327,6 +430,7 @@ describe('local-cli-opener', () => {
       session: { ...ds().session, cliId: 'traex', cliSessionId: 'trae-native' },
     }), {
       platform: 'darwin',
+      mode: 'resume',
       runOsascript,
       adapterFactory: () => ({ buildResumeCommand: () => 'traex resume trae-native' }),
     });

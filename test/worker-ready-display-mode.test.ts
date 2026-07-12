@@ -94,6 +94,9 @@ vi.mock('../src/adapters/cli/registry.js', () => ({
 vi.mock('../src/services/local-cli-opener.js', () => ({
   isLocalCliOpenEnabled: vi.fn(() => true),
   isLocalCliOpenReady: vi.fn((ds: DaemonSession, opts?: { cliId?: string }) => {
+    if (!ds.adoptedFrom && !ds.session.adoptedFrom && (ds.session.backendType === 'tmux' || ds.session.backendType === 'herdr')) {
+      return true;
+    }
     const cliId = opts?.cliId ?? ds.session.cliId;
     if (cliId === 'oh-my-pi') return true;
     return !!(ds.adoptedFrom?.sessionId ?? ds.session.adoptedFrom?.sessionId ?? ds.session.cliSessionId);
@@ -306,6 +309,27 @@ describe('Worker ready: set_display_mode re-sync', () => {
 
     expect(updateMessageMock).toHaveBeenCalledTimes(3);
     expect(JSON.parse(updateMessageMock.mock.calls.at(-1)![2])).toMatchObject({ localCliReady: true });
+  });
+
+  it('does not require cli_session_id for mode-aware managed tmux local attach readiness', async () => {
+    const fakeWorker = makeFakeWorker();
+    const ds = makeDs({
+      worker: fakeWorker,
+      streamCardPending: false,
+      streamCardId: 'om_existing_card',
+      workingDir: '/tmp',
+    });
+    ds.session.cliId = 'gemini' as any;
+    ds.session.backendType = 'tmux';
+    ds.session.cliSessionId = undefined;
+    ds.session.workingDir = '/tmp';
+
+    __testOnly_setupWorkerHandlers(ds, fakeWorker);
+    fakeWorker.emit('message', { type: 'ready', port: 9999, token: 'tok_abc' });
+    await flush();
+
+    expect(updateMessageMock).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(updateMessageMock.mock.calls[0][2])).toMatchObject({ localCliReady: true });
   });
 
   // Regression: a re-fork that happens while streamCardPending is true (new turn

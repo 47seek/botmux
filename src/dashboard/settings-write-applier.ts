@@ -38,6 +38,7 @@ export interface ResolvedDashboardSettingsView {
   publicReadOnly: boolean;
   openTerminalInFeishu: boolean;
   enableLocalCliOpen: boolean;
+  localCliOpenMode: 'attach' | 'resume';
   chatBotDiscovery: boolean;
   vcMeetingAgent: {
     enabled: boolean;
@@ -135,6 +136,7 @@ export type ApplySettingsWriteError =
   | 'invalid_publicReadOnly'
   | 'invalid_openTerminalInFeishu'
   | 'invalid_enableLocalCliOpen'
+  | 'invalid_localCliOpenMode'
   | 'invalid_chatBotDiscovery'
   | 'invalid_repoPickerMode'
   | 'invalid_remoteAccess'
@@ -191,6 +193,12 @@ export async function applySettingsWrite(
       return { ok: false, error: 'invalid_enableLocalCliOpen' };
     }
     patch.enableLocalCliOpen = obj.enableLocalCliOpen;
+  }
+  if ('localCliOpenMode' in obj) {
+    if (obj.localCliOpenMode !== 'attach' && obj.localCliOpenMode !== 'resume') {
+      return { ok: false, error: 'invalid_localCliOpenMode' };
+    }
+    patch.localCliOpenMode = obj.localCliOpenMode;
   }
   if ('chatBotDiscovery' in obj) {
     if (typeof obj.chatBotDiscovery !== 'boolean') {

@@ -299,6 +299,7 @@ interface ResolvedDashboardSettings {
   publicReadOnly: boolean;
   openTerminalInFeishu: boolean;
   enableLocalCliOpen: boolean;
+  localCliOpenMode: 'attach' | 'resume';
   /** Experimental current-chat bot discovery via Lark `/members/bots`. Default ON. */
   chatBotDiscovery: boolean;
   /** Machine-wide VC meeting listener kill-switch. Default ON. */
@@ -697,6 +698,7 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
     publicReadOnly: dashboard.publicReadOnly ?? config.dashboard.publicReadOnly,
     openTerminalInFeishu: dashboard.openTerminalInFeishu === true,
     enableLocalCliOpen: dashboard.enableLocalCliOpen === true,
+    localCliOpenMode: dashboard.localCliOpenMode ?? 'attach',
     chatBotDiscovery: dashboard.chatBotDiscovery !== false, // default ON
     vcMeetingAgent: {
       enabled: global.vcMeetingAgent?.enabled !== false,

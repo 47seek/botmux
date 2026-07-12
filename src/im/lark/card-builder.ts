@@ -8,7 +8,7 @@ import type { CliUsageLimitState } from '../../utils/cli-usage-limit.js';
 import { t, type Locale } from '../../i18n/index.js';
 import { readGlobalConfig } from '../../global-config.js';
 import type { ConfigCardData } from '../../services/bot-config-store.js';
-import { isLocalCliOpenEnabled, supportsLocalCliOpen } from '../../services/local-cli-opener.js';
+import { isLocalCliOpenEnabled } from '../../services/local-cli-opener.js';
 
 /** select_static 里代表「清回默认 / 未设置」的哨兵值（model / lang 下拉用）。 */
 export const CONFIG_UNSET = '__unset__';
@@ -254,13 +254,13 @@ export function terminalMultiUrl(url: string): Record<string, string> {
 /** 💻「打开 <CLI>」默认隐藏，通过 dashboard.enableLocalCliOpen 显式开启：
  *  1) 当前 iTerm-first opener 只支持 macOS；生产 daemon 常跑在 headless Linux，
  *     即使误开开关也不能生成一个必然失败的按钮。
- *  2) 当前实现会另起 `resume` 进程，而不是与 botmux worker 共用 PTY；切到本机继续交互
- *     后，飞书侧可能不再跟随同一会话，破坏对话连续性。
+ *  2) `attach` 模式只在当前 backend 有精确 attach 目标时显示，尽量保持同一路 I/O/历史；
+ *     `resume` 模式才要求 CLI direct resume readiness，且可能破坏飞书连续性。
  *
- *  后续若改为 tmux attach / 共享 I/O，可再评估默认开放。现在仅供明确接受上述限制的
- *  本地桌面部署 opt-in；handler 也会重复校验，防止已发出的旧卡片绕过开关。 */
+ *  localCliReady 必须由调用方按当前配置模式计算；handler 也会重复校验，防止已发出的
+ *  旧卡片绕过开关或模式切换。 */
 function localCliButton(cliId: CliId, actionBase: Record<string, string>, locale: Locale | undefined, localCliReady: boolean): any | undefined {
-  if (!isLocalCliOpenEnabled() || !supportsLocalCliOpen(cliId) || !localCliReady) return undefined;
+  if (!isLocalCliOpenEnabled() || !localCliReady) return undefined;
   const labelKey = cliId === 'codex'
     ? 'card.btn.open_local_codex'
     : cliId === 'traex'

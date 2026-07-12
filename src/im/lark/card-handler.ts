@@ -58,7 +58,6 @@ import { getSessionWorkingDir, buildNewTopicPrompt, getAvailableBots, persistStr
 import { publishAttentionPatch, announcePendingRepoSession } from '../../core/session-activity.js';
 import { fallbackTurnId } from '../../core/reply-target.js';
 import { validateWorkingDir } from '../../core/working-dir.js';
-import { openLocalTerminalForSession } from '../../core/local-terminal-opener.js';
 import type { DaemonToWorker, DisplayMode, TermActionKey } from '../../types.js';
 import { sessionKey, sessionAnchorId, frozenDisplayMode } from '../../core/types.js';
 import type { DaemonSession } from '../../core/types.js';
@@ -71,10 +70,9 @@ import {
   isLocalCliOpenCapable,
   isLocalCliOpenConfigured,
   isLocalCliOpenReady,
+  localCliOpenMode,
   openLocalCliInIterm,
   preflightLocalCliOpen,
-  supportsLocalCliOpen,
-  type LocalCliId,
 } from '../../services/local-cli-opener.js';
 
 // ─── Types ────────────────────────────────────────────────────────────────
@@ -1307,12 +1305,17 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       ? getSessionByActionValue(activeSessions, rootId, larkAppId, value.session_id, actionType)
       : activeSessions.get(rootId);
 
-    const launchLocalCli = (target: DaemonSession, cliId: LocalCliId, locDs: Locale) => {
-      const preflight = preflightLocalCliOpen(target, { cliId });
+    const launchLocalCli = (target: DaemonSession, locDs: Locale) => {
+      const cliId = sessionCliId(target);
+      const mode = localCliOpenMode();
+      const preflight = preflightLocalCliOpen(target, { cliId, mode });
       if (!preflight.ok) {
         logger.warn(`[${tag(target)}] Rejected ${actionType} preflight: ${preflight.error}: ${preflight.message}`);
         if (preflight.error === 'missing_resume_id') {
           return { toast: { type: 'warning', content: t('card.action.local_cli_not_ready', undefined, locDs) } };
+        }
+        if (preflight.error === 'unsupported_cli' || preflight.error === 'unsupported_backend' || preflight.error === 'missing_attach_target') {
+          return { toast: { type: 'warning', content: t('card.action.local_terminal_unsupported', { cliName: getCliDisplayName(cliId) }, locDs) } };
         }
         return { toast: { type: 'error', content: t('card.action.local_cli_failed', { reason: preflight.message }, locDs) } };
       }
@@ -1324,14 +1327,14 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         void sessionReply(rootId, t('card.action.local_cli_failed', { reason }, locDs))
           .catch((err) => logger.warn(`[${tag(target)}] ${actionType} failure reply failed: ${err instanceof Error ? err.message : String(err)}`));
       };
-      void openLocalCliInIterm(target, { cliId })
+      void openLocalCliInIterm(target, { cliId, mode })
         .then((result) => {
           if (!result.ok) {
             logger.warn(`[${tag(target)}] ${actionType} failed: ${result.error}: ${result.message}`);
             reportFailure(result.message);
             return;
           }
-          logger.info(`[${tag(target)}] ${actionType} launched local terminal for ${cliId}`);
+          logger.info(`[${tag(target)}] ${actionType} launched local terminal for ${cliId} (${mode})`);
         })
         .catch((err) => {
           const reason = err instanceof Error ? err.message : String(err);
@@ -1383,12 +1386,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       }
       const blocked = guardLocalCliOpen(ds, locDs);
       if (blocked) return blocked;
-      const cliId = sessionCliId(ds);
-      if (!supportsLocalCliOpen(cliId)) {
-        logger.warn(`[${tag(ds)}] Rejected open_local_cli for unsupported active CLI: ${cliId}`);
-        return { toast: { type: 'warning', content: t('card.action.local_terminal_unsupported', { cliName: getCliDisplayName(cliId) }, locDs) } };
-      }
-      return launchLocalCli(ds, cliId, locDs);
+      return launchLocalCli(ds, locDs);
     }
 
     // 🔊 语音总结 — no permission gate (任意人可点). Inject a condense-and-speak
@@ -1698,8 +1696,9 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
 
     // Compatibility path for cards emitted before open_local_cli was introduced.
     // The opt-in/capability guard still applies so old cards cannot bypass the
-    // default-off continuity protection. Once allowed, resumable CLIs use the
-    // iTerm-first opener; other legacy cards retain the generic opener.
+    // default-off continuity protection. Clicks read the current mode: attach
+    // mode uses exact backend attach with no fallback; resume mode uses the same
+    // precise resume preflight and also fails closed when unsupported.
     if (actionType === 'open_local_terminal') {
       const locDs = localeForBot(ds?.larkAppId ?? larkAppId);
       if (!ds) {
@@ -1707,21 +1706,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       }
       const blocked = guardLocalCliOpen(ds, locDs);
       if (blocked) return blocked;
-      const cliId = sessionCliId(ds);
-      if (supportsLocalCliOpen(cliId)) return launchLocalCli(ds, cliId, locDs);
-      const result = openLocalTerminalForSession(ds);
-      if (result.ok) {
-        logger.info(`[${tag(ds)}] Local terminal open requested via card (${result.launcher}, ${result.backend})`);
-        return { toast: { type: 'success', content: t('card.action.local_terminal_opened', { cliName: getCliDisplayName(sessionCliId(ds)) }, locDs) } };
-      }
-      logger.warn(`[${tag(ds)}] Local terminal open failed: ${result.error}${result.detail ? ` (${result.detail})` : ''}`);
-      if (result.error === 'cli_unavailable') {
-        return { toast: { type: 'warning', content: t('card.action.local_cli_missing', { cliName: getCliDisplayName(sessionCliId(ds)), executable: result.executable ?? sessionCliId(ds) }, locDs) } };
-      }
-      if (result.error === 'resume_unavailable' || result.error === 'unsupported_platform' || result.error === 'launcher_unavailable') {
-        return { toast: { type: 'warning', content: t('card.action.local_terminal_unsupported', { cliName: getCliDisplayName(sessionCliId(ds)) }, locDs) } };
-      }
-      return { toast: { type: 'error', content: t('card.action.local_terminal_failed', { reason: result.detail ?? result.error }, locDs) } };
+      return launchLocalCli(ds, locDs);
     }
 
     if (actionType === 'get_write_link' && ds && operatorOpenId) {

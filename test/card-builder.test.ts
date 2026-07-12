@@ -307,6 +307,15 @@ describe('buildSessionCard', () => {
       }
     });
 
+    it('can include local attach buttons for non-resume CLIs when mode-aware readiness is true', () => {
+      enableLocalCliOpen();
+      const card = parse(buildSessionCard(SID, ROOT, URL, TITLE, 'gemini', false, false, 'en', true));
+      const actions = findActions(card);
+      const btn = actions.find((a: any) => a.value?.action === 'open_local_cli');
+      expect(btn?.value.cli_id).toBe('gemini');
+      expect(btn?.text.content).toBe('💻 Open Gemini');
+    });
+
     it('does not include local-CLI open buttons when precise local resume is unavailable', () => {
       enableLocalCliOpen();
       for (const cli of ['codex-app', 'gemini', 'mira', 'mir', undefined] as const) {
