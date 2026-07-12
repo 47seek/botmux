@@ -279,6 +279,8 @@ const REQUIRED_KEYS: string[] = [
   'settings.publicReadOnlyHelp',
   'settings.openTerminalInFeishu',
   'settings.openTerminalInFeishuHelp',
+  'settings.enableLocalCliOpen',
+  'settings.enableLocalCliOpenHelp',
   'settings.autoUpdate',
   'settings.autoUpdateHelp',
   'settings.autoRestart',

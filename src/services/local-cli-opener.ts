@@ -1,7 +1,9 @@
 import { execFile } from 'node:child_process';
 import type { CliAdapter, CliId } from '../adapters/cli/types.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
+import { localTerminalCapable } from '../core/local-terminal-opener.js';
 import type { DaemonSession } from '../core/types.js';
+import { readGlobalConfig } from '../global-config.js';
 
 export const LOCAL_CLI_IDS = [
   'claude-code',
@@ -80,6 +82,21 @@ function fail(error: LocalCliOpenError, message: string): LocalCliOpenResult {
 
 export function supportsLocalCliOpen(cliId: string | undefined): cliId is LocalCliId {
   return !!cliId && LOCAL_CLI_ID_SET.has(cliId as CliId);
+}
+
+/** The iTerm-first opener is intentionally macOS-only. Keep the generic host
+ *  capability check as well so the policy stays aligned with native-terminal
+ *  availability if that check becomes stricter later. */
+export function isLocalCliOpenCapable(): boolean {
+  return process.platform === 'darwin' && localTerminalCapable();
+}
+
+export function isLocalCliOpenConfigured(): boolean {
+  return readGlobalConfig().dashboard?.enableLocalCliOpen === true;
+}
+
+export function isLocalCliOpenEnabled(): boolean {
+  return isLocalCliOpenConfigured() && isLocalCliOpenCapable();
 }
 
 function localCliId(cliId: string | undefined): LocalCliId | undefined {

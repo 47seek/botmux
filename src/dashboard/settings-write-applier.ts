@@ -37,6 +37,7 @@ import { isValidTimeZone } from '../utils/timezone.js';
 export interface ResolvedDashboardSettingsView {
   publicReadOnly: boolean;
   openTerminalInFeishu: boolean;
+  enableLocalCliOpen: boolean;
   chatBotDiscovery: boolean;
   vcMeetingAgent: {
     enabled: boolean;
@@ -74,7 +75,7 @@ export type ParseMaintenanceResult =
 export interface SettingsWriteApplierDeps {
   /** Snapshot of `~/.botmux/config.json`. Used to look up the persisted autoUpdate state when the incoming patch doesn't change it. */
   readGlobalConfig: () => GlobalConfig;
-  /** Atomic write of dashboard-level fields (publicReadOnly / openTerminalInFeishu). */
+  /** Atomic write of dashboard-level fields. */
   mergeDashboardConfig: (patch: DashboardGlobalConfig) => DashboardGlobalConfig;
   /** Atomic write of global-level fields (repoPickerMode / scheduleTimeZone / …).
    *  Mirrors the real `mergeGlobalConfig`: a `null` value deletes that key. */
@@ -133,6 +134,7 @@ export type ApplySettingsWriteResult =
 export type ApplySettingsWriteError =
   | 'invalid_publicReadOnly'
   | 'invalid_openTerminalInFeishu'
+  | 'invalid_enableLocalCliOpen'
   | 'invalid_chatBotDiscovery'
   | 'invalid_repoPickerMode'
   | 'invalid_remoteAccess'
@@ -155,7 +157,7 @@ export type ApplySettingsWriteError =
  * snapshot, or an error code string on validation failure.
  *
  * Behaviour mirrors `dashboard.ts:460-498` exactly:
- *   - Validates `publicReadOnly` / `openTerminalInFeishu` are booleans.
+ *   - Validates dashboard toggles are booleans.
  *   - Validates `repoPickerMode` is 'all' | 'repos'.
  *   - Validates `lang` is a valid locale or null.
  *   - Defers maintenance validation to `parseMaintenancePatch` (returns its error verbatim).
@@ -183,6 +185,12 @@ export async function applySettingsWrite(
       return { ok: false, error: 'invalid_openTerminalInFeishu' };
     }
     patch.openTerminalInFeishu = obj.openTerminalInFeishu;
+  }
+  if ('enableLocalCliOpen' in obj) {
+    if (typeof obj.enableLocalCliOpen !== 'boolean') {
+      return { ok: false, error: 'invalid_enableLocalCliOpen' };
+    }
+    patch.enableLocalCliOpen = obj.enableLocalCliOpen;
   }
   if ('chatBotDiscovery' in obj) {
     if (typeof obj.chatBotDiscovery !== 'boolean') {

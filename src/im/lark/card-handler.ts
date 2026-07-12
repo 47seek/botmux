@@ -67,7 +67,13 @@ import type { ProjectInfo } from '../../services/project-scanner.js';
 import { createRepoWorktree, removeRepoWorktree, dirSuffixForBranch } from '../../services/git-worktree.js';
 import { worktreeSlugFromContextAI } from '../../services/worktree-slug-ai.js';
 import { t, localeForBot, isLocale, type Locale } from '../../i18n/index.js';
-import { openLocalCliInIterm, supportsLocalCliOpen, type LocalCliId } from '../../services/local-cli-opener.js';
+import {
+  isLocalCliOpenCapable,
+  isLocalCliOpenConfigured,
+  openLocalCliInIterm,
+  supportsLocalCliOpen,
+  type LocalCliId,
+} from '../../services/local-cli-opener.js';
 
 // ─── Types ────────────────────────────────────────────────────────────────
 
@@ -1330,6 +1336,22 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       };
     };
 
+    const guardLocalCliOpen = (target: DaemonSession, locDs: Locale) => {
+      if (!isLocalCliOpenConfigured()) {
+        logger.info(`[${tag(target)}] Rejected ${actionType}: native CLI opening is disabled`);
+        return { toast: { type: 'warning', content: t('card.action.local_cli_disabled', undefined, locDs) } };
+      }
+      if (!isLocalCliOpenCapable()) {
+        logger.info(`[${tag(target)}] Rejected ${actionType}: daemon host cannot open the native CLI`);
+        return {
+          toast: {
+            type: 'warning',
+            content: t('card.action.local_terminal_unsupported', { cliName: getCliDisplayName(sessionCliId(target)) }, locDs),
+          },
+        };
+      }
+    };
+
     if (ds && actionType === 'open_local_cli') {
       const actualCliId = sessionCliId(ds);
       const locDs = localeForBot(ds.larkAppId);
@@ -1349,6 +1371,8 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       if (!ds) {
         return { toast: { type: 'warning', content: t('card.action.session_gone', undefined, locDs) } };
       }
+      const blocked = guardLocalCliOpen(ds, locDs);
+      if (blocked) return blocked;
       const cliId = sessionCliId(ds);
       if (!supportsLocalCliOpen(cliId)) {
         logger.warn(`[${tag(ds)}] Rejected open_local_cli for unsupported active CLI: ${cliId}`);
@@ -1662,13 +1686,16 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     }
 
     // Compatibility path for cards emitted before open_local_cli was introduced.
-    // Resumable CLIs use the same iTerm-first opener; other legacy cards retain
-    // the upstream generic terminal behavior.
+    // The opt-in/capability guard still applies so old cards cannot bypass the
+    // default-off continuity protection. Once allowed, resumable CLIs use the
+    // iTerm-first opener; other legacy cards retain the generic opener.
     if (actionType === 'open_local_terminal') {
       const locDs = localeForBot(ds?.larkAppId ?? larkAppId);
       if (!ds) {
         return { toast: { type: 'warning', content: t('card.action.session_gone', undefined, locDs) } };
       }
+      const blocked = guardLocalCliOpen(ds, locDs);
+      if (blocked) return blocked;
       const cliId = sessionCliId(ds);
       if (supportsLocalCliOpen(cliId)) return launchLocalCli(ds, cliId, locDs);
       const result = openLocalTerminalForSession(ds);

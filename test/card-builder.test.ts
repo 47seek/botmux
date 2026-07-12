@@ -7,7 +7,7 @@
  * Run:  pnpm vitest run test/card-builder.test.ts
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import {
@@ -23,7 +23,7 @@ import {
 import type { RelayPickerEntry } from '../src/im/lark/card-builder.js';
 import type { ProjectInfo } from '../src/services/project-scanner.js';
 import { LOCAL_CLI_IDS } from '../src/services/local-cli-opener.js';
-import { globalConfigPath } from '../src/global-config.js';
+import { globalConfigPath, mergeDashboardConfig } from '../src/global-config.js';
 
 // The terminal button's URL wrapping now depends on the global dashboard
 // setting `openTerminalInFeishu` (read via readGlobalConfig at build time):
@@ -31,12 +31,15 @@ import { globalConfigPath } from '../src/global-config.js';
 // empty temp dir so these tests see the DEFAULT (no config.json → direct),
 // independent of whatever the test runner's real ~/.botmux/config.json holds.
 let cardTestHome: string;
+let platformSpy: ReturnType<typeof vi.spyOn>;
 beforeEach(() => {
   cardTestHome = mkdtempSync(join(tmpdir(), 'botmux-card-builder-'));
   vi.stubEnv('HOME', cardTestHome);
+  platformSpy = vi.spyOn(process, 'platform', 'get').mockReturnValue('darwin');
   mkdirSync(dirname(globalConfigPath()), { recursive: true });
 });
 afterEach(() => {
+  vi.restoreAllMocks();
   vi.unstubAllEnvs();
   rmSync(cardTestHome, { recursive: true, force: true });
 });
@@ -83,7 +86,12 @@ function expectDirectUrl(actual: string, targetUrl: string): void {
 
 /** Opt into the Feishu sidebar wrapper for the current (isolated) HOME. */
 function enableOpenTerminalInFeishu(): void {
-  writeFileSync(globalConfigPath(), JSON.stringify({ dashboard: { openTerminalInFeishu: true } }));
+  mergeDashboardConfig({ openTerminalInFeishu: true });
+}
+
+/** Explicitly opt in to native CLI opening for the isolated desktop host. */
+function enableLocalCliOpen(): void {
+  mergeDashboardConfig({ enableLocalCliOpen: true });
 }
 
 // ─── getCliDisplayName ────────────────────────────────────────────────────
@@ -212,6 +220,20 @@ describe('buildSessionCard', () => {
   // ── Group card (showManageButtons = false / undefined) ─────────────────
 
   describe('group card (showManageButtons=false)', () => {
+    it('keeps native CLI opening hidden by default', () => {
+      const card = parse(buildSessionCard(SID, ROOT, URL, TITLE, 'codex', false, false, 'en'));
+      const actions = findActions(card);
+      expect(actions.some((a: any) => a.value?.action === 'open_local_cli')).toBe(false);
+    });
+
+    it('keeps native CLI opening hidden on Linux even when explicitly enabled', () => {
+      enableLocalCliOpen();
+      platformSpy.mockReturnValue('linux');
+      const card = parse(buildSessionCard(SID, ROOT, URL, TITLE, 'codex', false, false, 'en'));
+      const actions = findActions(card);
+      expect(actions.some((a: any) => a.value?.action === 'open_local_cli')).toBe(false);
+    });
+
     it('should have terminal button with primary type and multi_url', () => {
       const card = parse(buildSessionCard(SID, ROOT, URL, TITLE));
       const actions = findActions(card);
@@ -246,6 +268,7 @@ describe('buildSessionCard', () => {
     });
 
     it('includes Open Codex beside Web Terminal for codex sessions only', () => {
+      enableLocalCliOpen();
       const card = parse(buildSessionCard(SID, ROOT, URL, TITLE, 'codex', false, false, 'en'));
       const actions = findActions(card);
       expect(actions[0].text.content).toBe('🖥️ Open Web Terminal');
@@ -259,6 +282,7 @@ describe('buildSessionCard', () => {
     });
 
     it('includes Open TRAE beside Web Terminal for traex sessions', () => {
+      enableLocalCliOpen();
       const card = parse(buildSessionCard(SID, ROOT, URL, TITLE, 'traex', false, false, 'en'));
       const actions = findActions(card);
       expect(buttonTexts(actions)).toContain('Open TRAE');
@@ -266,6 +290,7 @@ describe('buildSessionCard', () => {
     });
 
     it('includes a local-CLI open button for every adapter with a portable resume command', () => {
+      enableLocalCliOpen();
       for (const cli of LOCAL_CLI_IDS) {
         const card = parse(buildSessionCard(SID, ROOT, URL, TITLE, cli));
         const actions = findActions(card);
@@ -274,6 +299,7 @@ describe('buildSessionCard', () => {
     });
 
     it('does not include local-CLI open buttons when precise local resume is unavailable', () => {
+      enableLocalCliOpen();
       for (const cli of ['codex-app', 'gemini', 'mira', 'mir', undefined] as const) {
         const card = parse(buildSessionCard(SID, ROOT, URL, TITLE, cli));
         const actions = findActions(card);
@@ -306,6 +332,7 @@ describe('buildSessionCard', () => {
     });
 
     it('should have exactly 4 buttons for codex (terminal, Open Codex, get_write_link, close)', () => {
+      enableLocalCliOpen();
       const card = parse(buildSessionCard(SID, ROOT, URL, TITLE, 'codex'));
       const actions = findActions(card);
       expect(actions).toHaveLength(4);
@@ -353,6 +380,7 @@ describe('buildSessionCard', () => {
     });
 
     it('does not include Open Codex in codex DM management cards', () => {
+      enableLocalCliOpen();
       const card = parse(buildSessionCard(SID, ROOT, URL, TITLE, 'codex', true, false, 'en'));
       const actions = findActions(card);
       expect(actions.map((a: any) => a.value?.action ?? 'url')).toEqual(['url', 'restart', 'close']);
@@ -655,6 +683,7 @@ describe('buildStreamingCard', () => {
     });
 
     it('should include Open TRAE beside Web Terminal for traex streaming cards', () => {
+      enableLocalCliOpen();
       const card = parse(buildStreamingCard(SID, ROOT, URL, TITLE, '', 'idle', 'traex', 'hidden', undefined, undefined, false, false, 'en'));
       const actions = findActions(card);
       expect(actions.map((a: any) => a.value?.action ?? 'url')).toEqual(['toggle_display', 'url', 'open_local_cli', 'get_write_link', 'close']);
@@ -1330,6 +1359,7 @@ describe('buildPrivateSnapshotCard', () => {
   });
 
   it('does not add Open Codex to private snapshots for codex sessions', () => {
+    enableLocalCliOpen();
     const card = parse(buildPrivateSnapshotCard(
       'https://t.example/ro',
       'my session',

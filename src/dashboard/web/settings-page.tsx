@@ -11,6 +11,7 @@ interface MaintenanceCfg { autoUpdate?: MaintenanceTaskCfg; autoRestart?: Mainte
 interface DashboardSettings {
   publicReadOnly: boolean;
   openTerminalInFeishu: boolean;
+  enableLocalCliOpen: boolean;
   chatBotDiscovery: boolean;
   vcMeetingAgent: {
     enabled: boolean;
@@ -65,6 +66,7 @@ function parseSettings(s: any): DashboardSettings {
   return {
     publicReadOnly: s?.publicReadOnly === true,
     openTerminalInFeishu: s?.openTerminalInFeishu === true,
+    enableLocalCliOpen: s?.enableLocalCliOpen === true,
     chatBotDiscovery: s?.chatBotDiscovery !== false,
     vcMeetingAgent: {
       enabled: s?.vcMeetingAgent?.enabled !== false,
@@ -434,7 +436,7 @@ function SettingsBody(props: {
   const autoUpdateDisabled = !canWrite || settings.localDevInstall || !settings.autoUpdateSupported;
   const autoRestartDisabled = !canWrite || settings.maintenance.autoUpdate?.enabled !== true;
 
-  const saveBoolean = (key: 'publicReadOnly' | 'openTerminalInFeishu' | 'chatBotDiscovery' | 'remoteAccess', value: boolean) => {
+  const saveBoolean = (key: 'publicReadOnly' | 'openTerminalInFeishu' | 'enableLocalCliOpen' | 'chatBotDiscovery' | 'remoteAccess', value: boolean) => {
     void props.onSave(key, { [key]: value }, s => ({ ...s, [key]: value }));
   };
   const repoModeOptions = useMemo(() => [
@@ -488,6 +490,13 @@ function SettingsBody(props: {
             checked={settings.openTerminalInFeishu}
             disabled={dis || savingKey === 'openTerminalInFeishu'}
             onChange={value => saveBoolean('openTerminalInFeishu', value)}
+          />
+          <ToggleRow
+            title={tr('settings.enableLocalCliOpen')}
+            help={tr('settings.enableLocalCliOpenHelp')}
+            checked={settings.enableLocalCliOpen}
+            disabled={dis || savingKey === 'enableLocalCliOpen'}
+            onChange={value => saveBoolean('enableLocalCliOpen', value)}
           />
         </SettingsBlock>
         <SettingsBlock title={tr('settings.sectionExperimental')}>

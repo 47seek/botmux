@@ -30,10 +30,11 @@ describe('global dashboard config', () => {
       dashboard: {
         publicReadOnly: 'yes',
         openTerminalInFeishu: true,
+        enableLocalCliOpen: true,
       },
     }));
 
-    expect(readGlobalConfig().dashboard).toEqual({ openTerminalInFeishu: true });
+    expect(readGlobalConfig().dashboard).toEqual({ openTerminalInFeishu: true, enableLocalCliOpen: true });
   });
 
   it('reads dashboard.chatBotDiscovery as a boolean (off)', () => {

@@ -17,10 +17,16 @@ vi.mock('@larksuiteoapi/node-sdk', () => {
 
 vi.mock('../src/services/local-cli-opener.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../src/services/local-cli-opener.js')>();
-  return { ...actual, openLocalCliInIterm: vi.fn() };
+  return {
+    ...actual,
+    isLocalCliOpenConfigured: vi.fn(() => true),
+    isLocalCliOpenCapable: vi.fn(() => true),
+    openLocalCliInIterm: vi.fn(),
+  };
 });
 
 vi.mock('../src/core/local-terminal-opener.js', () => ({
+  localTerminalCapable: vi.fn(() => true),
   openLocalTerminalForSession: vi.fn(() => ({ ok: true, launcher: 'iterm', backend: 'pty' })),
 }));
 
@@ -85,6 +91,8 @@ async function fresh() {
   const terminal = await import('../src/core/local-terminal-opener.js');
   const handler = await import('../src/im/lark/card-handler.js');
   registry.loadBotConfigs().forEach(c => registry.registerBot(c));
+  vi.mocked(opener.isLocalCliOpenConfigured).mockReset().mockReturnValue(true);
+  vi.mocked(opener.isLocalCliOpenCapable).mockReset().mockReturnValue(true);
   vi.mocked(opener.openLocalCliInIterm).mockReset().mockResolvedValue({ ok: true, command: 'resume' });
   vi.mocked(terminal.openLocalTerminalForSession).mockClear();
   return { types, opener, terminal, handler };
@@ -128,6 +136,32 @@ describe('card-handler open_local_cli', () => {
     expect(res?.toast?.type).toBe('warning');
     expect(res.toast.content).toContain('operate permission');
     expect(opener.openLocalCliInIterm).not.toHaveBeenCalled();
+  });
+
+  it('default-off policy rejects an old card before local command execution', async () => {
+    const { types, opener, terminal, handler } = await fresh();
+    deps.activeSessions.set(types.sessionKey('om_root', 'h1'), makeDs('codex'));
+    vi.mocked(opener.isLocalCliOpenConfigured).mockReturnValue(false);
+
+    const res = await handler.handleCardAction(action('ou_owner', 'codex'), deps, 'h1');
+
+    expect(res?.toast?.type).toBe('warning');
+    expect(res.toast.content).toContain('off by default');
+    expect(opener.openLocalCliInIterm).not.toHaveBeenCalled();
+    expect(terminal.openLocalTerminalForSession).not.toHaveBeenCalled();
+  });
+
+  it('unsupported daemon hosts are rejected even when the feature is enabled', async () => {
+    const { types, opener, terminal, handler } = await fresh();
+    deps.activeSessions.set(types.sessionKey('om_root', 'h1'), makeDs('traex'));
+    vi.mocked(opener.isLocalCliOpenCapable).mockReturnValue(false);
+
+    const res = await handler.handleCardAction(action('ou_owner', 'traex'), deps, 'h1');
+
+    expect(res?.toast?.type).toBe('warning');
+    expect(res.toast.content).toContain('cannot be opened locally');
+    expect(opener.openLocalCliInIterm).not.toHaveBeenCalled();
+    expect(terminal.openLocalTerminalForSession).not.toHaveBeenCalled();
   });
 
   it('legacy open_local_terminal non-operator keeps the old no-permission toast', async () => {

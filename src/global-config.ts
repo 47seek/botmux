@@ -131,6 +131,10 @@ export interface DashboardGlobalConfig {
   /** When true, terminal buttons on Feishu cards use Feishu's sidebar web_url
    *  wrapper. Default false opens the terminal URL directly. */
   openTerminalInFeishu?: boolean;
+  /** Opt in to native "Open <CLI>" buttons on supported desktop hosts.
+   *  Default false because the resumed CLI does not share the botmux worker's
+   *  PTY, so continuing locally can break Feishu-side conversation continuity. */
+  enableLocalCliOpen?: boolean;
   /** Experimental current-chat bot discovery via Lark `/members/bots`. Default
    *  ON (absent ⇒ enabled); set false to disable from the dashboard. Read live
    *  by the daemon — see config.ts `resolveChatBotDiscoveryConfig`. */
@@ -231,6 +235,7 @@ function readDashboard(raw: unknown): DashboardGlobalConfig | undefined {
   const out: DashboardGlobalConfig = {};
   if (typeof d.publicReadOnly === 'boolean') out.publicReadOnly = d.publicReadOnly;
   if (typeof d.openTerminalInFeishu === 'boolean') out.openTerminalInFeishu = d.openTerminalInFeishu;
+  if (typeof d.enableLocalCliOpen === 'boolean') out.enableLocalCliOpen = d.enableLocalCliOpen;
   if (typeof d.chatBotDiscovery === 'boolean') out.chatBotDiscovery = d.chatBotDiscovery;
   return Object.keys(out).length > 0 ? out : undefined;
 }

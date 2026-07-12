@@ -8,6 +8,7 @@ import {
   buildItermAppleScript,
   buildLocalCliOpenCommand,
   buildTerminalAppleScript,
+  isLocalCliOpenCapable,
   LOCAL_CLI_IDS,
   openLocalCliInIterm,
   shellQuote,
@@ -46,6 +47,16 @@ function ds(overrides: Partial<DaemonSession> = {}): DaemonSession {
 }
 
 describe('local-cli-opener', () => {
+  it('keeps GUI Linux hosts ineligible for the macOS-only iTerm opener', () => {
+    const platform = vi.spyOn(process, 'platform', 'get').mockReturnValue('linux');
+    vi.stubEnv('DISPLAY', ':0');
+
+    expect(isLocalCliOpenCapable()).toBe(false);
+
+    platform.mockRestore();
+    vi.unstubAllEnvs();
+  });
+
   it('supports every adapter with a portable local resume command', () => {
     for (const cliId of LOCAL_CLI_IDS) {
       const result = buildLocalCliOpenCommand(ds({
