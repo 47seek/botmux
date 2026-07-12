@@ -56,6 +56,7 @@ import { DONE_REACTION_EMOJI_TYPE } from './pending-response.js';
 import { buildTerminalUrl } from './terminal-url.js';
 import { prependBotmuxBin } from './botmux-wrapper.js';
 import { usageLimitStateKey, type CliUsageLimitState } from '../utils/cli-usage-limit.js';
+import { isLocalCliOpenEnabled, isLocalCliOpenReady } from '../services/local-cli-opener.js';
 
 type WindowsForkOptions = ForkOptions & { windowsHide?: boolean };
 
@@ -196,6 +197,51 @@ export function writableTerminalLinkFor(ds: DaemonSession): string | undefined {
   return buildTerminalUrl(ds, { write: true });
 }
 
+function scheduleLocalCliOpenReadinessPatch(ds: DaemonSession): void {
+  if (!isLocalCliOpenEnabled() || streamingCardDisabled(ds) || ds.suppressRecoveryCard) {
+    ds.pendingLocalCliButtonRefresh = undefined;
+    return;
+  }
+  if (ds.streamCardId === CARD_POSTING_SENTINEL) {
+    ds.pendingLocalCliButtonRefresh = true;
+    return;
+  }
+  if (!ds.streamCardId || !ds.workerPort) return;
+  ds.pendingLocalCliButtonRefresh = undefined;
+  const botCfg = getBot(ds.larkAppId).config;
+  const effectiveCliId = sessionCliId(ds, botCfg);
+  const status = ds.usageLimit ? 'limited' : (ds.lastScreenStatus ?? 'starting');
+  const cardJson = buildStreamingCard(
+    ds.session.sessionId,
+    sessionAnchorId(ds),
+    buildTerminalUrl(ds),
+    ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId),
+    ds.lastScreenContent ?? '',
+    status,
+    effectiveCliId,
+    ds.displayMode ?? 'hidden',
+    ds.streamCardNonce,
+    ds.currentImageKey,
+    !!ds.adoptedFrom,
+    false,
+    localeForBot(ds.larkAppId),
+    status === 'limited' ? ds.usageLimit : undefined,
+    writableTerminalLinkFor(ds),
+    isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
+  );
+  scheduleCardPatch(ds, cardJson);
+}
+
+function flushPendingLocalCliOpenReadinessPatch(ds: DaemonSession): void {
+  if (!ds.pendingLocalCliButtonRefresh) return;
+  ds.pendingLocalCliButtonRefresh = undefined;
+  scheduleLocalCliOpenReadinessPatch(ds);
+}
+
+function clearPendingLocalCliOpenReadinessPatch(ds: DaemonSession): void {
+  ds.pendingLocalCliButtonRefresh = undefined;
+}
+
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
 function tag(ds: DaemonSession): string {
@@ -333,6 +379,7 @@ function scheduleUsageLimitCardPatch(ds: DaemonSession): void {
     localeForBot(ds.larkAppId),
     ds.usageLimit,
     writableTerminalLinkFor(ds),
+    isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
   );
   scheduleCardPatch(ds, cardJson);
 }
@@ -519,6 +566,7 @@ export async function postFreshStreamingCard(
     localeForBot(ds.larkAppId),
     cardUsageLimit(ds),
     writableTerminalLinkFor(ds),
+    isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
   );
   ds.streamCardId = CARD_POSTING_SENTINEL;
   try {
@@ -530,12 +578,14 @@ export async function postFreshStreamingCard(
     ds.streamCardPending = false;
     persistStreamCardState(ds);
     recallFrozenCards(ds);
+    flushPendingLocalCliOpenReadinessPatch(ds);
     logger.info(`[${tag(ds)}] Posted streaming card via /card`);
     return true;
   } catch (err) {
     ds.streamCardId = prevCardId;
     ds.streamCardNonce = prevNonce;
     ds.streamCardPending = prevPending;
+    flushPendingLocalCliOpenReadinessPatch(ds);
     logger.warn(`[${tag(ds)}] /card POST failed: ${err}`);
     return false;
   }
@@ -672,6 +722,7 @@ function buildWritableTerminalCard(ds: DaemonSession): string | null {
     true,             // showManageButtons — write-link card includes restart & close
     !!ds.adoptedFrom, // adoptMode — disconnect, never close-the-CLI
     localeForBot(ds.larkAppId),
+    isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
   );
 }
 
@@ -1971,6 +2022,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
             // and post-daemon-restart paths still see lastScreenStatus
             // undefined and fall back to 'starting' (unchanged behavior).
             const initStatus = ds.usageLimit ? 'limited' : (ds.lastScreenStatus ?? 'starting');
+            const localCliReadyAtBuild = isLocalCliOpenReady(ds, { cliId: effectiveCliId });
             const streamCardJson = buildStreamingCard(
               ds.session.sessionId,
               sessionAnchorId(ds),
@@ -1987,8 +2039,15 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
               loc,
               initStatus === 'limited' ? ds.usageLimit : undefined,
               writableTerminalLinkFor(ds),
+              localCliReadyAtBuild,
             );
             await updateMessage(ds.larkAppId, restoredCardId, streamCardJson);
+            // Worker IPC handlers may run while the direct restore PATCH is in
+            // flight. Re-queue readiness after it completes so an older
+            // not-ready payload can never overwrite the cli_session_id PATCH.
+            if (!localCliReadyAtBuild && isLocalCliOpenReady(ds, { cliId: effectiveCliId })) {
+              scheduleLocalCliOpenReadinessPatch(ds);
+            }
             persistStreamCardState(ds);
             // Re-sync worker's display mode (it starts fresh in 'hidden')
             if (ds.worker && ds.displayMode && ds.displayMode !== 'hidden') {
@@ -2039,6 +2098,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
             loc,
             initStatus === 'limited' ? ds.usageLimit : undefined,
             writableTerminalLinkFor(ds),
+            isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
           );
           ds.streamCardId = await scopedReply(streamCardJson, 'interactive', msg.turnId);
           // This card IS the current turn's live card — clear the new-turn flag
@@ -2059,6 +2119,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
           // Done after `streamCardId` is committed so we never delete the old
           // card without a successor visible to the user.
           recallFrozenCards(ds);
+          flushPendingLocalCliOpenReadinessPatch(ds);
         } catch (err) {
           if (err instanceof MessageWithdrawnError) {
             logger.warn(`[${t}] Root message withdrawn, closing stale session`);
@@ -2069,9 +2130,11 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
           logger.warn(`[${t}] Failed to send streaming card, falling back to static card: ${err}`);
           // Clear sentinel so screen_updates can create a streaming card later
           ds.streamCardId = undefined;
+          clearPendingLocalCliOpenReadinessPatch(ds);
           persistStreamCardState(ds);
           // Fallback: send static session card
           try {
+            const localCliReadyAtBuild = isLocalCliOpenReady(ds, { cliId: effectiveCliId });
             const cardJson = buildSessionCard(
               ds.session.sessionId,
               sessionAnchorId(ds),
@@ -2081,8 +2144,28 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
               undefined,
               !!ds.adoptedFrom,
               loc,
+              localCliReadyAtBuild,
             );
-            await scopedReply(cardJson, 'interactive', msg.turnId);
+            const fallbackCardId = await scopedReply(cardJson, 'interactive', msg.turnId);
+            if (!localCliReadyAtBuild && isLocalCliOpenEnabled()
+              && isLocalCliOpenReady(ds, { cliId: effectiveCliId })) {
+              const readyCardJson = buildSessionCard(
+                ds.session.sessionId,
+                sessionAnchorId(ds),
+                readOnlyUrl,
+                ds.session.title || getCliDisplayName(effectiveCliId),
+                effectiveCliId,
+                undefined,
+                !!ds.adoptedFrom,
+                loc,
+                true,
+              );
+              try {
+                await updateMessage(ds.larkAppId, fallbackCardId, readyCardJson);
+              } catch (patchErr) {
+                logger.debug(`[${t}] Failed to add local CLI button to fallback card: ${patchErr}`);
+              }
+            }
           } catch (fallbackErr) {
             if (fallbackErr instanceof MessageWithdrawnError) {
               logger.warn(`[${t}] Root message withdrawn, closing stale session`);
@@ -2132,12 +2215,18 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
       }
 
       case 'cli_session_id': {
+        const wasLocalCliOpenReady = isLocalCliOpenReady(ds, { cliId: effectiveCliId });
         ds.session.cliSessionId = msg.cliSessionId;
+        if (ds.adoptedFrom) ds.adoptedFrom.sessionId = msg.cliSessionId;
+        if (ds.session.adoptedFrom) ds.session.adoptedFrom.sessionId = msg.cliSessionId;
         sessionStore.updateSession(ds.session);
         // Usage ledger: publish ownership the moment the CLI-native session id
         // is known, so consumers exclude this session from native parsers
         // before its first positive-delta record exists.
         recordOwnershipForDaemonSession(ds);
+        if (!wasLocalCliOpenReady && isLocalCliOpenReady(ds, { cliId: effectiveCliId })) {
+          scheduleLocalCliOpenReadinessPatch(ds);
+        }
         break;
       }
 
@@ -2226,6 +2315,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
             loc,
             cardUsageLimit(ds),
             writableTerminalLinkFor(ds),
+            isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
           );
           // Mark POST in-flight so subsequent screen_updates are dropped,
           // not POSTed as duplicate cards.
@@ -2241,6 +2331,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
               // every long session would leak old streaming cards into the
               // thread.
               recallFrozenCards(ds);
+              flushPendingLocalCliOpenReadinessPatch(ds);
             })
             .catch(err => {
               if (err instanceof MessageWithdrawnError) {
@@ -2251,6 +2342,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
               }
               logger.debug(`[${t}] Failed to create streaming card: ${err}`);
               ds.streamCardId = undefined;
+              clearPendingLocalCliOpenReadinessPatch(ds);
               persistStreamCardState(ds);
             });
         } else {
@@ -2274,6 +2366,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
             loc,
             cardUsageLimit(ds),
             writableTerminalLinkFor(ds),
+            isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
           );
           scheduleCardPatch(ds, cardJson);
         }
@@ -2314,6 +2407,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
           loc,
           cardUsageLimit(ds),
           writableTerminalLinkFor(ds),
+          isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
         );
         scheduleCardPatch(ds, cardJson);
         break;
@@ -2403,6 +2497,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
               ds.lastScreenContent ?? '', 'idle', effectiveCliId,
               ds.displayMode ?? 'hidden', ds.streamCardNonce, ds.currentImageKey,
               isAdopt, showTakeover, loc, undefined, writableTerminalLinkFor(ds),
+              isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
             );
             scheduleCardPatch(ds, frozenCard);
           }
@@ -2441,6 +2536,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
               ds.lastScreenContent ?? '', 'idle', effectiveCliId,
               ds.displayMode ?? 'hidden', ds.streamCardNonce, ds.currentImageKey,
               isAdopt, showTakeover, loc, undefined, writableTerminalLinkFor(ds),
+              isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
             );
             scheduleCardPatch(ds, frozenCard);
           }

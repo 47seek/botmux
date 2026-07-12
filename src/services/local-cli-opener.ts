@@ -59,6 +59,8 @@ export type LocalCliOpenResult =
   | { ok: true; command: string }
   | { ok: false; error: LocalCliOpenError; message: string };
 
+export type LocalCliPreflightResult = LocalCliOpenResult;
+
 export interface LocalCliOpenerDeps {
   platform?: NodeJS.Platform;
   adapterFactory?: (cliId: LocalCliId) => Pick<CliAdapter, 'buildResumeCommand'>;
@@ -174,6 +176,27 @@ export function buildLocalCliOpenCommand(
   if (!resumeCommand) return fail('missing_resume_id', `${cliId} returned an unsupported resume command.`);
 
   return { ok: true, command: `cd ${shellQuote(workingDir)} && ${resumeCommand}` };
+}
+
+/** Pure preflight for local CLI opening. It performs the same resume-target
+ *  resolution as the real opener, but never launches AppleScript. */
+export function preflightLocalCliOpen(
+  ds: DaemonSession,
+  opts: { cliId?: CliId; adapterFactory?: LocalCliOpenerDeps['adapterFactory'] } = {},
+): LocalCliPreflightResult {
+  try {
+    return buildLocalCliOpenCommand(ds, opts);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return fail('missing_resume_id', message || 'This CLI does not have a resumable session id yet.');
+  }
+}
+
+export function isLocalCliOpenReady(
+  ds: DaemonSession,
+  opts: { cliId?: CliId; adapterFactory?: LocalCliOpenerDeps['adapterFactory'] } = {},
+): boolean {
+  return preflightLocalCliOpen(ds, opts).ok;
 }
 
 function defaultRunOsascript(args: string[]): Promise<{ ok: boolean; stderr?: string }> {

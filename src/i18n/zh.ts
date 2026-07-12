@@ -657,6 +657,7 @@ export const messages: Record<string, string> = {
   'card.action.local_cli_no_permission': '🔒 没有操作权限，无法在本机打开 CLI',
   'card.action.local_cli_missing_cli_id': '⚠️ 卡片缺少 CLI 绑定，无法打开本机 CLI',
   'card.action.local_cli_cli_mismatch': '⚠️ 卡片 CLI 与当前会话不一致，已拒绝打开本机 CLI',
+  'card.action.local_cli_not_ready': '⚠️ 本机 CLI 会话暂未就绪，请等会话启动完成后再试。',
   'card.action.local_cli_failed': '⚠️ 无法打开本机 CLI：{reason}',
   'card.action.write_link_sent': '🔑 操作链接已私密发送，请查收',
   'card.action.write_link_no_permission': '🔒 没有操作权限，无法获取操作链接',

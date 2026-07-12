@@ -269,7 +269,7 @@ describe('buildSessionCard', () => {
 
     it('includes Open Codex beside Web Terminal for codex sessions only', () => {
       enableLocalCliOpen();
-      const card = parse(buildSessionCard(SID, ROOT, URL, TITLE, 'codex', false, false, 'en'));
+      const card = parse(buildSessionCard(SID, ROOT, URL, TITLE, 'codex', false, false, 'en', true));
       const actions = findActions(card);
       expect(actions[0].text.content).toBe('🖥️ Open Web Terminal');
       expect(actions[1].text.content).toBe('Open Codex');
@@ -283,16 +283,25 @@ describe('buildSessionCard', () => {
 
     it('includes Open TRAE beside Web Terminal for traex sessions', () => {
       enableLocalCliOpen();
-      const card = parse(buildSessionCard(SID, ROOT, URL, TITLE, 'traex', false, false, 'en'));
+      const card = parse(buildSessionCard(SID, ROOT, URL, TITLE, 'traex', false, false, 'en', true));
       const actions = findActions(card);
       expect(buttonTexts(actions)).toContain('Open TRAE');
       expect(actions.find((a: any) => a.text.content === 'Open TRAE')?.value.action).toBe('open_local_cli');
     });
 
+    it('shows native CLI opening only when local CLI readiness is true', () => {
+      enableLocalCliOpen();
+      const notReady = parse(buildSessionCard(SID, ROOT, URL, TITLE, 'codex', false, false, 'en', false));
+      const ready = parse(buildSessionCard(SID, ROOT, URL, TITLE, 'codex', false, false, 'en', true));
+
+      expect(findActions(notReady).some((a: any) => a.value?.action === 'open_local_cli')).toBe(false);
+      expect(findActions(ready).some((a: any) => a.value?.action === 'open_local_cli')).toBe(true);
+    });
+
     it('includes a local-CLI open button for every adapter with a portable resume command', () => {
       enableLocalCliOpen();
       for (const cli of LOCAL_CLI_IDS) {
-        const card = parse(buildSessionCard(SID, ROOT, URL, TITLE, cli));
+        const card = parse(buildSessionCard(SID, ROOT, URL, TITLE, cli, false, false, undefined, true));
         const actions = findActions(card);
         expect(actions.find((a: any) => a.value?.action === 'open_local_cli')?.value.cli_id).toBe(cli);
       }
@@ -333,7 +342,7 @@ describe('buildSessionCard', () => {
 
     it('should have exactly 4 buttons for codex (terminal, Open Codex, get_write_link, close)', () => {
       enableLocalCliOpen();
-      const card = parse(buildSessionCard(SID, ROOT, URL, TITLE, 'codex'));
+      const card = parse(buildSessionCard(SID, ROOT, URL, TITLE, 'codex', false, false, undefined, true));
       const actions = findActions(card);
       expect(actions).toHaveLength(4);
       expect(actions.map((a: any) => a.value?.action ?? 'url')).toEqual(['url', 'open_local_cli', 'get_write_link', 'close']);
@@ -684,11 +693,20 @@ describe('buildStreamingCard', () => {
 
     it('should include Open TRAE beside Web Terminal for traex streaming cards', () => {
       enableLocalCliOpen();
-      const card = parse(buildStreamingCard(SID, ROOT, URL, TITLE, '', 'idle', 'traex', 'hidden', undefined, undefined, false, false, 'en'));
+      const card = parse(buildStreamingCard(SID, ROOT, URL, TITLE, '', 'idle', 'traex', 'hidden', undefined, undefined, false, false, 'en', undefined, undefined, true));
       const actions = findActions(card);
       expect(actions.map((a: any) => a.value?.action ?? 'url')).toEqual(['toggle_display', 'url', 'open_local_cli', 'get_write_link', 'close']);
       expect(actions[2].text.content).toBe('Open TRAE');
       expect(actions[2].value.cli_id).toBe('traex');
+    });
+
+    it('shows streaming native CLI opening only when local CLI readiness is true', () => {
+      enableLocalCliOpen();
+      const notReady = parse(buildStreamingCard(SID, ROOT, URL, TITLE, '', 'idle', 'codex', 'hidden', undefined, undefined, false, false, 'en', undefined, undefined, false));
+      const ready = parse(buildStreamingCard(SID, ROOT, URL, TITLE, '', 'idle', 'codex', 'hidden', undefined, undefined, false, false, 'en', undefined, undefined, true));
+
+      expect(findActions(notReady).some((a: any) => a.value?.action === 'open_local_cli')).toBe(false);
+      expect(findActions(ready).some((a: any) => a.value?.action === 'open_local_cli')).toBe(true);
     });
   });
 

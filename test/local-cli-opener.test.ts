@@ -9,8 +9,10 @@ import {
   buildLocalCliOpenCommand,
   buildTerminalAppleScript,
   isLocalCliOpenCapable,
+  isLocalCliOpenReady,
   LOCAL_CLI_IDS,
   openLocalCliInIterm,
+  preflightLocalCliOpen,
   shellQuote,
   supportsLocalCliOpen,
 } from '../src/services/local-cli-opener.js';
@@ -175,6 +177,41 @@ describe('local-cli-opener', () => {
 
     expect(result.ok).toBe(false);
     expect(!result.ok && result.error).toBe('missing_resume_id');
+  });
+
+  it('reports readiness only after a native resume target is available', () => {
+    const pending = ds({ session: { ...ds().session, cliSessionId: undefined } });
+    const adapterFactory = () => ({
+      buildResumeCommand: ({ cliSessionId }: { cliSessionId?: string }) =>
+        cliSessionId ? `codex resume ${cliSessionId}` : null,
+    });
+
+    expect(isLocalCliOpenReady(pending, { adapterFactory })).toBe(false);
+    expect(preflightLocalCliOpen(pending, { adapterFactory })).toMatchObject({
+      ok: false,
+      error: 'missing_resume_id',
+    });
+
+    pending.session.cliSessionId = 'native-ready';
+    expect(isLocalCliOpenReady(pending, { adapterFactory })).toBe(true);
+  });
+
+  it('treats adopted ids and oh-my-pi continue as ready resume targets', () => {
+    const adopted = ds({
+      adoptedFrom: { source: 'tmux', tmuxTarget: 'dev:1.2', cliId: 'traex', cwd: '/repo', sessionId: 'adopt-native' },
+      workingDir: undefined,
+      session: { ...ds().session, cliId: 'traex', cliSessionId: undefined, workingDir: undefined },
+    });
+    expect(isLocalCliOpenReady(adopted, {
+      adapterFactory: () => ({ buildResumeCommand: ({ cliSessionId }) => `traex resume ${cliSessionId}` }),
+    })).toBe(true);
+
+    const ohMyPi = ds({
+      session: { ...ds().session, cliId: 'oh-my-pi', cliSessionId: undefined },
+    });
+    expect(isLocalCliOpenReady(ohMyPi, {
+      adapterFactory: () => ({ buildResumeCommand: () => 'omp --continue' }),
+    })).toBe(true);
   });
 
   it('rejects unsupported adapter resume commands, including URL schemes', () => {

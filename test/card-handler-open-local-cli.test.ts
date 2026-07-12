@@ -249,6 +249,27 @@ describe('card-handler open_local_cli', () => {
     expect(opener.openLocalCliInIterm).not.toHaveBeenCalled();
   });
 
+  it.each(['open_local_cli', 'open_local_terminal'] as const)(
+    '%s returns a not-ready toast before a fresh TRAE session has a native id',
+    async (actionType) => {
+      const { types, opener, handler } = await fresh();
+      const ds = makeDs('traex');
+      ds.session.cliSessionId = undefined;
+      deps.activeSessions.set(types.sessionKey('om_root', 'h1'), ds);
+
+      const res = await handler.handleCardAction(
+        action('ou_owner', 'traex', {}, { action: actionType }),
+        deps,
+        'h1',
+      );
+
+      expect(res?.toast?.type).toBe('warning');
+      expect(res?.toast?.content).toContain('not ready yet');
+      expect(opener.openLocalCliInIterm).not.toHaveBeenCalled();
+      expect(deps.sessionReply).not.toHaveBeenCalled();
+    },
+  );
+
   it('opener failure is handled asynchronously after an immediate ack', async () => {
     const { types, opener, handler } = await fresh();
     const ds = makeDs('traex');

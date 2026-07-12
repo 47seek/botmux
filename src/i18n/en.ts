@@ -654,6 +654,7 @@ export const messages: Record<string, string> = {
   'card.action.local_cli_no_permission': '🔒 You do not have operate permission, so you cannot open a local CLI.',
   'card.action.local_cli_missing_cli_id': '⚠️ This card is missing its CLI binding, so the local CLI was not opened.',
   'card.action.local_cli_cli_mismatch': '⚠️ This card no longer matches the active session CLI; local open was rejected.',
+  'card.action.local_cli_not_ready': '⚠️ The local CLI is not ready yet. Try again after the session finishes starting.',
   'card.action.local_cli_failed': '⚠️ Could not open the local CLI: {reason}',
   'card.action.write_link_sent': '🔑 The action link has been sent to you privately — please check your messages.',
   'card.action.write_link_no_permission': '🔒 You do not have operate permission, so you cannot get the action link.',

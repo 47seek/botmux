@@ -70,7 +70,9 @@ import { t, localeForBot, isLocale, type Locale } from '../../i18n/index.js';
 import {
   isLocalCliOpenCapable,
   isLocalCliOpenConfigured,
+  isLocalCliOpenReady,
   openLocalCliInIterm,
+  preflightLocalCliOpen,
   supportsLocalCliOpen,
   type LocalCliId,
 } from '../../services/local-cli-opener.js';
@@ -1306,6 +1308,14 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       : activeSessions.get(rootId);
 
     const launchLocalCli = (target: DaemonSession, cliId: LocalCliId, locDs: Locale) => {
+      const preflight = preflightLocalCliOpen(target, { cliId });
+      if (!preflight.ok) {
+        logger.warn(`[${tag(target)}] Rejected ${actionType} preflight: ${preflight.error}: ${preflight.message}`);
+        if (preflight.error === 'missing_resume_id') {
+          return { toast: { type: 'warning', content: t('card.action.local_cli_not_ready', undefined, locDs) } };
+        }
+        return { toast: { type: 'error', content: t('card.action.local_cli_failed', { reason: preflight.message }, locDs) } };
+      }
       const reportFailure = (reason: string) => {
         if (value.visibility === 'private') {
           logger.warn(`[${tag(target)}] ${actionType} failed for private card; suppressing public fallback: ${reason}`);
@@ -1564,6 +1574,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           locDs,
           undefined,
           writableTerminalLinkFor(ds),
+          isLocalCliOpenReady(ds, { cliId: sessionCliId(ds) }),
         );
         scheduleCardPatch(ds, cardJson);
       }
@@ -1728,6 +1739,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           true, // showManageButtons — write-link card includes restart & close
           !!ds.adoptedFrom, // adoptMode — disconnect, never close-the-CLI
           locDs,
+          isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
         );
         // 普通群发「仅自己可见」私密卡，话题群 / 单聊自动回退私聊 DM（两条通道都私密，
         // 不泄露写入 token）。fire-and-forget，保持卡片回调快速返回。
@@ -1795,6 +1807,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
               localeForBot(ds.larkAppId),
               cardUsageLimit(ds),
               writableTerminalLinkFor(ds),
+              isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
             );
             updateMessage(ds.larkAppId, cardMessageId, cardJson).catch(err =>
               logger.debug(`[${tag(ds)}] Failed to migrate unknown frozen card: ${err}`),
@@ -1837,6 +1850,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           localeForBot(ds.larkAppId),
           cardUsageLimit(ds),
           writableTerminalLinkFor(ds),
+          isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
         );
         updateMessage(ds.larkAppId, frozen.messageId, cardJson).catch(err =>
           logger.debug(`[${tag(ds)}] Failed to migrate frozen card: ${err}`),
@@ -1877,6 +1891,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           localeForBot(ds.larkAppId),
           cardUsageLimit(ds),
           writableTerminalLinkFor(ds),
+          isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
         );
         if (cardMessageId && cardMessageId !== ds.streamCardId) {
           updateMessage(ds.larkAppId, cardMessageId, cardJson).catch(err =>
@@ -1942,6 +1957,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           localeForBot(ds.larkAppId),
           cardUsageLimit(ds),
           writableTerminalLinkFor(ds),
+          isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
         );
         if (cardMessageId && cardMessageId !== ds.streamCardId) {
           updateMessage(ds.larkAppId, cardMessageId, cardJson).catch(err =>
@@ -1982,6 +1998,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           localeForBot(ds.larkAppId),
           cardUsageLimit(ds),
           writableTerminalLinkFor(ds),
+          isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
         );
         try { return JSON.parse(cardJson); } catch { /* fall through */ }
       }

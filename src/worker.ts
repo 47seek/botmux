@@ -2049,10 +2049,16 @@ function codexBridgeStartTimer(): void {
             if (probed) path = probed.path;
           } else if (isTraex) {
             const probed = findTraexRolloutByPid(codexAdoptPendingPid);
-            if (probed) path = probed.path;
+            if (probed) {
+              path = probed.path;
+              persistCliSessionId(probed.cliSessionId);
+            }
           } else {
             const probed = findCodexRolloutByPid(codexAdoptPendingPid);
-            if (probed) path = probed.path;
+            if (probed) {
+              path = probed.path;
+              persistCliSessionId(probed.cliSessionId);
+            }
           }
         }
         if (path) {
@@ -3830,7 +3836,10 @@ function setupAdoptTranscriptBridges(cfg: Extract<DaemonToWorker, { type: 'init'
     if (cfg.cliSessionId) rolloutPath = findCodexRolloutBySessionId(cfg.cliSessionId);
     if (!rolloutPath && cfg.adoptCliPid) {
       const probed = findCodexRolloutByPid(cfg.adoptCliPid);
-      if (probed) rolloutPath = probed.path;
+      if (probed) {
+        rolloutPath = probed.path;
+        persistCliSessionId(probed.cliSessionId);
+      }
     }
     if (rolloutPath) {
       codexBridgeAttach(rolloutPath, 'split-live');
@@ -3849,7 +3858,10 @@ function setupAdoptTranscriptBridges(cfg: Extract<DaemonToWorker, { type: 'init'
     if (cfg.cliSessionId) rolloutPath = findTraexRolloutBySessionId(cfg.cliSessionId);
     if (!rolloutPath && cfg.adoptCliPid) {
       const probed = findTraexRolloutByPid(cfg.adoptCliPid);
-      if (probed) rolloutPath = probed.path;
+      if (probed) {
+        rolloutPath = probed.path;
+        persistCliSessionId(probed.cliSessionId);
+      }
     }
     if (rolloutPath) {
       codexBridgeAttach(rolloutPath, 'split-live');

@@ -259,8 +259,8 @@ export function terminalMultiUrl(url: string): Record<string, string> {
  *
  *  后续若改为 tmux attach / 共享 I/O，可再评估默认开放。现在仅供明确接受上述限制的
  *  本地桌面部署 opt-in；handler 也会重复校验，防止已发出的旧卡片绕过开关。 */
-function localCliButton(cliId: CliId, actionBase: Record<string, string>, locale?: Locale): any | undefined {
-  if (!isLocalCliOpenEnabled() || !supportsLocalCliOpen(cliId)) return undefined;
+function localCliButton(cliId: CliId, actionBase: Record<string, string>, locale: Locale | undefined, localCliReady: boolean): any | undefined {
+  if (!isLocalCliOpenEnabled() || !supportsLocalCliOpen(cliId) || !localCliReady) return undefined;
   const labelKey = cliId === 'codex'
     ? 'card.btn.open_local_codex'
     : cliId === 'traex'
@@ -288,6 +288,7 @@ export function buildSessionCard(
   showManageButtons?: boolean,
   adoptMode?: boolean,
   locale?: Locale,
+  localCliReady = false,
 ): string {
   const cliName = getCliDisplayName(cliId ?? 'claude-code');
   const effectiveCliId = cliId ?? 'claude-code';
@@ -301,7 +302,7 @@ export function buildSessionCard(
     },
   ];
   if (!showManageButtons) {
-    const localBtn = cliId ? localCliButton(effectiveCliId, actionBase, locale) : undefined;
+    const localBtn = cliId ? localCliButton(effectiveCliId, actionBase, locale, localCliReady) : undefined;
     if (localBtn) actions.push(localBtn);
     actions.push({
       tag: 'button',
@@ -703,6 +704,7 @@ export function buildStreamingCard(
   locale?: Locale,
   usageLimit?: CliUsageLimitState,
   writableTerminalUrl?: string,
+  localCliReady = false,
 ): string {
   const effectiveCliId = cliId ?? 'claude-code';
   const cliName = getCliDisplayName(effectiveCliId);
@@ -745,7 +747,7 @@ export function buildStreamingCard(
     type: 'primary',
     multi_url: terminalMultiUrl(terminalUrl),
   });
-  const localBtn = cliId ? localCliButton(effectiveCliId, actionBase, locale) : undefined;
+  const localBtn = cliId ? localCliButton(effectiveCliId, actionBase, locale, localCliReady) : undefined;
   if (localBtn) headerActions.push(localBtn);
   if (status === 'limited' && usageLimit?.retryReady) {
     headerActions.push({
