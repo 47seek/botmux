@@ -94,6 +94,7 @@ import {
   installLocalSkillLinks,
   readSkillRegistry,
   removeInstalledSkill,
+  removeInstalledSkills,
   updateInstalledSkillAsync,
 } from './services/skill-registry-store.js';
 import { redactGitUrlCredentials } from './core/skills/sources.js';
@@ -1769,39 +1770,45 @@ function mergeSkillReferenceBot(refs: Map<string, SkillReferenceBot>, ref: Skill
   current.direct ||= ref.direct;
 }
 
-async function dashboardSkillReferences(skillName: string): Promise<SkillReferenceSummary> {
-  const refs = new Map<string, SkillReferenceBot>();
+async function dashboardSkillReferencesMany(skillNames: readonly string[]): Promise<Map<string, SkillReferenceSummary>> {
+  const uniqueNames = [...new Set(skillNames)];
+  const refsBySkill = new Map(uniqueNames.map(name => [name, new Map<string, SkillReferenceBot>()]));
   try {
-    for (const ref of analyzeSkillReferences(skillName, {
-      bots: loadBotConfigs(),
-    }).bots) mergeSkillReferenceBot(refs, ref);
+    const configuredBots = loadBotConfigs();
+    for (const name of uniqueNames) {
+      const refs = refsBySkill.get(name)!;
+      for (const ref of analyzeSkillReferences(name, { bots: configuredBots }).bots) mergeSkillReferenceBot(refs, ref);
+    }
   } catch {
     // Fall back to online daemon data below when the dashboard process cannot
     // read persistent bot config.
   }
 
   const onlineBots = [...registry.list()].sort((a, b) => a.botIndex - b.botIndex);
-  const onlineRefs = await Promise.all(onlineBots.map(async d => {
+  const onlineConfigs = await Promise.all(onlineBots.map(async d => {
     try {
       const r = await fetch(`http://127.0.0.1:${d.ipcPort}/api/bot-default-oncall`, {
         signal: AbortSignal.timeout(1_500),
       });
       if (!r.ok) return null;
       const j = await r.json() as any;
-      const [ref] = analyzeSkillReferences(skillName, {
-        bots: [{ larkAppId: d.larkAppId, botName: d.botName ?? j.botName ?? d.larkAppId, skills: j.skills as BotSkillPolicy | null | undefined }],
-      }).bots;
-      return ref ?? null;
+      return { larkAppId: d.larkAppId, botName: d.botName ?? j.botName ?? d.larkAppId, skills: j.skills as BotSkillPolicy | null | undefined };
     } catch {
       return null;
     }
   }));
-  for (const ref of onlineRefs) {
-    if (ref) mergeSkillReferenceBot(refs, ref);
+  const availableOnlineConfigs = onlineConfigs.filter(config => config !== null);
+  for (const name of uniqueNames) {
+    const refs = refsBySkill.get(name)!;
+    for (const ref of analyzeSkillReferences(name, { bots: availableOnlineConfigs }).bots) mergeSkillReferenceBot(refs, ref);
   }
-  return {
+  return new Map([...refsBySkill].map(([name, refs]) => [name, {
     bots: [...refs.values()].sort((a, b) => a.botName.localeCompare(b.botName)),
-  };
+  }]));
+}
+
+async function dashboardSkillReferences(skillName: string): Promise<SkillReferenceSummary> {
+  return (await dashboardSkillReferencesMany([skillName])).get(skillName) ?? { bots: [] };
 }
 
 /** Extract the sessionId from a terminal path `/s/<sessionId>[/...]`. Returns
@@ -2294,6 +2301,41 @@ const server = createServer(async (req, res) => {
 
     if (req.method === 'GET' && url.pathname === '/api/skills') {
       return jsonRes(res, 200, dashboardSkillsPayload());
+    }
+
+    if (req.method === 'DELETE' && url.pathname === '/api/skills') {
+      let parsed: unknown;
+      try {
+        parsed = await readJsonBody(req);
+      } catch {
+        return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+      }
+      const body = parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as Record<string, unknown> : {};
+      const rawNames = Array.isArray(body.names) ? body.names : [];
+      if (rawNames.some(name => typeof name !== 'string')) return jsonRes(res, 400, { ok: false, error: 'invalid_skill_names' });
+      const names = [...new Set((rawNames as string[]).map(name => name.trim()).filter(Boolean))];
+      if (names.length === 0) return jsonRes(res, 400, { ok: false, error: 'skills_required' });
+      if (names.length > 500) return jsonRes(res, 400, { ok: false, error: 'too_many_skills' });
+      const registrySkills = readSkillRegistry().skills;
+      const missing = names.filter(name => !registrySkills[name]);
+      if (missing.length > 0) return jsonRes(res, 400, { ok: false, error: 'skill_not_installed', missing });
+
+      const referencesBySkill = await dashboardSkillReferencesMany(names);
+      const references = names.map(name => ({ name, refs: referencesBySkill.get(name) ?? { bots: [] } }));
+      const affectedSkills = references
+        .filter(item => item.refs.bots.length > 0)
+        .map(item => ({ name: item.name, affectedBots: item.refs.bots }));
+      if (body.force !== true && affectedSkills.length > 0) {
+        return jsonRes(res, 409, {
+          ok: false,
+          error: 'skills_in_use',
+          affectedSkills,
+        });
+      }
+
+      const result = removeInstalledSkills(names);
+      if (!result.ok) return jsonRes(res, 400, { ok: false, error: result.reason, missing: result.missing });
+      return jsonRes(res, 200, { ok: true, removed: result.removed, affectedSkills });
     }
 
     if (req.method === 'PUT' && url.pathname === '/api/skills/global') {
