@@ -1,13 +1,26 @@
 import { readFileSync, statSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { basename, join } from 'node:path';
 
 export interface DirMeta { url?: string; name?: string }
 
 let cache: { path: string; mtimeMs: number; meta: DirMeta } | null = null;
 
+/**
+ * `~` 展开。session.workingDir 可能是**字面量** `~/...`：oncall 绑定（oncallChats /
+ * defaultOncall）落盘时存的就是原始字符串，而 resolvePinnedWorkingDir 走 oncallEntry
+ * 那一支时不展开。别的消费方都自己展开了（session-manager 给 spawn 的 cwd 用 expandHome），
+ * 只有这里漏了 —— statSync('~/x') 必然 ENOENT → 读不到 .botmux-dir.json → 角色名丢失。
+ */
+function expandHome(p: string): string {
+  return p === '~' ? homedir()
+    : p.startsWith('~/') ? join(homedir(), p.slice(2))
+    : p;
+}
+
 /** 读取目录元数据 <workingDir>/.botmux-dir.json（mtime 缓存；缺失/损坏 → {}）。 */
 export function readDirMeta(workingDir: string): DirMeta {
-  const p = join(workingDir, '.botmux-dir.json');
+  const p = join(expandHome(workingDir), '.botmux-dir.json');
   try {
     const st = statSync(p);
     if (cache && cache.path === p && cache.mtimeMs === st.mtimeMs) return cache.meta;

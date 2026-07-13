@@ -1,5 +1,5 @@
-import { mkdtempSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { renderBrandTemplate } from '../src/im/lark/brand-template.js';
@@ -22,6 +22,21 @@ describe('renderBrandTemplate', () => {
     const dir = mkdtempSync(join(tmpdir(), 'brand-'));
     writeFileSync(join(dir, '.botmux-dir.json'), JSON.stringify({ name: '售后客服', url: 'https://x.feishu.cn/docx/abc' }));
     expect(renderBrandTemplate('[{cwdName}]({cwdUrl})', dir)).toBe('[售后客服](https://x.feishu.cn/docx/abc)');
+  });
+
+  it('workingDir 以 ~ 开头时展开成 home 再读 .botmux-dir.json（oncall 绑定存的就是字面量 ~）', () => {
+    // 复现：resolvePinnedWorkingDir 走 oncallEntry.workingDir 那一支时不展开 ~，
+    // 字面量 `~/...` 直接流到这里；Node 的 fs 不认 ~ → statSync ENOENT → 角色名丢失。
+    // 其它消费方（session-manager.ts spawn 的 cwd）都 expandHome 了，只有这里漏了。
+    const home = homedir();
+    const dir = mkdtempSync(join(home, '.brand-tilde-'));
+    try {
+      writeFileSync(join(dir, '.botmux-dir.json'), JSON.stringify({ name: '默认助理', url: 'https://x.feishu.cn/docx/abc' }));
+      const tilde = `~/${basename(dir)}`;             // 字面量 ~，正是 oncall 绑定里存的形态
+      expect(renderBrandTemplate('[{cwdName}]({cwdUrl})', tilde)).toBe('[默认助理](https://x.feishu.cn/docx/abc)');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it('url 缺失时空链接降级为纯文本', () => {
