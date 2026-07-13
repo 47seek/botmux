@@ -24,6 +24,7 @@ export const LOCAL_CLI_IDS = [
   'copilot',
   'oh-my-pi',
   'kimi',
+  'grok',
 ] as const satisfies readonly CliId[];
 
 export type LocalCliId = typeof LOCAL_CLI_IDS[number];
@@ -47,6 +48,7 @@ const RESUME_COMMAND_PREFIXES: Record<Exclude<LocalCliId, 'oh-my-pi'>, string> =
   'pi': 'pi --session-id',
   'copilot': 'copilot --resume',
   'kimi': 'kimi --resume',
+  'grok': 'grok --resume',
 };
 
 type AdoptedMetadata = NonNullable<DaemonSession['adoptedFrom']> | NonNullable<DaemonSession['session']['adoptedFrom']>;
