@@ -198,11 +198,12 @@ function buildManagedAttachCommand(ds: DaemonSession): LocalCliOpenResult {
   return fail('unsupported_backend', 'This session backend does not provide a safe local attach command.');
 }
 
-function buildAdoptedTmuxAttachCommand(adopted: AdoptedMetadata): LocalCliOpenResult {
-  const target = adopted.tmuxTarget?.trim();
-  if (!target || typeof adopted.originalCliPid !== 'number' || !Number.isFinite(adopted.originalCliPid)) {
-    return fail('missing_attach_target', 'Adopted tmux session metadata is not reliable enough to attach.');
-  }
+/** Adopted tmux is deliberately never opened locally, regardless of metadata:
+ *  the pane coordinates captured at adopt time (`tmuxTarget` / `originalCliPid`)
+ *  can be stale or reused by the time the user clicks, so there is no reliably
+ *  safe attach target. Always fails closed — resume mode is the supported path
+ *  for these sessions. */
+function buildAdoptedTmuxAttachCommand(_adopted: AdoptedMetadata): LocalCliOpenResult {
   return fail('missing_attach_target', 'Adopted tmux sessions are not opened locally because pane targets can be stale or reused.');
 }
 
