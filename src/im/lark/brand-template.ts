@@ -74,13 +74,17 @@ function safeText(s: string): string {
 }
 
 /**
- * URL 位：只放行 http/https，且不得含空白、`(`/`)`（闭合 URL）或 `[`/`]`（万一被塞进文本位）。
- * 其余一律丢弃 → 走既有的空链接降级成纯文本。
+ * URL 位：只放行 http/https，且禁掉一串会破坏链接或钓鱼的字符：
+ *   - 空白 / `(` `)` / `[` `]` / `<` `>` / 引号反引号 → 闭合链接或注入文本位
+ *   - `\` → 在 markdown 里转义掉模板的闭合 `)`
+ *   - `@` → userinfo 钓鱼形态 `https://trusted@evil.example/…`（真实 host 是 @ 后面那个）
+ * 用途上这里的 url 只会是飞书知识文档链接（`.../docx/TOKEN`），本就不含上述字符，收紧无副作用。
+ * 不合规一律丢弃 → 走既有的空链接降级成纯文本。
  */
 function safeUrl(v: unknown): string | undefined {
   if (typeof v !== 'string') return undefined;
   const s = v.trim();
-  return /^https?:\/\/[^\s()[\]<>"'`]+$/i.test(s) ? s : undefined;
+  return /^https?:\/\/[^\s()[\]<>"'`\\@]+$/i.test(s) ? s : undefined;
 }
 
 /**

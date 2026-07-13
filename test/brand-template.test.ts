@@ -78,6 +78,17 @@ describe('renderBrandTemplate', () => {
     expect(renderBrandTemplate('[{cwdName}]({cwdUrl})', dir)).toBe('x');
   });
 
+  it('safeUrl 拒绝 userinfo 钓鱼形态与反斜杠', () => {
+    const mk = (url: string) => {
+      const dir = mkdtempSync(join(tmpdir(), 'brand-url-'));
+      writeFileSync(join(dir, '.botmux-dir.json'), JSON.stringify({ name: 'x', url }));
+      return renderBrandTemplate('[{cwdName}]({cwdUrl})', dir);
+    };
+    expect(mk('https://trusted.example@evil.example/p')).toBe('x');  // userinfo → 丢弃 → 降级
+    expect(mk('https://example.com\\')).toBe('x');                   // 反斜杠 → 丢弃
+    expect(mk('https://x.feishu.cn/docx/abc')).toBe('[x](https://x.feishu.cn/docx/abc)'); // 正常 url 照过
+  });
+
   it('workingDir 恰好是 `~` 时，{cwdName} 取 home 的 basename 而不是字面量 ~', () => {
     expect(renderBrandTemplate('{cwdName}', '~')).toBe(basename(homedir()));
   });
