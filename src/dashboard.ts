@@ -2502,6 +2502,7 @@ const server = createServer(async (req, res) => {
     // 含 aiden×claude / aiden×codex 网关项——前端打开"添加机器人"表单时拉取填充下拉.
     // id 既可能是普通 cliId, 也可能是 'aiden-x-claude' 这类选择键, 由 resolveCliSelection 解析.
     if (req.method === 'GET' && url.pathname === '/api/cli-options') {
+      const webSession = await botOnboarding.sessionStatus();
       return jsonRes(res, 200, {
         options: CLI_SELECT_OPTIONS.map((o) => ({
           id: o.key,
@@ -2514,11 +2515,22 @@ const server = createServer(async (req, res) => {
         // ttadk 模型默认值 + 候选 (单一事实源在 cli-selection), 供前端模型框使用.
         ttadkModelDefault: TTADK_DEFAULT_MODEL,
         ttadkModelSuggestions: TTADK_MODEL_SUGGESTIONS,
+        suggestedAppName: botOnboarding.suggestedAppName(),
+        webSession,
       });
     }
 
     if (req.method === 'POST' && url.pathname === '/api/bot-onboarding/start') {
-      let parsed: { cliId?: unknown; workingDir?: unknown; dirMode?: unknown; model?: unknown };
+      let parsed: {
+        appName?: unknown;
+        registrationMode?: unknown;
+        sessionMode?: unknown;
+        expectedIdentity?: unknown;
+        cliId?: unknown;
+        workingDir?: unknown;
+        dirMode?: unknown;
+        model?: unknown;
+      };
       try {
         const chunks: Buffer[] = [];
         for await (const c of req) chunks.push(c as Buffer);
@@ -2556,7 +2568,40 @@ const server = createServer(async (req, res) => {
       }
       const dirMode = dirModeRaw === 'fixed' ? 'fixed' as const : dirModeRaw === 'card' ? 'card' as const : undefined;
       const model = typeof parsed.model === 'string' && parsed.model.trim() ? parsed.model.trim() : undefined;
-      const job = botOnboarding.start({ cliId, wrapperCli, workingDir, dirMode, model });
+      const appName = typeof parsed.appName === 'string' && parsed.appName.trim() ? parsed.appName.trim() : undefined;
+      if (appName && Array.from(appName).length > 64) {
+        return jsonRes(res, 400, { ok: false, error: 'invalid_app_name', message: '应用名称不能超过 64 个字符' });
+      }
+      const registrationModeRaw = typeof parsed.registrationMode === 'string' ? parsed.registrationMode.trim() : '';
+      if (registrationModeRaw && registrationModeRaw !== 'web' && registrationModeRaw !== 'compat') {
+        return jsonRes(res, 400, { ok: false, error: 'invalid_registration_mode', message: 'registrationMode 必须是 web 或 compat' });
+      }
+      const registrationMode = registrationModeRaw === 'compat' ? 'compat' as const : 'web' as const;
+      const sessionModeRaw = typeof parsed.sessionMode === 'string' ? parsed.sessionMode.trim() : '';
+      if (registrationMode === 'web' && sessionModeRaw && sessionModeRaw !== 'reuse' && sessionModeRaw !== 'qr') {
+        return jsonRes(res, 400, { ok: false, error: 'invalid_session_mode', message: 'sessionMode 必须是 reuse 或 qr' });
+      }
+      const identityRecord = parsed.expectedIdentity && typeof parsed.expectedIdentity === 'object' && !Array.isArray(parsed.expectedIdentity)
+        ? parsed.expectedIdentity as Record<string, unknown>
+        : {};
+      const expectedIdentity = typeof identityRecord.userId === 'string' && identityRecord.userId
+        && typeof identityRecord.tenantId === 'string' && identityRecord.tenantId
+        ? { userId: identityRecord.userId, tenantId: identityRecord.tenantId }
+        : undefined;
+      if (registrationMode === 'web' && sessionModeRaw === 'reuse' && !expectedIdentity) {
+        return jsonRes(res, 400, { ok: false, error: 'missing_expected_identity', message: '免扫码添加前必须确认当前账号与企业' });
+      }
+      const sessionMode = sessionModeRaw === 'reuse' ? 'reuse' as const : 'qr' as const;
+      const job = botOnboarding.start({
+        appName,
+        registrationMode,
+        ...(registrationMode === 'web' ? { sessionMode, expectedIdentity } : {}),
+        cliId,
+        wrapperCli,
+        workingDir,
+        dirMode,
+        model,
+      });
       return jsonRes(res, 202, { job: botOnboarding.get(job.id) });
     }
     let mOwner: RegExpMatchArray | null;

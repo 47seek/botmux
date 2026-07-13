@@ -21114,18 +21114,74 @@ dialog.onboarding-dialog .onboarding-form {
   width: 100%;
 }
 
+dialog.onboarding-dialog .onboarding-session {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 52px;
+  padding: 10px 12px;
+  border: 1px solid color-mix(in srgb, var(--accent) 24%, var(--border-soft));
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--accent) 5%, var(--surface));
+}
+
+dialog.onboarding-dialog .onboarding-session :where(p, strong, small) {
+  display: block;
+  margin: 0;
+}
+
+dialog.onboarding-dialog .onboarding-session strong {
+  color: var(--fg);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+dialog.onboarding-dialog .onboarding-session small {
+  margin-top: 2px;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+dialog.onboarding-dialog button.onboarding-session-action {
+  flex: 0 0 auto;
+  min-height: 30px;
+  padding: 0 10px;
+  border-color: transparent;
+  background: transparent;
+  color: var(--accent);
+  font-size: 11px;
+  box-shadow: none;
+}
+
+dialog.onboarding-dialog button.onboarding-session-action:hover:not(:disabled) {
+  border-color: color-mix(in srgb, var(--accent) 30%, var(--border-soft));
+  background: color-mix(in srgb, var(--accent) 7%, transparent);
+  color: var(--accent-strong);
+}
+
 dialog.onboarding-dialog .onboarding-field {
   width: 100%;
   min-width: 0;
 }
 
-dialog.onboarding-dialog .onboarding-field > :where(input[type="text"], .onboarding-menu) {
+dialog.onboarding-dialog .onboarding-field-hint {
+  display: block;
+  margin-top: 5px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1.45;
+}
+
+dialog.onboarding-dialog .onboarding-field > :where(input[type="text"], input[type="email"], .onboarding-menu) {
   width: 100%;
   min-width: 0;
   max-width: none;
 }
 
-dialog.onboarding-dialog .onboarding-field > input[type="text"] {
+dialog.onboarding-dialog .onboarding-field > :where(input[type="text"], input[type="email"]) {
   height: var(--button-height);
   min-height: var(--button-height);
   max-height: var(--button-height);
@@ -21140,7 +21196,7 @@ dialog.onboarding-dialog .onboarding-field > input[type="text"] {
   box-shadow: none;
 }
 
-dialog.onboarding-dialog .onboarding-field > input[type="text"]:not([type=checkbox]):not([type=radio]):not([type=range]):not([type=color]):not([type=file]):not([type=submit]):not([type=button]) {
+dialog.onboarding-dialog .onboarding-field > :where(input[type="text"], input[type="email"]):not([type=checkbox]):not([type=radio]):not([type=range]):not([type=color]):not([type=file]):not([type=submit]):not([type=button]) {
   height: var(--button-height);
   min-height: var(--button-height);
   max-height: var(--button-height);
@@ -21155,8 +21211,8 @@ dialog.onboarding-dialog .onboarding-field > input[type="text"]:not([type=checkb
   box-shadow: none;
 }
 
-dialog.onboarding-dialog .onboarding-field > input[type="text"]:hover:not(:disabled),
-dialog.onboarding-dialog .onboarding-field > input[type="text"]:focus {
+dialog.onboarding-dialog .onboarding-field > :where(input[type="text"], input[type="email"]):hover:not(:disabled),
+dialog.onboarding-dialog .onboarding-field > :where(input[type="text"], input[type="email"]):focus {
   border-color: var(--accent);
   background: color-mix(in srgb, var(--accent) 8%, transparent);
   color: var(--accent-strong);
@@ -21164,8 +21220,8 @@ dialog.onboarding-dialog .onboarding-field > input[type="text"]:focus {
   box-shadow: none;
 }
 
-dialog.onboarding-dialog .onboarding-field > input[type="text"]:not([type=checkbox]):not([type=radio]):not([type=range]):not([type=color]):not([type=file]):not([type=submit]):not([type=button]):hover:not(:disabled),
-dialog.onboarding-dialog .onboarding-field > input[type="text"]:not([type=checkbox]):not([type=radio]):not([type=range]):not([type=color]):not([type=file]):not([type=submit]):not([type=button]):focus {
+dialog.onboarding-dialog .onboarding-field > :where(input[type="text"], input[type="email"]):not([type=checkbox]):not([type=radio]):not([type=range]):not([type=color]):not([type=file]):not([type=submit]):not([type=button]):hover:not(:disabled),
+dialog.onboarding-dialog .onboarding-field > :where(input[type="text"], input[type="email"]):not([type=checkbox]):not([type=radio]):not([type=range]):not([type=color]):not([type=file]):not([type=submit]):not([type=button]):focus {
   border-color: var(--accent);
   background: color-mix(in srgb, var(--accent) 8%, transparent);
   color: var(--accent-strong);
@@ -21224,6 +21280,34 @@ dialog.onboarding-dialog .onboarding-actions button.onboarding-submit.primary:ho
   border-color: var(--accent);
   background: color-mix(in srgb, var(--accent) 8%, transparent);
   color: var(--accent-strong);
+}
+
+dialog.onboarding-dialog .onboarding-technical {
+  padding: 10px 12px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-md);
+  background: var(--surface-muted);
+  color: var(--muted);
+  font-size: 12px;
+}
+
+dialog.onboarding-dialog .onboarding-technical > summary {
+  cursor: pointer;
+  font-weight: 700;
+}
+
+dialog.onboarding-dialog .onboarding-technical > code {
+  display: block;
+  margin-top: 8px;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  dialog.onboarding-dialog .qr-card,
+  dialog.onboarding-dialog .onboarding-status {
+    transition-property: opacity;
+  }
 }
 
 .insights-page .insight-head-acts {
