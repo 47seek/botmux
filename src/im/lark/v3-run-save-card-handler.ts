@@ -8,7 +8,7 @@ import {
 } from '../../workflows/v3/library-service.js';
 import { SavedWorkflowUnsafeLiteralError } from '../../workflows/v3/library-materialize.js';
 import { loadAuthorizedV3Run } from '../../workflows/v3/run-envelope.js';
-import { defaultBaseDir, type RunChatBinding } from '../../workflows/v3/grill-state.js';
+import { defaultBaseDir } from '../../workflows/v3/grill-state.js';
 import { isValidRunId } from '../../workflows/v3/ops-projection.js';
 import { readJournal } from '../../workflows/v3/journal.js';
 import { materialize } from '../../workflows/v3/state.js';
@@ -29,8 +29,6 @@ export function isV3RunSaveAction(action: unknown): boolean {
 export interface V3RunSaveCardHandlerDeps {
   baseDir?: string;
   dataDir: string;
-  /** Global publication is an IM-only privileged action, checked per click. */
-  canPublishGlobal: (binding: RunChatBinding, operatorOpenId: string) => boolean;
   saveRun?: typeof saveTerminalRunAsWorkflowIdempotent;
   onError?: (runId: string, error: unknown) => void;
 }
@@ -93,8 +91,11 @@ export async function handleV3RunSaveAction(
   ) {
     return stale('nonce 不匹配');
   }
-  if (value.scope === 'global' && !deps.canPublishGlobal(binding, operatorOpenId)) {
-    return denied('只有本群可操作成员才能保存为全局 Workflow');
+  if (value.scope === 'global') {
+    return denied(
+      `卡片不再直接发布当前 Bot 全局 Workflow；请显式发送 ` +
+      `\`/workflow save ${value.runId} [名称] --global\``,
+    );
   }
 
   const context: SavedWorkflowActorContext = {

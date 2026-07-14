@@ -152,6 +152,14 @@ describe('v3 run publication crash durability', () => {
       const materialized = materializeSavedWorkflowRun({
         metadata,
         revision,
+        context: {
+          initiatorOpenId: metadata.owner.openId,
+          chatBinding: {
+            larkAppId: metadata.owner.larkAppId,
+            chatId: 'oc_test',
+            ownerOpenId: metadata.owner.openId,
+          },
+        },
         bots: [{
           larkAppId: 'cli_test',
           larkAppSecret: 'secret',

@@ -382,6 +382,9 @@ export async function listSavedWorkflows(
 }
 
 function isVisible(metadata: SavedWorkflowMetadata, opts: ListSavedWorkflowOptions): boolean {
+  // Every saved workflow is namespaced by the app that created it. `global`
+  // means global to that bot/app, not global to every bot sharing dataDir.
+  if (!opts.actor || metadata.owner.larkAppId !== opts.actor.larkAppId) return false;
   if (metadata.status === 'archived' && opts.includeArchived !== true) return false;
   if (metadata.scope.kind === 'chat' && metadata.scope.chatId !== opts.chatId) return false;
   if (metadata.status === 'draft') {

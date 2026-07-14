@@ -12,12 +12,11 @@ import type { RunChatBinding } from '../../workflows/v3/grill-state.js';
 import {
   instantiatePublishedSavedWorkflow,
   listVisibleSavedWorkflows,
+  loadVisibleSavedWorkflow,
   resolveOwnedTerminalRunDir,
-  resolveVisibleSavedWorkflow,
   saveTerminalRunAsWorkflow,
   type SavedWorkflowActorContext,
 } from '../../workflows/v3/library-service.js';
-import { loadCurrentSavedWorkflow } from '../../workflows/v3/library-store.js';
 import {
   readV3RunChatBinding,
   requestV3RunCancel,
@@ -27,6 +26,10 @@ import type { V3SavedWorkflowCommand } from './v3-saved-workflow-command.js';
 import { v3SavedWorkflowAdHocRunEscapeHint } from './v3-saved-workflow-command.js';
 
 export type ExecutableV3SavedWorkflowCommand = Exclude<V3SavedWorkflowCommand, { kind: 'invalid' }>;
+
+function savedWorkflowScopeLabel(scope: { kind: 'chat' | 'global' }): string {
+  return scope.kind === 'global' ? '当前 Bot 全局' : '本群';
+}
 
 export interface V3SavedWorkflowMessageTargetsInput {
   /** Existing daemon routing anchor; it may be an oc_ chat id in chat scope. */
@@ -101,8 +104,7 @@ export interface V3SavedWorkflowExecutionInput {
 
 export interface V3SavedWorkflowExecutionDeps {
   listVisible: typeof listVisibleSavedWorkflows;
-  resolveVisible: typeof resolveVisibleSavedWorkflow;
-  loadCurrent: typeof loadCurrentSavedWorkflow;
+  loadVisible: typeof loadVisibleSavedWorkflow;
   resolveOwnedRun: typeof resolveOwnedTerminalRunDir;
   saveRun: typeof saveTerminalRunAsWorkflow;
   instantiate: typeof instantiatePublishedSavedWorkflow;
@@ -167,29 +169,24 @@ export async function executeV3SavedWorkflowCommand(
       const lines = listed.entries.length === 0
         ? ['还没有 Saved Workflow。成功跑完后发 `/workflow save last [名称]` 即可固化。']
         : listed.entries.map((entry) =>
-            `- ${entry.displayName} — \`${entry.workflowId}\` · ${entry.scope.kind} · ${entry.status}`,
+            `- ${entry.displayName} — \`${entry.workflowId}\` · ${savedWorkflowScopeLabel(entry.scope)} · ${entry.status}`,
           );
-      if (listed.invalid.length > 0) lines.push(`\n⚠️ ${listed.invalid.length} 个目录项损坏，已隔离不展示。`);
       return { effect: 'read_completed', message: lines.join('\n') };
     }
 
     if (command.kind === 'show') {
-      const metadata = await deps.resolveVisible({ dataDir, ref: command.ref, context });
-      const loaded = await deps.loadCurrent(dataDir, metadata.workflowId, {
-        revision: metadata.publishedRevision ? 'published' : 'latest',
-        requireActive: false,
-      });
+      const loaded = await deps.loadVisible({ dataDir, ref: command.ref, context });
+      const metadata = loaded.metadata;
       const params = Object.keys(loaded.revision.payload.inputs);
       return {
         effect: 'read_completed',
         message: [
           `Saved Workflow：${metadata.displayName}`,
           `workflowId: ${metadata.workflowId}`,
-          `scope: ${metadata.scope.kind}`,
+          `scope: ${savedWorkflowScopeLabel(metadata.scope)}`,
           `status: ${metadata.status}`,
           `revision: v${loaded.revision.payload.humanVersion} (${loaded.revision.revisionId})`,
           `params: ${params.length > 0 ? params.join(', ') : '(无)'}`,
-          `source run: ${loaded.revision.payload.sourceRunId}`,
         ].join('\n'),
       };
     }
@@ -265,7 +262,7 @@ export async function executeV3SavedWorkflowCommand(
           `✅ 已固化 Saved Workflow：${result.metadata.displayName}`,
           `workflowId: ${result.metadata.workflowId}`,
           `revision: v${result.revision.payload.humanVersion} (${result.revision.revisionId})`,
-          `scope: ${result.metadata.scope.kind}`,
+          `scope: ${savedWorkflowScopeLabel(result.metadata.scope)}`,
           `status: ${result.metadata.status}`,
         ].join('\n'),
       };
@@ -308,8 +305,7 @@ export async function executeV3SavedWorkflowCommand(
 
 export const defaultV3SavedWorkflowExecutionServices = {
   listVisible: listVisibleSavedWorkflows,
-  resolveVisible: resolveVisibleSavedWorkflow,
-  loadCurrent: loadCurrentSavedWorkflow,
+  loadVisible: loadVisibleSavedWorkflow,
   resolveOwnedRun: resolveOwnedTerminalRunDir,
   saveRun: saveTerminalRunAsWorkflow,
   instantiate: instantiatePublishedSavedWorkflow,
@@ -318,8 +314,7 @@ export const defaultV3SavedWorkflowExecutionServices = {
 } satisfies Pick<
   V3SavedWorkflowExecutionDeps,
   | 'listVisible'
-  | 'resolveVisible'
-  | 'loadCurrent'
+  | 'loadVisible'
   | 'resolveOwnedRun'
   | 'saveRun'
   | 'instantiate'

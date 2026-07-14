@@ -70,8 +70,8 @@ function seedRun(runId = 'save-run-001', goal = 'write report') {
   return { envelope, runDir };
 }
 
-function deps(canPublishGlobal = vi.fn(() => true)) {
-  return { baseDir, dataDir, canPublishGlobal };
+function deps() {
+  return { baseDir, dataDir };
 }
 
 describe('v3 terminal run save card', () => {
@@ -86,18 +86,10 @@ describe('v3 terminal run save card', () => {
     const value = buildV3RunSaveActionValue(envelope, 'chat');
     const first = await handleV3RunSaveAction(value, 'ou_owner', 'cli_test', deps()) as any;
     const replay = await handleV3RunSaveAction(value, 'ou_owner', 'cli_test', deps()) as any;
-    const globalReplay = await handleV3RunSaveAction(
-      buildV3RunSaveActionValue(envelope, 'global'),
-      'ou_owner',
-      'cli_test',
-      deps(),
-    ) as any;
-
     expect(first.header.template).toBe('green');
     expect(first.header.title.content).toContain('已保存');
     const firstDefinition = first.elements[0].fields[2].text.content;
     expect(replay.elements[0].fields[2].text.content).toBe(firstDefinition);
-    expect(JSON.stringify(globalReplay)).toContain('全局”请求未重复创建');
   });
 
   it('is wired through the generic Lark card handler before its legacy permission gate', async () => {
@@ -116,7 +108,7 @@ describe('v3 terminal run save card', () => {
     expect(result.header.title.content).toContain('已保存');
   });
 
-  it('rejects a forged operator, receiving app, global permission, and nonce', async () => {
+  it('rejects a forged operator, receiving app, old global card action, and nonce', async () => {
     const { envelope } = seedRun();
     const chat = buildV3RunSaveActionValue(envelope, 'chat');
     expect((await handleV3RunSaveAction(chat, 'ou_other', 'cli_test', deps()) as any).toast.content)
@@ -127,10 +119,22 @@ describe('v3 terminal run save card', () => {
       .toContain('nonce');
 
     const global = buildV3RunSaveActionValue(envelope, 'global');
-    const canPublishGlobal = vi.fn(() => false);
-    expect((await handleV3RunSaveAction(global, 'ou_owner', 'cli_test', deps(canPublishGlobal)) as any).toast.content)
-      .toContain('可操作成员');
-    expect(canPublishGlobal).toHaveBeenCalled();
+    const saveRun = vi.fn();
+    expect((await handleV3RunSaveAction(
+      global,
+      'ou_owner',
+      'cli_test',
+      { ...deps(), saveRun: saveRun as any },
+    ) as any).toast.content)
+      .toContain('当前 Bot 全局');
+    expect((await handleV3RunSaveAction(
+      global,
+      'ou_owner',
+      'cli_test',
+      { ...deps(), saveRun: saveRun as any },
+    ) as any).toast.content)
+      .toContain('/workflow save save-run-001 [名称] --global');
+    expect(saveRun).not.toHaveBeenCalled();
   });
 
   it('requires a fresh explicit confirmation for unsafe reusable literals', async () => {

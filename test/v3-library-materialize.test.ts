@@ -179,6 +179,35 @@ describe('Saved Workflow materialization + daemon execution', () => {
     }
   });
 
+  it('enforces the owning app before publishing a low-level materialized run', async () => {
+    const root = fresh('v3-lib-app-boundary-');
+    try {
+      const compiled = compileSavedWorkflowFromRun(seedSucceededAdHocRun(join(root, 'source')));
+      const created = await createSavedWorkflow(join(root, 'data'), {
+        displayName: compiled.displayName,
+        owner: OWNER,
+        scope: { kind: 'global' },
+        revision: compiled.revision,
+        publish: true,
+        workflowId: 'wf_33333333333333333333333333333333',
+      });
+      expect(() => materializeSavedWorkflowRun({
+        metadata: created.metadata,
+        revision: created.revision,
+        context: {
+          initiatorOpenId: OWNER.openId,
+          chatBinding: { ...BINDING, larkAppId: 'cli_other' },
+        },
+        bots: [{ larkAppId: 'cli_test', cliId: 'claude-code', workingDir: '/w' } as any],
+        baseDir: join(root, 'runs'),
+        runId: 'wrong-app-run',
+      })).toThrow(/outside its owning app/);
+      expect(existsSync(join(root, 'runs', 'wrong-app-run'))).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('creates a no-grill run, keeps values out of DAG/goal, and injects params as untrusted JSON', async () => {
     const root = fresh('v3-lib-materialize-');
     try {
@@ -293,6 +322,7 @@ describe('Saved Workflow materialization + daemon execution', () => {
       expect(() => materializeSavedWorkflowRun({
         metadata: created.metadata,
         revision: created.revision,
+        context: { chatBinding: BINDING, initiatorOpenId: OWNER.openId },
         bots: [{ larkAppId: 'cli_test', cliId: 'claude-code', workingDir: '/w' } as any],
         baseDir: join(root, 'runs'),
         runId: 'missing-param-run',
@@ -326,6 +356,7 @@ describe('Saved Workflow materialization + daemon execution', () => {
         metadata: created.metadata,
         revision: created.revision,
         rawParams: { token: { kind: 'string', value: 'top-secret-value' } },
+        context: { chatBinding: BINDING, initiatorOpenId: OWNER.openId },
         bots: [{ larkAppId: 'cli_test', cliId: 'claude-code', workingDir: '/w' } as any],
         baseDir: join(root, 'runs'),
         runId: 'sensitive-param-run',

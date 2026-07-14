@@ -84,8 +84,7 @@ describe('Saved Workflow IM policy', () => {
 function executionDeps(overrides: Partial<V3SavedWorkflowExecutionDeps> = {}): V3SavedWorkflowExecutionDeps {
   return {
     listVisible: vi.fn(),
-    resolveVisible: vi.fn(),
-    loadCurrent: vi.fn(),
+    loadVisible: vi.fn(),
     resolveOwnedRun: vi.fn(),
     saveRun: vi.fn(),
     instantiate: vi.fn(),
@@ -110,6 +109,35 @@ const EXECUTION_BASE = {
 };
 
 describe('Saved Workflow execution seam', () => {
+  it('shows only a sanitized definition summary without source-run provenance', async () => {
+    const deps = executionDeps({
+      loadVisible: vi.fn().mockResolvedValue({
+        metadata: {
+          displayName: 'Weekly Report',
+          workflowId: 'wf_0123456789abcdef0123456789abcdef',
+          scope: { kind: 'global' },
+          status: 'active',
+        },
+        revision: {
+          revisionId: 'rev_public',
+          payload: {
+            humanVersion: 1,
+            inputs: { region: { type: 'string' } },
+            sourceRunId: 'private-project-person-260714',
+          },
+        },
+      }),
+    });
+    const result = await executeV3SavedWorkflowCommand({
+      ...EXECUTION_BASE,
+      command: { kind: 'show', ref: 'Weekly Report' },
+    }, deps);
+    expect(result.message).toContain('scope: 当前 Bot 全局');
+    expect(result.message).toContain('params: region');
+    expect(result.message).not.toContain('source run');
+    expect(result.message).not.toContain('private-project-person');
+  });
+
   it('returns a committed save notification without owning Lark delivery', async () => {
     const deps = executionDeps({
       resolveOwnedRun: vi.fn().mockResolvedValue('/tmp/source-run'),
@@ -135,8 +163,35 @@ describe('Saved Workflow execution seam', () => {
     }, deps);
     expect(result.effect).toBe('save_committed');
     expect(result.message).toContain('✅ 已固化 Saved Workflow：Weekly Report');
+    expect(result.message).toContain('scope: 本群');
     expect(deps.saveRun).toHaveBeenCalledTimes(1);
     expect(deps.saveRun).toHaveBeenCalledWith(expect.objectContaining({ acknowledgeUnsafeLiterals: true }));
+  });
+
+  it('labels global Saved Workflow scope as current-bot global', async () => {
+    const deps = executionDeps({
+      resolveOwnedRun: vi.fn().mockResolvedValue('/tmp/source-run'),
+      saveRun: vi.fn().mockResolvedValue({
+        metadata: {
+          displayName: 'Shared Report',
+          workflowId: 'wf_0123456789abcdef0123456789abcdef',
+          scope: { kind: 'global' },
+          status: 'active',
+        },
+        revision: {
+          revisionId: 'rev_deadbeef',
+          payload: { humanVersion: 1 },
+        },
+      }),
+    });
+    const result = await executeV3SavedWorkflowCommand({
+      ...EXECUTION_BASE,
+      command: {
+        kind: 'save', source: 'last', displayName: 'Shared Report', global: true,
+        acknowledgeUnsafeLiterals: false,
+      },
+    }, deps);
+    expect(result.message).toContain('scope: 当前 Bot 全局');
   });
 
   it('keeps a started run successful independently of later notification delivery', async () => {

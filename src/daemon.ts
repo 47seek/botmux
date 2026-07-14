@@ -1515,7 +1515,7 @@ async function handleV3SavedWorkflowCommandIfAny(
   });
   if (!policy.ok) {
     if (policy.reason === 'global_requires_operate') {
-      await notify('❌ 只有本群可操作成员才能使用 `--global` 发布全局 Saved Workflow。', 'authorization');
+      await notify('❌ 只有本群可操作成员才能使用 `--global` 发布当前 Bot 全局 Saved Workflow。', 'authorization');
     }
     // Quota denial owns its exhausted-card notification in the shared quota
     // gate; avoid a second reply here.
@@ -1743,9 +1743,6 @@ const v3ProgressCardManager = new V3ProgressCardManager({
       binding?.ownerOpenId
         ? {
             chat: buildV3RunSaveActionValue(loaded.envelope, 'chat'),
-            ...(canOperate(binding.larkAppId, binding.chatId, binding.ownerOpenId)
-              ? { global: buildV3RunSaveActionValue(loaded.envelope, 'global') }
-              : {}),
           }
         : undefined;
     return buildV3ProgressCard(view, saveActions ? { saveActions } : {});
@@ -1886,8 +1883,6 @@ const cardDeps: CardHandlerDeps = {
   v3RunSaveDeps: {
     baseDir: v3DefaultBaseDir(),
     dataDir: dirname(v3DefaultBaseDir()),
-    canPublishGlobal: (binding, operatorOpenId) =>
-      canOperate(binding.larkAppId, binding.chatId, operatorOpenId),
     onError: (runId, err) => logger.warn(
       `[v3:${runId}] terminal save card failed: ${err instanceof Error ? err.message : String(err)}`,
     ),

@@ -101,13 +101,28 @@ function writeLegacyGrill(runDir: string, runId: string, larkAppId: string): voi
 }
 
 describe('v3-runs-api', () => {
+  it('GET list/detail 未授权 → 401，不泄漏 run 是否存在', async () => {
+    const base = mkdtempSync(join(tmpdir(), 'v3-api-'));
+    try {
+      buildRun(base, 'r-260602-0907');
+      for (const path of ['/api/v3/runs', '/api/v3/runs/r-260602-0907', '/api/v3/runs/missing']) {
+        const m = mockRes();
+        const { req, url } = get(path);
+        const handled = await handleV3RunsApi(req, m.res, url, apiDeps(base), false);
+        expect(handled).toBe(true);
+        expect(m.status, path).toBe(401);
+        expect(m.json()).toEqual({ ok: false, error: 'auth_required' });
+      }
+    } finally { rmSync(base, { recursive: true, force: true }); }
+  });
+
   it('GET /api/v3/runs → 200 + runs[]', async () => {
     const base = mkdtempSync(join(tmpdir(), 'v3-api-'));
     try {
       buildRun(base, 'r-260602-0907');
       const { req, url } = get('/api/v3/runs');
       const m = mockRes();
-      const handled = await handleV3RunsApi(req, m.res, url, apiDeps(base), false);
+      const handled = await handleV3RunsApi(req, m.res, url, apiDeps(base), true);
       expect(handled).toBe(true);
       expect(m.status).toBe(200);
       const body = m.json() as { runs: Array<{ runId: string }> };
@@ -121,7 +136,7 @@ describe('v3-runs-api', () => {
       buildRun(base, 'r-260602-0907');
       const { req, url } = get('/api/v3/runs/r-260602-0907');
       const m = mockRes();
-      await handleV3RunsApi(req, m.res, url, apiDeps(base), false);
+      await handleV3RunsApi(req, m.res, url, apiDeps(base), true);
       expect(m.status).toBe(200);
       const view = m.json() as { runId: string; nodes: Array<{ id: string; webTerminal?: unknown }> };
       expect(view.runId).toBe('r-260602-0907');
@@ -135,11 +150,11 @@ describe('v3-runs-api', () => {
     const base = mkdtempSync(join(tmpdir(), 'v3-api-'));
     try {
       const m1 = mockRes();
-      await handleV3RunsApi(get('/api/v3/runs/missing-260602-0000').req, m1.res, get('/api/v3/runs/missing-260602-0000').url, apiDeps(base), false);
+      await handleV3RunsApi(get('/api/v3/runs/missing-260602-0000').req, m1.res, get('/api/v3/runs/missing-260602-0000').url, apiDeps(base), true);
       expect(m1.status).toBe(404);
       // 单段但含非法字符（projectRunById 的 isValidRunId 拒 → 404）
       const m2 = mockRes();
-      await handleV3RunsApi(get('/api/v3/runs/bad!id').req, m2.res, get('/api/v3/runs/bad!id').url, apiDeps(base), false);
+      await handleV3RunsApi(get('/api/v3/runs/bad!id').req, m2.res, get('/api/v3/runs/bad!id').url, apiDeps(base), true);
       expect(m2.status).toBe(404);
     } finally { rmSync(base, { recursive: true, force: true }); }
   });

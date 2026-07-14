@@ -241,7 +241,7 @@ export function buildV3BlockedCard(input: V3BlockedCardInput): string {
     actions: [
       {
         tag: 'button',
-        text: { tag: 'plain_text', content: 'Web 详情' },
+        text: { tag: 'plain_text', content: 'Web 详情（需登录）' },
         type: 'default',
         multi_url: {
           url: webDetailUrl, pc_url: webDetailUrl, android_url: webDetailUrl, ios_url: webDetailUrl,

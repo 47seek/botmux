@@ -38,6 +38,7 @@ const MAX_PARAMS = 128;
 
 export type SavedWorkflowScope =
   | { kind: 'chat'; chatId: string }
+  /** Visible across chats owned by the same Lark app/bot, never across apps. */
   | { kind: 'global' };
 
 /** open_id is app-scoped, so ownership must retain the app it came from. */

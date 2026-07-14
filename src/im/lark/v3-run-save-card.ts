@@ -71,7 +71,7 @@ export function buildV3RunSaveWarningCard(input: {
   warnings: readonly string[];
   warningDigest: string;
 }): string {
-  const scopeText = input.scope === 'global' ? '全局' : '本群';
+  const scopeText = input.scope === 'global' ? '当前 Bot 全局' : '本群';
   const warningLines = input.warnings.slice(0, 8).map((warning) => `- ${escapeMd(warning)}`);
   if (input.warnings.length > warningLines.length) {
     warningLines.push(`- 另有 ${input.warnings.length - warningLines.length} 项`);
@@ -138,7 +138,7 @@ export function buildV3RunSavedCard(input: {
         tag: 'div',
         fields: [
           { is_short: true, text: { tag: 'lark_md', content: `**Run**\n${escapeMd(short(input.runId, 28))}` } },
-          { is_short: true, text: { tag: 'lark_md', content: `**范围**\n${input.scope === 'global' ? '全局' : '本群'}` } },
+          { is_short: true, text: { tag: 'lark_md', content: `**范围**\n${input.scope === 'global' ? '当前 Bot 全局' : '本群'}` } },
           { is_short: false, text: { tag: 'lark_md', content: `**Definition**\n\`${input.workflowId}\` · v${input.humanVersion} · \`${short(input.revisionId, 18)}\`` } },
         ],
       },
@@ -151,7 +151,7 @@ export function buildV3RunSavedCard(input: {
         tag: 'note',
         elements: [{
           tag: 'plain_text',
-          content: `该 run 此前已保存到${input.scope === 'global' ? '全局' : '本群'}；本次“${input.requestedScope === 'global' ? '全局' : '本群'}”请求未重复创建。`,
+          content: `该 run 此前已保存到${input.scope === 'global' ? '当前 Bot 全局' : '本群'}；本次“${input.requestedScope === 'global' ? '当前 Bot 全局' : '本群'}”请求未重复创建。`,
         }],
       }] : []),
     ],

@@ -23,11 +23,14 @@ import {
   SavedWorkflowPermissionError,
   createSavedWorkflow,
   loadCurrentSavedWorkflow,
+  savedWorkflowMetadataPath,
+  workflowLibraryRoot,
 } from '../src/workflows/v3/library-store.js';
 import {
   SavedWorkflowServiceError,
   instantiatePublishedSavedWorkflow,
   listVisibleSavedWorkflows,
+  loadVisibleSavedWorkflow,
   resolveOwnedTerminalRunDir,
   resolveVisibleSavedWorkflow,
   saveTerminalRunAsWorkflow,
@@ -43,6 +46,7 @@ import { writeGrillState } from '../src/workflows/v3/grill-state.js';
 
 const OWNER: SavedWorkflowOwner = { openId: 'ou_owner', larkAppId: 'cli_test' };
 const OTHER: SavedWorkflowOwner = { openId: 'ou_other', larkAppId: 'cli_test' };
+const OTHER_APP: SavedWorkflowOwner = { openId: 'ou_owner', larkAppId: 'cli_other' };
 
 function context(
   actor: SavedWorkflowOwner = OWNER,
@@ -293,6 +297,20 @@ describe('Saved Workflow application service', () => {
       context: context(OTHER, 'oc_b'),
       ref: chatSaved.metadata.workflowId,
     })).rejects.toMatchObject({ code: 'not_found' });
+    await expect(listVisibleSavedWorkflows({
+      dataDir,
+      context: context(OTHER_APP),
+    })).resolves.toMatchObject({ entries: [], invalid: [] });
+    await expect(resolveVisibleSavedWorkflow({
+      dataDir,
+      context: context(OTHER_APP),
+      ref: globalSaved.metadata.workflowId,
+    })).rejects.toMatchObject({ code: 'not_found' });
+    await expect(resolveVisibleSavedWorkflow({
+      dataDir,
+      context: context(OTHER_APP),
+      ref: chatSaved.metadata.workflowId,
+    })).rejects.toMatchObject({ code: 'not_found' });
   });
 
   it('replays a completed-run save idempotently and lets the first scope win', async () => {
@@ -329,6 +347,45 @@ describe('Saved Workflow application service', () => {
     });
     expect(explicitCopy.created).toBe(true);
     expect(explicitCopy.metadata.workflowId).not.toBe(first.metadata.workflowId);
+  });
+
+  it('does not expose malformed shared-library directory counts to a bot catalog', async () => {
+    const corruptId = 'wf_99999999999999999999999999999999';
+    mkdirSync(join(workflowLibraryRoot(dataDir), corruptId), { recursive: true });
+    writeFileSync(savedWorkflowMetadataPath(dataDir, corruptId), '{broken-json', 'utf-8');
+
+    await expect(listVisibleSavedWorkflows({ dataDir, context: context() }))
+      .resolves.toEqual({ entries: [], invalid: [] });
+  });
+
+  it('re-checks app, archive, and chat visibility after the second show read', async () => {
+    const created = await createSavedWorkflow(dataDir, {
+      displayName: 'Race-safe show',
+      owner: OWNER,
+      scope: { kind: 'global' },
+      revision: parameterizedRevision(),
+      publish: true,
+      workflowId: 'wf_88888888888888888888888888888888',
+    });
+    const input = { dataDir, context: context(), ref: created.metadata.workflowId };
+    const resolveVisible = async () => created.metadata;
+    const secondRead = (metadata: typeof created.metadata) => ({
+      resolveVisible,
+      loadCurrent: async () => ({ metadata, revision: created.revision }),
+    });
+
+    await expect(loadVisibleSavedWorkflow(input, secondRead({
+      ...created.metadata,
+      owner: { ...created.metadata.owner, larkAppId: 'cli_other' },
+    }))).rejects.toMatchObject({ code: 'not_found' });
+    await expect(loadVisibleSavedWorkflow(input, secondRead({
+      ...created.metadata,
+      status: 'archived',
+    }))).rejects.toMatchObject({ code: 'not_found' });
+    await expect(loadVisibleSavedWorkflow(input, secondRead({
+      ...created.metadata,
+      scope: { kind: 'chat', chatId: 'oc_other' },
+    }))).rejects.toMatchObject({ code: 'scope_mismatch' });
   });
 
   it('appends only to an explicit owner workflow and keeps failed runs draft-only', async () => {
@@ -373,6 +430,18 @@ describe('Saved Workflow application service', () => {
       workflowId: initial.metadata.workflowId,
       allowDraft: true,
     })).rejects.toBeInstanceOf(SavedWorkflowPermissionError);
+
+    const otherAppSource = seedTerminalAdHocRun(sourceDir, {
+      runId: 'source-other-app',
+      owner: OTHER_APP,
+    });
+    await expect(saveTerminalRunAsWorkflow({
+      dataDir,
+      runDir: otherAppSource,
+      context: context(OTHER_APP),
+      workflowId: initial.metadata.workflowId,
+      allowDraft: true,
+    })).rejects.toMatchObject({ code: 'not_found' });
   });
 
   it('fails closed when the source run belongs to another chat/actor or has no owner binding', async () => {

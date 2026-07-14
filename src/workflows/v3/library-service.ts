@@ -486,10 +486,10 @@ export async function saveTerminalRunAsWorkflow(
       if (err instanceof SavedWorkflowNotFoundError) throw notFound(input.workflowId);
       throw err;
     }
+    assertMetadataVisibleInContext(metadata, context);
     if (!sameOwner(metadata.owner, context.actor)) {
       throw new SavedWorkflowPermissionError(metadata.workflowId);
     }
-    assertMetadataVisibleInContext(metadata, context);
     const written = await appendSavedWorkflowRevision(input.dataDir, input.workflowId, {
       actor: context.actor,
       revision: compiled.revision,
@@ -565,9 +565,12 @@ export async function listVisibleSavedWorkflows(
   // Archived definitions are management state, not a shared catalog surface.
   // Even when explicitly requested, only their owner sees them.
   return {
-    ...listed,
     entries: listed.entries.filter((metadata) =>
       metadata.status !== 'archived' || sameOwner(metadata.owner, context.actor)),
+    // A malformed directory has no trustworthy app owner. Exposing even its
+    // count would leak shared-dataDir state across bots, so user-facing list
+    // operations omit it. Store-level diagnostics remain available to ops.
+    invalid: [],
   };
 }
 
@@ -602,6 +605,34 @@ export async function resolveVisibleSavedWorkflow(
     );
   }
   return matches[0]!;
+}
+
+/** Resolve and re-check visibility after the second metadata/revision read. */
+export async function loadVisibleSavedWorkflow(
+  input: ResolveVisibleSavedWorkflowInput,
+  deps: {
+    resolveVisible?: typeof resolveVisibleSavedWorkflow;
+    loadCurrent?: typeof loadCurrentSavedWorkflow;
+  } = {},
+): Promise<SavedWorkflowWriteResult> {
+  const context = requireActorContext(input.context);
+  const resolveVisible = deps.resolveVisible ?? resolveVisibleSavedWorkflow;
+  const loadCurrent = deps.loadCurrent ?? loadCurrentSavedWorkflow;
+  const resolved = await resolveVisible({ ...input, context });
+  let current: SavedWorkflowWriteResult;
+  try {
+    current = await loadCurrent(input.dataDir, resolved.workflowId, {
+      revision: resolved.publishedRevision ? 'published' : 'latest',
+      requireActive: false,
+    });
+  } catch (err) {
+    if (err instanceof SavedWorkflowNotFoundError) throw notFound(resolved.workflowId);
+    throw err;
+  }
+  // Metadata is mutable. Re-check after loading the revision so a concurrent
+  // archive/scope/app change cannot disclose the second read through show.
+  assertMetadataVisibleInContext(current.metadata, context);
+  return current;
 }
 
 /** Resolve the active revision and atomically materialize a fresh authorized run. */
@@ -726,6 +757,9 @@ function assertMetadataVisibleInContext(
   metadata: SavedWorkflowMetadata,
   context: SavedWorkflowActorContext,
 ): void {
+  // Treat a cross-app lookup exactly like a missing workflow: callers must not
+  // learn whether another bot sharing dataDir owns this id/name.
+  if (metadata.owner.larkAppId !== context.actor.larkAppId) throw notFound(metadata.workflowId);
   if (metadata.status === 'archived') throw notFound(metadata.workflowId);
   if (metadata.scope.kind === 'chat' && metadata.scope.chatId !== context.chatId) {
     throw new SavedWorkflowServiceError(

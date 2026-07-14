@@ -10,17 +10,70 @@ import { defaultBaseDir } from '../workflows/v3/grill-state.js';
 import {
   instantiatePublishedSavedWorkflow,
   listVisibleSavedWorkflows,
+  loadVisibleSavedWorkflow,
   resolveOwnedTerminalRunDir,
   resolveVisibleSavedWorkflow,
   saveTerminalRunAsWorkflow,
   type SavedWorkflowActorContext,
 } from '../workflows/v3/library-service.js';
-import { loadCurrentSavedWorkflow } from '../workflows/v3/library-store.js';
 import { SAVED_WORKFLOW_PARAM_NAME_RE } from '../workflows/v3/library-schema.js';
 import { postWorkflowDaemonMutation } from '../workflows/v3/daemon-ipc-client.js';
 
 const FORBIDDEN_PARAM_NAMES = new Set(['__proto__', 'prototype', 'constructor']);
 const RUN_FLAGS_WITH_VALUE = new Set(['--library-dir', '--base-dir', '--run-id']);
+
+function savedWorkflowScopeLabel(scope: { kind: 'chat' | 'global' }): string {
+  return scope.kind === 'global' ? '当前 Bot 全局' : '本群';
+}
+
+export function formatSavedWorkflowCliShow(
+  loaded: Awaited<ReturnType<typeof loadVisibleSavedWorkflow>>,
+  context: SavedWorkflowActorContext,
+  raw: boolean,
+): string {
+  if (raw) {
+    if (
+      loaded.metadata.owner.openId !== context.actor.openId ||
+      loaded.metadata.owner.larkAppId !== context.actor.larkAppId
+    ) {
+      throw new Error('Saved Workflow 完整定义仅 owner 可查看；其它用户只能查看脱敏摘要');
+    }
+    return JSON.stringify(loaded, null, 2);
+  }
+  const params = Object.keys(loaded.revision.payload.inputs);
+  return [
+    `Saved Workflow：${loaded.metadata.displayName}`,
+    `workflowId: ${loaded.metadata.workflowId}`,
+    `scope: ${savedWorkflowScopeLabel(loaded.metadata.scope)}`,
+    `status: ${loaded.metadata.status}`,
+    `revision: v${loaded.revision.payload.humanVersion} (${loaded.revision.revisionId})`,
+    `params: ${params.length > 0 ? params.join(', ') : '(无)'}`,
+  ].join('\n');
+}
+
+export function formatSavedWorkflowCliList(
+  listed: Awaited<ReturnType<typeof listVisibleSavedWorkflows>>,
+  json: boolean,
+): string {
+  // The library metadata contains immutable ownership/routing fields. A
+  // current-bot global catalog is readable by other chats, so neither the
+  // machine-readable nor human-readable list may serialize metadata directly.
+  const entries = listed.entries.map((entry) => ({
+    workflowId: entry.workflowId,
+    displayName: entry.displayName,
+    scope: savedWorkflowScopeLabel(entry.scope),
+    status: entry.status,
+    ...(entry.publishedRevision ? { publishedRevision: entry.publishedRevision } : {}),
+  }));
+  if (json) return JSON.stringify({ entries }, null, 2);
+  if (entries.length === 0) {
+    return '还没有 Saved Workflow。成功跑完一次后用 `botmux workflow save last [名称]` 固化。';
+  }
+  return entries.map((entry) =>
+    `${entry.displayName}\t${entry.workflowId}\t${entry.scope}\t${entry.status}` +
+    `${entry.publishedRevision ? `\t${entry.publishedRevision}` : ''}`,
+  ).join('\n');
+}
 
 function argValue(args: string[], flag: string): string | undefined {
   for (let i = 0; i < args.length; i++) {
@@ -101,7 +154,7 @@ export function assertDaemonManagedRunBaseDir(baseDir: string, canonical = defau
 export function assertAgentFacingSaveScope(args: readonly string[]): void {
   if (args.includes('--global')) {
     throw new Error(
-      'botmux workflow save 不接受 --global：请由用户在飞书中显式发送 ' +
+      'botmux workflow save 不接受 --global（当前 Bot 全局）：请由用户在飞书中显式发送 ' +
       '`/workflow save [last|runId] [名称] --global`，由 daemon 校验 canOperate 权限',
     );
   }
@@ -116,15 +169,21 @@ export function assertAgentFacingSaveScope(args: readonly string[]): void {
 export async function assertAgentFacingAppendScope(
   dataDir: string,
   workflowId: string,
-  loadCurrent: typeof loadCurrentSavedWorkflow = loadCurrentSavedWorkflow,
+  context: SavedWorkflowActorContext,
+  resolveVisible: typeof resolveVisibleSavedWorkflow = resolveVisibleSavedWorkflow,
 ): Promise<void> {
-  const existing = await loadCurrent(dataDir, workflowId, {
-    revision: 'latest',
-    requireActive: false,
+  // Resolve through the application-service visibility boundary before
+  // revealing scope. A guessed ID owned by another app/chat must look exactly
+  // like a missing workflow to the agent-facing CLI.
+  const metadata = await resolveVisible({
+    dataDir,
+    ref: workflowId,
+    context,
+    includeDrafts: true,
   });
-  if (existing.metadata.scope.kind === 'global') {
+  if (metadata.scope.kind === 'global') {
     throw new Error(
-      `agent-facing CLI 不能修改 global Saved Workflow ${workflowId}：` +
+      `agent-facing CLI 不能修改当前 Bot 全局 Saved Workflow ${workflowId}：` +
       '该操作需要 daemon 侧 canOperate 授权，当前版本请新建 chat scope 版本或等待 IM 编辑入口',
     );
   }
@@ -217,7 +276,7 @@ export async function cmdSavedWorkflow(sub: string, args: string[]): Promise<voi
     const source = positional[0] ?? 'last';
     const displayName = positional.slice(1).join(' ').trim() || undefined;
     const workflowId = argValue(args, '--workflow-id');
-    if (workflowId) await assertAgentFacingAppendScope(dataDir, workflowId);
+    if (workflowId) await assertAgentFacingAppendScope(dataDir, workflowId, context);
     const runDir = await resolveOwnedTerminalRunDir({ baseDir, source, context });
     const result = await saveTerminalRunAsWorkflow(workflowId ? {
       dataDir,
@@ -270,29 +329,15 @@ export async function cmdSavedWorkflow(sub: string, args: string[]): Promise<voi
 
   if (sub === 'list' || sub === 'ls') {
     const listed = await listVisibleSavedWorkflows({ dataDir, context });
-    if (json) console.log(JSON.stringify(listed, null, 2));
-    else if (listed.entries.length === 0) {
-      console.log('还没有 Saved Workflow。成功跑完一次后用 `botmux workflow save last [名称]` 固化。');
-    } else {
-      for (const entry of listed.entries) {
-        console.log(
-          `${entry.displayName}\t${entry.workflowId}\t${entry.scope.kind}\t${entry.status}` +
-          `${entry.publishedRevision ? `\t${entry.publishedRevision}` : ''}`,
-        );
-      }
-    }
+    console.log(formatSavedWorkflowCliList(listed, json));
     return;
   }
 
   if (sub === 'show') {
     const ref = positionals(args, ['--library-dir', '--base-dir'])[0];
     if (!ref) throw new Error('用法: botmux workflow show <名称|workflowId>');
-    const metadata = await resolveVisibleSavedWorkflow({ dataDir, ref, context });
-    const loaded = await loadCurrentSavedWorkflow(dataDir, metadata.workflowId, {
-      revision: metadata.publishedRevision ? 'published' : 'latest',
-      requireActive: false,
-    });
-    console.log(JSON.stringify(loaded, null, 2));
+    const loaded = await loadVisibleSavedWorkflow({ dataDir, ref, context });
+    console.log(formatSavedWorkflowCliShow(loaded, context, json));
     return;
   }
 

@@ -27,6 +27,7 @@ import {
 
 const OWNER: SavedWorkflowOwner = { openId: 'ou_owner', larkAppId: 'cli_owner' };
 const OTHER: SavedWorkflowOwner = { openId: 'ou_other', larkAppId: 'cli_owner' };
+const OTHER_APP: SavedWorkflowOwner = { openId: 'ou_owner', larkAppId: 'cli_other' };
 
 const IDS = {
   one: 'wf_11111111111111111111111111111111',
@@ -195,6 +196,12 @@ describe('v3 Saved Workflow library store', () => {
       .toMatchObject({ kind: 'resolved', metadata: { workflowId: IDS.one } });
     expect(await resolveSavedWorkflowRef(dataDir, IDS.three, { chatId: 'oc_a', actor: OWNER }))
       .toEqual({ kind: 'not_found' });
+
+    const fromOtherApp = await listSavedWorkflows(dataDir, { chatId: 'oc_a', actor: OTHER_APP });
+    expect(fromOtherApp.entries).toEqual([]);
+    expect(await resolveSavedWorkflowRef(dataDir, IDS.one, { chatId: 'oc_a', actor: OTHER_APP }))
+      .toEqual({ kind: 'not_found' });
+    expect((await listSavedWorkflows(dataDir, { chatId: 'oc_a' })).entries).toEqual([]);
   });
 
   it('serializes concurrent appends and rejects a stale expectedLatestRevision', async () => {

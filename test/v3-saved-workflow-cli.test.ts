@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -10,6 +10,8 @@ import {
   assertDaemonManagedRunBaseDir,
   collectSavedWorkflowRawParams,
   contextFromEnv,
+  formatSavedWorkflowCliList,
+  formatSavedWorkflowCliShow,
 } from '../src/cli/saved-workflow.js';
 
 describe('Saved Workflow CLI param parsing', () => {
@@ -158,6 +160,11 @@ describe('Saved Workflow CLI daemon-managed run root', () => {
 });
 
 describe('Saved Workflow CLI scope authorization', () => {
+  const context = {
+    actor: { openId: 'ou_actor', larkAppId: 'cli_current' },
+    chatId: 'oc_current',
+  };
+
   it('keeps agent-facing saves chat-scoped and delegates global authorization to IM', () => {
     expect(() => assertAgentFacingSaveScope(['last', '周报'])).not.toThrow();
     expect(() => assertAgentFacingSaveScope(['last', '周报', '--global']))
@@ -167,20 +174,107 @@ describe('Saved Workflow CLI scope authorization', () => {
   });
 
   it('rejects appending a revision to an existing global definition', async () => {
-    const loadCurrent = async () => ({
-      metadata: { scope: { kind: 'global' as const } },
-      revision: {},
+    const resolveVisible = vi.fn(async () => ({ scope: { kind: 'global' as const } }));
+    await expect(assertAgentFacingAppendScope(
+      '/tmp/library', 'wf_deadbeef', context, resolveVisible as any,
+    ))
+      .rejects.toThrow(/不能修改当前 Bot 全局 Saved Workflow.*canOperate/);
+    expect(resolveVisible).toHaveBeenCalledWith({
+      dataDir: '/tmp/library',
+      ref: 'wf_deadbeef',
+      context,
+      includeDrafts: true,
     });
-    await expect(assertAgentFacingAppendScope('/tmp/library', 'wf_deadbeef', loadCurrent as any))
-      .rejects.toThrow(/不能修改 global Saved Workflow.*canOperate/);
   });
 
   it('allows appending a revision to a chat-scoped definition', async () => {
-    const loadCurrent = async () => ({
-      metadata: { scope: { kind: 'chat' as const, chatId: 'oc_1' } },
-      revision: {},
-    });
-    await expect(assertAgentFacingAppendScope('/tmp/library', 'wf_deadbeef', loadCurrent as any))
+    const resolveVisible = async () => ({ scope: { kind: 'chat' as const, chatId: 'oc_current' } });
+    await expect(assertAgentFacingAppendScope(
+      '/tmp/library', 'wf_deadbeef', context, resolveVisible as any,
+    ))
       .resolves.toBeUndefined();
+  });
+
+  it('does not unwrap cross-app/chat not-found results before the visibility boundary', async () => {
+    const hidden = Object.assign(new Error('not found'), { code: 'not_found' });
+    const resolveVisible = vi.fn(async () => { throw hidden; });
+    await expect(assertAgentFacingAppendScope(
+      '/tmp/library', 'wf_hidden', context, resolveVisible as any,
+    )).rejects.toBe(hidden);
+  });
+});
+
+describe('Saved Workflow CLI list privacy', () => {
+  const listed = {
+    entries: [{
+      workflowId: 'wf_0123456789abcdef0123456789abcdef',
+      displayName: 'Shared report',
+      owner: { openId: 'ou_private_owner', larkAppId: 'cli_private_app' },
+      scope: { kind: 'global' as const },
+      status: 'active' as const,
+      publishedRevision: `rev_${'a'.repeat(64)}`,
+      aliases: ['private-alias'],
+      createdAt: '2026-07-14T00:00:00.000Z',
+      updatedAt: '2026-07-14T00:01:00.000Z',
+    }],
+    invalid: [],
+  } as any;
+
+  it('emits a safe current-bot catalog for non-owner JSON readers', () => {
+    const output = formatSavedWorkflowCliList(listed, true);
+    expect(output).toContain('当前 Bot 全局');
+    expect(output).toContain('Shared report');
+    expect(output).not.toContain('ou_private_owner');
+    expect(output).not.toContain('cli_private_app');
+    expect(output).not.toContain('owner');
+    expect(output).not.toContain('chatId');
+    expect(output).not.toContain('private-alias');
+    expect(output).not.toContain('createdAt');
+  });
+
+  it('uses the same unambiguous scope label in human output', () => {
+    expect(formatSavedWorkflowCliList(listed, false)).toContain('\t当前 Bot 全局\t');
+  });
+});
+
+describe('Saved Workflow CLI show privacy', () => {
+  const owner = { openId: 'ou_owner', larkAppId: 'cli_current' };
+  const loaded = {
+    metadata: {
+      displayName: 'Shared report',
+      workflowId: 'wf_0123456789abcdef0123456789abcdef',
+      owner,
+      scope: { kind: 'global' as const },
+      status: 'active' as const,
+    },
+    revision: {
+      revisionId: `rev_${'a'.repeat(64)}`,
+      payload: {
+        humanVersion: 2,
+        inputs: { region: { type: 'string' } },
+        sourceRunId: 'private-project-person-260714',
+        dagTemplate: { nodes: [{ goal: 'private project detail' }] },
+      },
+    },
+  } as any;
+
+  it('returns only a sanitized summary by default', () => {
+    const summary = formatSavedWorkflowCliShow(loaded, {
+      actor: { openId: 'ou_reader', larkAppId: 'cli_current' },
+      chatId: 'oc_other',
+    }, false);
+    expect(summary).toContain('scope: 当前 Bot 全局');
+    expect(summary).toContain('params: region');
+    expect(summary).not.toContain('sourceRunId');
+    expect(summary).not.toContain('private-project-person');
+    expect(summary).not.toContain('private project detail');
+  });
+
+  it('limits raw definition output to the immutable owner tuple', () => {
+    expect(() => formatSavedWorkflowCliShow(loaded, {
+      actor: { openId: 'ou_reader', larkAppId: 'cli_current' },
+    }, true)).toThrow(/owner/);
+    expect(formatSavedWorkflowCliShow(loaded, { actor: owner }, true))
+      .toContain('private project detail');
   });
 });

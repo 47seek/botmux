@@ -12,11 +12,11 @@
  *   GET /api/v3/runs/:id/nodes/:nodeId/pty-log        → raw PTY bytes (AUTH ONLY)
  *   POST /api/v3/runs/:id/cancel                      → owner-daemon proxy (AUTH ONLY)
  *
- * Security: the pty-log raw stream can contain secrets that scrolled a node's
- * terminal, so — exactly like v0.2's `…/terminal-log/raw` — it is NOT in the
- * read-only allowlist (see auth.ts) and additionally requires `authed` here.
- * The RunView itself never carries the web-terminal write token or raw fs paths
- * (codex security review 2026-06-02).
+ * Security: every route in this module is authenticated. Even though RunView
+ * omits write tokens and raw fs paths, its goals, node ids, and run ids may
+ * contain project or personal information. The per-node pty-log is more
+ * sensitive still because terminal output can contain credentials. Keep the
+ * handler-level guard as defense in depth in addition to dashboard/auth.ts.
  */
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { createReadStream, lstatSync, statSync } from 'node:fs';
@@ -44,6 +44,14 @@ export async function handleV3RunsApi(
   deps: V3RunsApiDeps,
   authed: boolean = false,
 ): Promise<boolean> {
+  // Fail closed before route matching or filesystem access. This also keeps an
+  // unauthenticated caller from using 404/400 differences as a run-id oracle
+  // if this router is ever wired without the outer dashboard auth guard.
+  if (req.method === 'GET' && url.pathname.startsWith('/api/v3/') && !authed) {
+    jsonRes(res, 401, { ok: false, error: 'auth_required' });
+    return true;
+  }
+
   // GET /api/v3/runs
   if (req.method === 'GET' && url.pathname === '/api/v3/runs') {
     jsonRes(res, 200, { runs: listRuns(deps.runsDir) });

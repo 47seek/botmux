@@ -118,7 +118,7 @@ export function parseV3SavedWorkflowCommand(content: string): V3SavedWorkflowCom
 export function v3SavedWorkflowUsage(): string {
   return [
     'Saved Workflow：',
-    '/workflow save [last|runId] [名称] [--global] [--ack-unsafe]',
+    '/workflow save [last|runId] [名称] [--global（当前 Bot 全局）] [--ack-unsafe]',
     '/workflow run <名称或 workflowId> [key=value ...]',
     '/workflow cancel <runId>',
     '/workflow list',

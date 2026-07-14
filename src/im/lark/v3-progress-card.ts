@@ -21,7 +21,6 @@ export interface V3ProgressCardOptions {
    */
   saveActions?: {
     chat: V3RunSaveActionValue;
-    global?: V3RunSaveActionValue;
   };
 }
 
@@ -137,12 +136,6 @@ export function buildV3ProgressCard(
           type: 'primary',
           value: options.saveActions.chat,
         },
-        ...(options.saveActions.global ? [{
-          tag: 'button',
-          text: { tag: 'plain_text', content: '保存为全局' },
-          type: 'default',
-          value: options.saveActions.global,
-        }] : []),
       ],
     });
   }
@@ -152,7 +145,7 @@ export function buildV3ProgressCard(
     actions: [
       {
         tag: 'button',
-        text: { tag: 'plain_text', content: 'Web 详情' },
+        text: { tag: 'plain_text', content: 'Web 详情（需登录）' },
         type: 'default',
         multi_url: {
           url: webDetailUrl,

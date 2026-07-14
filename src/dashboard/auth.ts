@@ -181,9 +181,11 @@ export type AuthDecision =
  *  even in public mode — so a newly-added GET endpoint is private by default
  *  and can't silently leak (connector configs, webhook-secret metadata,
  *  trigger logs, role/persona files, per-bot config, onboarding, raw PTY are
- *  all absent on purpose). Workflow reads + the static SPA shell are public in
- *  ALL modes and handled separately in decideDashboardAuth.
- *  口径：公开 = 会话板 / 排程(脱敏) / 设置(只读) / 群名册 / 事件流 / workflow 进度。 */
+ *  all absent on purpose). The static SPA shell and the zero-I/O legacy
+ *  workflow tombstone are handled separately in decideDashboardAuth. Full v3
+ *  workflow projections stay private because goals, node ids, and run ids can
+ *  contain project or personal information.
+ *  口径：公开 = 会话板 / 排程(脱敏) / 设置(只读) / 群名册 / 事件流。 */
 const PUBLIC_READ_PATHS: ReadonlySet<string> = new Set([
   '/api/sessions',    // session board
   '/api/schedules',   // schedules page — task prompt redacted for anon upstream
@@ -218,13 +220,6 @@ export function decideDashboardAuth(opts: {
     method === 'GET' &&
     (pathname === '/api/workflows' || pathname.startsWith('/api/workflows/')) &&
     !isRawTerminalLog;
-  // v3 read-only API is link-shareable like the v0.2 one, EXCEPT the per-node
-  // raw PTY stream (`…/pty-log`) which — same rationale as terminal-log/raw —
-  // can leak secrets that scrolled the terminal, so it stays behind cookie auth.
-  const isV3ReadOnly =
-    method === 'GET' &&
-    pathname.startsWith('/api/v3/') &&
-    !pathname.endsWith('/pty-log');
   const isStaticShell =
     (method === 'GET' || method === 'HEAD') &&
     (
@@ -246,7 +241,7 @@ export function decideDashboardAuth(opts: {
 
   const authed = !!presentedToken && presentedToken === activeToken;
 
-  if (!authed && !isWorkflowReadOnly && !isV3ReadOnly && !isStaticShell && !isPublicRead) {
+  if (!authed && !isWorkflowReadOnly && !isStaticShell && !isPublicRead) {
     return { kind: 'deny401' };
   }
 

@@ -1226,7 +1226,7 @@ description: 统一处理 v3 Workflow：把有界的复合目标 grill 后编排
 
 自然语言与命令是同一能力，用户不需要记 slash command：
 
-- “把刚才那个流程存下来（叫周报）” → \`botmux workflow save last 周报\`（IM 等价：\`/workflow save last 周报\`）。只保存已成功结束且属于当前用户/话题的 run；agent-facing CLI 固定为 chat scope。用户明确要求跨话题复用时，不得替用户执行 \`--global\`，请让用户本人在飞书显式发送 \`/workflow save last 周报 --global\`，由 daemon 校验 canOperate。
+- “把刚才那个流程存下来（叫周报）” → \`botmux workflow save last 周报\`（IM 等价：\`/workflow save last 周报\`）。只保存已成功结束且属于当前用户/话题的 run；agent-facing CLI 固定为 chat scope。用户明确要求在**当前 Bot 的其它群**复用时，不得替用户执行 \`--global\`，请让用户本人在飞书显式发送 \`/workflow save last 周报 --global\`，由 daemon 校验 canOperate。\`--global\` 只表示当前 Bot 全局，不会对共享 dataDir 的其它 Bot 可见。
 - “运行已保存的周报流程，region=sg” → \`botmux workflow run 周报 --param region=sg\`（IM 等价：\`/workflow run 周报 region=sg\`）。缺必填参数时只补问缺的项；名称有歧义时展示候选，不要猜。
 - “取消刚才正在跑的流程” → \`botmux workflow cancel <runId>\`（IM 等价：\`/workflow cancel <runId>\`）。只使用真实 v3 runId；CLI 会校验当前 turn 与 run 的 owner/chat/app 绑定，IM 中本群可操作成员也可取消。v2 run 已不可变，只能查静态归档。
 - “我有哪些流程” → \`botmux workflow list\`（IM：\`/workflow list\`）。

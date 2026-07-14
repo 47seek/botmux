@@ -72,7 +72,7 @@ describe('buildV3ProgressCard', () => {
     const detail = card.elements.find(
       (element: any) => element.tag === 'action' && element.actions?.[0]?.multi_url,
     ).actions[0];
-    expect(detail.text.content).toBe('Web 详情');
+    expect(detail.text.content).toBe('Web 详情（需登录）');
     expect(detail.multi_url).toEqual({
       url: 'https://example.test/v3/run',
       pc_url: 'https://example.test/v3/run',
@@ -132,7 +132,7 @@ describe('buildV3ProgressCard', () => {
     expect(running).not.toContain('/workflow save');
   });
 
-  it('ad_hoc 成功时原样渲染调用方准备的本群/全局保存 action，不自行构造 nonce', () => {
+  it('ad_hoc 成功时只渲染调用方准备的本群保存 action，不自行构造 nonce', () => {
     const view = baseView({ status: 'succeeded' });
     const chat: V3RunSaveActionValue = {
       action: 'v3_run_save',
@@ -140,30 +140,21 @@ describe('buildV3ProgressCard', () => {
       scope: 'chat',
       nonce: 'trusted-chat-nonce',
     };
-    const global: V3RunSaveActionValue = {
-      action: 'v3_run_save',
-      runId: view.runId,
-      scope: 'global',
-      nonce: 'trusted-global-nonce',
-    };
     const card = JSON.parse(buildV3ProgressCard(view, {
       webDetailUrl: 'https://example.test/v3/run',
-      saveActions: { chat, global },
+      saveActions: { chat },
     }));
     const saveButtons = card.elements
       .filter((element: any) => element.tag === 'action')
       .flatMap((element: any) => element.actions)
       .filter((action: any) => action.value?.action === 'v3_run_save');
 
-    expect(saveButtons.map((button: any) => button.text.content)).toEqual([
-      '保存到本群',
-      '保存为全局',
-    ]);
-    expect(saveButtons.map((button: any) => button.value)).toEqual([chat, global]);
+    expect(saveButtons.map((button: any) => button.text.content)).toEqual(['保存到本群']);
+    expect(saveButtons.map((button: any) => button.value)).toEqual([chat]);
     expect(allText(card)).toContain('/workflow save');
   });
 
-  it('保存按钮仅在 ad_hoc 成功态出现，global 未授权时只显示本群按钮', () => {
+  it('保存按钮仅在 ad_hoc 成功态出现，全局发布保留给显式命令', () => {
     const chat: V3RunSaveActionValue = {
       action: 'v3_run_save',
       runId: 'weekly-report-260711-120000-ab12cd34',
@@ -174,7 +165,7 @@ describe('buildV3ProgressCard', () => {
 
     const succeeded = allText(JSON.parse(buildV3ProgressCard(baseView({ status: 'succeeded' }), opts)));
     expect(succeeded).toContain('保存到本群');
-    expect(succeeded).not.toContain('保存为全局');
+    expect(succeeded).not.toContain('保存为');
 
     const running = allText(JSON.parse(buildV3ProgressCard(baseView(), opts)));
     expect(running).not.toContain('保存到本群');
