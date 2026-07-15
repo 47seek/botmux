@@ -63,7 +63,7 @@ import { sessionKey, sessionAnchorId, frozenDisplayMode } from '../../core/types
 import type { DaemonSession } from '../../core/types.js';
 import { buildTerminalUrl } from '../../core/terminal-url.js';
 import type { ProjectInfo } from '../../services/project-scanner.js';
-import { createRepoWorktree, removeRepoWorktree, dirSuffixForBranch } from '../../services/git-worktree.js';
+import { createRepoWorktree, removeRepoWorktree, dirSuffixForBranch, pushWorktreeBranch } from '../../services/git-worktree.js';
 import { worktreeSlugFromContextAI } from '../../services/worktree-slug-ai.js';
 import { t, localeForBot, isLocale, type Locale } from '../../i18n/index.js';
 import {
@@ -2429,6 +2429,20 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           return;
         }
         if (sessionChanged()) return notSwitched(creation, 'mid-flight');
+        // riff：新建的 worktree 分支只存在于本地，远程沙箱克隆不到 → 先推送
+        // 分支指针到远端，riff 任务才能钉住这个新分支。推送失败不阻塞（worker
+        // 推导会按现状回退默认分支并在卡片注入告警），只提示用户。
+        if (getBot(targetDs.larkAppId).config.backendType === 'riff') {
+          for (const c of created) {
+            try {
+              await pushWorktreeBranch(c.result.path, c.result.branch);
+            } catch (e) {
+              const errMsg = e instanceof Error ? e.message : String(e);
+              logger.warn(`[${tag(targetDs)}] riff worktree branch push failed (${c.result.branch}): ${errMsg}`);
+              await sessionReply(rootId, t('card.repo.riff_worktree_push_failed', { branch: c.result.branch, error: errMsg }, locTarget));
+            }
+          }
+        }
         await sessionReply(rootId, t('cmd.repo.worktree_created', {
           path: creation.path, branch: creation.branch, base: creation.baseRef,
         }, locTarget));
