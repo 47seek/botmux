@@ -8208,7 +8208,13 @@ process.on('message', async (raw: unknown) => {
       // native /rename and an owned CLI restart are the exceptions: never splice
       // into the rename UI, write through an old backend during async teardown,
       // or type into the replacement before its real prompt is ready.
-      if (cliRestartInProgress || rawInputRestartGate || sessionRenameInFlight) {
+      // TUI 注入是第三个例外：注入进行中（injectionFlushing——Serially 只互斥
+      // text→Enter 短窗口，覆盖不了注入后的 quiescence 等待）或队列里有 cwd
+      // barrier（shouldDeferUserFlush——/cd 未落地前任何用户输入都不得写入，
+      // 否则 passthrough 会执行在旧 cwd 的 CLI 里）时入队。注入排空后由
+      // flushPendingInjections 的 finally 补踢 flushPending 送达。
+      if (cliRestartInProgress || rawInputRestartGate || sessionRenameInFlight
+        || injectionFlushing || shouldDeferUserFlush(pendingInjections)) {
         pendingRawInputs.push(msg);
         log(`Deferred passthrough slash command until CLI input gate settles: ${msg.content}`);
       } else {
