@@ -109,10 +109,11 @@ describe('dashboard sessions filters', () => {
       .not.toBe(historySenderKey({ senderType: 'bot', senderId: 'ou_bot' }));
   });
 
-  it('defaults terminal entry to writable unless public read-only sharing is enabled', () => {
+  it('prioritizes dashboard auth over public read-only sharing', () => {
     expect(shouldOpenWritableTerminal({ authed: true, publicReadOnly: false })).toBe(true);
-    expect(shouldOpenWritableTerminal({ authed: true, publicReadOnly: true })).toBe(false);
+    expect(shouldOpenWritableTerminal({ authed: true, publicReadOnly: true })).toBe(true);
     expect(shouldOpenWritableTerminal({ authed: false, publicReadOnly: true })).toBe(false);
+    expect(shouldOpenWritableTerminal({ authed: false, publicReadOnly: false })).toBe(false);
   });
 
   it('renders the CLI filter as a multi-select checkbox group, not a dropdown', () => {
