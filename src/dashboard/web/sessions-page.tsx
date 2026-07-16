@@ -2511,15 +2511,6 @@ function SessionsPage(): JSX.Element {
     }
   }, []);
 
-  useEffect(() => {
-    const maybeOpenFromEntry = () => {
-      if (consumePendingCreateSession() && ui.authed) void openCreateSession();
-    };
-    maybeOpenFromEntry();
-    window.addEventListener(OPEN_CREATE_SESSION_EVENT, maybeOpenFromEntry);
-    return () => window.removeEventListener(OPEN_CREATE_SESSION_EVENT, maybeOpenFromEntry);
-  }, [openCreateSession]);
-
   // 侧边菜单「创建会话」入口：已在本页时收事件直接打开；跨页跳转时消费挂载前的 pending
   useEffect(() => {
     const maybeOpenFromEntry = () => {
