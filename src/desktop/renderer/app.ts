@@ -72,7 +72,14 @@ const desktopShellInjectedCss = `
     min-height: 100vh !important;
   }
 
+  .chrome-body {
+    /* Hidden sidebar is removed from auto-placement, but explicit grid tracks remain. */
+    grid-template-columns: minmax(0, 1fr) !important;
+    gap: 0 !important;
+  }
+
   .workspace {
+    grid-column: 1 / -1 !important;
     min-width: 0 !important;
     width: 100% !important;
   }

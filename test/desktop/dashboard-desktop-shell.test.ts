@@ -14,6 +14,9 @@ describe('desktop dashboard shell mode', () => {
     expect(rendererSource).toContain('const desktopShellInjectedCss');
     expect(rendererSource).toContain('.sidebar,');
     expect(rendererSource).toContain('.topbar');
+    expect(rendererSource).toContain('.chrome-body');
+    expect(rendererSource).toContain('grid-template-columns: minmax(0, 1fr) !important;');
+    expect(rendererSource).toContain('grid-column: 1 / -1 !important;');
     expect(rendererSource).toContain('dashboardFrame.insertCSS(desktopShellInjectedCss)');
   });
 
