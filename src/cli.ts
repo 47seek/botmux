@@ -5,7 +5,7 @@
  * Usage:
  *   botmux setup          — interactive first-time configuration
  *   botmux setup --no-open-platform-auto — skip Feishu Open Platform automation
- *   botmux setup list|add|edit|remove — scripted (non-TUI) bot management, see `botmux setup help`
+ *   botmux setup list|add|configure|edit|remove — scripted (non-TUI) bot management, see `botmux setup help`
  *   botmux start          — start daemon and auto plugin services
  *   botmux stop [--with-plugin] — stop daemon (optionally stop auto plugin services)
  *   botmux restart [--include-pm2] [--with-plugin] — restart daemon, then ensure auto plugin services
@@ -53,6 +53,12 @@ import {
 import { resolveCliSelection, selectionKeyForBot } from './setup/cli-selection.js';
 import { checkCliAvailability, hasAgentLaunchConfigChanged } from './setup/cli-availability.js';
 import { resolveSetupAppName } from './setup/app-name.js';
+import {
+  blocksSetupBotStart,
+  classifySetupOpenPlatformOutcome,
+  setupOpenPlatformOutcomeJson,
+  type SetupOpenPlatformOutcome,
+} from './setup/open-platform-outcome.js';
 import {
   buildBotFromAddFlags,
   editInputFromFlags,
@@ -598,28 +604,32 @@ function printRemainingSteps(appId: string, brand: 'feishu' | 'lark'): void {
 async function finishOpenPlatformSetup(
   appId: string,
   brand: 'feishu' | 'lark',
-  options: { reuseOnly?: boolean; quiet?: boolean } = {},
-): Promise<void> {
+  options: { reuseOnly?: boolean; forceQrLogin?: boolean; quiet?: boolean } = {},
+): Promise<SetupOpenPlatformOutcome> {
   const say = (...args: unknown[]) => { if (!options.quiet) console.log(...args); };
   const { parseSetupOpenPlatformAutoFlag, automateOpenPlatformSetup } = await import('./setup/open-platform-automation.js');
   if (!parseSetupOpenPlatformAutoFlag(process.argv.slice(3))) {
     say('\n已跳过开放平台自动配置 (--no-open-platform-auto)。');
     if (!options.quiet) printRemainingSteps(appId, brand);
-    return;
+    return { status: 'skipped' };
   }
 
   say('\n── 开放平台自动配置 ──\n');
-  say(options.reuseOnly
-    ? '将复用创建应用时的 Feishu Web session，自动导入权限、配置 redirect URL 并创建/发布版本；本路径不会再显示二维码。'
-    : '将获取或复用 Feishu Web session，自动导入权限、配置 redirect URL 并创建/发布版本。');
+  say(options.forceQrLogin
+    ? '将按 --switch-account 明确重新扫码，自动导入权限、配置 redirect URL 并创建/发布版本。'
+    : options.reuseOnly
+      ? '将复用创建应用时的 Feishu Web session，自动导入权限、配置 redirect URL 并创建/发布版本；本路径不会再显示二维码。'
+      : '将获取或复用 Feishu Web session，自动导入权限、配置 redirect URL 并创建/发布版本。');
   say('如失败会自动回退到手动步骤提示，不影响已写入的 botmux 配置。\n');
 
   const result = await automateOpenPlatformSetup({
     appId,
     brand,
+    forceQrLogin: options.forceQrLogin,
     disableQrLogin: options.reuseOnly,
-    disableBytedcliFallback: options.reuseOnly,
+    disableBytedcliFallback: options.reuseOnly || options.forceQrLogin,
   });
+  const outcome = classifySetupOpenPlatformOutcome(result);
   if (result.ok) {
     say('✅ 开放平台自动配置完成');
     say(`   Session 来源: ${result.sessionSource}`);
@@ -635,13 +645,14 @@ async function finishOpenPlatformSetup(
     if (result.versionId) say(`   已提交发布版本: ${result.versionId}`);
     else say('   已创建版本；未从响应中解析到 versionId，请到开放平台确认是否需要手动发布。');
     say('');
-    return;
+    return outcome;
   }
 
-  say(`⚠️  开放平台自动配置失败 (${result.reason}): ${result.message}`);
+  say(`${outcome.status === 'manual' ? 'ℹ️ ' : '⚠️ '} 开放平台自动配置${outcome.status === 'manual' ? '需要手动完成' : '失败'} (${result.reason}): ${result.message}`);
   if (result.sessionFile) say(`   botmux session 文件: ${result.sessionFile}`);
   say('   请按下面的手动步骤继续完成开放平台配置。');
   if (!options.quiet) printRemainingSteps(appId, brand);
+  return outcome;
 }
 
 /**
@@ -1394,7 +1405,7 @@ function botJsonView(bot: Record<string, any>, index: number): Record<string, an
 }
 
 /**
- * `botmux setup list|add|edit|remove` — 脚本化（非 TUI）bot 管理。
+ * `botmux setup list|add|configure|edit|remove` — 脚本化（非 TUI）bot 管理。
  * 给 coding agent / 脚本一个字段级稳定接口，不依赖交互问答顺序（管道喂数字
  * 的老姿势在问题序列变化时会静默错位）。校验口径与 TUI 一致：目录存在性、
  * owner 必填、凭证变更时的 tenant_access_token 校验，任一失败不写盘。
@@ -1425,6 +1436,59 @@ async function cmdSetupScripted(argv: string[]): Promise<void> {
     } else {
       console.log(formatBotConfigTable(bots));
       console.log('\n完整字段用 --json 查看（secret 脱敏；明文只在 ~/.botmux/bots.json）。');
+    }
+    return;
+  }
+
+  if (cmd.action === 'configure') {
+    const index = parseBotSelection(cmd.selector, bots);
+    if (index === undefined) {
+      failSetupScripted(cmd.json, `找不到机器人 "${cmd.selector}"（接受进程名 botmux-N 或 AppID，botmux setup list 可查）。`);
+      return;
+    }
+    const bot = bots[index];
+    const processName = botProcessName(bot, index, PM2_NAME);
+    const continueCommand = `botmux setup configure ${bot.larkAppId}`;
+    const openPlatform = await finishOpenPlatformSetup(bot.larkAppId, botBrand(bot), {
+      // Machine-readable callers must never be surprised by an interactive QR.
+      reuseOnly: cmd.json && !cmd.switchAccount,
+      forceQrLogin: cmd.switchAccount,
+      quiet: cmd.json,
+    });
+    if (openPlatform.status === 'failed' || openPlatform.status === 'manual') {
+      failSetupScripted(
+        cmd.json,
+        openPlatform.status === 'manual'
+          ? '该租户不支持自动配置，请按开放平台手动步骤完成。'
+          : `开放平台自动配置未完成；机器人配置保留，未自动上线。请修复后重试 ${continueCommand}。`,
+        {
+          partial: true,
+          action: 'configure',
+          bot: botJsonView(bot, index),
+          appId: bot.larkAppId,
+          openPlatform: setupOpenPlatformOutcomeJson(openPlatform),
+          continueCommand,
+        },
+      );
+      return;
+    }
+    const live = ensureBotDaemonStarted(bot.larkAppId, { quiet: cmd.json });
+    const next = live.ok ? 'live' : (live.reason === 'fleet_down' ? 'botmux start' : 'botmux restart');
+    if (cmd.json) {
+      console.log(JSON.stringify({
+        ok: true,
+        action: 'configure',
+        bot: botJsonView(bot, index),
+        appId: bot.larkAppId,
+        openPlatform: setupOpenPlatformOutcomeJson(openPlatform),
+        live,
+        next,
+      }, null, 2));
+    } else {
+      console.log(`✅ 已完成 ${processName} (${bot.larkAppId}) 的开放平台配置`);
+      if (live.ok) console.log(`✅ 已自动上线（${live.processName}）`);
+      else if (live.reason === 'fleet_down') console.log('下一步: botmux start（daemon 尚未运行）');
+      else console.log(`⚠️  自动上线失败（${live.message}）。下一步: botmux restart`);
     }
     return;
   }
@@ -1641,14 +1705,40 @@ async function cmdSetupScripted(argv: string[]): Promise<void> {
     }
 
     // 已有凭证模式默认跳过；--create-app 默认开启并复用刚才的 Web session。
+    let openPlatform: SetupOpenPlatformOutcome = { status: 'skipped' };
     if (cmd.openPlatformAuto) {
-      await finishOpenPlatformSetup(bot.larkAppId, botBrand(bot), {
+      openPlatform = await finishOpenPlatformSetup(bot.larkAppId, botBrand(bot), {
         reuseOnly: cmd.createApp && !cmd.compatibilityMode && botBrand(bot) === 'feishu',
         quiet: cmd.json,
       });
     }
 
     const index = existing.length;
+    if (blocksSetupBotStart(openPlatform)) {
+      const continueCommand = `botmux setup configure ${bot.larkAppId}`;
+      failSetupScripted(
+        cmd.json,
+        `机器人配置已写入，但开放平台自动配置未完成，未自动上线。修复后运行 ${continueCommand}；不会重复创建应用。`,
+        {
+          partial: true,
+          action: 'add',
+          bot: botJsonView(bot, index),
+          appId: bot.larkAppId,
+          ...(createdAppName ? { appName: createdAppName } : {}),
+          botsFile: BOTS_JSON_FILE,
+          envMigrated: migratedEnv || undefined,
+          openPlatform: setupOpenPlatformOutcomeJson(openPlatform),
+          continueCommand,
+          live: {
+            ok: false,
+            reason: 'open_platform_incomplete',
+            message: '开放平台关键配置未完成，未启动新机器人',
+          },
+          next: continueCommand,
+        },
+      );
+      return;
+    }
     // daemon 在跑就直接把新 bot 那一个进程拉起来，免整组 botmux restart。
     const live = ensureBotDaemonStarted(bot.larkAppId, { quiet: cmd.json });
     const next = live.ok ? 'live' : (live.reason === 'fleet_down' ? 'botmux start' : 'botmux restart');
@@ -1661,7 +1751,7 @@ async function cmdSetupScripted(argv: string[]): Promise<void> {
         ...(cmd.createApp && botBrand(bot) === 'feishu' && !cmd.compatibilityMode ? { appName: resolveSetupAppName(cmd.flags.appName, index) } : {}),
         botsFile: BOTS_JSON_FILE,
         envMigrated: migratedEnv || undefined,
-        openPlatform: cmd.openPlatformAuto ? 'attempted' : 'skipped',
+        openPlatform: setupOpenPlatformOutcomeJson(openPlatform),
         live,
         next,
       }, null, 2));
@@ -8541,7 +8631,7 @@ switch (command) {
   case '--version':
   case '-v':      console.log(getVersion()); break;
   case 'setup': {
-    // 带子命令（list/add/edit/remove/help）走脚本化非 TUI 模式；空参数 / 纯
+    // 带子命令（list/add/configure/edit/remove/help）走脚本化非 TUI 模式；空参数 / 纯
     // flag（如 --no-open-platform-auto）保持原交互 TUI，向后兼容。
     const setupArgs = process.argv.slice(3);
     if (isScriptedSetupInvocation(setupArgs)) await cmdSetupScripted(setupArgs);

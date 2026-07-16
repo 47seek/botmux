@@ -262,6 +262,7 @@ botmux setup add --create-app \
   --allowed-users alice@example.com          # 首次扫码；后续有效登录态下免扫
 botmux setup add --create-app --switch-account \
   --allowed-users alice@example.com          # 明确更换账号并覆盖本机登录态
+botmux setup configure botmux-1              # partial 后重跑开放平台配置并上线
 botmux setup add \
   --app-id cli_xxx --app-secret xxx \
   --allowed-users alice@example.com \
@@ -273,7 +274,8 @@ botmux setup help                            # 完整 flag 列表
 ```
 
 - `--working-dir` 是仓库选择卡片的扫描根；`--default-working-dir` 是固定默认目录（新话题直接启动、不弹卡），对应 TUI 里工作目录模式的两个选项。
-- `--create-app` 默认先复用并在 stderr 显示已确认的账号/企业；无缓存时首次扫码。`--switch-account` 强制重新扫码并覆盖本机登录态。`--json` 不会在缺少有效缓存时自行弹码，需显式加 `--switch-account`；成功时返回冻结后的 `appName` 与 `appId`，应用已创建但后续失败时返回 `partial`、`appId` 和带 `--open-platform-auto` 的继续命令，不会重复建应用。
+- `--create-app` 默认先复用并在 stderr 显示已确认的账号/企业；无缓存时首次扫码。`--switch-account` 强制重新扫码并覆盖本机登录态。`--json` 不会在缺少有效缓存时自行弹码，需显式加 `--switch-account`。
+- 成功 JSON 会把 `openPlatform.status` 明确标成 `ready` / `ready_with_warnings` / `manual` / `skipped`。应用和本地配置已创建、但 Feishu 权限/事件/回调等关键配置失败时，命令返回非零退出码与 `partial: true`，不会启动新 Bot，并给出 `botmux setup configure <bot>` 继续命令；重试不会重复建应用，缓存账号不对时可加 `--switch-account` 明确重新扫码。
 - 已有凭证模式的开放平台自动配置默认跳过，需要时显式加 `--open-platform-auto`。`--compatibility-mode` 必须显式选择，可能需要额外扫码且不支持 `--app-name`。
 - 以前对交互问答「管道喂数字」的脚本请迁移到这些子命令：问答序列一变（本版本就新增了工作目录模式一问），喂数字会静默错位。
 

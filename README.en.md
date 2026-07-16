@@ -118,6 +118,7 @@ botmux setup add --create-app \
   --allowed-users alice@example.com          # first use scans once; later valid sessions skip it
 botmux setup add --create-app --switch-account \
   --allowed-users alice@example.com          # explicitly rescan and replace the local session
+botmux setup configure botmux-1              # retry Open Platform setup after a partial add
 botmux setup add \
   --app-id cli_xxx --app-secret xxx \
   --allowed-users alice@example.com \
@@ -129,7 +130,8 @@ botmux setup help                            # full flag reference
 ```
 
 - `--working-dir` is the repo-select card's scan root; `--default-working-dir` is the fixed default dir (new topics start there directly, no card) — the same two modes as the TUI question.
-- `--create-app` reuses a valid session and reports the confirmed account/tenant on stderr; the first use scans once. `--switch-account` explicitly rescans and replaces the local session. `--json` never opens an unexpected QR when no valid cache exists unless `--switch-account` is passed. On success it returns the frozen `appName` and `appId`; a post-creation failure returns `partial`, `appId`, and an `--open-platform-auto` recovery command without creating another app.
+- `--create-app` reuses a valid session and reports the confirmed account/tenant on stderr; the first use scans once. `--switch-account` explicitly rescans and replaces the local session. `--json` never opens an unexpected QR when no valid cache exists unless `--switch-account` is passed.
+- Successful JSON reports `openPlatform.status` as `ready`, `ready_with_warnings`, `manual`, or `skipped`. If the app and local config were created but critical Feishu permissions/events/callback setup failed, the command exits non-zero with `partial: true`, does not start the new bot, and returns a `botmux setup configure <bot>` continuation command that retries without creating another app; pass `--switch-account` to that command when the cached account is wrong.
 - Existing-credential mode skips Open Platform automation unless `--open-platform-auto` is passed. `--compatibility-mode` must be selected explicitly, may need another scan, and does not support `--app-name`.
 - If you previously scripted setup by piping numbered answers into the TUI, migrate to these subcommands: whenever the question sequence changes (this release adds the working-dir mode question), piped answers silently shift.
 
