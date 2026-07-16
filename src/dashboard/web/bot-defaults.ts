@@ -32,6 +32,10 @@ export type BotSubstituteMode = {
   chats?: string[];
   replyMode?: 'thread' | 'quote';
   disableControlCard?: boolean;
+  /** 话题群支持（缺省 true；显式 false 关）。 */
+  topicGroups?: boolean;
+  /** 话题里已有本 bot 活跃会话时是否仍触发替身（缺省 true）。 */
+  topicActiveSessionTrigger?: boolean;
 };
 
 export type BotDefaultsRow = {

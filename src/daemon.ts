@@ -13892,7 +13892,11 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   messageQueue.ensureQueue(anchor);
   messageQueue.appendMessage(anchor, parsed);
 
+  // Control card compensates for the card-less (avatar-style) chat-scope
+  // substitute session. Topic-group substitute sessions (#475) are thread-scope
+  // and keep their normal streaming card — no compensation needed there.
   const shouldSendSubstituteControlCard = substituteTrigger
+    && scope === 'chat'
     && !botCfg.substituteMode?.disableControlCard
     && !session.substituteControlCardSent;
 
@@ -14786,7 +14790,10 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     session.scope = scope;
     sessionStore.updateSession(session);
 
+    // chat-scope only — see the handleNewTopic twin above (topic substitute
+    // sessions keep their streaming card, no control-card compensation).
     const shouldSendSubstituteControlCard = substituteTrigger
+      && scope === 'chat'
       && !botCfg.substituteMode?.disableControlCard
       && !session.substituteControlCardSent;
 

@@ -2317,11 +2317,19 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         // per-chat toggle disk read entirely for bots that never configured a
         // substitute target (the overwhelming majority on the hot path).
         const substituteCfg = getBot(larkAppId).config.substituteMode;
-        let substituteTrigger = substituteCfg?.enabled === true
-          && chatType === 'group'
-          && await getChatMode(larkAppId, chatId) === 'group'
-          && isSubstituteEnabledForChat(larkAppId, chatId)
-          && isSubstituteAllowedChat(substituteCfg, chatId)
+        let substituteChatMode: 'group' | 'topic' | undefined;
+        // chats 白名单在 getChatMode 之前（纯内存判断走在 API roundtrip 前），
+        // 对普通群与话题群统一生效：白名单是「替身可触发的群」清单，与群形态无关。
+        if (substituteCfg?.enabled === true && chatType === 'group' && isSubstituteAllowedChat(substituteCfg, chatId)) {
+          const chatMode = await getChatMode(larkAppId, chatId);
+          const modeSupported = chatMode === 'group'
+            // 话题群支持默认开（缺省=开，normalize 只在显式 false 时关）。
+            || (chatMode === 'topic' && substituteCfg.topicGroups !== false);
+          if (modeSupported && isSubstituteEnabledForChat(larkAppId, chatId)) {
+            substituteChatMode = chatMode as 'group' | 'topic';
+          }
+        }
+        let substituteTrigger = substituteChatMode
           ? resolveSubstituteTrigger(larkAppId, message)
           : undefined;
         if (substituteTrigger && !explicitlyMentionedThisBot) {
@@ -2329,15 +2337,35 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
           const stripped = rawText ? stripLeadingMentions(rawText.trim(), message?.mentions ?? []).trim() : '';
           if (stripped.startsWith('/')) substituteTrigger = undefined;
         }
+        if (substituteTrigger && substituteChatMode === 'topic'
+            && substituteCfg?.topicActiveSessionTrigger === false
+            && (handlers.isSessionOwner?.(routing.anchor, larkAppId) ?? false)) {
+          // 话题里已有本 bot 活跃会话 + 用户关掉了「活跃话题也触发」：
+          // 单独 @替身对象 是明确转交，必须在任何通用免 @ 规则前直接让路；
+          // 只清掉 metadata 不够，1v1 群/mentionMode=never 仍会把消息喂给 bot。
+          substituteTrigger = undefined;
+          if (!explicitlyMentionedThisBot) {
+            logger.debug(
+              `[substitute:${larkAppId}] active-topic trigger disabled; backing off ` +
+              `msg=${messageId.substring(0, 12)} thread=${String(routing.anchor).substring(0, 12)}`,
+            );
+            return;
+          }
+        }
         if (substituteTrigger) {
-          routing.scope = 'chat';
-          routing.anchor = chatId;
-          routingSource = 'regular-group-chat';
-          // Top-level substitute messages need their own reply anchor so that
-          // concurrent triggers from different users in the same chat-scope
-          // session don't collapse or thread under the wrong message. Existing
-          // real threads keep their root_id.
-          replyRootId = (message.root_id && message.thread_id) ? message.root_id : messageId;
+          if (substituteChatMode === 'group') {
+            routing.scope = 'chat';
+            routing.anchor = chatId;
+            routingSource = 'regular-group-chat';
+            // Top-level substitute messages need their own reply anchor so that
+            // concurrent triggers from different users in the same chat-scope
+            // session don't collapse or thread under the wrong message. Existing
+            // real threads keep their root_id.
+            replyRootId = (message.root_id && message.thread_id) ? message.root_id : messageId;
+          }
+          // 话题群：保持 decideRouting 的 thread-scope/话题锚点不动——替身回合
+          // 直接搭该话题自己的会话（无会话则由 handleNewTopic 新开），与普通群
+          // 「搭群 chat-scope 会话」同构；回复天然落回本话题，无需 replyRootId。
           const configuredTargetId = substituteTrigger.target.openId
             ?? substituteTrigger.target.userId
             ?? substituteTrigger.target.unionId
@@ -2345,7 +2373,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
           const configuredTargetForLog = JSON.stringify(configuredTargetId.slice(0, 128));
           logger.info(
             `[substitute:${larkAppId}] mention target=${configuredTargetForLog} ` +
-            `msg=${messageId.substring(0, 12)} chat=${chatId.substring(0, 12)} → chat-scope`,
+            `msg=${messageId.substring(0, 12)} chat=${chatId.substring(0, 12)} → ${substituteChatMode === 'group' ? 'chat-scope' : `topic thread=${String(routing.anchor).substring(0, 12)}`}`,
           );
         }
 

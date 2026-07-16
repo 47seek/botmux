@@ -775,6 +775,13 @@ export interface SubstituteModeConfig {
    *  - 'quote': quote-reply the trigger message without creating a new topic.
    */
   replyMode?: 'thread' | 'quote';
+  /** 话题群支持：在话题群（chat_mode=topic）里也响应替身触发。替身回合沿话题
+   *  路由进该话题自己的会话（无会话则新开），与普通群「进群 chat-scope 会话」
+   *  同构。缺省 true；显式 false 关闭。 */
+  topicGroups?: boolean;
+  /** 话题里已有本 bot 活跃会话时是否仍触发替身（替身回合注入该会话）。false 时
+   *  回落到原让路行为（@别人=转交别人，保持沉默）。仅话题群路径生效，缺省 true。 */
+  topicActiveSessionTrigger?: boolean;
 }
 
 export interface VcMeetingAgentConfig {
