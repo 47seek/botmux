@@ -1,14 +1,32 @@
-import { BrowserWindow, shell, type WebContents } from 'electron';
+import { BrowserWindow, screen, shell, type WebContents } from 'electron';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
+
+export const desktopShellSidebarWidth = 250;
+export const desktopDashboardPreferredContentWidth = 1320;
+export const desktopDashboardMinContentWidth = 980;
+export const desktopWindowPreferredWidth = desktopDashboardPreferredContentWidth + desktopShellSidebarWidth;
+export const desktopWindowMinWidth = desktopDashboardMinContentWidth + desktopShellSidebarWidth;
+const desktopWindowScreenMargin = 48;
+
+export function desktopWindowInitialWidth(
+  workAreaWidth = screen.getPrimaryDisplay().workAreaSize.width,
+): number {
+  // The desktop shell adds a native rail around the browser dashboard; reserve
+  // that rail so the embedded pages do not start in their narrow layout.
+  return Math.max(
+    desktopWindowMinWidth,
+    Math.min(desktopWindowPreferredWidth, workAreaWidth - desktopWindowScreenMargin),
+  );
+}
 
 export function createMainWindow(preloadPath: string, rendererDir: string): BrowserWindow {
   const rendererPath = join(rendererDir, 'index.html');
   const rendererUrl = pathToFileURL(rendererPath);
   const win = new BrowserWindow({
-    width: 1320,
+    width: desktopWindowInitialWidth(),
     height: 860,
-    minWidth: 980,
+    minWidth: desktopWindowMinWidth,
     minHeight: 680,
     title: 'Botmux',
     webPreferences: {

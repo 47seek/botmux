@@ -38,8 +38,8 @@ html,
 body {
   margin: 0;
   width: 100%;
-  /* Match BrowserWindow min size so text and controls never reflow below spec. */
-  min-width: 980px;
+  /* Match desktopWindowMinWidth: 980px dashboard content + 250px native rail. */
+  min-width: 1230px;
   min-height: 680px;
   height: 100%;
   overflow: hidden;

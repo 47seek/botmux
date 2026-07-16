@@ -1,13 +1,20 @@
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { beforeAll, describe, expect, it, vi } from 'vitest';
 
 type WindowModule = typeof import('../../src/desktop/main/window.js');
 
+let desktopShellSidebarWidth: WindowModule['desktopShellSidebarWidth'];
+let desktopWindowInitialWidth: WindowModule['desktopWindowInitialWidth'];
+let desktopWindowMinWidth: WindowModule['desktopWindowMinWidth'];
+let desktopWindowPreferredWidth: WindowModule['desktopWindowPreferredWidth'];
 let shouldBlockTopLevelNavigation: WindowModule['shouldBlockTopLevelNavigation'];
 let shouldOpenGuestNavigationExternally: WindowModule['shouldOpenGuestNavigationExternally'];
 let shouldOpenUrlExternally: WindowModule['shouldOpenUrlExternally'];
 
 vi.mock('electron', () => ({
   BrowserWindow: vi.fn(),
+  screen: { getPrimaryDisplay: vi.fn(() => ({ workAreaSize: { width: 1920, height: 1080 } })) },
   shell: { openExternal: vi.fn() },
 }));
 
@@ -15,6 +22,10 @@ beforeAll(async () => {
   // Import after the Electron mock so these pure navigation guards do not depend
   // on a downloaded Electron binary in unit-test environments.
   const mod = await import('../../src/desktop/main/window.js');
+  desktopShellSidebarWidth = mod.desktopShellSidebarWidth;
+  desktopWindowInitialWidth = mod.desktopWindowInitialWidth;
+  desktopWindowMinWidth = mod.desktopWindowMinWidth;
+  desktopWindowPreferredWidth = mod.desktopWindowPreferredWidth;
   shouldBlockTopLevelNavigation = mod.shouldBlockTopLevelNavigation;
   shouldOpenGuestNavigationExternally = mod.shouldOpenGuestNavigationExternally;
   shouldOpenUrlExternally = mod.shouldOpenUrlExternally;
@@ -22,6 +33,29 @@ beforeAll(async () => {
 
 describe('desktop window navigation guard', () => {
   const rendererUrl = new URL('file:///Applications/Botmux.app/Contents/Resources/app.asar/dist/desktop/renderer/index.html');
+
+  it('reserves native shell width for the embedded dashboard viewport', () => {
+    // The Desktop app wraps the browser dashboard with its own rail. If the
+    // BrowserWindow keeps the old dashboard-only width, table-heavy pages open
+    // in a cramped viewport.
+    expect(desktopWindowPreferredWidth - desktopShellSidebarWidth).toBe(1320);
+    expect(desktopWindowMinWidth - desktopShellSidebarWidth).toBe(980);
+    expect(desktopWindowInitialWidth(2560)).toBe(desktopWindowPreferredWidth);
+    expect(desktopWindowInitialWidth(1440)).toBe(1392);
+    expect(desktopWindowInitialWidth(1200)).toBe(desktopWindowMinWidth);
+  });
+
+  it('keeps renderer minimum width aligned with the native window minimum', () => {
+    const styleSource = readFileSync(
+      fileURLToPath(new URL('../../src/desktop/renderer/style.css', import.meta.url)),
+      'utf-8',
+    );
+    const sidebarWidth = Number(/--sidebar-width:\s*(\d+)px;/.exec(styleSource)?.[1] ?? NaN);
+    const shellMinWidth = Number(/min-width:\s*(\d+)px;/.exec(styleSource)?.[1] ?? NaN);
+
+    expect(sidebarWidth).toBe(desktopShellSidebarWidth);
+    expect(shellMinWidth).toBe(desktopWindowMinWidth);
+  });
 
   it('allows embedded dashboard navigation while blocking top-level escapes', () => {
     // Embedded dashboard guests need to load the local HTTP dashboard; blocking
