@@ -33,6 +33,7 @@ import { resolveSessionContext } from './core/session-marker.js';
 import { resolveBotmuxDataDir } from './core/data-dir.js';
 import { dashboardSecretPath } from './core/dashboard-secret.js';
 import { parseDispatchBotSpec, buildDispatchMessages, buildRepoPrimeText, buildReportContent, eligibleAutoMentionAliases, offTopicSubBotTopic, resolveReportTarget, resolveSendTarget } from './core/dispatch.js';
+import { pickTurnReplyTarget } from './core/reply-target.js';
 import { enableAutostart, disableAutostart, autostartStatus, refreshAutostart } from './autostart.js';
 import { tmuxEnv } from './setup/ensure-tmux.js';
 import { writeBotsJsonAtomic as writeBotsAtomic } from './setup/bots-store.js';
@@ -2757,6 +2758,8 @@ interface SessionData {
   /** Chat-scope quote chain — see Session.quoteTargetId in types.ts. */
   quoteTargetId?: string;
   currentReplyTarget?: { rootMessageId: string; turnId: string; updatedAt: string; quoteOnly?: boolean; substitute?: boolean };
+  /** Per-turn reply targets（见 Session.replyTargets in types.ts）——排队/并发轮次各自的回复锚点。 */
+  replyTargets?: Record<string, { rootMessageId: string; updatedAt: string; quoteOnly?: boolean; substitute?: boolean }>;
   /** 文档评论入口 per-turn 回复落点（见 Session.docCommentTargets in types.ts）。 */
   docCommentTargets?: Record<string, { fileToken: string; fileType: string; commentId: string; replyToName?: string; replyToOpenId?: string; turnId: string; replyId?: string; reactionId?: string }>;
   quoteTargetSenderOpenId?: string;
@@ -5709,6 +5712,10 @@ async function cmdSend(rest: string[]): Promise<void> {
   if (!s) { console.error(`未找到 session ${sid}`); process.exit(1); }
   if (!s.larkAppId) { console.error(`session ${sid} 缺少 larkAppId`); process.exit(1); }
 
+  // 本轮的回复锚点：优先按 turnId 精确取 per-turn 落点（排队/并发轮次不再被
+  // 后到轮次覆盖 currentReplyTarget 而塌成群顶层 plain），无记录再退回单槽。
+  const turnReplyTarget = pickTurnReplyTarget(s, currentTurnId);
+
   // Read content from: --content-file > positional arg > stdin
   let content = '';
   let customCard: Record<string, unknown> | undefined;
@@ -5841,9 +5848,9 @@ async function cmdSend(rest: string[]): Promise<void> {
           chatScope: s.scope === 'chat',
           chatId: canonicalOutput.targetChatId,
           rootMessageId: s.rootMessageId,
-          replyTargetRootId: s.currentReplyTarget?.rootMessageId,
-          replyTargetTurnId: s.currentReplyTarget?.turnId,
-          replyTargetQuoteOnly: s.currentReplyTarget?.quoteOnly,
+          replyTargetRootId: turnReplyTarget?.rootMessageId,
+          replyTargetTurnId: turnReplyTarget?.turnId,
+          replyTargetQuoteOnly: turnReplyTarget?.quoteOnly,
           currentTurnId,
         });
         const managedProviderOptions = prepared
@@ -6067,7 +6074,7 @@ async function cmdSend(rest: string[]): Promise<void> {
   };
   // Dispatch helper: top-level / chat-scope send vs reply-in-thread, single
   // decision point. Used for file attachments (always plain in chat scope).
-  const sendTarget = resolveSendTarget({ into: sendInto, topLevel: sendTopLevel, chatScope: isChatScope, chatId: targetChatId, rootMessageId: s.rootMessageId, replyTargetRootId: s.currentReplyTarget?.rootMessageId, replyTargetTurnId: s.currentReplyTarget?.turnId, replyTargetQuoteOnly: s.currentReplyTarget?.quoteOnly, currentTurnId });
+  const sendTarget = resolveSendTarget({ into: sendInto, topLevel: sendTopLevel, chatScope: isChatScope, chatId: targetChatId, rootMessageId: s.rootMessageId, replyTargetRootId: turnReplyTarget?.rootMessageId, replyTargetTurnId: turnReplyTarget?.turnId, replyTargetQuoteOnly: turnReplyTarget?.quoteOnly, currentTurnId });
   const dispatch = (
     content: string,
     msgType: string,
@@ -6350,7 +6357,7 @@ async function cmdSend(rest: string[]): Promise<void> {
         ? { ...s, lastCallerOpenId: explicitVcMeetingImOrigin.replyTargetSenderOpenId }
         : s, {
           isOncall: !!oncallEntry,
-          isSubstitute: s.currentReplyTarget?.turnId === currentTurnId && s.currentReplyTarget?.substitute === true,
+          isSubstitute: turnReplyTarget?.turnId === currentTurnId && turnReplyTarget?.substitute === true,
           hasExplicitBotMention: explicitKnownBotMention,
           knownBotOpenIds,
         });

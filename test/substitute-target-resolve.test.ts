@@ -17,7 +17,9 @@ const deps: SubstituteResolveDeps = {
     return { resolved: [...new Set(map.values())], map };
   },
   async getProfile(_app, openId) {
-    return NAMES[openId] ? { name: NAMES[openId] } : null;
+    return NAMES[openId]
+      ? { status: 'ok' as const, profile: { name: NAMES[openId] } }
+      : { status: 'not_visible' as const };
   },
 };
 
@@ -77,16 +79,46 @@ describe('resolveSubstituteTargets', () => {
     expect(resolution).toEqual([{ input: 'ou_other_app', ok: false, reason: 'cross_app_open_id' }]);
   });
 
-  it('reports a THROWN profile lookup for a hand-typed open_id as resolve_failed, not cross-app', async () => {
+  it('reports a transient profile failure for a hand-typed open_id as resolve_failed, not cross-app', async () => {
     // A transient network / rate-limit error must not tell the user their
     // open_id "belongs to another app" — that misleads them into discarding a
-    // perfectly valid target. Only a definitive null profile is cross-app.
+    // perfectly valid target. Only a definitive not_visible is cross-app.
     const flaky: SubstituteResolveDeps = {
       resolveRaw: deps.resolveRaw,
-      getProfile: async () => { throw new Error('timeout'); },
+      getProfile: async () => ({ status: 'error' as const }),
     };
     const { targets, resolution } = await resolveSubstituteTargets('app', [{ openId: 'ou_direct' }], flaky);
     expect(targets).toEqual([]);
     expect(resolution).toEqual([{ input: 'ou_direct', ok: false, reason: 'resolve_failed' }]);
+
+    // Same for a thrown lookup (defensive: the injected impl shouldn't throw).
+    const throwing: SubstituteResolveDeps = {
+      resolveRaw: deps.resolveRaw,
+      getProfile: async () => { throw new Error('timeout'); },
+    };
+    const thrown = await resolveSubstituteTargets('app', [{ openId: 'ou_direct' }], throwing);
+    expect(thrown.resolution).toEqual([{ input: 'ou_direct', ok: false, reason: 'resolve_failed' }]);
+  });
+
+  it('reports resolve_failed for an email when the batch resolver signals a transient error', async () => {
+    // The real resolveAllowedUsersWithMap swallows API errors internally and
+    // never rejects — the errored flag is the only production-reachable signal.
+    const flaky: SubstituteResolveDeps = {
+      resolveRaw: async () => ({ resolved: [], map: new Map(), errored: true }),
+      getProfile: deps.getProfile,
+    };
+    const { targets, resolution } = await resolveSubstituteTargets('app', [{ email: 'alice@x.com' }], flaky);
+    expect(targets).toEqual([]);
+    expect(resolution).toEqual([{ input: 'alice@x.com', ok: false, reason: 'resolve_failed' }]);
+  });
+
+  it('keeps an email-resolved target when only the profile lookup transiently fails', async () => {
+    const flaky: SubstituteResolveDeps = {
+      resolveRaw: deps.resolveRaw,
+      getProfile: async () => ({ status: 'error' as const }),
+    };
+    const { targets, resolution } = await resolveSubstituteTargets('app', [{ email: 'alice@x.com', name: 'A.' }], flaky);
+    expect(targets).toEqual([{ openId: 'ou_alice', name: 'A.', email: 'alice@x.com' }]);
+    expect(resolution).toEqual([{ input: 'alice@x.com', ok: true, openId: 'ou_alice', name: 'A.', avatarUrl: undefined }]);
   });
 });

@@ -24,6 +24,14 @@ import { expandHomePath } from '../utils/working-dir.js';
 
 /**
  * Upsert an oncall binding. Returns whether it was newly created.
+ *
+ * A manual bind is an explicit opt-IN, so it clears any tombstone in
+ * `defaultOncallAutoboundChats` — the tombstone means "auto-bind must not
+ * touch this chat again" (written by unbind and by auto-bind itself), and it
+ * doubles as the provenance list for the leave-oncall release in
+ * {@link setWorkingDirMode}. Clearing it here keeps both consumers honest: a
+ * manually (re-)bound chat is neither auto-bind territory nor releasable as
+ * "auto-bound". A later unbind re-tombstones as before.
  */
 export async function bindOncall(
   larkAppId: string,
@@ -41,6 +49,9 @@ export async function bindOncall(
     if (created) cur.push(next);
     else cur[curIdx] = next; // wholesale replace strips legacy keys
     entry.oncallChats = cur;
+    if (Array.isArray(entry.defaultOncallAutoboundChats) && entry.defaultOncallAutoboundChats.includes(chatId)) {
+      entry.defaultOncallAutoboundChats = entry.defaultOncallAutoboundChats.filter((c: string) => c !== chatId);
+    }
     return { write: true, result: { created } };
   });
   if (!r.ok) return { ok: false, reason: r.reason };
@@ -49,6 +60,9 @@ export async function bindOncall(
   const inMem = (bot.config.oncallChats ??= []);
   const memIdx = inMem.findIndex(c => c.chatId === chatId);
   if (memIdx >= 0) inMem[memIdx] = next; else inMem.push(next);
+  if (bot.config.defaultOncallAutoboundChats?.includes(chatId)) {
+    bot.config.defaultOncallAutoboundChats = bot.config.defaultOncallAutoboundChats.filter(c => c !== chatId);
+  }
 
   logger.info(`[oncall:${larkAppId}] bind chat=${chatId} dir=${workingDir}`);
   return { ok: true, entry: next, created: r.result.created };

@@ -55,10 +55,18 @@ export interface SubstituteTargetResolution {
 /** Injected Lark resolvers (real impls live in `im/lark/client`; tests mock). */
 export interface SubstituteResolveDeps {
   /** Resolve a mixed list of `ou_*` / `on_*` / email strings → open_ids, with a
-   *  `raw → open_id` map (matches `resolveAllowedUsersWithMap`). */
-  resolveRaw: (larkAppId: string, raw: string[]) => Promise<{ resolved: string[]; map: Map<string, string> }>;
-  /** open_id → display name (+ avatar). Returns null when unknown. */
-  getProfile: (larkAppId: string, openId: string) => Promise<{ name: string; avatarUrl?: string } | null>;
+   *  `raw → open_id` map (matches `resolveAllowedUsersWithMap`). `errored`
+   *  reports a transient failure during resolution (real impl swallows API
+   *  errors internally, so a thrown rejection alone can't signal this). */
+  resolveRaw: (larkAppId: string, raw: string[]) => Promise<{ resolved: string[]; map: Map<string, string>; errored?: boolean }>;
+  /** open_id → profile lookup with definitive/transient distinction (matches
+   *  `getUserProfileStrict`): 'not_visible' = this app can never see the user
+   *  (cross-app / out of contact scope); 'error' = transient, retry may succeed. */
+  getProfile: (larkAppId: string, openId: string) => Promise<
+    | { status: 'ok'; profile: { name: string; avatarUrl?: string } }
+    | { status: 'not_visible' }
+    | { status: 'error' }
+  >;
 }
 
 type RawTarget = { openId?: string; userId?: string; unionId?: string; email?: string; name?: string };
@@ -92,8 +100,11 @@ export async function resolveSubstituteTargets(
   let map = new Map<string, string>();
   let resolveErrored = false;
   if (rawList.length) {
-    try { ({ map } = await deps.resolveRaw(larkAppId, rawList)); }
-    catch { resolveErrored = true; map = new Map(); }
+    try {
+      const r = await deps.resolveRaw(larkAppId, rawList);
+      map = r.map;
+      resolveErrored = r.errored === true;
+    } catch { resolveErrored = true; map = new Map(); }
   }
 
   const targets: SubstituteTarget[] = [];
@@ -108,23 +119,24 @@ export async function resolveSubstituteTargets(
     if (openId) {
       let name = t.name;
       let avatarUrl: string | undefined;
-      let profileReachable = true;
-      // A definitive null profile means this app cannot see the open_id
-      // (cross-app / out of contact scope); a THROWN lookup is a transient
-      // failure (network / rate limit) and must not masquerade as cross-app.
-      let unreachableReason: 'cross_app_open_id' | 'resolve_failed' = 'cross_app_open_id';
-      try {
-        const p = await deps.getProfile(larkAppId, openId);
-        if (p?.name) { name = p.name; avatarUrl = p.avatarUrl; }
+      // Three-state lookup: 'not_visible' is definitive (this app can never see
+      // the open_id — cross-app / out of contact scope), 'error' is transient
+      // (network / rate limit) and must not masquerade as cross-app or the user
+      // gets told to discard a perfectly valid target.
+      const lookup = await deps.getProfile(larkAppId, openId)
+        .catch(() => ({ status: 'error' as const }));
+      if (lookup.status === 'ok' && lookup.profile.name) {
+        name = lookup.profile.name;
+        avatarUrl = lookup.profile.avatarUrl;
+      } else if (isRawOpenId) {
         // A hand-typed open_id must be reachable by this app to be matchable at
         // runtime. Email/union_id resolved open_ids are already app-scoped, so a
-        // transient profile lookup failure is not fatal.
-        else if (isRawOpenId) { profileReachable = false; }
-      } catch {
-        if (isRawOpenId) { profileReachable = false; unreachableReason = 'resolve_failed'; }
-      }
-      if (!profileReachable) {
-        resolution.push({ input: raw, ok: false, reason: unreachableReason });
+        // failed profile lookup is not fatal for them.
+        resolution.push({
+          input: raw,
+          ok: false,
+          reason: lookup.status === 'not_visible' ? 'cross_app_open_id' : 'resolve_failed',
+        });
         continue;
       }
       resolution.push({ input: raw, ok: true, openId, name, avatarUrl });

@@ -415,6 +415,32 @@ describe('default-oncall store persistence', () => {
     ]);
   });
 
+  it('manual re-bind to the SAME oncall dir survives leaving oncall mode (bind clears tombstone)', async () => {
+    // codex 2nd-review P2: dir-matching alone cannot protect a manual re-bind
+    // that happens to target the oncall dir itself. bindOncall now clears the
+    // tombstone (explicit opt-in), so the release pass no longer sees oc_x as
+    // auto-bound provenance.
+    writeConfig({
+      defaultOncall: { enabled: true, workingDir: '/repos/oncall', since: 5_000 },
+      defaultOncallAutoboundChats: ['oc_x'],
+    });
+    const { registry, store } = await freshModules();
+    registry.loadBotConfigs().forEach(c => registry.registerBot(c));
+
+    const bind = await store.bindOncall('app_default', 'oc_x', '/repos/oncall');
+    expect(bind.ok).toBe(true);
+    expect(readConfig().defaultOncallAutoboundChats).toEqual([]);
+    expect(registry.getBot('app_default').config.defaultOncallAutoboundChats).toEqual([]);
+
+    const r = await store.setWorkingDirMode('app_default', 'default', '/repos/dwd');
+
+    expect(r.ok).toBe(true);
+    expect(readConfig().oncallChats).toEqual([{ chatId: 'oc_x', workingDir: '/repos/oncall' }]);
+    expect(registry.getBot('app_default').config.oncallChats).toEqual([
+      { chatId: 'oc_x', workingDir: '/repos/oncall' },
+    ]);
+  });
+
   it('setWorkingDirMode does not release bindings when defaultOncall was not enabled', async () => {
     // Tombstones can exist from plain /oncall unbind history without defaultOncall
     // ever having been enabled; a working-dir mode save must not touch bindings.

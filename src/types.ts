@@ -212,6 +212,16 @@ export interface Session {
    * Used by substitute-mode mentions so avatar-style replies stay flat.
    */
   currentReplyTarget?: { rootMessageId: string; turnId: string; updatedAt: string; quoteOnly?: boolean; substitute?: boolean };
+  /**
+   * Per-turn reply targets keyed by turnId (the inbound message_id that opened
+   * the turn). currentReplyTarget above only remembers the LATEST turn — when
+   * turns queue up (e.g. two substitute triggers, or a trigger while the CLI is
+   * busy) the earlier turn's send would see a mismatched turnId and degrade to
+   * a top-level plain send. `botmux send` and the daemon resolve the executing
+   * turn against this map first. Bounded (oldest pruned); evicted turns fall
+   * back to the single-slot behavior.
+   */
+  replyTargets?: Record<string, { rootMessageId: string; updatedAt: string; quoteOnly?: boolean; substitute?: boolean }>;
   /** True once a substitute-mode control card has been DM'd to the owner(s). Persisted to avoid re-sends on worker restart or daemon recovery. */
   substituteControlCardSent?: boolean;
   /**

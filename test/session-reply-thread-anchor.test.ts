@@ -45,8 +45,9 @@ const CHAT = 'oc_shared_chat';
 const NOW = new Date().toISOString();
 
 type Target = { rootMessageId: string; turnId: string; updatedAt: string; quoteOnly?: boolean };
+type TurnTargets = Record<string, { rootMessageId: string; updatedAt: string; quoteOnly?: boolean; substitute?: boolean }>;
 
-function seedSharedSession(currentReplyTarget?: Target): DaemonSession {
+function seedSharedSession(currentReplyTarget?: Target, replyTargets?: TurnTargets): DaemonSession {
   const ds = {
     scope: 'chat',
     chatId: CHAT,
@@ -59,6 +60,7 @@ function seedSharedSession(currentReplyTarget?: Target): DaemonSession {
       status: 'active',
       createdAt: NOW,
       currentReplyTarget,
+      replyTargets,
     },
     currentReplyTarget,
   } as unknown as DaemonSession;
@@ -121,6 +123,41 @@ describe('sessionReply chat-scope chokepoint — shared fold-back anchoring', ()
     await sessionReply(CHAT, 'hello', 'text', APP);
     expect(mocks.sendMessage).toHaveBeenCalledTimes(1);
     expect(mocks.replyMessage).not.toHaveBeenCalled();
+  });
+
+  it('a queued earlier turn still replies under ITS OWN trigger after a later turn overwrote the slot', async () => {
+    // codex 2nd-review P2 repro: trigger A, then trigger B before A's reply.
+    // currentReplyTarget = B (single slot), but turn A resolves via the
+    // per-turn map and must NOT degrade to a top-level plain send.
+    seedSharedSession(
+      { rootMessageId: 'om_trigger_b', turnId: 'turn-b', updatedAt: NOW },
+      {
+        'turn-a': { rootMessageId: 'om_trigger_a', updatedAt: NOW },
+        'turn-b': { rootMessageId: 'om_trigger_b', updatedAt: NOW },
+      },
+    );
+    await sessionReply(CHAT, 'reply for A', 'text', APP, 'turn-a');
+    expect(mocks.replyMessage).toHaveBeenCalledWith(APP, 'om_trigger_a', 'reply for A', 'text', true, undefined, expect.anything());
+    expect(mocks.sendMessage).not.toHaveBeenCalled();
+
+    await sessionReply(CHAT, 'reply for B', 'text', APP, 'turn-b');
+    expect(mocks.replyMessage).toHaveBeenCalledWith(APP, 'om_trigger_b', 'reply for B', 'text', true, undefined, expect.anything());
+  });
+
+  it('reverse order: the latest turn replies via the slot, the earlier one via the map', async () => {
+    seedSharedSession(
+      { rootMessageId: 'om_trigger_a', turnId: 'turn-a', updatedAt: NOW },
+      {
+        'turn-b': { rootMessageId: 'om_trigger_b', updatedAt: NOW, quoteOnly: true },
+        'turn-a': { rootMessageId: 'om_trigger_a', updatedAt: NOW },
+      },
+    );
+    await sessionReply(CHAT, 'reply for B', 'text', APP, 'turn-b');
+    // Per-turn quoteOnly honored for the overwritten turn too.
+    expect(mocks.replyMessage).toHaveBeenCalledWith(APP, 'om_trigger_b', 'reply for B', 'text', false, undefined, expect.anything());
+    await sessionReply(CHAT, 'reply for A', 'text', APP, 'turn-a');
+    expect(mocks.replyMessage).toHaveBeenCalledWith(APP, 'om_trigger_a', 'reply for A', 'text', true, undefined, expect.anything());
+    expect(mocks.sendMessage).not.toHaveBeenCalled();
   });
 
   it('quoteOnly anchor replies to the trigger message without creating a Lark thread', async () => {

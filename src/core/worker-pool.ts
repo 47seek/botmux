@@ -18,7 +18,7 @@ import { config } from '../config.js';
 import { readGlobalConfig } from '../global-config.js';
 import * as sessionStore from '../services/session-store.js';
 import { persistStreamCardState, rememberLastCliInput } from './session-manager.js';
-import { fallbackTurnId } from './reply-target.js';
+import { fallbackTurnId, isSubstituteTurn } from './reply-target.js';
 import { updateMessage, deleteMessage, sendEphemeralCard, sendUserMessage, addReaction, removeReaction, MessageWithdrawnError } from '../im/lark/client.js';
 import { buildStreamingCard, buildPrivateSnapshotCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, buildRelayedFrozenCard, getCliDisplayName } from '../im/lark/card-builder.js';
 import { loadFrozenCards, saveFrozenCards } from '../services/frozen-card-store.js';
@@ -267,7 +267,7 @@ export function isRelayableRealSession(ds: DaemonSession): boolean {
 // session card. Read fresh from the in-memory registry so a dashboard toggle
 // takes effect without a daemon restart. The `/card` command can override it
 // per-session via `ds.streamingCardForced` (manually summon a live card).
-function streamingCardDisabled(ds: DaemonSession): boolean {
+function streamingCardDisabled(ds: DaemonSession, turnId?: string): boolean {
   if (isDocNativeSession(ds)) return true;
   if (ds.streamingCardForced) return false;
   try {
@@ -275,7 +275,8 @@ function streamingCardDisabled(ds: DaemonSession): boolean {
     return cfg.disableStreamingCard === true
       || (!!ds.chatId && !!cfg.noCardChats?.includes(ds.chatId))
       // Per-turn substitute gate — see streamingCardDisabledFor in daemon.ts.
-      || (ds.currentReplyTarget ?? ds.session.currentReplyTarget)?.substitute === true;
+      // Callers with a turnId (screen updates) get an exact per-turn answer.
+      || isSubstituteTurn(ds, turnId);
   } catch { return false; }
 }
 
@@ -2669,8 +2670,10 @@ function setupWorkerHandlers(
         if (managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) break;
 
         // Bot opted out of the streaming card — dashboard SSE above already got
-        // the status patch; just don't touch any Lark card.
-        if (streamingCardDisabled(ds)) break;
+        // the status patch; just don't touch any Lark card. Turn-exact: a
+        // substitute turn's screen updates stay card-less even after a queued
+        // normal turn overwrote currentReplyTarget (and vice versa).
+        if (streamingCardDisabled(ds, msg.turnId)) break;
 
         // Restart recovery: a restored worker may emit screen updates as the CLI
         // redraws on resume. Stay silent (no post/patch) until the first real

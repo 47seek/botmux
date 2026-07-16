@@ -141,7 +141,7 @@ import {
 import { triggerSessionTurn } from './core/trigger-session.js';
 import { applyQueuedCodexAppLegacyFallback, mergeQueuedCodexAppTurn } from './core/session-create.js';
 import { findOnlineDaemon, listOnlineDaemons } from './utils/daemon-discovery.js';
-import { beginReplyTargetTurn, fallbackTurnId, resolveSessionReplyTarget, syncReplyTargetState } from './core/reply-target.js';
+import { beginReplyTargetTurn, fallbackTurnId, isSubstituteTurn, resolveSessionReplyTarget, syncReplyTargetState } from './core/reply-target.js';
 import { sweepOrphanSandboxes } from './adapters/backend/sandbox.js';
 import { TmuxBackend } from './adapters/backend/tmux-backend.js';
 import { HerdrBackend } from './adapters/backend/herdr-backend.js';
@@ -2269,7 +2269,7 @@ function startMemoryDiagnostics(): ReturnType<typeof setInterval> | undefined {
  * Lark message ids start with `om_` and chat ids with `oc_`, so the two
  * address spaces never collide; the lookup just tries both.
  */
-function streamingCardDisabledFor(ds: DaemonSession): boolean {
+function streamingCardDisabledFor(ds: DaemonSession, turnId?: string): boolean {
   if (ds.streamingCardForced) return false;
   try {
     const cfg = getBot(ds.larkAppId).config;
@@ -2278,7 +2278,8 @@ function streamingCardDisabledFor(ds: DaemonSession): boolean {
       // Substitute (avatar-style) turns hide the streaming card per-turn: the
       // shared chat-scope session serves substitute AND direct @bot turns, so a
       // session-level latch would permanently kill cards for normal turns too.
-      || (ds.currentReplyTarget ?? ds.session.currentReplyTarget)?.substitute === true;
+      // Callers with a turnId (turn reactions) get an exact per-turn answer.
+      || isSubstituteTurn(ds, turnId);
   } catch { return false; }
 }
 
@@ -2333,7 +2334,9 @@ export async function noteTurnReceived(
   // each get their own ✋. `finishTurnReactions` flips every pending ✋ to ✅ when
   // the worker next goes idle.
   if (ds.session.vcMeetingReceiver) return;
-  if (!streamingCardDisabledFor(ds)) return;
+  // Turn-exact card-off check: the reaction ack belongs to THIS message's turn,
+  // not to whichever turn most recently overwrote currentReplyTarget.
+  if (!streamingCardDisabledFor(ds, triggerMessageId)) return;
   if (silentTurnReactionsFor(ds)) return;
   // Only Lark messages carry reactions — doc-comment ids / chat anchors can't.
   if (!triggerMessageId.startsWith('om_')) return;

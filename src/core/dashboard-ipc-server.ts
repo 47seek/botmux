@@ -66,7 +66,7 @@ import * as chatFirstSeenStore from '../services/chat-first-seen-store.js';
 import * as scheduler from './scheduler.js';
 import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners, forkWorker, suspendWorker } from './worker-pool.js';
 import { listOnlineDaemons } from '../utils/daemon-discovery.js';
-import { getChatMode, replyMessage, sendMessage, resolveUnionIdFromOpenId, listThreadMessages, listChatMessages, listChatBotMembers, getUserProfile, resolveAllowedUsersWithMap, type ChatBotMember } from '../im/lark/client.js';
+import { getChatMode, replyMessage, sendMessage, resolveUnionIdFromOpenId, listThreadMessages, listChatMessages, listChatBotMembers, getUserProfile, getUserProfileStrict, resolveAllowedUsersWithMap, type ChatBotMember } from '../im/lark/client.js';
 import { parseApiMessage, cardContentHasUpgradeFallback, resolveMergedCardContent } from '../im/lark/message-parser.js';
 import { resumeSession, spawnDashboardSession, activateQueuedSession, closeCliMismatchedSessionsForBot, suspendActiveSessionsForBot } from './session-manager.js';
 import { parseSpawnRequest } from './session-create.js';
@@ -1738,7 +1738,7 @@ ipcRoute('PUT', '/api/bot-substitute-mode', async (req, res) => {
   const { targets, resolution } = await substituteModeStore.resolveSubstituteTargets(
     cachedLarkAppId,
     rec.targets,
-    { resolveRaw: resolveAllowedUsersWithMap, getProfile: getUserProfile },
+    { resolveRaw: resolveAllowedUsersWithMap, getProfile: getUserProfileStrict },
   );
   const chats = Array.isArray(rec.chats)
     ? [...new Set(rec.chats.map(String).map(s => s.trim()).filter(Boolean))]
@@ -1767,7 +1767,7 @@ ipcRoute('POST', '/api/bot-substitute-targets/resolve', async (req, res) => {
   const { resolution } = await substituteModeStore.resolveSubstituteTargets(
     cachedLarkAppId,
     [target],
-    { resolveRaw: resolveAllowedUsersWithMap, getProfile: getUserProfile },
+    { resolveRaw: resolveAllowedUsersWithMap, getProfile: getUserProfileStrict },
   );
   jsonRes(res, 200, { ok: true, resolution: resolution[0] ?? null });
 });
