@@ -5,7 +5,10 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { logger } from '../utils/logger.js';
 import { cliAuthBind, verifyHmac } from '../dashboard/auth.js';
+import { WORKFLOW_DAEMON_IPC_ROUTE_PREFIX } from '../workflows/v3/daemon-ipc-auth.js';
+import { V3_SESSION_RUN_MUTATION_ROUTE_PREFIX } from '../workflows/v3/session-relay.js';
 import { listenWithProbe } from '../utils/listen-with-probe.js';
+import { dashboardSecretPath } from './dashboard-secret.js';
 import * as sessionStore from '../services/session-store.js';
 import * as scheduleStore from '../services/schedule-store.js';
 import * as groupsStore from '../services/groups-store.js';
@@ -84,19 +87,10 @@ import {
   writeRoleProfileEntry,
 } from '../services/role-profile-store.js';
 import { triggerSessionTurn } from './trigger-session.js';
-import { triggerWorkflowFromEnvelope } from '../workflows/trigger-from-envelope.js';
-import type { TriggerInput, TriggerResult } from '../workflows/trigger-run.js';
 import { validateTriggerRequest, type TriggerResponse } from '../services/trigger-types.js';
 import { resolveCliSelection, selectionKeyForBot } from '../setup/cli-selection.js';
 import { checkCliAvailability } from '../setup/cli-availability.js';
 import { enrichHistorySenders, type HistoryBotInfo } from '../dashboard/history-senders.js';
-
-// Workflow runner is wired by the daemon (it owns the heavy triggerWorkflowRun
-// deps). Until set, workflow-targeted triggers report not-implemented.
-let workflowRunner: ((input: TriggerInput) => Promise<TriggerResult>) | null = null;
-export function setWorkflowRunner(fn: (input: TriggerInput) => Promise<TriggerResult>): void {
-  workflowRunner = fn;
-}
 
 // 机器人真·改名 renamer，由 daemon 启动时注册（开放平台自动化 + daemon 侧
 // botName/descriptor/bots-info 同步都在 daemon 的闭包里做）。未注册（测试环境）
@@ -189,10 +183,14 @@ let injectedIpcSecret: string | null = null;
 export function setIpcAuthSecret(secret: string | null): void { injectedIpcSecret = secret; }
 function ipcAuthSecret(): string | null {
   if (injectedIpcSecret) return injectedIpcSecret;
-  try { return readFileSync(join(homedir(), '.botmux', '.dashboard-secret'), 'utf8').trim() || null; }
+  try { return readFileSync(dashboardSecretPath(), 'utf8').trim() || null; }
   catch { return null; }
 }
-function tokenRouteAuthorized(req: IncomingMessage): boolean {
+/** Authenticate legacy terminal-token routes with the machine-local dashboard
+ * secret. Workflow v3 mutations intentionally use their separate, full-request
+ * protocol (`workflows/v3/daemon-ipc-auth`) and must never call this bare
+ * ts:nonce verifier. */
+export function ipcHmacAuthorized(req: IncomingMessage): boolean {
   if (trustedHostRequests.has(req)) return true;
   const secret = ipcAuthSecret();
   if (!secret) return false; // fail-closed: no secret on disk → nobody can sign
@@ -221,6 +219,18 @@ function routeHasNarrowUntrustedAuth(method: string, pathname: string): boolean 
   if (method === 'POST' && pathname === '/api/asks') return true;
   if (method === 'POST' && pathname === '/api/hooks/emit') return true;
   if (method === 'POST' && pathname === '/api/attention') return true;
+  // Workflow v3 mutations carry their own domain-separated full-envelope
+  // protocol (request signature over method/path/exact body with nonce
+  // anti-replay + boot audience, signed response), keyed on the same host
+  // secret as the outer gate. The handler fail-closes on that envelope, which
+  // is strictly stronger binding than the outer ts:nonce HMAC, so the prefix
+  // is admitted here instead of being double-signed with the same secret.
+  if (method === 'POST' && pathname.startsWith(`${WORKFLOW_DAEMON_IPC_ROUTE_PREFIX}/`)) return true;
+  // Workflow v3 session relay: sandboxed / read-isolated chat CLIs cannot read
+  // the host secret, so these handlers verify the session's rotating per-turn
+  // capability and re-derive the caller tuple from the daemon's own live
+  // session record (same posture as /api/asks above).
+  if (method === 'POST' && pathname.startsWith(`${V3_SESSION_RUN_MUTATION_ROUTE_PREFIX}/`)) return true;
   return false;
 }
 
@@ -759,12 +769,12 @@ ipcRoute('POST', '/api/sessions/:sessionId/lock', async (req, res, params) => {
  *
  * Two gates protect it: at the dashboard's HTTP boundary this path is absent
  * from the public allow-list, so an anonymous browser 401s; and here on the
- * daemon IPC, tokenRouteAuthorized requires a loopback-HMAC signed with
+ * daemon IPC, ipcHmacAuthorized requires a loopback-HMAC signed with
  * .dashboard-secret, so a local process that merely knows the ipcPort still
  * can't pull a write token.
  */
 ipcRoute('GET', '/api/sessions/:sessionId/write-link', (req, res, params) => {
-  if (!tokenRouteAuthorized(req)) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
+  if (!ipcHmacAuthorized(req)) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
   const ds = findActiveBySessionId(params.sessionId);
   if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
   // Riff backend: the sandbox URL is the writable link — no local worker needed.
@@ -787,7 +797,7 @@ ipcRoute('GET', '/api/sessions/:sessionId/write-link', (req, res, params) => {
  * credential, just into Lark rather than into the HTTP response.
  */
 ipcRoute('POST', '/api/sessions/:sessionId/write-link-card', async (req, res, params) => {
-  if (!tokenRouteAuthorized(req)) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
+  if (!ipcHmacAuthorized(req)) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
   const ds = findActiveBySessionId(params.sessionId);
   if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
   const r = await deliverWriteLinkCardToOwners(ds);
@@ -1166,15 +1176,22 @@ ipcRoute('POST', '/api/trigger', async (req, res) => {
     }
   }
   try {
-    let result;
     if (valid.request.target.kind === 'workflow') {
-      if (!workflowRunner) {
-        return jsonRes(res, 501, { ok: false, errorCode: 'workflow_trigger_not_implemented', error: 'workflow runner not wired on this daemon' });
-      }
-      result = await triggerWorkflowFromEnvelope(valid.request, { larkAppId: cachedLarkAppId, runWorkflow: workflowRunner });
-    } else {
-      result = await triggerSessionTurn(valid.request, { larkAppId: cachedLarkAppId, activeSessions });
+      return jsonRes(res, 410, {
+        ok: false,
+        errorCode: 'legacy_workflow_retired',
+        error: 'v2 workflow trigger targets are retired; migrate the definition and run it through /workflow',
+      });
     }
+    const activeSessions = getActiveSessionsRegistry();
+    if (!activeSessions) {
+      return jsonRes(res, 503, {
+        ok: false,
+        errorCode: 'trigger_failed',
+        error: 'active session registry unavailable',
+      });
+    }
+    const result = await triggerSessionTurn(valid.request, { larkAppId: cachedLarkAppId, activeSessions });
     const status = result.ok
       ? 200
       : result.errorCode === 'bot_not_in_chat'
