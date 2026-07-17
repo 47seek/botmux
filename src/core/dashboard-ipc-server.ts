@@ -66,7 +66,7 @@ import * as chatFirstSeenStore from '../services/chat-first-seen-store.js';
 import * as scheduler from './scheduler.js';
 import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners, forkWorker, suspendWorker, killWorker } from './worker-pool.js';
 import { listOnlineDaemons } from '../utils/daemon-discovery.js';
-import { getChatMode, replyMessage, sendMessage, resolveUnionIdFromOpenId, listThreadMessages, listChatMessages, listChatBotMembers, getUserProfile, resolveAllowedUsersWithMap, type ChatBotMember } from '../im/lark/client.js';
+import { getChatMode, replyMessage, sendMessage, resolveUnionIdFromOpenId, listThreadMessages, listChatMessages, listChatBotMembers, getUserProfile, getUserProfileStrict, resolveAllowedUsersWithMap, type ChatBotMember } from '../im/lark/client.js';
 import { parseApiMessage, cardContentHasUpgradeFallback, resolveMergedCardContent } from '../im/lark/message-parser.js';
 import { resumeSession, spawnDashboardSession, activateQueuedSession, closeCliMismatchedSessionsForBot, suspendActiveSessionsForBot } from './session-manager.js';
 import { parseSpawnRequest } from './session-create.js';
@@ -1864,18 +1864,41 @@ ipcRoute('PUT', '/api/bot-substitute-mode', async (req, res) => {
   const { targets, resolution } = await substituteModeStore.resolveSubstituteTargets(
     cachedLarkAppId,
     rec.targets,
-    { resolveRaw: resolveAllowedUsersWithMap, getProfile: getUserProfile },
+    { resolveRaw: resolveAllowedUsersWithMap, getProfile: getUserProfileStrict },
   );
+  const chats = Array.isArray(rec.chats)
+    ? [...new Set(rec.chats.map(String).map(s => s.trim()).filter(Boolean))]
+    : [];
   const r = await substituteModeStore.updateBotSubstituteMode(cachedLarkAppId, {
     enabled: rec.enabled === true,
     targets,
     disclosure: rec.disclosure === 'none' ? 'none' : 'prefix',
+    replyMode: rec.replyMode === 'quote' ? 'quote' : 'thread',
+    disableControlCard: rec.disableControlCard === true,
+    ...(chats.length ? { chats } : {}),
     // 话题群开关：显式 false 才关（旧客户端不带字段 → normalize 缺省开）。
     topicGroups: rec.topicGroups,
     topicActiveSessionTrigger: rec.topicActiveSessionTrigger,
   });
   if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason, resolution });
   jsonRes(res, 200, { ok: true, substituteMode: r.substituteMode, resolution });
+});
+
+// Preview resolution for a single substitute target without persisting anything.
+// Used by the dashboard to auto-fill name/avatar while the user is typing.
+ipcRoute('POST', '/api/bot-substitute-targets/resolve', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  let body: unknown;
+  try { body = await readJsonBody(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  const rec = body && typeof body === 'object' && !Array.isArray(body) ? body as Record<string, unknown> : {};
+  const target = rec.target && typeof rec.target === 'object' && !Array.isArray(rec.target) ? rec.target : {};
+  const { resolution } = await substituteModeStore.resolveSubstituteTargets(
+    cachedLarkAppId,
+    [target],
+    { resolveRaw: resolveAllowedUsersWithMap, getProfile: getUserProfileStrict },
+  );
+  jsonRes(res, 200, { ok: true, resolution: resolution[0] ?? null });
 });
 
 // Per-bot explicit `/summary` history range. Body `{ limit, sinceHours }`.

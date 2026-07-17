@@ -1114,6 +1114,11 @@ export function resolveSubstituteTrigger(
   return undefined;
 }
 
+function isSubstituteAllowedChat(cfg: { chats?: string[] } | undefined, chatId: string): boolean {
+  if (!cfg?.chats?.length) return true;
+  return cfg.chats.includes(chatId);
+}
+
 function mentionMatchesBot(m: any, larkAppId: string, botOpenId?: string): boolean {
   const openId = mentionOpenId(m);
   if (botOpenId && openId === botOpenId) return true;
@@ -2313,7 +2318,9 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         // substitute target (the overwhelming majority on the hot path).
         const substituteCfg = getBot(larkAppId).config.substituteMode;
         let substituteChatMode: 'group' | 'topic' | undefined;
-        if (substituteCfg?.enabled === true && chatType === 'group') {
+        // chats 白名单在 getChatMode 之前（纯内存判断走在 API roundtrip 前），
+        // 对普通群与话题群统一生效：白名单是「替身可触发的群」清单，与群形态无关。
+        if (substituteCfg?.enabled === true && chatType === 'group' && isSubstituteAllowedChat(substituteCfg, chatId)) {
           const chatMode = await getChatMode(larkAppId, chatId);
           const modeSupported = chatMode === 'group'
             // 话题群支持默认开（缺省=开，normalize 只在显式 false 时关）。
@@ -2350,7 +2357,11 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
             routing.scope = 'chat';
             routing.anchor = chatId;
             routingSource = 'regular-group-chat';
-            if (message.root_id && message.thread_id) replyRootId = message.root_id;
+            // Top-level substitute messages need their own reply anchor so that
+            // concurrent triggers from different users in the same chat-scope
+            // session don't collapse or thread under the wrong message. Existing
+            // real threads keep their root_id.
+            replyRootId = (message.root_id && message.thread_id) ? message.root_id : messageId;
           }
           // 话题群：保持 decideRouting 的 thread-scope/话题锚点不动——替身回合
           // 直接搭该话题自己的会话（无会话则由 handleNewTopic 新开），与普通群

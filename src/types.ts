@@ -207,8 +207,23 @@ export interface Session {
    * Current turn's reply destination for chat-scope topic aliases. `turnId` is
    * the inbound message_id that opened/updated this turn, preventing a stale
    * topic target from being confused with a later group-top-level turn.
+   * `quoteOnly` means the reply should quote the target message via
+   * replyMessage(..., replyInThread=false) instead of creating a Lark thread.
+   * Used by substitute-mode mentions so avatar-style replies stay flat.
    */
-  currentReplyTarget?: { rootMessageId: string; turnId: string; updatedAt: string };
+  currentReplyTarget?: { rootMessageId: string; turnId: string; updatedAt: string; quoteOnly?: boolean; substitute?: boolean };
+  /**
+   * Per-turn reply targets keyed by turnId (the inbound message_id that opened
+   * the turn). currentReplyTarget above only remembers the LATEST turn — when
+   * turns queue up (e.g. two substitute triggers, or a trigger while the CLI is
+   * busy) the earlier turn's send would see a mismatched turnId and degrade to
+   * a top-level plain send. `botmux send` and the daemon resolve the executing
+   * turn against this map first. Bounded (oldest pruned); evicted turns fall
+   * back to the single-slot behavior.
+   */
+  replyTargets?: Record<string, { rootMessageId: string; updatedAt: string; quoteOnly?: boolean; substitute?: boolean }>;
+  /** True once a substitute-mode control card has been DM'd to the owner(s). Persisted to avoid re-sends on worker restart or daemon recovery. */
+  substituteControlCardSent?: boolean;
   /**
    * 文档评论入口（/watch-comment / /subscribe-lark-doc）：当本会话「当前这一轮」由飞书文档评论
    * 触发时，`botmux send` 的用户可见回复要回到该文档评论（而非飞书）。因 botmux

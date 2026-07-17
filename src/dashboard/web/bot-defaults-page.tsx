@@ -9,11 +9,13 @@ import {
   fetchCliOptions,
   fmtSince,
   modelSuggestionsForOption,
+  resolveSubstituteTarget,
   selectedCliOption,
   type BotDefaultsRow,
   type BotSubstituteMode,
   type BotSubstituteTarget,
   type CliOptionsState,
+  type SubstituteTargetResolution,
 } from './bot-defaults.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
 import { useT } from './react-hooks.js';
@@ -175,13 +177,6 @@ function nonNegativeInteger(raw: string, fallback: number): number | null {
 
 type SubstituteTargetIdField = 'email' | 'openId' | 'userId' | 'unionId';
 
-type SubstituteTargetResolution = {
-  input?: string;
-  ok?: boolean;
-  openId?: string;
-  name?: string;
-};
-
 type SubstituteTargetDraft = {
   key: number;
   idField: SubstituteTargetIdField;
@@ -189,9 +184,25 @@ type SubstituteTargetDraft = {
   name: string;
   persisted: BotSubstituteTarget;
   originalIdField?: SubstituteTargetIdField;
+  resolving?: boolean;
+  resolution?: {
+    ok: boolean;
+    name?: string;
+    avatarUrl?: string;
+    reason?: SubstituteTargetResolution['reason'];
+  };
 };
 
 const substituteTargetIdFields: SubstituteTargetIdField[] = ['email', 'openId', 'userId', 'unionId'];
+
+function parseSubstituteChats(text: string): string[] {
+  const values = text.split(/[\r\n,，;；]+/).map(s => s.trim()).filter(Boolean);
+  return [...new Set(values)];
+}
+
+function formatSubstituteChats(chats?: string[]): string {
+  return (chats ?? []).join('\n');
+}
 
 function substituteTargetIdField(target?: BotSubstituteTarget): SubstituteTargetIdField {
   return substituteTargetIdFields.find(field => target?.[field]?.trim()) ?? 'email';
@@ -1886,7 +1897,19 @@ function SubstituteModeSection(props: { bot: BotDefaultsRow; patchBot: PatchBot 
   const tr = useT();
   const initial = props.bot.substituteMode ?? null;
   const [enabled, setEnabled] = useState(initial?.enabled === true);
+  function substituteReasonText(reason?: SubstituteTargetResolution['reason']): string {
+    switch (reason) {
+      case 'cross_app_open_id': return tr('botDefaults.substituteReasonCrossAppOpenId');
+      case 'not_visible': return tr('botDefaults.substituteReasonNotVisible');
+      case 'resolve_failed': return tr('botDefaults.substituteReasonResolveFailed');
+      case 'unresolvable': return tr('botDefaults.substituteReasonUnresolvable');
+      default: return tr('botDefaults.substituteUnresolved');
+    }
+  }
   const [disclosure, setDisclosure] = useState<'prefix' | 'none'>(initial?.disclosure === 'none' ? 'none' : 'prefix');
+  const [replyMode, setReplyMode] = useState<'thread' | 'quote'>(initial?.replyMode === 'quote' ? 'quote' : 'thread');
+  const [controlCard, setControlCard] = useState(initial?.disableControlCard !== true);
+  const [chatsText, setChatsText] = useState(() => formatSubstituteChats(initial?.chats));
   // 话题群相关开关缺省开：只有显式 false 才是关（与 normalize 语义一致）。
   const [topicGroups, setTopicGroups] = useState(initial?.topicGroups !== false);
   const [topicActiveSessionTrigger, setTopicActiveSessionTrigger] = useState(initial?.topicActiveSessionTrigger !== false);
@@ -1904,7 +1927,64 @@ function SubstituteModeSection(props: { bot: BotDefaultsRow; patchBot: PatchBot 
       name: target?.name ?? '',
       persisted: target ? { ...target } : {},
       originalIdField: target ? idField : undefined,
+      resolution: target?.name || target?.avatarUrl
+        ? { ok: true, name: target.name, avatarUrl: target.avatarUrl }
+        : undefined,
     };
+  }
+
+  // Monotonic per-row resolve epoch: two quick blurs create two in-flight
+  // requests; only the latest one may apply, or a slow stale response would
+  // overwrite the fresh result (last-completion-wins race).
+  const resolveEpochs = useRef(new Map<number, number>());
+
+  async function resolveTargetRow(key: number): Promise<void> {
+    const epoch = (resolveEpochs.current.get(key) ?? 0) + 1;
+    resolveEpochs.current.set(key, epoch);
+    const isCurrent = () => resolveEpochs.current.get(key) === epoch;
+    setTargetRows(rows => rows.map(row => row.key === key ? { ...row, resolving: true } : row));
+    try {
+      const row = targetRows.find(r => r.key === key);
+      if (!row) return;
+      const idValue = row.idValue.trim();
+      if (!idValue) {
+        setTargetRows(rows => rows.map(r => r.key === key ? { ...r, resolving: false, resolution: undefined } : r));
+        return;
+      }
+      const target: BotSubstituteTarget = { [row.idField]: idValue };
+      if (row.name.trim()) target.name = row.name.trim();
+      const res = await resolveSubstituteTarget(props.bot.larkAppId, target);
+      if (!isCurrent()) return;
+      setTargetRows(rows => rows.map(r => {
+        if (r.key !== key) return r;
+        if (!res.ok) return { ...r, resolving: false, resolution: { ok: false } };
+        const entry = res.resolution;
+        if (entry?.ok === true) {
+          // userId passthrough: nothing was verified (no openId / profile) —
+          // keep the editable name input instead of showing a fake chip.
+          if (!entry.openId) return { ...r, resolving: false, resolution: undefined };
+          const persisted: BotSubstituteTarget = { ...r.persisted };
+          persisted.openId = entry.openId;
+          if (entry.name) persisted.name = entry.name;
+          if (entry.avatarUrl) persisted.avatarUrl = entry.avatarUrl;
+          return {
+            ...r,
+            name: entry.name ?? r.name,
+            persisted,
+            resolving: false,
+            resolution: { ok: true, name: entry.name, avatarUrl: entry.avatarUrl },
+          };
+        }
+        return {
+          ...r,
+          resolving: false,
+          resolution: { ok: false, reason: entry?.reason },
+        };
+      }));
+    } catch {
+      if (!isCurrent()) return;
+      setTargetRows(rows => rows.map(r => r.key === key ? { ...r, resolving: false, resolution: { ok: false } } : r));
+    }
   }
 
   const [targetRows, setTargetRows] = useState<SubstituteTargetDraft[]>(() => {
@@ -1920,13 +2000,16 @@ function SubstituteModeSection(props: { bot: BotDefaultsRow; patchBot: PatchBot 
     const next = props.bot.substituteMode ?? null;
     setEnabled(next?.enabled === true);
     setDisclosure(next?.disclosure === 'none' ? 'none' : 'prefix');
+    setReplyMode(next?.replyMode === 'quote' ? 'quote' : 'thread');
+    setControlCard(next?.disableControlCard !== true);
+    setChatsText(formatSubstituteChats(next?.chats));
     setTopicGroups(next?.topicGroups !== false);
     setTopicActiveSessionTrigger(next?.topicActiveSessionTrigger !== false);
     const targets = next?.targets ?? [];
     setTargetRows(targets.length ? targets.map(target => makeTargetDraft(target)) : [makeTargetDraft()]);
   }, [props.bot.larkAppId, props.bot.substituteMode]);
 
-  async function save(body: { enabled: boolean; targets: BotSubstituteTarget[]; disclosure?: 'prefix' | 'none'; topicGroups?: boolean; topicActiveSessionTrigger?: boolean }): Promise<void> {
+  async function save(body: { enabled: boolean; targets: BotSubstituteTarget[]; disclosure?: 'prefix' | 'none'; chats?: string[]; replyMode?: 'thread' | 'quote'; disableControlCard?: boolean; topicGroups?: boolean; topicActiveSessionTrigger?: boolean }): Promise<void> {
     setBusy(true);
     setStatus(null);
     try {
@@ -1944,6 +2027,9 @@ function SubstituteModeSection(props: { bot: BotDefaultsRow; patchBot: PatchBot 
           .filter(Boolean);
         setEnabled(next?.enabled === true);
         setDisclosure(next?.disclosure === 'none' ? 'none' : 'prefix');
+        setReplyMode(next?.replyMode === 'quote' ? 'quote' : 'thread');
+        setControlCard(next?.disableControlCard !== true);
+        setChatsText(formatSubstituteChats(next?.chats));
         setTopicGroups(next?.topicGroups !== false);
         setTopicActiveSessionTrigger(next?.topicActiveSessionTrigger !== false);
         if (resolution.length) {
@@ -1955,12 +2041,23 @@ function SubstituteModeSection(props: { bot: BotDefaultsRow; patchBot: PatchBot 
               const index = pending.findIndex(entry => String(entry.input ?? '').trim() === input);
               if (index < 0) return row;
               const entry = pending.splice(index, 1)[0];
-              if (entry?.ok !== true) return row;
-              const persisted: BotSubstituteTarget = { ...row.persisted };
-              if (entry.openId) persisted.openId = entry.openId;
-              if (row.idField === 'email') persisted.email = input;
-              if (entry.name) persisted.name = entry.name;
-              return { ...row, name: entry.name ?? row.name, persisted };
+              if (entry?.ok === true) {
+                const persisted: BotSubstituteTarget = { ...row.persisted };
+                if (entry.openId) persisted.openId = entry.openId;
+                if (row.idField === 'email') persisted.email = input;
+                if (entry.name) persisted.name = entry.name;
+                if (entry.avatarUrl) persisted.avatarUrl = entry.avatarUrl;
+                return {
+                  ...row,
+                  name: entry.name ?? row.name,
+                  persisted,
+                  resolution: { ok: true, name: entry.name, avatarUrl: entry.avatarUrl },
+                };
+              }
+              return {
+                ...row,
+                resolution: { ok: false, reason: entry?.reason },
+              };
             });
           });
         } else {
@@ -2005,12 +2102,16 @@ function SubstituteModeSection(props: { bot: BotDefaultsRow; patchBot: PatchBot 
       setStatus({ text: `✗ ${tr('botDefaults.substituteTargetsInvalid')}` });
       return;
     }
-    void save({ enabled, targets, disclosure, topicGroups, topicActiveSessionTrigger });
+    void save({ enabled, targets, disclosure, chats: parseSubstituteChats(chatsText), replyMode, disableControlCard: !controlCard, topicGroups, topicActiveSessionTrigger });
   }
 
   const disclosureOptions: DropdownFieldOption<'prefix' | 'none'>[] = [
     { value: 'prefix', label: tr('botDefaults.substituteDisclosurePrefix') },
     { value: 'none', label: tr('botDefaults.substituteDisclosureNone') },
+  ];
+  const replyModeOptions: DropdownFieldOption<'thread' | 'quote'>[] = [
+    { value: 'thread', label: tr('botDefaults.substituteReplyModeThread') },
+    { value: 'quote', label: tr('botDefaults.substituteReplyModeQuote') },
   ];
 
   return (
@@ -2053,6 +2154,40 @@ function SubstituteModeSection(props: { bot: BotDefaultsRow; patchBot: PatchBot 
           />
         </div>
       </div>
+      <div className="bd-row">
+        <div className="bd-field">
+          <FieldTitle help={tr('botDefaults.substituteReplyModeHelp')}>{tr('botDefaults.substituteReplyMode')}</FieldTitle>
+          <DropdownField<'thread' | 'quote'>
+            dataInput="substituteReplyMode"
+            ariaLabel={tr('botDefaults.substituteReplyMode')}
+            value={replyMode}
+            disabled={busy}
+            options={replyModeOptions}
+            onChange={value => setReplyMode(value)}
+          />
+        </div>
+      </div>
+      <ToggleRow
+        checked={controlCard}
+        disabled={busy}
+        dataAction="toggle-substitute-control-card"
+        title={tr('botDefaults.substituteControlCard')}
+        help={tr('botDefaults.substituteControlCardHelp')}
+        onChange={setControlCard}
+      />
+      <div className="bd-row">
+        <label>
+          <FieldTitle help={tr('botDefaults.substituteChatsHelp')}>{tr('botDefaults.substituteChats')}</FieldTitle>
+          <textarea
+            data-input="substituteChats"
+            rows={3}
+            placeholder={tr('botDefaults.substituteChatsPlaceholder')}
+            value={chatsText}
+            disabled={busy}
+            onChange={event => setChatsText(event.currentTarget.value)}
+          />
+        </label>
+      </div>
       <div className="bd-row bd-substitute-targets">
         <FieldTitle help={tr('botDefaults.substituteTargetsHelp')}>{tr('botDefaults.substituteTargets')}</FieldTitle>
         <div className="bd-substitute-target-list" data-input="substituteTargets">
@@ -2070,7 +2205,7 @@ function SubstituteModeSection(props: { bot: BotDefaultsRow; patchBot: PatchBot 
                 }))}
                 onChange={idField => {
                   setTargetRows(rows => rows.map(row => row.key === target.key
-                    ? { ...row, idField, idValue: row.persisted[idField] ?? '' }
+                    ? { ...row, idField, idValue: row.persisted[idField] ?? '', resolution: undefined }
                     : row));
                 }}
               />
@@ -2084,22 +2219,45 @@ function SubstituteModeSection(props: { bot: BotDefaultsRow; patchBot: PatchBot 
                 disabled={busy}
                 onChange={event => {
                   const idValue = event.currentTarget.value;
-                  setTargetRows(rows => rows.map(row => row.key === target.key ? { ...row, idValue } : row));
+                  setTargetRows(rows => rows.map(row => row.key === target.key ? { ...row, idValue, resolution: undefined } : row));
+                }}
+                onBlur={() => {
+                  if (target.idValue.trim()) void resolveTargetRow(target.key);
                 }}
               />
-              <input
-                className="bd-substitute-target-name"
-                type="text"
-                data-input={`substituteTargetName-${target.key}`}
-                aria-label={`${tr('botDefaults.substituteTargetName')} ${index + 1}`}
-                placeholder={tr('botDefaults.substituteTargetNamePlaceholder')}
-                value={target.name}
-                disabled={busy}
-                onChange={event => {
-                  const name = event.currentTarget.value;
-                  setTargetRows(rows => rows.map(row => row.key === target.key ? { ...row, name } : row));
-                }}
-              />
+              <div className="bd-substitute-target-name">
+                {target.resolving ? (
+                  <span className="bd-substitute-target-resolving">{tr('botDefaults.substituteResolving')}</span>
+                ) : target.resolution?.ok === true && (target.name || target.resolution.avatarUrl) ? (
+                  <>
+                    {target.resolution.avatarUrl ? (
+                      <Html html={botAvatarHtml({ name: target.resolution.name, avatarUrl: target.resolution.avatarUrl, size: 'sm' })} />
+                    ) : null}
+                    <span
+                      className="bd-substitute-target-name-chip"
+                      data-chip={`substituteTargetName-${target.key}`}
+                      aria-label={`${tr('botDefaults.substituteTargetName')} ${index + 1}`}
+                    >
+                      {target.name}
+                    </span>
+                  </>
+                ) : target.resolution?.ok === false ? (
+                  <span className="bd-substitute-target-resolution-badge">{substituteReasonText(target.resolution.reason)}</span>
+                ) : (
+                  <input
+                    type="text"
+                    data-input={`substituteTargetName-${target.key}`}
+                    aria-label={`${tr('botDefaults.substituteTargetName')} ${index + 1}`}
+                    placeholder={tr('botDefaults.substituteTargetNamePlaceholder')}
+                    value={target.name}
+                    disabled={busy}
+                    onChange={event => {
+                      const name = event.currentTarget.value;
+                      setTargetRows(rows => rows.map(row => row.key === target.key ? { ...row, name } : row));
+                    }}
+                  />
+                )}
+              </div>
               <button
                 type="button"
                 className="bd-substitute-target-remove"

@@ -947,6 +947,50 @@ describe('PUT /api/bot-skills', () => {
   });
 });
 
+describe('PUT /api/bot-substitute-mode', () => {
+  it('preserves quote reply mode in the response and bots.json', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-substitute-ipc-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-substitute-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId,
+        larkAppSecret: 'secret',
+        cliId: 'codex',
+      }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+
+      const res = await fetch(`http://127.0.0.1:${handle.port}/api/bot-substitute-mode`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          enabled: true,
+          targets: [{ userId: 'u_alice', name: 'Alice' }],
+          disclosure: 'prefix',
+          replyMode: 'quote',
+        }),
+      });
+
+      expect(res.status).toBe(200);
+      expect(await res.json()).toMatchObject({
+        ok: true,
+        substituteMode: { replyMode: 'quote' },
+      });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].substituteMode).toMatchObject({
+        replyMode: 'quote',
+      });
+    } finally {
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('PUT /api/bot-agent', () => {
   it('updates cli selection and model through bots.json and live config', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-agent-ipc-'));

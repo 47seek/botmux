@@ -757,6 +757,8 @@ export interface SubstituteTarget {
   email?: string;
   /** Human-readable label for prompt disclosure. */
   name?: string;
+  /** Cached avatar URL so the dashboard can show the resolved person's picture. */
+  avatarUrl?: string;
 }
 
 export interface SubstituteModeConfig {
@@ -764,6 +766,15 @@ export interface SubstituteModeConfig {
   targets: SubstituteTarget[];
   /** prefix = disclose "I will answer on behalf of X"; none = no extra disclosure instruction. */
   disclosure?: 'prefix' | 'none';
+  /** Optional allow-list of chat IDs. When provided, substitute trigger only fires in these chats. */
+  chats?: string[];
+  /** When true, do not automatically DM the owner a control card for substitute-mode sessions. */
+  disableControlCard?: boolean;
+  /** How the bot replies to a substitute-mode trigger:
+   *  - 'thread' (default): reply in a Lark thread under the trigger message.
+   *  - 'quote': quote-reply the trigger message without creating a new topic.
+   */
+  replyMode?: 'thread' | 'quote';
   /** 话题群支持：在话题群（chat_mode=topic）里也响应替身触发。替身回合沿话题
    *  路由进该话题自己的会话（无会话则新开），与普通群「进群 chat-scope 会话」
    *  同构。缺省 true；显式 false 关闭。 */

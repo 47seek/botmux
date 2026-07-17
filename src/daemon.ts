@@ -141,7 +141,7 @@ import {
 import { triggerSessionTurn } from './core/trigger-session.js';
 import { applyQueuedCodexAppLegacyFallback, mergeQueuedCodexAppTurn } from './core/session-create.js';
 import { findOnlineDaemon, listOnlineDaemons } from './utils/daemon-discovery.js';
-import { beginReplyTargetTurn, fallbackTurnId, resolveSessionReplyTarget, syncReplyTargetState } from './core/reply-target.js';
+import { beginReplyTargetTurn, fallbackTurnId, isSubstituteTurn, resolveSessionReplyTarget, syncReplyTargetState } from './core/reply-target.js';
 import { sweepOrphanSandboxes } from './adapters/backend/sandbox.js';
 import { TmuxBackend } from './adapters/backend/tmux-backend.js';
 import { HerdrBackend } from './adapters/backend/herdr-backend.js';
@@ -2269,12 +2269,17 @@ function startMemoryDiagnostics(): ReturnType<typeof setInterval> | undefined {
  * Lark message ids start with `om_` and chat ids with `oc_`, so the two
  * address spaces never collide; the lookup just tries both.
  */
-function streamingCardDisabledFor(ds: DaemonSession): boolean {
+function streamingCardDisabledFor(ds: DaemonSession, turnId?: string): boolean {
   if (ds.streamingCardForced) return false;
   try {
     const cfg = getBot(ds.larkAppId).config;
     return cfg.disableStreamingCard === true
-      || (!!ds.chatId && !!cfg.noCardChats?.includes(ds.chatId));
+      || (!!ds.chatId && !!cfg.noCardChats?.includes(ds.chatId))
+      // Substitute (avatar-style) turns hide the streaming card per-turn: the
+      // shared chat-scope session serves substitute AND direct @bot turns, so a
+      // session-level latch would permanently kill cards for normal turns too.
+      // Callers with a turnId (turn reactions) get an exact per-turn answer.
+      || isSubstituteTurn(ds, turnId);
   } catch { return false; }
 }
 
@@ -2329,7 +2334,9 @@ export async function noteTurnReceived(
   // each get their own ✋. `finishTurnReactions` flips every pending ✋ to ✅ when
   // the worker next goes idle.
   if (ds.session.vcMeetingReceiver) return;
-  if (!streamingCardDisabledFor(ds)) return;
+  // Turn-exact card-off check: the reaction ack belongs to THIS message's turn,
+  // not to whichever turn most recently overwrote currentReplyTarget.
+  if (!streamingCardDisabledFor(ds, triggerMessageId)) return;
   if (silentTurnReactionsFor(ds)) return;
   // Only Lark messages carry reactions — doc-comment ids / chat anchors can't.
   if (!triggerMessageId.startsWith('om_')) return;
@@ -2463,6 +2470,7 @@ async function sessionReply(
       // (the resolveSessionReplyTarget × fallbackTurnId composition it relies on).
       const target = resolveSessionReplyTarget(ds, fallbackTurnId(ds, turnId));
       if (target.mode === 'thread') return replyWithHookPolicy(target.rootMessageId, content, msgType, true, opts?.uuid);
+      if (target.mode === 'quote') return replyWithHookPolicy(target.rootMessageId, content, msgType, false, opts?.uuid);
       if (ds.session.rootMessageId) {
         const mode = await getChatMode(appId, chatId, { forceRefresh: true });
         if (mode === 'topic') {
@@ -13884,6 +13892,14 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   messageQueue.ensureQueue(anchor);
   messageQueue.appendMessage(anchor, parsed);
 
+  // Control card compensates for the card-less (avatar-style) chat-scope
+  // substitute session. Topic-group substitute sessions (#475) are thread-scope
+  // and keep their normal streaming card — no compensation needed there.
+  const shouldSendSubstituteControlCard = substituteTrigger
+    && scope === 'chat'
+    && !botCfg.substituteMode?.disableControlCard
+    && !session.substituteControlCardSent;
+
   const ds: DaemonSession = {
     session,
     worker: null,
@@ -13905,6 +13921,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
     pendingAttachments: attachments.length > 0 ? attachments : undefined,
     pendingMentions: parsed.mentions,
     pendingSubstituteTrigger: substituteTrigger,
+    pendingSubstituteControlCard: shouldSendSubstituteControlCard,
     pendingSender: newTopicSender,
     ownerOpenId: senderOpenId,
     currentTurnTitle: content.substring(0, 50),
@@ -13914,7 +13931,10 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
     ds.session.workingDir = pinnedWorkingDir;
     sessionStore.updateSession(ds.session);
   }
-  beginReplyTargetTurn(ds, replyRootId, messageId);
+  const substituteReplyMode = substituteTrigger
+    ? (botCfg.substituteMode?.replyMode ?? 'thread')
+    : 'thread';
+  beginReplyTargetTurn(ds, replyRootId, messageId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute: !!substituteTrigger });
   sessionStore.updateSession(ds.session);
   activeSessions.set(sessionKey(anchor, larkAppId), ds);
 
@@ -14654,7 +14674,10 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
         rememberVcMeetingImTurnOrigin(ds.session, ctx.vcMeetingImTurnOrigin);
       }
     }
-    beginReplyTargetTurn(ds, replyRootId, parsed.messageId);
+    const substituteReplyMode = substituteTrigger
+      ? (getBot(larkAppId).config.substituteMode?.replyMode ?? 'thread')
+      : 'thread';
+    beginReplyTargetTurn(ds, replyRootId, parsed.messageId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute: !!substituteTrigger });
     if (callerOpenId && ds.session.lastCallerOpenId !== callerOpenId) {
       ds.session.lastCallerOpenId = callerOpenId;
     }
@@ -14767,6 +14790,13 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     session.scope = scope;
     sessionStore.updateSession(session);
 
+    // chat-scope only — see the handleNewTopic twin above (topic substitute
+    // sessions keep their streaming card, no control-card compensation).
+    const shouldSendSubstituteControlCard = substituteTrigger
+      && scope === 'chat'
+      && !botCfg.substituteMode?.disableControlCard
+      && !session.substituteControlCardSent;
+
     // Use the same layered oncall / inherit / default lookup as handleNewTopic
     // so stale inherited peers are ignored consistently in both spawn paths.
     const { pinnedWorkingDir, oncallEntry, inheritedFrom, pinnedFromBotDefault } = await resolvePinnedWorkingDir({
@@ -14804,6 +14834,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       pendingAttachments: attachments.length > 0 ? attachments : undefined,
       pendingMentions: parsed.mentions,
       pendingSubstituteTrigger: substituteTrigger,
+      pendingSubstituteControlCard: shouldSendSubstituteControlCard,
       pendingSender: autoCreateSender,
       ownerOpenId,
       currentTurnTitle: parsed.content.substring(0, 50),
@@ -14813,7 +14844,10 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       newDs.session.workingDir = pinnedWorkingDir;
       sessionStore.updateSession(newDs.session);
     }
-    beginReplyTargetTurn(newDs, replyRootId, parsed.messageId);
+    const substituteReplyMode = substituteTrigger
+      ? (botCfg.substituteMode?.replyMode ?? 'thread')
+      : 'thread';
+    beginReplyTargetTurn(newDs, replyRootId, parsed.messageId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute: !!substituteTrigger });
     sessionStore.updateSession(newDs.session);
     activeSessions.set(sessionKey(anchor, larkAppId), newDs);
 
