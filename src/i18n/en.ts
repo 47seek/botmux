@@ -512,7 +512,7 @@ export const messages: Record<string, string> = {
   'help.heading_collab': '🤝 Multi-bot collaboration:',
   'help.introduce': '/introduce          - Register the bots in this chat with each other by open_id for precise collaboration mentions',
   'help.relay': '/relay              - Pick a live session from another chat/topic and relay it into the current chat/topic',
-  'help.relay_create': '/relay --create [name] - Create a collaboration group and relay the current session there (mention target bots)',
+  'help.relay_create': '/relay --create [name] - Create a collaboration group and relay the current session there (mention target bots in a group; in a DM just send it — new group = you + this bot)',
   'help.heading_login': '🔐 User OAuth:',
   'help.login': '/login              - Lark user OAuth (lets you download images etc. from third-party cards)',
   'help.login_status': '/login status       - Show auth status',

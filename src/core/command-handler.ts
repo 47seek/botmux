@@ -2521,6 +2521,11 @@ export async function handleCommand(
        * the @-mentioned bots, then migrate every bot's session in this
        * thread (including the leader's) into the new chat.
        *
+       * p2p (私聊) variant: `/relay --create [群名]` with NO mentions — DMs
+       * have no member roster so @-ing a bot is impossible there. The bot
+       * itself is the sole participant and leader; the new group is user +
+       * this bot, and the DM session migrates over (solo relay, no peers).
+       *
        * Two-path command:
        *   • `--create` (PR2) — implemented below; creates a new chat.
        *   • no flag (PR3)    — picker card listing user's relayable sessions
@@ -2673,32 +2678,41 @@ export async function handleCommand(
           break;
         }
 
+        // ── p2p (私聊) solo relay: no mention gate, no leader election ──────
+        // 飞书私聊里 @ 不到任何机器人（DM 没有成员列表），mention 门与 leader
+        // 选举在这里没有意义 —— 本 bot 就是唯一参与者兼 leader，新群 = 用户 +
+        // 本 bot，无 peer 协调（peerAppIds 自然为空）。群聊路径语义不变。
+        // chatType 取自 ds（会话创建时从 Lark 事件记录，权威、不漂移）。
+        const sourceIsP2p = ds.chatType === 'p2p';
+
         // ── Mention parsing & leader election (mirror of /group) ───────────
         const mentions = message.mentions ?? [];
         const knownBotNames = globalKnownBotNames();
-        if (knownBotNames.size === 0 && mentions.some(m => !!m.name)) {
-          logger.warn(`[${logTag}] /relay --create: global bot registry empty; cannot elect a creator`);
-          await sessionReply(rootId, t('cmd.relay.resolve_failed', undefined, loc));
-          break;
-        }
-        const botMentions = mentions.filter(m => m.name && knownBotNames.has(m.name.toLowerCase()));
-        if (botMentions.length === 0) {
-          await sessionReply(rootId, t('cmd.relay.no_mentions', undefined, loc));
-          break;
-        }
+        const botMentions = sourceIsP2p ? [] : mentions.filter(m => m.name && knownBotNames.has(m.name.toLowerCase()));
+        if (!sourceIsP2p) {
+          if (knownBotNames.size === 0 && mentions.some(m => !!m.name)) {
+            logger.warn(`[${logTag}] /relay --create: global bot registry empty; cannot elect a creator`);
+            await sessionReply(rootId, t('cmd.relay.resolve_failed', undefined, loc));
+            break;
+          }
+          if (botMentions.length === 0) {
+            await sessionReply(rootId, t('cmd.relay.no_mentions', undefined, loc));
+            break;
+          }
 
-        // Am I `mentions[0]`?
-        const firstBot = botMentions[0];
-        const myOpenId = getBotOpenId(creatorAppId);
-        const myName = getBot(creatorAppId).botName?.toLowerCase();
-        const myNameAmbiguous = !!myName
-          && botMentions.filter(m => m.name?.toLowerCase() === myName).length > 1;
-        const iAmFirstBot =
-          (!!myOpenId && firstBot.openId === myOpenId) ||
-          (!myOpenId && !!myName && !myNameAmbiguous && firstBot.name?.toLowerCase() === myName);
-        if (!iAmFirstBot) {
-          logger.info(`[${logTag}] /relay --create: not the first @-mentioned bot, staying silent`);
-          break;
+          // Am I `mentions[0]`?
+          const firstBot = botMentions[0];
+          const myOpenId = getBotOpenId(creatorAppId);
+          const myName = getBot(creatorAppId).botName?.toLowerCase();
+          const myNameAmbiguous = !!myName
+            && botMentions.filter(m => m.name?.toLowerCase() === myName).length > 1;
+          const iAmFirstBot =
+            (!!myOpenId && firstBot.openId === myOpenId) ||
+            (!myOpenId && !!myName && !myNameAmbiguous && firstBot.name?.toLowerCase() === myName);
+          if (!iAmFirstBot) {
+            logger.info(`[${logTag}] /relay --create: not the first @-mentioned bot, staying silent`);
+            break;
+          }
         }
 
         // Owner-only — only the source session owner may relay this session.
@@ -2708,33 +2722,39 @@ export async function handleCommand(
         }
 
         // ── Resolve @-bots to larkAppIds via the source chat's bot roster ──
+        // p2p: 跳过成员表解析（DM 没有 bot roster，listChatBotMembers 会失败），
+        // 参与者就是本 bot 自己；名字兜底走 botDisplayName（nameOf）。
         const sourceChatId = ds.chatId;
-        let members: Awaited<ReturnType<typeof listChatBotMembers>> = [];
-        try {
-          members = await listChatBotMembers(creatorAppId, sourceChatId);
-        } catch (e: any) {
-          logger.warn(`[${logTag}] /relay --create: failed to list source chat members: ${e?.message ?? e}`);
-        }
-        const memberByOpenId = new Map(members.map(m => [m.openId, m]));
         const appIdToName = new Map<string, string>();
-        for (const m of members) {
-          if (m.larkAppId && m.displayName) appIdToName.set(m.larkAppId, m.displayName);
-        }
         const mentionedBotAppIds: string[] = [];
-        const seenApp = new Set<string>();
-        let unresolved: string | undefined;
-        for (const bm of botMentions) {
-          const mem = bm.openId ? memberByOpenId.get(bm.openId) : undefined;
-          if (!mem || !mem.larkAppId) { unresolved = bm.name; break; }
-          if (!seenApp.has(mem.larkAppId)) {
-            seenApp.add(mem.larkAppId);
-            mentionedBotAppIds.push(mem.larkAppId);
+        if (sourceIsP2p) {
+          mentionedBotAppIds.push(creatorAppId);
+        } else {
+          let members: Awaited<ReturnType<typeof listChatBotMembers>> = [];
+          try {
+            members = await listChatBotMembers(creatorAppId, sourceChatId);
+          } catch (e: any) {
+            logger.warn(`[${logTag}] /relay --create: failed to list source chat members: ${e?.message ?? e}`);
           }
-        }
-        if (unresolved) {
-          logger.warn(`[${logTag}] /relay --create: unresolved bot "${unresolved}"`);
-          await sessionReply(rootId, t('cmd.relay.resolve_failed', undefined, loc));
-          break;
+          const memberByOpenId = new Map(members.map(m => [m.openId, m]));
+          for (const m of members) {
+            if (m.larkAppId && m.displayName) appIdToName.set(m.larkAppId, m.displayName);
+          }
+          const seenApp = new Set<string>();
+          let unresolved: string | undefined;
+          for (const bm of botMentions) {
+            const mem = bm.openId ? memberByOpenId.get(bm.openId) : undefined;
+            if (!mem || !mem.larkAppId) { unresolved = bm.name; break; }
+            if (!seenApp.has(mem.larkAppId)) {
+              seenApp.add(mem.larkAppId);
+              mentionedBotAppIds.push(mem.larkAppId);
+            }
+          }
+          if (unresolved) {
+            logger.warn(`[${logTag}] /relay --create: unresolved bot "${unresolved}"`);
+            await sessionReply(rootId, t('cmd.relay.resolve_failed', undefined, loc));
+            break;
+          }
         }
 
         // ── Group name extraction (mirror of /group) ───────────────────────
@@ -2798,10 +2818,14 @@ export async function handleCommand(
 
         // Resolve friendly source-chat label for the M1 body — falls back to
         // raw chatId if Lark can't return a name. Mirrors picker-path
-        // (card-handler.ts:341) so the message reads the same in both UX
-        // entry points.
+        // (card-handler.ts relay_confirm) so the message reads the same in
+        // both UX entry points; p2p source has no chat name (chat.get often
+        // fails/returns empty for DMs) — use the locale-aware 单聊 label
+        // instead of leaking a raw oc_ id into the M1.
         const { getChatName } = await import('../im/lark/client.js');
-        const sourceLabel = (await getChatName(creatorAppId, sourceChatId).catch(() => null)) ?? sourceChatId;
+        const sourceLabel = sourceIsP2p
+          ? t('card.relay.type_p2p', undefined, loc)
+          : (await getChatName(creatorAppId, sourceChatId).catch(() => null)) ?? sourceChatId;
 
         // ── Step 1: leader transfers its own session (if any) ───────────────
         // Empty-leader handling: daemon auto-creates a placeholder ds for any

@@ -515,7 +515,7 @@ export const messages: Record<string, string> = {
   'help.heading_collab': '🤝 多机器人协作：',
   'help.introduce': '/introduce          - 让本群机器人互相登记 open_id，用于协作时精确 @ 对方',
   'help.relay': '/relay              - 选择一个其他群/话题里的活跃会话，接力到当前群/话题',
-  'help.relay_create': '/relay --create [群名]  - 新建协作群，并把当前会话接力过去（需 @ 目标 bot）',
+  'help.relay_create': '/relay --create [群名]  - 新建协作群，并把当前会话接力过去（群里需 @ 目标 bot；私聊直接发即可，新群 = 你 + 本机器人）',
   'help.heading_login': '🔐 用户授权：',
   'help.login': '/login              - 飞书用户授权（可下载第三方卡片图片等）',
   'help.login_status': '/login status       - 查看授权状态',

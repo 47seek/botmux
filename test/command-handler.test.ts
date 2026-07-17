@@ -3374,6 +3374,62 @@ describe('handleCommand', () => {
       expect(mockedCreate).not.toHaveBeenCalled();
     });
 
+    // ── p2p (私聊) solo --create ─────────────────────────────────────────────
+    // DMs have no member roster, so @-ing a bot is impossible there — the
+    // mention gate / leader election / roster resolve are all bypassed and the
+    // bot itself is the sole participant. New group = user + this bot; the DM
+    // session migrates over with no peer coordination.
+    it('p2p --create: solo relay without mentions — group is user + this bot, session migrates', async () => {
+      const ds = makeDaemonSession({
+        session: makeSession({ ownerOpenId: 'ou_sender', chatType: 'p2p' }),
+        chatType: 'p2p',
+      });
+      const deps = makeDeps(ds);
+
+      await handleCommand('/relay', ROOT_ID, makeLarkMessage('/relay --create 搬去群里'), deps, LARK_APP_ID);
+
+      // Group created with ONLY this bot; ownership transferred to the sender.
+      expect(mockedCreate).toHaveBeenCalledTimes(1);
+      const opts = mockedCreate.mock.calls[0][0];
+      expect(opts.larkAppIds).toEqual([LARK_APP_ID]);
+      expect(opts.userOpenIds).toEqual(['ou_sender']);
+      expect(opts.transferOwnerTo).toBe('ou_sender');
+
+      // No roster lookup for a DM — listChatBotMembers fails on p2p chats.
+      expect(mockedListBots).not.toHaveBeenCalled();
+
+      // The DM session was transferred into the new chat (chat-scope group).
+      const wp = await import('../src/core/worker-pool.js');
+      expect(wp.transferSession).toHaveBeenCalledWith('sess-001', 'oc_new_group', 'oc_new_group', 'group', 'chat');
+
+      // M1 lands in the new group and labels the source as 单聊 instead of
+      // leaking the raw DM chatId.
+      expect(mockedSend).toHaveBeenCalled();
+      const [, m1ChatId, m1Text] = mockedSend.mock.calls[0];
+      expect(m1ChatId).toBe('oc_new_group');
+      expect(m1Text).toContain('单聊');
+      expect(m1Text).not.toContain(CHAT_ID);
+
+      // Source-side report carries the new group name.
+      const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      expect(reply).toContain('搬去群里');
+      expect(reply).toContain('Claude');
+    });
+
+    it('p2p --create: owner-only check still enforced', async () => {
+      const ds = makeDaemonSession({
+        session: makeSession({ ownerOpenId: 'ou_other_user', chatType: 'p2p' }),
+        chatType: 'p2p',
+      });
+      const deps = makeDeps(ds);
+
+      await handleCommand('/relay', ROOT_ID, makeLarkMessage('/relay --create G'), deps, LARK_APP_ID);
+
+      const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      expect(reply).toContain('发起人');
+      expect(mockedCreate).not.toHaveBeenCalled();
+    });
+
     it('rejects --create when sender is not the source session owner', async () => {
       const ds = makeDaemonSession({ session: makeSession({ ownerOpenId: 'ou_other_user' }) });
       const deps = makeDeps(ds);
