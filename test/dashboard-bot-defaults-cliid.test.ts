@@ -71,7 +71,7 @@ describe('bot onboarding Agent availability warning', () => {
 });
 
 describe('riff CLI switch persistence (PR #467 P1)', () => {
-  it('save-riff persists the CLI selection via PUT /agent before PUT /riff', async () => {
+  it('save-riff saves the riff config first, then persists the CLI selection (PUT /riff → /agent)', async () => {
     const requests: Array<{ method: string; url: string; body: any }> = [];
     (globalThis as any).fetch = async (url: string, init?: any) => {
       requests.push({ method: init?.method ?? 'GET', url: String(url), body: init?.body ? JSON.parse(init.body) : undefined });
