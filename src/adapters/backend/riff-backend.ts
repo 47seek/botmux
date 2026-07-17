@@ -42,7 +42,7 @@ const DEFAULT_RIFF_SYSTEM_PROMPT = [
  * Mandatory setup commands run in the riff sandbox to ensure `botmux` is
  * available. These are ALWAYS sent to the riff API via `config.setupCommands`
  * (not via prompt injection) so the install is reliable and not dependent on
- * the agent parsing a prompt. The riff sandbox has Node.js (it runs aiden),
+ * the agent parsing a prompt. The riff sandbox has Node.js (it runs codex),
  * so npm install works. Any user-configured setupCommands are appended AFTER
  * these mandatory commands.
  */

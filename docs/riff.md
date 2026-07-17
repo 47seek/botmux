@@ -1,6 +1,6 @@
 # Riff 机器人接入指南
 
-> Riff 后端：消息发给飞书机器人 → riff 云端沙箱运行 agent（aiden / codex 等）→ 结果自动回到飞书。agent 跑在远端沙箱里，本机无需安装任何 CLI；botmux 自动把仓库、环境变量、回投凭证带进沙箱。要求 botmux ≥ 2.109.0。
+> Riff 后端：消息发给飞书机器人 → riff 云端沙箱运行 codex agent → 结果自动回到飞书。agent 跑在远端沙箱里，本机无需安装任何 CLI；botmux 自动把仓库、环境变量、回投凭证带进沙箱。要求 botmux ≥ 2.109.0。
 
 ## 快速接入（约 5 分钟）
 

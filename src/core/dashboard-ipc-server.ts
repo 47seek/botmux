@@ -2275,7 +2275,7 @@ ipcRoute('PUT', '/api/bot-env', async (req, res) => {
 });
 
 // Per-bot riff 后端配置。Body `{ riff: string }`（原始 JSON 文本，如
-// `{"baseUrl":"https://...","agent":"aiden","model":"...","injectStatusLines":true}`）：
+// `{"baseUrl":"https://...","model":"gpt-5.5","reasoningEffort":"high"}`）：
 // 空白 → 清除；否则按 json kind 解析后落盘。走 applyConfigField（与 /botconfig
 // 同一写盘 + 内存热更新路径），next-session 生效。仅 backendType=riff 时使用。
 /** riff 配置里 dashboard 可编辑的字段——PUT /bot-riff 只覆盖这些，其余保留。 */
