@@ -2,7 +2,7 @@
  * Tests for TmuxBackend's shell-wrapped CLI launch.
  *
  * The design (see tmux-backend.ts spawn() else branch):
- *   tmux new-session ... -- <shell> <shellFlags> -c <SCRIPT> _ <cwd> KEY=VAL... bin args...
+ *   tmux new-session ... -- /usr/bin/env DISABLE_AUTO_UPDATE=true GIT_TERMINAL_PROMPT=0 <shell> <shellFlags> -c <SCRIPT> _ <cwd> KEY=VAL... bin args...
  *
  * Goal: give the CLI an environment that matches "user opens a terminal and
  * runs the CLI by hand" — PATH / NVM / PNPM / mise / etc. come from the
@@ -16,6 +16,11 @@
  *
  * SCRIPT also `cd`s back to the requested cwd before exec, so a stray `cd`
  * in the user's rcfile doesn't drag the CLI's working directory away.
+ *
+ * Non-interactive startup: shellLaunchArgv() prepends `env DISABLE_AUTO_UPDATE=true
+ * GIT_TERMINAL_PROMPT=0` to the shell command so these vars are visible to the
+ * rcfile during sourcing — preventing oh-my-zsh's update prompt and git
+ * credential dialogs from blocking the shell startup before the CLI launches.
  */
 import { describe, it, expect, afterEach } from 'vitest';
 import { existsSync, mkdtempSync, writeFileSync, chmodSync, rmSync, readFileSync } from 'node:fs';
@@ -26,9 +31,11 @@ import {
   buildBotmuxEnvAssignments,
   buildDebugKeepShellScript,
   DIAGNOSTIC_SHELL_SCRIPT,
+  NON_INTERACTIVE_SHELL_ENV,
   resolveUserShell,
   resolveShellOverride,
   SHELL_WRAPPER_SCRIPT,
+  shellLaunchArgv,
 } from '../src/adapters/backend/tmux-backend.js';
 
 describe('buildBotmuxEnvAssignments()', () => {
@@ -233,6 +240,98 @@ describe('buildBotmuxEnvAssignments()', () => {
     expect(buildBotmuxEnvAssignments({ BOTMUX: '1', SESSION_DATA_DIR: '/d' }))
       .toEqual(['BOTMUX=1', 'SESSION_DATA_DIR=/d']);
   });
+});
+
+describe('NON_INTERACTIVE_SHELL_ENV', () => {
+  it('includes DISABLE_UPDATE_PROMPT=true (oh-my-zsh update prompt)', () => {
+    // DISABLE_UPDATE_PROMPT=true (not DISABLE_AUTO_UPDATE=true): oh-my-zsh
+    // still auto-updates (update_mode=auto) but skips the interactive "[Y/n]"
+    // prompt, so the user's own terminal keeps auto-upgrading while botmux
+    // shells don't get stuck waiting for a keypress.
+    expect(NON_INTERACTIVE_SHELL_ENV).toContain('DISABLE_UPDATE_PROMPT=true');
+  });
+
+  it('does NOT include DISABLE_AUTO_UPDATE (we want updates to still happen)', () => {
+    expect(NON_INTERACTIVE_SHELL_ENV).not.toContain('DISABLE_AUTO_UPDATE=true');
+  });
+
+  it('includes GIT_TERMINAL_PROMPT=0 (git credential dialogs)', () => {
+    expect(NON_INTERACTIVE_SHELL_ENV).toContain('GIT_TERMINAL_PROMPT=0');
+  });
+});
+
+describe('shellLaunchArgv()', () => {
+  it('prepends env(1) + non-interactive vars before shell + flags', () => {
+    const argv = shellLaunchArgv('/bin/zsh', ['-l', '-i']);
+    expect(argv).toEqual([
+      '/usr/bin/env',
+      'DISABLE_UPDATE_PROMPT=true',
+      'GIT_TERMINAL_PROMPT=0',
+      '/bin/zsh',
+      '-l',
+      '-i',
+    ]);
+  });
+
+  it('works with no flags (sh-style)', () => {
+    const argv = shellLaunchArgv('/bin/sh', []);
+    expect(argv).toEqual([
+      '/usr/bin/env',
+      'DISABLE_UPDATE_PROMPT=true',
+      'GIT_TERMINAL_PROMPT=0',
+      '/bin/sh',
+    ]);
+  });
+
+  it('works with a single flag (bash-style)', () => {
+    const argv = shellLaunchArgv('/bin/bash', ['-i']);
+    expect(argv).toEqual([
+      '/usr/bin/env',
+      'DISABLE_UPDATE_PROMPT=true',
+      'GIT_TERMINAL_PROMPT=0',
+      '/bin/bash',
+      '-i',
+    ]);
+  });
+});
+
+describe('shellLaunchArgv end-to-end (env vars visible to rcfile)', () => {
+  const hasEnvBin = existsSync('/usr/bin/env');
+  const hasBash = existsSync('/bin/bash');
+
+  it.skipIf(!hasEnvBin || !hasBash)(
+    'DISABLE_UPDATE_PROMPT is visible to the rcfile during sourcing (the oh-my-zsh fix)',
+    () => {
+      // Plant a fake .bashrc that checks $DISABLE_UPDATE_PROMPT and prints it.
+      // This emulates oh-my-zsh's check_for_upgrade.sh reading the var:
+      //   [[ "$DISABLE_UPDATE_PROMPT" != true ]] || update_mode=auto
+      // When set, update_mode=auto → no "[Y/n]" prompt, update runs silently.
+      const dir = mkdtempSync(join(tmpdir(), 'bmx-env-rcfile-'));
+      try {
+        writeFileSync(join(dir, '.bashrc'),
+          `if [ "$DISABLE_UPDATE_PROMPT" = "true" ]; then\n` +
+          `  echo AUTO_UPDATE_NO_PROMPT\n` +
+          `else\n` +
+          `  echo WOULD_PROMPT_FOR_UPDATE\n` +
+          `fi\n`,
+        );
+        // Launch via shellLaunchArgv — the env(1) prefix must set the var
+        // BEFORE bash sources .bashrc (which it does because -i sources rcfile).
+        const argv = shellLaunchArgv('/bin/bash', ['-i']);
+        const result = spawnSync(
+          argv[0],
+          [...argv.slice(1), '-c', 'echo DONE'],
+          { encoding: 'utf-8', env: { HOME: dir, PATH: '/usr/bin:/bin' } },
+        );
+        expect(result.status).toBe(0);
+        // The rcfile must see DISABLE_UPDATE_PROMPT=true → auto-update, no prompt.
+        expect(result.stdout).toContain('AUTO_UPDATE_NO_PROMPT');
+        expect(result.stdout).not.toContain('WOULD_PROMPT_FOR_UPDATE');
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    },
+  );
 });
 
 describe('resolveUserShell()', () => {

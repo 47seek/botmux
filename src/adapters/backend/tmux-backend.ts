@@ -327,7 +327,7 @@ export class TmuxBackend implements SessionBackend {
         '-x', String(opts.cols),
         '-y', String(opts.rows),
         '--',
-        shellSpec.shell, ...shellSpec.flags, '-c', script, '_',
+        ...shellLaunchArgv(shellSpec.shell, shellSpec.flags), '-c', script, '_',
         opts.cwd,
         ...envAssignments,
         bin, ...args,
@@ -588,6 +588,48 @@ export class TmuxBackend implements SessionBackend {
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 /**
+ * Env vars that must be set BEFORE the user's shell rcfile loads, so interactive
+ * prompts during rcfile sourcing don't block the shell startup and prevent the
+ * CLI from launching. These are injected as `env KEY=VAL shell -i -c '...'` so
+ * the rcfile sees them while sourcing (oh-my-zsh's check_for_upgrade.sh reads
+ * $DISABLE_UPDATE_PROMPT before showing its "Would you like to update Oh My Zsh?
+ * [Y/n]" prompt; git credential dialogs read $GIT_TERMINAL_PROMPT).
+ *
+ * DISABLE_UPDATE_PROMPT=true (not DISABLE_AUTO_UPDATE=true): oh-my-zsh still
+ * performs the update automatically (update_mode=auto) but skips the interactive
+ * "[Y/n]" prompt — so the user's own terminal keeps auto-upgrading exactly as
+ * before, while botmux-launched shells don't get stuck waiting for a keypress.
+ *
+ * Why here and not in buildBotmuxEnvAssignments: those are injected via
+ * `exec /usr/bin/env "$@"` which runs AFTER rcfile load — too late for an
+ * oh-my-zsh update prompt that already blocked the shell. These must be in the
+ * shell process's own environment when it starts, so they're visible to the
+ * rcfile. Applied via `env(1)` prefix in shellLaunchArgv() so they work even
+ * when the tmux server was already started by a different client.
+ */
+export const NON_INTERACTIVE_SHELL_ENV = [
+  'DISABLE_UPDATE_PROMPT=true',
+  'GIT_TERMINAL_PROMPT=0',
+] as const;
+
+/**
+ * Build the argv prefix that launches the user's shell with non-interactive
+ * env vars set BEFORE rcfile load. Returns:
+ *   ['/usr/bin/env', 'DISABLE_UPDATE_PROMPT=true', 'GIT_TERMINAL_PROMPT=0', shell, ...flags]
+ *
+ * Backends splat this before `-c <SCRIPT> _ <cwd> KEY=VAL... bin args...`:
+ *   tmux new-session ... -- /usr/bin/env DISABLE_UPDATE_PROMPT=true GIT_TERMINAL_PROMPT=0 <shell> <flags> -c <SCRIPT> _ ...
+ *
+ * The env(1) prefix sets the vars in the shell process's own environment so
+ * the rcfile sees them during sourcing; they are NOT in the tmux server global
+ * env (so they don't leak to the user's own interactive tmux sessions) and
+ * they're NOT re-injected by the wrapper's `exec /usr/bin/env "$@"` (that only
+ * re-applies the per-bot KEY=VAL pairs).
+ */
+export function shellLaunchArgv(shell: string, flags: string[]): string[] {
+  return ['/usr/bin/env', ...NON_INTERACTIVE_SHELL_ENV, shell, ...flags];
+}
+
 /**
  * Build the `KEY=VAL` argv slice passed to `/usr/bin/env`. Only forwards the
  * centralized BOTMUX_INJECTED_ENV_KEYS allowlist and only when the value is
