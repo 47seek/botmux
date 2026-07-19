@@ -135,23 +135,25 @@ function nonEmptyString(value: unknown): string {
   return typeof value === 'string' ? value.trim() : '';
 }
 
+function sessionTopicKind(s: any): SessionTopicKind {
+  const chatId = nonEmptyString(s?.chatId);
+  const rootMessageId = nonEmptyString(s?.rootMessageId);
+  if (s?.scope === 'chat') return chatId ? 'chat' : 'session';
+  return chatId && rootMessageId ? 'thread' : 'session';
+}
+
 /** Stable location key for the current schema. Keep it separate from any
  * future `collaborationId`: location and logical task identity are different
  * dimensions and must not silently alias each other. */
 export function sessionTopicKey(s: any): string {
   const chatId = nonEmptyString(s?.chatId);
   const rootMessageId = nonEmptyString(s?.rootMessageId);
-  if (s?.scope !== 'chat' && rootMessageId) {
+  const kind = sessionTopicKind(s);
+  if (kind === 'thread') {
     return `thread:${encodeURIComponent(chatId)}:${encodeURIComponent(rootMessageId)}`;
   }
-  if (chatId) return `chat:${encodeURIComponent(chatId)}`;
+  if (kind === 'chat') return `chat:${encodeURIComponent(chatId)}`;
   return `session:${encodeURIComponent(nonEmptyString(s?.sessionId) || 'unknown')}`;
-}
-
-function sessionTopicKind(s: any): SessionTopicKind {
-  if (s?.scope !== 'chat' && nonEmptyString(s?.rootMessageId)) return 'thread';
-  if (nonEmptyString(s?.chatId)) return 'chat';
-  return 'session';
 }
 
 function topicTitle(rows: any[], fallback: string): string {

@@ -145,6 +145,23 @@ describe('dashboard sessions filters', () => {
     expect(groups[0].rootMessageId).toBeUndefined();
   });
 
+  it('keeps thread sessions with incomplete topic anchors separate', () => {
+    const first = {
+      sessionId: 'a', chatId: 'oc_chat', rootMessageId: '', scope: 'thread',
+      larkAppId: 'app_a', status: 'idle',
+    };
+    const second = {
+      sessionId: 'b', chatId: 'oc_chat', scope: 'thread',
+      larkAppId: 'app_b', status: 'idle',
+    };
+    const groups = groupSessionsByTopic([first, second]);
+
+    expect(sessionTopicKey(first)).not.toBe(sessionTopicKey(second));
+    expect(groups).toHaveLength(2);
+    expect(groups.every(group => group.kind === 'session')).toBe(true);
+    expect(groups.every(group => !group.multiBot)).toBe(true);
+  });
+
   it('does not infer multiple Bots from sessions whose Bot identity is missing', () => {
     const groups = groupSessionsByTopic([
       { sessionId: 'a', chatId: 'oc_chat', rootMessageId: 'om_topic', scope: 'thread', status: 'idle' },
@@ -185,6 +202,28 @@ describe('dashboard sessions filters', () => {
     expect(html).toContain('多 Bot 协作');
     expect(html).toContain('1 个会话最近由 Bot 唤醒（推断）');
     expect((html.match(/<article class="session-card/g) ?? []).length).toBe(2);
+  });
+
+  it('labels an incomplete topic anchor as a single session', () => {
+    const html = renderToStaticMarkup(createElement(TopicGroupsView, {
+      rows: [{
+        sessionId: 'orphan', chatId: 'oc_coding', rootMessageId: '', scope: 'thread',
+        larkAppId: 'app_codex', botName: 'Nil-Codex', cliId: 'codex', status: 'idle',
+        lastMessageAt: 100,
+      }],
+      selected: new Set<string>(),
+      hidden: false,
+      onToggleSelect: () => {},
+      onOpen: () => {},
+      onHistory: () => {},
+      onLocate: async () => true,
+      onRestart: () => {},
+      onLock: () => {},
+      onClose: () => {},
+    }));
+
+    expect(html).toContain('>单会话</code>');
+    expect(html).not.toContain('整群会话');
   });
 
   it('keeps full topic relation metadata when current filters hide sibling sessions', () => {

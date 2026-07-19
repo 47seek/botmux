@@ -1081,7 +1081,8 @@ type TopicGroupsViewProps = {
 function topicGroupTitle(group: SessionTopicGroup<SessionRow>): string {
   const title = stripMentionPrefix(group.title).trim();
   if (title) return title;
-  return group.kind === 'thread' ? t('sessions.topic.untitled') : t('sessions.topic.wholeChat');
+  if (group.kind === 'thread') return t('sessions.topic.untitled');
+  return group.kind === 'chat' ? t('sessions.topic.wholeChat') : t('sessions.topic.singleSession');
 }
 
 export function TopicGroupsView(props: TopicGroupsViewProps): JSX.Element {
@@ -1115,7 +1116,11 @@ export function TopicGroupsView(props: TopicGroupsViewProps): JSX.Element {
               <div className="session-topic-heading">
                 <span className="session-topic-location">{location}</span>
                 <h2 title={relation.title}>{title}</h2>
-                <code title={anchor}>{relation.kind === 'thread' ? anchor : t('sessions.topic.wholeChat')}</code>
+                <code title={anchor}>{relation.kind === 'thread'
+                  ? anchor
+                  : relation.kind === 'chat'
+                    ? t('sessions.topic.wholeChat')
+                    : t('sessions.topic.singleSession')}</code>
               </div>
               <div className="session-topic-summary" aria-label={t('sessions.topic.summary')}>
                 {relation.multiBot ? <span className="topic-chip collaboration">{t('sessions.topic.collaboration')}</span> : null}
