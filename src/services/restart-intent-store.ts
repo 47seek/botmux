@@ -15,11 +15,11 @@ import { join } from 'node:path';
 import { config } from '../config.js';
 import { readProcessStartIdentity } from '../core/session-marker.js';
 
-export type RestartKind = 'manual' | 'update';
+export type RestartKind = 'manual' | 'update' | 'rollback';
 
 export interface RestartIntent {
   kind: RestartKind;
-  /** Present for kind==='update': the changelog/version delta to report. */
+  /** Present for an update or rollback: the version delta to report. */
   oldVersion?: string;
   newVersion?: string;
   /** ISO 8601 timestamp the breadcrumb was written. */
@@ -45,6 +45,10 @@ export function writeRestartIntentTo(dir: string, intent: RestartIntent): void {
   const tmp = `${path}.${process.pid}.tmp`;
   writeFileSync(tmp, JSON.stringify(intent, null, 2) + '\n');
   renameSync(tmp, path);
+}
+
+export function clearRestartIntentTo(dir: string): void {
+  try { rmSync(restartIntentPathIn(dir)); } catch { /* absent / best-effort */ }
 }
 
 function readRaw(dir: string): RestartIntent | null {
@@ -170,6 +174,10 @@ export function writeManualIntentIfAbsentTo(dir: string, nowMs: number, atIso: s
 
 export function writeRestartIntent(intent: RestartIntent): void {
   writeRestartIntentTo(config.session.dataDir, intent);
+}
+
+export function clearRestartIntent(): void {
+  clearRestartIntentTo(config.session.dataDir);
 }
 
 export function consumeRestartIntent(nowMs: number = Date.now()): RestartIntent | null {

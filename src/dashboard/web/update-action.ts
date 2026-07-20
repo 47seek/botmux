@@ -23,13 +23,20 @@ function responseError(response: Response, body: Record<string, unknown>): Error
   return new Error(typeof detail === 'string' ? detail : `HTTP ${response.status}`);
 }
 
-/** Install the latest botmux package, then restart to apply or reconcile it. */
+/** Install the latest, or atomically roll back to an allow-listed older version. */
 export async function updateAndRestartBotmux(
   fetchImpl: FetchLike,
   onPhase: (phase: BotmuxUpdatePhase) => void = () => {},
+  targetVersion?: string,
 ): Promise<BotmuxUpdateResult> {
   onPhase('updating');
-  const updateResponse = await fetchImpl('/api/update/run', { method: 'POST' });
+  const updateResponse = await fetchImpl(targetVersion ? '/api/update/rollback' : '/api/update/run', targetVersion
+    ? {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ version: targetVersion }),
+      }
+    : { method: 'POST' });
   const update = await responseBody(updateResponse);
   if (!updateResponse.ok || update.ok === false) throw responseError(updateResponse, update);
   if (
@@ -40,6 +47,9 @@ export async function updateAndRestartBotmux(
   ) {
     throw new Error('Invalid update response');
   }
+  if (targetVersion && (update.newVersion !== targetVersion || update.changed !== true)) {
+    throw new Error('Invalid rollback response');
+  }
 
   const result: BotmuxUpdateResult = {
     oldVersion: update.oldVersion,
@@ -49,6 +59,10 @@ export async function updateAndRestartBotmux(
   };
 
   onPhase('restarting');
+  // The rollback endpoint holds the install lock through restart handoff, so
+  // there is deliberately no client-side /restart gap for maintenance to race.
+  if (targetVersion) return { ...result, restarted: true };
+
   const restartResponse = await fetchImpl('/api/update/restart', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },

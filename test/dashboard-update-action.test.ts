@@ -49,6 +49,42 @@ describe('dashboard update and restart action', () => {
     expect(fetchImpl).toHaveBeenCalledTimes(2);
   });
 
+  it('installs an allow-listed rollback version before restarting', async () => {
+    const fetchImpl = vi.fn().mockResolvedValueOnce(json(202, {
+      ok: true,
+      oldVersion: '3.1.0',
+      newVersion: '3.0.0',
+      changed: true,
+    }));
+    const phases: string[] = [];
+
+    await expect(updateAndRestartBotmux(fetchImpl, phase => phases.push(phase), '3.0.0')).resolves.toMatchObject({
+      oldVersion: '3.1.0',
+      newVersion: '3.0.0',
+      restarted: true,
+    });
+    expect(phases).toEqual(['updating', 'restarting']);
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(fetchImpl).toHaveBeenCalledWith('/api/update/rollback', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ version: '3.0.0' }),
+    });
+  });
+
+  it('rejects a rollback response that did not install the requested version', async () => {
+    const fetchImpl = vi.fn().mockResolvedValueOnce(json(202, {
+      ok: true,
+      oldVersion: '3.1.0',
+      newVersion: '3.1.0',
+      changed: false,
+    }));
+
+    await expect(updateAndRestartBotmux(fetchImpl, undefined, '3.0.0'))
+      .rejects.toThrow('Invalid rollback response');
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
   it('never restarts after an install failure', async () => {
     const fetchImpl = vi.fn().mockResolvedValue(json(500, {
       ok: false,

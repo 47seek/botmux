@@ -3,6 +3,7 @@ import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
+  clearRestartIntentTo,
   writeRestartIntentTo,
   consumeRestartIntentTo,
   bindRestartLeaseTo,
@@ -26,6 +27,22 @@ describe('restart-intent store', () => {
     const got = consumeRestartIntentTo(dir, T0 + 5_000);
     expect(got).toMatchObject({ kind: 'update', oldVersion: '2.64.0', newVersion: '2.65.0' });
     expect(existsSync(restartIntentPathIn(dir))).toBe(false);
+  });
+
+  it('round-trips a rollback intent with its version delta', () => {
+    writeRestartIntentTo(dir, { kind: 'rollback', oldVersion: '3.1.0', newVersion: '3.0.0', at: iso(T0) });
+    expect(consumeRestartIntentTo(dir, T0 + 5_000)).toMatchObject({
+      kind: 'rollback',
+      oldVersion: '3.1.0',
+      newVersion: '3.0.0',
+    });
+  });
+
+  it('clears a rollback intent when restart launch fails', () => {
+    writeRestartIntentTo(dir, { kind: 'rollback', oldVersion: '3.1.0', newVersion: '3.0.0', at: iso(T0) });
+    clearRestartIntentTo(dir);
+    expect(existsSync(restartIntentPathIn(dir))).toBe(false);
+    expect(() => clearRestartIntentTo(dir)).not.toThrow();
   });
 
   it('consume returns null and deletes a stale intent (aborted restart left it behind)', () => {
