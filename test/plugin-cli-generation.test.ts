@@ -7,8 +7,10 @@ import { installLocalPlugin } from '../src/core/plugins/install.js';
 import { prepareCliPluginGeneration } from '../src/core/plugins/cli-generation.js';
 import {
   readSessionMcpRuntimeManifest,
+  sessionMcpRuntimeHostOnlyPaths,
   sessionMcpRuntimeManifestPath,
 } from '../src/core/plugins/mcp/session-runtime.js';
+import { pluginMcpPrivatePath } from '../src/core/plugins/paths.js';
 import { readSessionPluginManifest } from '../src/core/plugins/session-manifest.js';
 import { readSessionSkillManifest } from '../src/core/skills/manifest-store.js';
 
@@ -81,13 +83,14 @@ describe('CLI plugin generation', () => {
         server: { transport: 'stdio', command: ['./mcp/server.mjs'] },
       }],
     });
-    expect(first.mcpReadonlyRoots).toEqual([
+    if (!firstMcpRuntime) throw new Error('expected session MCP runtime manifest');
+    expect(sessionMcpRuntimeHostOnlyPaths(firstMcpRuntime, dataDir)).toEqual([
       sessionMcpRuntimeManifestPath('same-session', dataDir),
-      join(home, '.botmux', 'plugins', 'demo', 'dist'),
-    ]);
-    expect(first.mcpHidePaths).toEqual([
+      pluginMcpPrivatePath('demo'),
       join(home, '.botmux', 'plugins', 'demo', 'dist', 'mcp', 'index.json'),
     ]);
+    expect('mcpReadonlyRoots' in first).toBe(false);
+    expect('mcpHidePaths' in first).toBe(false);
 
     const refreshed = prepareCliPluginGeneration({
       sessionId: 'same-session',
@@ -111,9 +114,10 @@ describe('CLI plugin generation', () => {
       pluginIds: [],
       entries: [],
     });
-    expect(refreshed.mcpReadonlyRoots).toEqual([
+    const refreshedMcpRuntime = readSessionMcpRuntimeManifest('same-session', dataDir);
+    if (!refreshedMcpRuntime) throw new Error('expected refreshed session MCP runtime manifest');
+    expect(sessionMcpRuntimeHostOnlyPaths(refreshedMcpRuntime, dataDir)).toEqual([
       sessionMcpRuntimeManifestPath('same-session', dataDir),
     ]);
-    expect(refreshed.mcpHidePaths).toEqual([]);
   });
 });

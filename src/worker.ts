@@ -61,6 +61,16 @@ import {
 } from './services/vc-meeting-send-policy.js';
 import { TurnTerminalDeduper } from './services/turn-terminal-deduper.js';
 import { defaultGatewayEntry, ensureGatewayEntry } from './core/plugins/mcp/gateway-installer.js';
+import { startSessionMcpGatewayHost, type SessionMcpGatewayHost } from './core/plugins/mcp/host.js';
+import {
+  MCP_GATEWAY_REQUIRED_ENV,
+  MCP_GATEWAY_SOCKET_ENV,
+} from './core/plugins/mcp/environment.js';
+import {
+  readSessionMcpRuntimeManifest,
+  sessionMcpRuntimeHostOnlyPaths,
+  type SessionMcpRuntimeManifest,
+} from './core/plugins/mcp/session-runtime.js';
 import { prepareCliPluginGeneration } from './core/plugins/cli-generation.js';
 import { loadBotConfigs, type BotConfig } from './bot-registry.js';
 import { readGlobalConfig } from './global-config.js';
@@ -209,6 +219,7 @@ let sandboxRelayOutbox: string | null = null;
 let sandboxRelayCapability: { token: string; turnId?: string; dispatchAttempt?: number } | null = null;
 let readIsolationOriginCapabilityFile: string | null = null;
 let sandboxTeardownDone = false;                     // guards the exit-time best-effort teardown from double-running / running on suspend-for-resume
+let sessionMcpGatewayHost: SessionMcpGatewayHost | null = null;
 /** Counts consecutive in-worker restart cycles (see case 'restart'). Used by
  *  the SECONDARY guard so an adapter whose checkResumeTargetExists misses
  *  (returns undefined) or whose resume target vanishes between the check and
@@ -224,6 +235,15 @@ let tmuxRestartTimer: NodeJS.Timeout | null = null;
 let resumeFallbackNotified = false;
 /** Skill catalog to attach to the first user turn after a prompt-less CLI restart. */
 let deferredPluginSkillCatalog: string | null = null;
+
+function stopSessionMcpGatewayHost(): void {
+  const host = sessionMcpGatewayHost;
+  sessionMcpGatewayHost = null;
+  if (!host) return;
+  void host.close().catch((error) => {
+    log(`[mcp-gateway] host shutdown failed: ${error instanceof Error ? error.message : String(error)}`);
+  });
+}
 
 function refreshCliPluginGeneration(
   cfg: Extract<DaemonToWorker, { type: 'init' }>,
@@ -270,8 +290,6 @@ function refreshCliPluginGeneration(
   }
   cfg.skillPluginDir = generation.skillPluginDir;
   cfg.skillReadonlyRoots = generation.skillReadonlyRoots;
-  cfg.mcpReadonlyRoots = generation.mcpReadonlyRoots;
-  cfg.mcpHidePaths = generation.mcpHidePaths;
   deferredPluginSkillCatalog = generation.deferredSkillCatalog ?? null;
   log(`Plugin generation refreshed: ${generation.pluginManifest.pluginIds.join(', ') || '(none)'}`);
 }
@@ -5133,7 +5151,7 @@ function scheduleBusyPatternIdleProbe(source: string): void {
   busyPatternIdleProbeTimer.unref?.();
 }
 
-function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
+async function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): Promise<void> {
   clearSessionRenameInFlight();
   // (startupCommands one-shot is re-armed below, AFTER the reattach-vs-fresh
   // prediction — only a genuinely fresh CLI process replays them; see
@@ -5586,6 +5604,24 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
       }
     }
   }
+  let mcpRuntimeManifest: SessionMcpRuntimeManifest | null = readSessionMcpRuntimeManifest(
+    cfg.sessionId,
+    config.session.dataDir,
+  );
+  if (cliAdapter.mcpGateway && mcpRuntimeManifest?.entries.length && persistentSessionName && effectiveBackendType !== 'pty') {
+    const paneLive = effectiveBackendType === 'tmux'
+      ? TmuxBackend.hasSession(persistentSessionName)
+      : effectiveBackendType === 'zellij'
+        ? ZellijBackend.hasSession(persistentSessionName)
+        : HerdrBackend.hasSession(persistentSessionName);
+    if (paneLive) {
+      // The trusted Gateway host belongs to the worker and cannot survive a
+      // worker/daemon replacement. Cold-resume the CLI so its MCP client gets a
+      // fresh relay socket instead of reattaching to a dead connection.
+      log(`[mcp-gateway] persistent pane ${cfg.sessionId} has plugin MCP state — cold-resuming with a fresh host`);
+      killPersistentSession(effectiveBackendType as PersistentBackendType, persistentSessionName);
+    }
+  }
   const willReattachPersistent = persistentSessionName
     ? effectiveBackendType === 'tmux'
       ? TmuxBackend.hasSession(persistentSessionName)
@@ -5597,7 +5633,19 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   // The plugin set is stable only for the lifetime of one real CLI process.
   // A warm worker reattach keeps the existing Gateway and catalog untouched;
   // every fresh/resumed CLI spawn atomically refreshes both from current Bot config.
-  if (!willReattachPersistent) refreshCliPluginGeneration(cfg, cliAdapter);
+  if (!willReattachPersistent) {
+    refreshCliPluginGeneration(cfg, cliAdapter);
+    mcpRuntimeManifest = readSessionMcpRuntimeManifest(cfg.sessionId, config.session.dataDir);
+    stopSessionMcpGatewayHost();
+    if (cliAdapter.mcpGateway && mcpRuntimeManifest?.entries.length) {
+      sessionMcpGatewayHost = await startSessionMcpGatewayHost({
+        sessionId: cfg.sessionId,
+        dataDir: config.session.dataDir,
+        onError: error => log(`[mcp-gateway] host error: ${error.message}`),
+      });
+      log(`[mcp-gateway] trusted host listening for ${mcpRuntimeManifest.entries.length} plugin server(s)`);
+    }
+  }
 
   // Re-arm the startup-commands one-shot ONLY for a genuinely fresh CLI process.
   // A reattach to a LIVE persistent pane (daemon-restart recovery) is the SAME
@@ -5889,6 +5937,13 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   // namespaced BOTMUX_LARK_APP_ID injected below; the worker keeps its own
   // bare creds (forkWorker) for lark-upload. See utils/child-env.ts.
   const childEnv = redactChildEnv(process.env);
+  if (sessionMcpGatewayHost) {
+    childEnv[MCP_GATEWAY_SOCKET_ENV] = sessionMcpGatewayHost.socketPath;
+    childEnv[MCP_GATEWAY_REQUIRED_ENV] = '1';
+  } else {
+    delete childEnv[MCP_GATEWAY_SOCKET_ENV];
+    delete childEnv[MCP_GATEWAY_REQUIRED_ENV];
+  }
   // Put the daemon-written wrapper dir (~/.botmux/bin/botmux = THIS build) ahead of any
   // stale npm-global botmux in PATH, so the agent's `botmux` is always this build. Matters
   // most under read isolation: only this build has the send-cred reader — a shadowing stale
@@ -6021,7 +6076,6 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
         }),
       ];
       finalDenyPaths = carve.finalDenyPaths.map(canonical);
-      finalDenyPaths.push(...(cfg.mcpHidePaths ?? []).map(canonical));
       traverseDirs = carve.traverseDirs.map(canonical);
       protectedWrites = buildReadIsolationProtectedWriteRules(profileCtx, {
         // Keep lexical roots as well as their canonical targets. Canonical
@@ -6033,6 +6087,12 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
         ],
         sessionDataDirs: [readIsolationCtx.sessionDataDir],
       });
+    }
+    if (mcpRuntimeManifest) {
+      finalDenyPaths.push(...sessionMcpRuntimeHostOnlyPaths(
+        mcpRuntimeManifest,
+        config.session.dataDir,
+      ).map(canonical));
     }
     // WRITE rules — the macOS file-sandbox (Linux-bwrap twin). Realpath the writable
     // zones + crown-jewel re-denies for the same symlink-safety reason as reads.
@@ -6207,10 +6267,9 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
           extraExecPaths: cliAdapter.sandboxExtraExecPaths?.(),
           readonlyRoots: [
             ...(cfg.skillReadonlyRoots ?? []),
-            ...(cfg.mcpReadonlyRoots ?? []),
             ...(readIsoLinuxMasks?.ownReadOnlyPaths ?? []),
           ],
-          postReadonlyHidePaths: cfg.mcpHidePaths ?? [],
+          mcpGatewaySocketPath: sessionMcpGatewayHost?.socketPath,
           trustedBotmuxCommandPaths: [defaultGatewayEntry().command],
           userReadonlyPaths: cfg.sandboxReadonlyPaths ?? [],
           net: cfg.sandboxNetwork !== false,
@@ -6627,6 +6686,7 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
       log(`Ignored stale backend exit (code: ${code}, signal: ${signal})`);
       return;
     }
+    stopSessionMcpGatewayHost();
     const exitedTurnId = currentBotmuxTurnId;
     const exitedDispatchAttempt = currentBotmuxDispatchAttempt;
     // Fail closed as soon as this CLI generation ends. The Node worker may
@@ -6755,6 +6815,7 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
 }
 
 function killCli(opts: { preservePending?: boolean } = {}): void {
+  stopSessionMcpGatewayHost();
   destroyCrashDiagnosticTerminal('killCli');
   idleDetector?.dispose();
   idleDetector = null;
@@ -6875,7 +6936,7 @@ async function restartCliProcess(
           startScreenUpdates();
           startScreenAnalyzer();
           try {
-            spawnCli({ ...lastInitConfig, resume: true, prompt: '' });
+            await spawnCli({ ...lastInitConfig, resume: true, prompt: '' });
           } catch (err) {
             cliRestartInProgress = false;
             await sendFatalWorkerErrorAndExit(err);
@@ -8140,7 +8201,7 @@ process.on('message', async (raw: unknown) => {
           port = await startWebServer(config.web.workerHost, msg.webPort);
           log('Workflow worker mode: web terminal enabled; skipping screen updates and screen analyzer');
         }
-        spawnCli(msg);
+        await spawnCli(msg);
 
         // Queue the initial prompt — flushed when CLI shows idle.
         // Adapters with passesInitialPromptViaArgs (e.g. Gemini -i) bake the
@@ -8236,7 +8297,7 @@ process.on('message', async (raw: unknown) => {
         startScreenUpdates();
         startScreenAnalyzer();
         try {
-          spawnCli({ ...lastInitConfig, resume: true, prompt: '' });
+          await spawnCli({ ...lastInitConfig, resume: true, prompt: '' });
         } catch (err) {
           // Pass the message's own attempt (not the stale currentBotmux* from a
           // prior IM turn) so a durable delivery relaunch failure carries the
@@ -8623,6 +8684,7 @@ process.on('message', async (raw: unknown) => {
 // ─── Cleanup ─────────────────────────────────────────────────────────────────
 
 function cleanup(): void {
+  stopSessionMcpGatewayHost();
   if (tmuxRestartTimer) {
     clearTimeout(tmuxRestartTimer);
     tmuxRestartTimer = null;

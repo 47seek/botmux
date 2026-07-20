@@ -3,7 +3,7 @@ import { dirname, isAbsolute, join } from 'node:path';
 import { config } from '../../../config.js';
 import { readPluginRegistry } from '../../../services/plugin-registry-store.js';
 import { atomicWriteFileSync } from '../../../utils/atomic-write.js';
-import { pluginRuntimeDir } from '../paths.js';
+import { pluginMcpPrivatePath, pluginRuntimeDir } from '../paths.js';
 import { sessionPluginManifestPath } from '../session-manifest.js';
 import type { PluginMcpServer } from '../types.js';
 import { isPluginMcpServer, readPluginMcpDescriptor } from './private-store.js';
@@ -88,20 +88,17 @@ export function refreshSessionMcpRuntimeManifest(opts: {
   return manifest;
 }
 
-export function sessionMcpRuntimeReadonlyRoots(
+/** Credential-bearing paths consumed only by the trusted Gateway host. They
+ * must never become CLI sandbox read carve-outs. */
+export function sessionMcpRuntimeHostOnlyPaths(
   manifest: SessionMcpRuntimeManifest,
   dataDir: string = config.session.dataDir,
 ): string[] {
-  return [
+  return [...new Set([
     sessionMcpRuntimeManifestPath(manifest.sessionId, dataDir),
-    ...new Set(manifest.entries.map(entry => entry.pluginDir)),
-  ];
-}
-
-/** Installation input may contain credentials, but the Gateway never reads it
- * at runtime. Hide it after re-binding plugin runtime roots into a sandbox. */
-export function sessionMcpRuntimeSensitivePaths(
-  manifest: SessionMcpRuntimeManifest,
-): string[] {
-  return [...new Set(manifest.entries.map(entry => join(entry.pluginDir, 'mcp', 'index.json')))];
+    ...manifest.entries.flatMap(entry => [
+      pluginMcpPrivatePath(entry.pluginId),
+      join(entry.pluginDir, 'mcp', 'index.json'),
+    ]),
+  ])];
 }

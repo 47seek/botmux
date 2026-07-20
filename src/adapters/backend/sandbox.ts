@@ -29,6 +29,10 @@ import { basename, isAbsolute, join, dirname, relative, resolve } from 'node:pat
 import { fileURLToPath } from 'node:url';
 import { spawn, spawnSync } from 'node:child_process';
 import { PROXY_ENV_KEYS } from '../../utils/child-env.js';
+import {
+  MCP_GATEWAY_REQUIRED_ENV,
+  MCP_GATEWAY_SOCKET_ENV,
+} from '../../core/plugins/mcp/environment.js';
 
 /** Host root for the HOME overlay's upper/work — MUST be OUTSIDE the home lower
  *  (overlayfs forbids upper/work inside lower). */
@@ -149,6 +153,9 @@ export interface SandboxPlan {
   homeMerged: string;
   /** Daemon-mediated `botmux send` outbox — bound LAST so it wins over any mask. */
   outbox: string;
+  /** Trusted worker-side MCP socket directory. The sandbox sees only this
+   * session's socket at a fixed path under its private /run tmpfs. */
+  mcpGatewaySocket?: { hostDir: string; sandboxDir: string };
   /** Per-bot privacy masks: directories blanked with an empty tmpfs. */
   hideDirs: string[];
   /** Per-bot privacy masks: files blanked with a read-only empty placeholder. */
@@ -198,6 +205,10 @@ export function buildSandboxArgs(plan: SandboxPlan): string[] {
   a.push('--ro-bind', '/', '/');
   // Fresh kernel/runtime dirs (the ro-bind of / would otherwise carry host /tmp etc.).
   a.push('--proc', '/proc', '--dev', '/dev', '--tmpfs', '/tmp', '--tmpfs', '/run', '--tmpfs', '/dev/shm');
+  if (plan.mcpGatewaySocket) {
+    a.push('--dir', plan.mcpGatewaySocket.sandboxDir);
+    a.push('--ro-bind', plan.mcpGatewaySocket.hostDir, plan.mcpGatewaySocket.sandboxDir);
+  }
   // Write-isolated home + project (overlay merged: reads=real lower, writes=upper).
   // If cwd IS HOME, two binds to the same destination would make the later
   // project bind silently shadow the home overlay. Use the project overlay as
@@ -582,6 +593,8 @@ export function prepareSandbox(opts: {
   userReadonlyPaths?: readonly string[];
   /** Keep network egress. Defaults to true for backwards compatibility. */
   net?: boolean;
+  /** Worker-owned Unix socket for the credential-bearing MCP Gateway. */
+  mcpGatewaySocketPath?: string;
 }): SandboxSpawn | null {
   if (!opts.enabled) return null;
   if (process.platform !== 'linux') return null; // overlayfs + bwrap are Linux-only
@@ -776,6 +789,21 @@ export function prepareSandbox(opts: {
   classifyMasks(opts.finalHidePaths ?? [], finalHideDirs, finalHideFiles);
   classifyMasks(opts.postReadonlyHidePaths ?? [], postReadonlyHideDirs, postReadonlyHideFiles);
 
+  let mcpGatewaySocket: SandboxPlan['mcpGatewaySocket'];
+  let sandboxMcpGatewaySocketPath: string | undefined;
+  if (opts.mcpGatewaySocketPath) {
+    try {
+      const socketPath = resolve(opts.mcpGatewaySocketPath);
+      if (!lstatSync(socketPath).isSocket()) return null;
+      const hostDir = realpathSync(dirname(socketPath));
+      const sandboxDir = '/run/botmux-mcp';
+      mcpGatewaySocket = { hostDir, sandboxDir };
+      sandboxMcpGatewaySocketPath = join(sandboxDir, basename(socketPath));
+    } catch {
+      return null;
+    }
+  }
+
   // CLI auth/login paths kept real+writable (token refresh / login must persist,
   // unlike isolated project edits). Resolve `~` and bind only existing paths — a
   // missing auth file isn't a valid mountpoint (the CLI must be logged in on the
@@ -791,6 +819,7 @@ export function prepareSandbox(opts: {
     home,
     homeMerged,
     outbox,
+    mcpGatewaySocket,
     hideDirs,
     hideFiles,
     authReal,
@@ -858,6 +887,10 @@ export function prepareSandbox(opts: {
   // Not a credential: every route it reaches authenticates independently.
   if (process.env.BOTMUX_DAEMON_IPC_PORT) {
     env.BOTMUX_DAEMON_IPC_PORT = process.env.BOTMUX_DAEMON_IPC_PORT;
+  }
+  if (sandboxMcpGatewaySocketPath) {
+    env[MCP_GATEWAY_SOCKET_ENV] = sandboxMcpGatewaySocketPath;
+    env[MCP_GATEWAY_REQUIRED_ENV] = '1';
   }
   // Never inherit a custom credential config path into the sandbox. Its host
   // path is masked above as defense in depth, while unsetenv prevents an

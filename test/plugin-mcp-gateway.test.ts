@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { spawnSync } from 'node:child_process';
 import { PassThrough } from 'node:stream';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
@@ -13,6 +14,11 @@ import {
   resolveGatewayEnvironment,
 } from '../src/core/plugins/mcp/gateway.js';
 import { refreshSessionMcpRuntimeManifest } from '../src/core/plugins/mcp/session-runtime.js';
+import { startSessionMcpGatewayHost } from '../src/core/plugins/mcp/host.js';
+import {
+  MCP_GATEWAY_REQUIRED_ENV,
+  MCP_GATEWAY_SOCKET_ENV,
+} from '../src/core/plugins/mcp/environment.js';
 
 describe('plugin MCP Gateway', () => {
   let home: string;
@@ -31,7 +37,7 @@ describe('plugin MCP Gateway', () => {
     rmSync(home, { recursive: true, force: true });
   });
 
-  function installFixturePlugin(pluginId: string, fixtureName: string) {
+  function installFixturePlugin(pluginId: string, fixtureName: string, env?: Record<string, string>) {
     const source = join(home, `${pluginId}-src`);
     mkdirSync(join(source, 'dist', 'mcp'), { recursive: true });
     writeFileSync(join(source, 'package.json'), JSON.stringify({
@@ -44,6 +50,7 @@ describe('plugin MCP Gateway', () => {
     writeFileSync(join(source, 'dist', 'mcp', 'index.json'), JSON.stringify({
       transport: 'stdio',
       command: [process.execPath, fixture, fixtureName],
+      ...(env ? { env } : {}),
     }));
     installLocalPlugin(source);
   }
@@ -134,11 +141,12 @@ describe('plugin MCP Gateway', () => {
 
   it('uses one Botmux session id resolver for marker and isolated-env contexts', () => {
     const markerPid = 24680;
-    const markerDir = join(home, '.botmux', 'data', '.botmux-cli-pids');
+    const markerDataDir = join(home, 'custom-marker-data');
+    const markerDir = join(markerDataDir, '.botmux-cli-pids');
     mkdirSync(markerDir, { recursive: true });
     writeFileSync(join(markerDir, String(markerPid)), JSON.stringify({ sessionId: 'session-from-marker' }));
 
-    const resolved = resolveGatewayEnvironment({ HOME: home }, markerPid);
+    const resolved = resolveGatewayEnvironment({ HOME: home, SESSION_DATA_DIR: markerDataDir }, markerPid);
     expect(resolved.BOTMUX_SESSION_ID).toBe('session-from-marker');
     rmSync(markerDir, { recursive: true, force: true });
     expect(resolveGatewayEnvironment({ BOTMUX_SESSION_ID: 'session-from-env' }, markerPid).BOTMUX_SESSION_ID)
@@ -268,6 +276,72 @@ describe('plugin MCP Gateway', () => {
       await client.close();
       rmSync(resolve('data', 'mcp-gateway', `${sessionId}.json`), { force: true });
     }
+  });
+
+  it('relays a custom-data-dir session through the trusted host without exposing its snapshot to mcp serve', async () => {
+    const sessionId = 'trusted-host-custom-data-dir';
+    const customDataDir = join(home, 'custom-botmux', 'data');
+    vi.stubEnv('SESSION_DATA_DIR', customDataDir);
+    installFixturePlugin('plugin-a', 'alpha', { PRIVATE_MCP_TOKEN: 'host-only-token' });
+    refreshSessionMcpRuntimeManifest({
+      sessionId,
+      pluginIds: ['plugin-a'],
+      dataDir: customDataDir,
+    });
+    const host = await startSessionMcpGatewayHost({ sessionId, dataDir: customDataDir });
+    const transport = new StdioClientTransport({
+      command: process.execPath,
+      args: ['--import', 'tsx', resolve('src/cli.ts'), 'mcp', 'serve'],
+      cwd: resolve('.'),
+      env: {
+        ...mcpServeEnvironment(sessionId),
+        SESSION_DATA_DIR: customDataDir,
+        [MCP_GATEWAY_SOCKET_ENV]: host.socketPath,
+        [MCP_GATEWAY_REQUIRED_ENV]: '1',
+      },
+      stderr: 'pipe',
+    });
+    const client = new Client({ name: 'trusted-host-relay-test', version: '1.0.0' });
+    try {
+      await client.connect(transport);
+      expect((await client.listTools()).tools.map(tool => tool.name).sort()).toEqual(['alpha_unique', 'echo']);
+      const result = await client.callTool({ name: 'echo', arguments: {} });
+      expect((result.content[0] as { text: string }).text).toContain(
+        `session=${sessionId}:token=host-only-token`,
+      );
+    } finally {
+      await client.close().catch(() => undefined);
+      await host.close();
+    }
+  });
+
+  it('fails closed when a managed relay loses its worker-owned socket', () => {
+    const run = spawnSync(
+      process.execPath,
+      ['--import', 'tsx', resolve('src/cli.ts'), 'mcp', 'serve'],
+      {
+        cwd: resolve('.'),
+        env: {
+          ...mcpServeEnvironment('missing-host-socket'),
+          [MCP_GATEWAY_REQUIRED_ENV]: '1',
+        },
+        encoding: 'utf8',
+        timeout: 10_000,
+      },
+    );
+    expect(run.status).not.toBe(0);
+    expect(run.stderr).toContain('Botmux MCP Gateway host socket is unavailable');
+  });
+
+  it('revokes the worker-owned socket path synchronously during shutdown', async () => {
+    const host = await startSessionMcpGatewayHost({
+      sessionId: 'synchronous-socket-revoke',
+      dataDir: join(home, 'custom-botmux', 'data'),
+    });
+    expect(existsSync(host.socketPath)).toBe(true);
+    const closing = host.close();
+    expect(existsSync(host.socketDir)).toBe(false);
+    await closing;
   });
 
   it('closes the Gateway once when its MCP host stdin ends', async () => {

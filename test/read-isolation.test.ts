@@ -207,7 +207,7 @@ describe('v2 HYBRID model (buildV2DenyPaths)', () => {
     expect(buildV2CarveOuts(v2()).allowPaths).toContain('/Users/bot/.botmux/data/sessions-cli_self.json');
   });
 
-  it('protects plugin-private MCP descriptors and re-opens only the current session snapshot', () => {
+  it('keeps plugin-private MCP descriptors and every session snapshot host-only', () => {
     const ctx = v2({
       botmuxHome: '/srv/botmux',
       sessionDataDir: '/srv/botmux/data',
@@ -217,13 +217,14 @@ describe('v2 HYBRID model (buildV2DenyPaths)', () => {
       '/Users/bot/.botmux/plugins/demo/private/mcp.json',
       '/srv/botmux/plugins/demo/private/mcp.json',
       '/Users/bot/.botmux/plugins/demo/dist/mcp/index.json',
+      '/srv/botmux/data/sessions/session-self/plugin-mcp-runtime.json',
       '/srv/botmux/data/sessions/session-other/plugin-mcp-runtime.json',
     ]) expect(regexes.some(regex => regex.test(path))).toBe(true);
 
     const ownSnapshot = '/srv/botmux/data/sessions/session-self/plugin-mcp-runtime.json';
     const siblingSnapshot = '/srv/botmux/data/sessions/session-other/plugin-mcp-runtime.json';
     const carve = buildV2CarveOuts(ctx);
-    expect(carve.allowPaths).toContain(ownSnapshot);
+    expect(carve.allowPaths).not.toContain(ownSnapshot);
     expect(carve.allowPaths).not.toContain(siblingSnapshot);
     const profile = buildSeatbeltProfile(
       buildV2DenyPaths(ctx),
@@ -232,8 +233,7 @@ describe('v2 HYBRID model (buildV2DenyPaths)', () => {
       carve.traverseDirs,
       buildV2DenyRegexes(ctx),
     );
-    expect(profile.indexOf(`(allow file-read* (subpath "${ownSnapshot}"))`))
-      .toBeGreaterThan(profile.indexOf('plugin-mcp-runtime'));
+    expect(profile).not.toContain(`(allow file-read* (subpath "${ownSnapshot}"))`);
 
     const protectedWrites = buildReadIsolationProtectedWriteRules(ctx);
     const writeRegexes = protectedWrites.denyWriteRegexes.map(pattern => new RegExp(pattern));
@@ -330,7 +330,6 @@ describe('v2 HYBRID model (buildV2DenyPaths)', () => {
       '/Users/bot/.botmux/data/sessions-cli_self.json',
       '/Users/bot/.botmux/data/attachments/cli_self',
       managedOriginCapabilityPath('/Users/bot/.botmux/data', 'session-self'),
-      '/Users/bot/.botmux/data/sessions/session-self/plugin-mcp-runtime.json',
     ]);
     // traverse shim on each wholesale-denied parent (stat/realpath, not listing)
     expect(carve.traverseDirs).toEqual([
@@ -352,7 +351,7 @@ describe('v2 HYBRID model (buildV2DenyPaths)', () => {
     expect(c.finalDenyPaths).toEqual(['/ok/path']);
   });
 
-  it('assertSafeAppId rejects path-traversal / separators, accepts real Feishu ids (review L2)', () => {
+  it('rejects unsafe app ids and hashes session ids before using them in paths', () => {
     expect(assertSafeAppId('cli_aab4eaea67395bc9')).toBe('cli_aab4eaea67395bc9');
     expect(() => assertSafeAppId('../evil')).toThrow();
     expect(() => assertSafeAppId('a/b')).toThrow();
@@ -364,7 +363,9 @@ describe('v2 HYBRID model (buildV2DenyPaths)', () => {
     expect(() => assertSafeAppId('..')).toThrow();
     expect(() => assertSafeAppId('...')).toThrow();
     expect(() => buildV2CarveOuts(v2({ currentAppId: '..' }))).toThrow();
-    expect(() => buildV2CarveOuts(v2({ currentSessionId: '../other' }))).toThrow();
+    expect(buildV2CarveOuts(v2({ currentSessionId: '../other' })).allowPaths).toContain(
+      managedOriginCapabilityPath('/Users/bot/.botmux/data', '../other'),
+    );
     // botHomePath must also reject an unsafe id (used for own + other BOT_HOMEs)
     expect(() => botHomePath('/Users/bot/.botmux', '../x')).toThrow();
   });

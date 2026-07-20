@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { createConnection } from 'node:net';
 import { existsSync, mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -48,6 +49,10 @@ import {
 } from './session-runtime.js';
 import { readPluginMcpDescriptor } from './private-store.js';
 import type { PluginMcpServer } from '../types.js';
+import {
+  MCP_GATEWAY_REQUIRED_ENV,
+  MCP_GATEWAY_SOCKET_ENV,
+} from './environment.js';
 
 const GATEWAY_VERSION = '1.0.0';
 const DOWNSTREAM_INITIALIZE_TIMEOUT_MS = 10_000;
@@ -57,7 +62,7 @@ export function resolveGatewayEnvironment(
   startPid: number = process.ppid,
 ): NodeJS.ProcessEnv {
   const sessionId = resolveSessionContext(
-    config.session.dataDir,
+    gatewayDataDir(env),
     env.BOTMUX_SESSION_ID?.trim() || undefined,
     startPid,
   )?.sessionId.trim();
@@ -138,10 +143,14 @@ export function bindGatewayInputLifecycle(
 function gatewayPluginIds(env: NodeJS.ProcessEnv = process.env): string[] {
   const sessionId = env.BOTMUX_SESSION_ID?.trim();
   if (sessionId) {
-    const manifest = readSessionPluginManifest(sessionId);
+    const manifest = readSessionPluginManifest(sessionId, gatewayDataDir(env));
     if (manifest) return manifest.pluginIds;
   }
   return normalizePluginIdList(readGlobalConfig().plugins) ?? [];
+}
+
+function gatewayDataDir(env: NodeJS.ProcessEnv): string {
+  return env.SESSION_DATA_DIR?.trim() || config.session.dataDir;
 }
 
 function gatewayDescriptors(pluginIds: readonly string[]): GatewayDescriptor[] {
@@ -180,7 +189,9 @@ function resolveGatewayRuntime(
 ): { pluginIds: string[]; descriptors: GatewayDescriptor[] } {
   if (!requestedPluginIds) {
     const sessionId = env.BOTMUX_SESSION_ID?.trim();
-    const snapshot = sessionId ? readSessionMcpRuntimeManifest(sessionId) : null;
+    const snapshot = sessionId
+      ? readSessionMcpRuntimeManifest(sessionId, gatewayDataDir(env))
+      : null;
     if (snapshot) {
       return {
         pluginIds: snapshot.pluginIds,
@@ -192,15 +203,15 @@ function resolveGatewayRuntime(
   return { pluginIds, descriptors: gatewayDescriptors(pluginIds) };
 }
 
-function diagnosticsPath(sessionId: string | undefined): string {
+function diagnosticsPath(sessionId: string | undefined, dataDir: string): string {
   const safe = sessionId && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(sessionId)
     ? sessionId
     : 'standalone';
-  return join(config.session.dataDir, 'mcp-gateway', `${safe}.json`);
+  return join(dataDir, 'mcp-gateway', `${safe}.json`);
 }
 
-function writeDiagnostics(file: McpGatewayDiagnosticsFile): void {
-  const path = diagnosticsPath(file.sessionId);
+function writeDiagnostics(file: McpGatewayDiagnosticsFile, dataDir: string): void {
+  const path = diagnosticsPath(file.sessionId, dataDir);
   mkdirSync(dirname(path), { recursive: true });
   atomicWriteFileSync(path, `${JSON.stringify(file, null, 2)}\n`, { mode: 0o600 });
 }
@@ -323,7 +334,7 @@ export class PluginMcpGateway {
         pluginIds: this.pluginIds,
         generatedAt: new Date().toISOString(),
         servers: this.diagnostics,
-      });
+      }, gatewayDataDir(this.env));
     } catch (error) {
       process.stderr.write(
         `[botmux-mcp] diagnostics write skipped: ${error instanceof Error ? error.message : String(error)}\n`,
@@ -683,7 +694,19 @@ export class PluginMcpGateway {
 }
 
 export async function runMcpGateway(): Promise<void> {
-  const gateway = new PluginMcpGateway(undefined, resolveGatewayEnvironment());
+  const env = resolveGatewayEnvironment();
+  const socketPath = env[MCP_GATEWAY_SOCKET_ENV]?.trim();
+  if (socketPath) {
+    await relayMcpGateway(socketPath);
+    return;
+  }
+  if (env[MCP_GATEWAY_REQUIRED_ENV] === '1') {
+    throw new Error('Botmux MCP Gateway host socket is unavailable; restart this Botmux session');
+  }
+  // A managed Botmux session without plugin MCP contributions needs a stable,
+  // empty server for the globally installed CLI entry. Never inspect descriptor
+  // files from this CLI-side process.
+  const gateway = new PluginMcpGateway(env.BOTMUX_SESSION_ID ? [] : undefined, env);
   const transport = new StdioServerTransport();
   const connectPromise = gateway.connect(transport);
   const reportCloseError = (error: unknown) => {
@@ -698,4 +721,38 @@ export async function runMcpGateway(): Promise<void> {
   process.once('SIGINT', requestClose);
   process.once('SIGTERM', requestClose);
   await connectPromise;
+}
+
+/** Byte-for-byte stdio relay from a CLI-native MCP launcher to the trusted
+ * worker-side Gateway. No plugin metadata or credentials are loaded here. */
+export async function relayMcpGateway(
+  socketPath: string,
+  input: NodeJS.ReadableStream = process.stdin,
+  output: NodeJS.WritableStream = process.stdout,
+): Promise<void> {
+  const socket = createConnection({ path: socketPath });
+  socket.setNoDelay(true);
+  await new Promise<void>((resolve, reject) => {
+    const onConnect = () => {
+      socket.off('error', onInitialError);
+      resolve();
+    };
+    const onInitialError = (error: Error) => {
+      socket.off('connect', onConnect);
+      reject(new Error(`Botmux MCP Gateway relay connection failed: ${error.message}`));
+    };
+    socket.once('connect', onConnect);
+    socket.once('error', onInitialError);
+  });
+
+  input.pipe(socket);
+  socket.pipe(output, { end: false });
+  await new Promise<void>((resolve, reject) => {
+    socket.once('close', resolve);
+    socket.once('error', reject);
+  }).finally(() => {
+    input.unpipe(socket);
+    socket.unpipe(output);
+    socket.destroy();
+  });
 }

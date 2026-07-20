@@ -68,15 +68,6 @@ export function assertSafeAppId(appId: string): string {
   return appId;
 }
 
-const SAFE_PLUGIN_SESSION_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
-
-function sessionMcpRuntimePath(sessionDataDir: string, sessionId: string): string {
-  if (!SAFE_PLUGIN_SESSION_ID.test(sessionId) || sessionId === '.' || sessionId === '..') {
-    throw new Error(`[read-isolation] unsafe session id used as path segment: ${JSON.stringify(sessionId)}`);
-  }
-  return `${sessionDataDir.replace(/\/+$/, '')}/sessions/${sessionId}/plugin-mcp-runtime.json`;
-}
-
 /** A bot's private home under BOTMUX_HOME: `<botmuxHome>/bots/<appId>`. Holds the
  *  bot's redirected CLI config/transcripts/memory (CLAUDE_CONFIG_DIR=<here>/claude,
  *  CODEX_HOME=<here>/codex). The ONLY thing under BOTMUX_HOME v2 re-allows. */
@@ -380,9 +371,6 @@ export function buildV2CarveOuts(ctx: V2IsolationContext): {
       // Parent read-isolation/ stays wholesale-denied; only this session's
       // rotating origin capability is visible to the confined CLI.
       managedOriginCapabilityPath(sd, ctx.currentSessionId),
-      // The Gateway receives only this session's full descriptor snapshot.
-      // Sibling snapshots stay denied by buildV2DenyRegexes.
-      sessionMcpRuntimePath(sd, ctx.currentSessionId),
     ],
     // file-read-metadata on the wholesale-denied parents so the CLI/skill can realpath()
     // through them WITHOUT `ls` (enumeration) leaking.
@@ -706,7 +694,7 @@ export function buildSeatbeltProfile(
   return lines.join('\n') + '\n';
 }
 
-export const ISOLATION_PANE_MARKER_VERSION = 3;
+export const ISOLATION_PANE_MARKER_VERSION = 4;
 
 /** Versioned marker written beside a freshly spawned persistent sandbox. */
 export function isolationPaneMarkerContent(bootId: string): string {
