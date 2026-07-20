@@ -1455,22 +1455,23 @@ function usesForwardFollowupDelay(mentionMode: GroupMentionMode): boolean {
 }
 
 /**
- * Registry of forward-followup restore functions, keyed by larkAppId.
+ * Per-app barriers that resolve once `restoreActiveSessions()` completes.
  *
- * Restoration is deferred until after `restoreActiveSessions()` completes:
- * `isSessionOwner` reads the in-memory `activeSessions` map, which is only
- * populated once sessions are rehydrated. Flushing a persisted seed before
- * that point would always see `ownsSession=false` and route a thread reply
- * through `handleNewTopic`, potentially duplicating sessions.
+ * Persisted forward-followup seeds are loaded into the in-memory buffer at
+ * dispatcher startup (so root-linked clarifications can still pair with them
+ * while the WS is already receiving events), but any flush — timer expiry or
+ * immediate dispatch — waits for this barrier. Without it, `isSessionOwner`
+ * would always return false before sessions are rehydrated, routing thread
+ * replies through `handleNewTopic` and potentially duplicating sessions.
  */
-const forwardFollowupRestorers = new Map<string, () => void>();
+const sessionsReadyBarriers = new Map<string, { promise: Promise<void>; resolve: () => void }>();
+const sessionsReadyApps = new Set<string>();
 
-/** Restore persisted forward-followup seeds for a bot. Call after active sessions are restored. */
-export function restorePendingForwardFollowups(larkAppId: string): void {
-  const restore = forwardFollowupRestorers.get(larkAppId);
-  if (!restore) return;
-  forwardFollowupRestorers.delete(larkAppId);
-  restore();
+/** Mark a bot's active sessions as restored so pending forward-followup seeds can flush. */
+export function markForwardFollowupsSessionsReady(larkAppId: string): void {
+  sessionsReadyApps.add(larkAppId);
+  const barrier = sessionsReadyBarriers.get(larkAppId);
+  if (barrier) barrier.resolve();
 }
 
 export interface EventHandlers {
@@ -2042,6 +2043,14 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
     config.daemon.forwardFollowupWaitMs,
     err => logger.error(`Error flushing delayed topic seed: ${err}`),
   );
+  // Barrier that resolves once restoreActiveSessions() completes. Flushes wait
+  // on it so isSessionOwner reads the populated activeSessions map. If the app
+  // was already marked ready (e.g. tests or a restart within the same process),
+  // resolve immediately.
+  let resolveSessionsReady!: () => void;
+  const sessionsReady = new Promise<void>(resolve => { resolveSessionsReady = resolve; });
+  if (sessionsReadyApps.has(larkAppId)) resolveSessionsReady();
+  sessionsReadyBarriers.set(larkAppId, { promise: sessionsReady, resolve: resolveSessionsReady });
   const dispatchHumanMessage = async (payload: PendingForwardTopicPayload): Promise<void> => {
     await serializeByAnchor(payload.ctx.anchor, () => {
       const ownsSession = handlers.isSessionOwner?.(payload.ctx.anchor, larkAppId) ?? payload.ownsSession;
@@ -2054,41 +2063,40 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
     seedMessageId: string,
     payload: PendingForwardTopicPayload,
   ): Promise<void> => {
+    // Wait for activeSessions to be rehydrated before checking ownership, so a
+    // thread reply isn't misrouted to handleNewTopic during daemon startup.
+    await sessionsReady;
     await dispatchHumanMessage(payload);
     removeForwardFollowup(larkAppId, seedMessageId);
   };
-  // Defer restoration until after restoreActiveSessions() — isSessionOwner
-  // reads the in-memory activeSessions map, which is empty at dispatcher
-  // startup. Flushing now would always route thread replies through
-  // handleNewTopic. The daemon calls restorePendingForwardFollowups() once
-  // sessions are rehydrated.
-  forwardFollowupRestorers.set(larkAppId, () => {
-    for (const record of listForwardFollowups<PendingForwardTopicPayload>(larkAppId)) {
-      const senderOpenId = record.payload?.data?.sender?.sender_id?.open_id as string | undefined;
-      const chatId = record.payload?.ctx?.chatId;
-      if (!senderOpenId || !chatId || !record.payload?.ctx?.anchor) {
-        removeForwardFollowup(larkAppId, record.messageId);
-        continue;
-      }
-      const flush = (payload: PendingForwardTopicPayload) =>
-        dispatchPersistedForwardFollowup(record.messageId, payload);
-      const remainingMs = record.dueAt - Date.now();
-      const isUnpairedSeed = !record.payload.ctx.forwardSeedData;
-      const delayStillEnabled = usesForwardFollowupDelay(resolveGroupMentionMode(larkAppId));
-      if (isUnpairedSeed && delayStillEnabled && remainingMs > 0 && forwardFollowups.hold({
-        larkAppId,
-        chatId,
-        senderOpenId,
-        messageId: record.messageId,
-        payload: record.payload,
-        flush,
-      }, remainingMs)) {
-        logger.info(`[forward-followup] restored pending seed=${record.messageId.substring(0, 12)} remaining=${remainingMs}ms`);
-      } else {
-        void flush(record.payload).catch(err => logger.error(`Error restoring delayed topic seed: ${err}`));
-      }
+  // Load persisted seeds into the buffer immediately so root-linked
+  // clarifications can pair with them while the WS is already receiving
+  // events. Flushes (timer expiry or immediate) wait on sessionsReady above.
+  for (const record of listForwardFollowups<PendingForwardTopicPayload>(larkAppId)) {
+    const senderOpenId = record.payload?.data?.sender?.sender_id?.open_id as string | undefined;
+    const chatId = record.payload?.ctx?.chatId;
+    if (!senderOpenId || !chatId || !record.payload?.ctx?.anchor) {
+      removeForwardFollowup(larkAppId, record.messageId);
+      continue;
     }
-  });
+    const flush = (payload: PendingForwardTopicPayload) =>
+      dispatchPersistedForwardFollowup(record.messageId, payload);
+    const remainingMs = record.dueAt - Date.now();
+    const isUnpairedSeed = !record.payload.ctx.forwardSeedData;
+    const delayStillEnabled = usesForwardFollowupDelay(resolveGroupMentionMode(larkAppId));
+    if (isUnpairedSeed && delayStillEnabled && remainingMs > 0 && forwardFollowups.hold({
+      larkAppId,
+      chatId,
+      senderOpenId,
+      messageId: record.messageId,
+      payload: record.payload,
+      flush,
+    }, remainingMs)) {
+      logger.info(`[forward-followup] restored pending seed=${record.messageId.substring(0, 12)} remaining=${remainingMs}ms`);
+    } else {
+      void flush(record.payload).catch(err => logger.error(`Error restoring delayed topic seed: ${err}`));
+    }
+  }
   const seedRoutingGates = new Map<string, { ready: Promise<void>; complete: () => void }>();
   const registerSeedRoutingGate = (messageId: string) => {
     let resolveReady!: () => void;
