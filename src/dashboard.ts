@@ -899,7 +899,10 @@ async function cachedLatestVersion(force = false): Promise<LatestVersionCache> {
   const now = Date.now();
   const ttl = latestVersionCache?.lookupOk ? LATEST_TTL_MS : FAILURE_TTL_MS;
   if (!force && latestVersionCache && now - latestVersionCache.at < ttl) return latestVersionCache;
-  if (latestVersionLookupInFlight) return latestVersionLookupInFlight;
+  // When forcing a refresh, don't piggy-back on an in-flight lookup that may
+  // have started before the user asked for a refresh — start a fresh one so
+  // the result reflects the current upstream state, not a stale query.
+  if (!force && latestVersionLookupInFlight) return latestVersionLookupInFlight;
 
   const lookup = (async () => {
     const value = await fetchLatestVersion();

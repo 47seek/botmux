@@ -5,6 +5,8 @@ export interface BotmuxUpdateResult {
   newVersion: string;
   changed: boolean;
   restarted: boolean;
+  /** Populated when the update succeeded but the restart handoff failed. */
+  restartError?: string;
 }
 
 type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
@@ -53,7 +55,13 @@ export async function updateAndRestartBotmux(
     }),
   });
   const restart = await responseBody(restartResponse);
-  if (!restartResponse.ok || restart.ok === false) throw responseError(restartResponse, restart);
+  if (!restartResponse.ok || restart.ok === false) {
+    // The update itself succeeded — the new version is already installed.
+    // Return restarted:false instead of throwing so the caller can surface a
+    // "please restart manually" message rather than treating it as a full
+    // update failure (which would tempt the user to re-run the install).
+    return { ...result, restarted: false, restartError: responseError(restartResponse, restart).message };
+  }
   if (restart.ok !== true) throw new Error('Invalid restart response');
   return { ...result, restarted: true };
 }

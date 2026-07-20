@@ -103,6 +103,7 @@ export function runMaintenanceTick(deps: MaintenanceDeps): void {
 
   let before = '';
   let after = '';
+  let restartFailed = false;
   try {
     deps.withUpdateLock(() => {
       before = deps.currentVersion();
@@ -110,7 +111,17 @@ export function runMaintenanceTick(deps: MaintenanceDeps): void {
       after = deps.currentVersion();
       if (after !== before && cfg.autoRestart?.enabled) {
         deps.writeIntent({ kind: 'update', oldVersion: before, newVersion: after, at: new Date(now).toISOString() });
-        deps.triggerRestart();
+        try {
+          deps.triggerRestart();
+        } catch (e) {
+          // Update succeeded but the restart handoff failed (e.g. lease taken
+          // by a concurrent manual restart, or the detached driver did not
+          // start). The new version is already on disk — log it clearly so it
+          // isn't mistaken for a full update failure, and don't rethrow: the
+          // next tick sees after===before and would otherwise never retry.
+          restartFailed = true;
+          log(`auto-update: installed ${after} but restart failed: ${e instanceof Error ? e.message : e}`);
+        }
       }
     });
   } catch (e) {
@@ -122,11 +133,11 @@ export function runMaintenanceTick(deps: MaintenanceDeps): void {
     return;
   }
 
-  // A newer version was installed. Restart to apply it only if opted in.
-  if (cfg.autoRestart?.enabled) {
-    log(`auto-update: ${before} → ${after}, restarting to apply`);
-  } else {
+  // A newer version was installed.
+  if (!cfg.autoRestart?.enabled) {
     log(`auto-update: installed ${after} (was ${before}); auto-restart off — applies on next restart`);
+  } else if (!restartFailed) {
+    log(`auto-update: ${before} → ${after}, restarting to apply`);
   }
 }
 

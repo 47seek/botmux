@@ -605,7 +605,15 @@ function TopbarVersionControl(props: {
     setErrorDetail('');
     try {
       const previousInstance = await dashboardInstance();
-      await updateAndRestartBotmux(fetch, setPhase);
+      const result = await updateAndRestartBotmux(fetch, setPhase);
+      if (!result.restarted) {
+        // Update installed but the restart handoff failed — surface it
+        // directly instead of polling for a reconnect that will never come.
+        actionInFlightRef.current = false;
+        setPhase('error');
+        setErrorDetail(t('update.restartFailed', { detail: result.restartError ?? 'unknown' }));
+        return;
+      }
       pollReconnect(previousInstance);
     } catch (error) {
       actionInFlightRef.current = false;
@@ -1161,7 +1169,10 @@ void (async () => {
   window.addEventListener(PLUGIN_PINS_CHANGED_EVENT, () => { void loadPinnedPluginNavItems(); });
   void loadPinnedPluginNavItems();
   void checkUpdateBadge();
-  window.setInterval(() => void checkUpdateBadge(), 30 * 60_000);
+  window.setInterval(() => {
+    if (document.hidden) return;
+    void checkUpdateBadge();
+  }, 30 * 60_000);
   initOwnerAvatar();
   try {
     await bootstrap();

@@ -60,7 +60,7 @@ describe('dashboard update and restart action', () => {
     expect(fetchImpl).toHaveBeenCalledTimes(1);
   });
 
-  it('surfaces a rejected restart instead of pretending to reconnect', async () => {
+  it('returns restarted:false when the restart handoff is rejected', async () => {
     const fetchImpl = vi.fn()
       .mockResolvedValueOnce(json(200, {
         ok: true,
@@ -70,7 +70,13 @@ describe('dashboard update and restart action', () => {
       }))
       .mockResolvedValueOnce(json(500, { ok: false, error: 'restart_failed' }));
 
-    await expect(updateAndRestartBotmux(fetchImpl)).rejects.toThrow('restart_failed');
+    await expect(updateAndRestartBotmux(fetchImpl)).resolves.toEqual({
+      oldVersion: '3.0.0',
+      newVersion: '3.1.0',
+      changed: true,
+      restarted: false,
+      restartError: 'restart_failed',
+    });
     expect(fetchImpl).toHaveBeenCalledTimes(2);
   });
 
