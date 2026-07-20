@@ -6,9 +6,12 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { prepareSandbox } from '../src/adapters/backend/sandbox.js';
 import { installLocalPlugin } from '../src/core/plugins/install.js';
+import { pluginMcpPrivatePath } from '../src/core/plugins/paths.js';
 import {
   refreshSessionMcpRuntimeManifest,
+  sessionMcpRuntimeManifestPath,
   sessionMcpRuntimeReadonlyRoots,
+  sessionMcpRuntimeSensitivePaths,
 } from '../src/core/plugins/mcp/session-runtime.js';
 
 const builtCli = resolve('dist/cli.js');
@@ -35,12 +38,24 @@ describe.skipIf(process.platform !== 'linux' || !existsSync(builtCli))('plugin M
     rmSync(root, { recursive: true, force: true });
   });
 
-  it('initializes, lists, and calls a session-scoped plugin MCP inside bwrap', async () => {
+  it.each(['default', 'custom'] as const)(
+    'initializes, lists, and calls a session-scoped plugin MCP inside bwrap with %s data dir',
+    async (dataDirMode) => {
+    if (dataDirMode === 'custom') {
+      dataDir = join(root, 'custom-botmux-home', 'data');
+      mkdirSync(dataDir, { recursive: true });
+      vi.stubEnv('SESSION_DATA_DIR', dataDir);
+    }
     const sessionId = `mcp-sandbox-${Math.random().toString(36).slice(2)}`;
+    const siblingSessionId = `${sessionId}-sibling`;
     const pluginId = 'plugin-a';
     const source = join(root, 'plugin-source');
     const fixture = resolve('test/fixtures/plugin-mcp-server.mjs');
     mkdirSync(join(source, 'dist', 'mcp'), { recursive: true });
+    const installedMcpIndex = join(home, '.botmux', 'plugins', pluginId, 'dist', 'mcp', 'index.json');
+    const privateDescriptor = pluginMcpPrivatePath(pluginId);
+    const currentSnapshot = sessionMcpRuntimeManifestPath(sessionId, dataDir);
+    const siblingSnapshot = sessionMcpRuntimeManifestPath(siblingSessionId, dataDir);
     writeFileSync(join(source, 'package.json'), JSON.stringify({
       name: '@botmux-ai/plugin-plugin-a',
       version: '0.1.0',
@@ -50,10 +65,27 @@ describe.skipIf(process.platform !== 'linux' || !existsSync(builtCli))('plugin M
     }));
     writeFileSync(join(source, 'dist', 'mcp', 'index.json'), JSON.stringify({
       transport: 'stdio',
-      command: [process.execPath, fixture, 'alpha'],
+      command: [
+        '/bin/sh',
+        '-c',
+        'test ! -s "$1" && test ! -s "$2" && test ! -s "$3" && test -s "$4" || exit 78; shift 4; exec "$@"',
+        'verify-session-mcp-isolation',
+        installedMcpIndex,
+        privateDescriptor,
+        siblingSnapshot,
+        currentSnapshot,
+        process.execPath,
+        fixture,
+        'alpha',
+      ],
     }));
-    installLocalPlugin(source, { link: true });
+    installLocalPlugin(source);
 
+    refreshSessionMcpRuntimeManifest({
+      sessionId: siblingSessionId,
+      pluginIds: [pluginId],
+      dataDir,
+    });
     const runtime = refreshSessionMcpRuntimeManifest({
       sessionId,
       pluginIds: [pluginId],
@@ -77,6 +109,7 @@ describe.skipIf(process.platform !== 'linux' || !existsSync(builtCli))('plugin M
         cliBin: gatewayBin,
         cliArgs: ['mcp', 'serve'],
         readonlyRoots: sessionMcpRuntimeReadonlyRoots(runtime, dataDir),
+        postReadonlyHidePaths: sessionMcpRuntimeSensitivePaths(runtime),
         trustedBotmuxCommandPaths: [gatewayBin],
       });
       if (!sandbox) return; // Required Linux sandbox runtime is unavailable.
@@ -105,5 +138,7 @@ describe.skipIf(process.platform !== 'linux' || !existsSync(builtCli))('plugin M
       else if (transport) await transport.close().catch(() => undefined);
       if (sandbox) sandbox.cleanup();
     }
-  });
+    },
+    20_000,
+  );
 });

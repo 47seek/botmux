@@ -185,6 +185,40 @@ describe('plugin MCP Gateway', () => {
     await gateway.close();
   });
 
+  it('keeps MCP tools isolated between two bot sessions that enable different plugins', async () => {
+    installFixturePlugin('plugin-a', 'alpha');
+    const dataDir = join(home, '.botmux', 'data');
+    refreshSessionMcpRuntimeManifest({
+      sessionId: 'bot-a-session',
+      pluginIds: ['plugin-a'],
+      dataDir,
+    });
+    refreshSessionMcpRuntimeManifest({
+      sessionId: 'bot-b-session',
+      pluginIds: [],
+      dataDir,
+    });
+
+    const listForSession = async (sessionId: string): Promise<string[]> => {
+      const gateway = new PluginMcpGateway(
+        undefined,
+        { ...process.env, SESSION_DATA_DIR: dataDir, BOTMUX_SESSION_ID: sessionId },
+      );
+      const client = new Client({ name: `gateway-${sessionId}`, version: '1.0.0' });
+      const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+      await Promise.all([gateway.connect(serverTransport), client.connect(clientTransport)]);
+      try {
+        return (await client.listTools()).tools.map(tool => tool.name).sort();
+      } finally {
+        await client.close();
+        await gateway.close();
+      }
+    };
+
+    expect(await listForSession('bot-a-session')).toEqual(['alpha_unique', 'echo']);
+    expect(await listForSession('bot-b-session')).toEqual([]);
+  });
+
   it('keeps serving when diagnostics cannot be persisted', async () => {
     const blockedDataDir = join(home, 'not-a-directory');
     writeFileSync(blockedDataDir, 'blocked');

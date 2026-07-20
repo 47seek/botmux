@@ -68,6 +68,15 @@ export function assertSafeAppId(appId: string): string {
   return appId;
 }
 
+const SAFE_PLUGIN_SESSION_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+
+function sessionMcpRuntimePath(sessionDataDir: string, sessionId: string): string {
+  if (!SAFE_PLUGIN_SESSION_ID.test(sessionId) || sessionId === '.' || sessionId === '..') {
+    throw new Error(`[read-isolation] unsafe session id used as path segment: ${JSON.stringify(sessionId)}`);
+  }
+  return `${sessionDataDir.replace(/\/+$/, '')}/sessions/${sessionId}/plugin-mcp-runtime.json`;
+}
+
 /** A bot's private home under BOTMUX_HOME: `<botmuxHome>/bots/<appId>`. Holds the
  *  bot's redirected CLI config/transcripts/memory (CLAUDE_CONFIG_DIR=<here>/claude,
  *  CODEX_HOME=<here>/codex). The ONLY thing under BOTMUX_HOME v2 re-allows. */
@@ -258,7 +267,7 @@ export function buildV2DenyRegexes(ctx: V2IsolationContext): string[] {
   const bh = ctx.botmuxHome.replace(/\/+$/, '');
   const h = ctx.homeDir.replace(/\/+$/, '');
   const defaultBh = (ctx.defaultBotmuxHome ?? `${h}/.botmux`).replace(/\/+$/, '');
-  const dashboardRoots = dedupe([defaultBh, bh]);
+  const botmuxRoots = dedupe([defaultBh, bh]);
   return dedupe([
     `^${escapeForRegex(sd)}/sessions-[^/]+\\.json$`,
     // Any `bots.json.` sidecar (backups/temp) — trailing dot so it matches
@@ -277,10 +286,13 @@ export function buildV2DenyRegexes(ctx: V2IsolationContext): string[] {
     // Secret/token creation and atomic rotation use sibling temp files. Deny
     // the whole basename class at both the fixed and custom roots so a live
     // isolated process cannot race-read a fully populated temp inode.
-    ...dashboardRoots.flatMap(root => [
+    ...botmuxRoots.flatMap(root => [
       `^${escapeForRegex(root)}/\\.dashboard-secret(?:\\.|$)`,
       `^${escapeForRegex(root)}/\\.dashboard-token(?:\\.|$)`,
+      `^${escapeForRegex(root)}/plugins/[^/]+/private(?:/|$)`,
+      `^${escapeForRegex(root)}/plugins/[^/]+/dist/mcp/index\\.json$`,
     ]),
+    `^${escapeForRegex(sd)}/sessions/[^/]+/plugin-mcp-runtime\\.json$`,
   ]);
 }
 
@@ -319,10 +331,16 @@ export function buildReadIsolationProtectedWriteRules(
         `${root}/read-isolation`,
       ]),
     ]),
-    denyWriteRegexes: dedupe(dashboardRoots.flatMap(root => [
-      `^${escapeForRegex(root)}/\\.dashboard-secret(?:\\.|$)`,
-      `^${escapeForRegex(root)}/\\.dashboard-token(?:\\.|$)`,
-    ])),
+    denyWriteRegexes: dedupe([
+      ...dashboardRoots.flatMap(root => [
+        `^${escapeForRegex(root)}/\\.dashboard-secret(?:\\.|$)`,
+        `^${escapeForRegex(root)}/\\.dashboard-token(?:\\.|$)`,
+        `^${escapeForRegex(root)}/plugins/[^/]+/private(?:/|$)`,
+        `^${escapeForRegex(root)}/plugins/[^/]+/dist/mcp/index\\.json$`,
+      ]),
+      ...sessionDataDirs.map(root =>
+        `^${escapeForRegex(root)}/sessions/[^/]+/plugin-mcp-runtime\\.json$`),
+    ]),
     // Prevent replacing an entire authority-bearing root to sidestep the
     // exact/regex child rules. `literal` protects only the directory entry;
     // ordinary writes to unrelated descendants remain available.
@@ -362,6 +380,9 @@ export function buildV2CarveOuts(ctx: V2IsolationContext): {
       // Parent read-isolation/ stays wholesale-denied; only this session's
       // rotating origin capability is visible to the confined CLI.
       managedOriginCapabilityPath(sd, ctx.currentSessionId),
+      // The Gateway receives only this session's full descriptor snapshot.
+      // Sibling snapshots stay denied by buildV2DenyRegexes.
+      sessionMcpRuntimePath(sd, ctx.currentSessionId),
     ],
     // file-read-metadata on the wholesale-denied parents so the CLI/skill can realpath()
     // through them WITHOUT `ls` (enumeration) leaking.
@@ -685,7 +706,7 @@ export function buildSeatbeltProfile(
   return lines.join('\n') + '\n';
 }
 
-export const ISOLATION_PANE_MARKER_VERSION = 2;
+export const ISOLATION_PANE_MARKER_VERSION = 3;
 
 /** Versioned marker written beside a freshly spawned persistent sandbox. */
 export function isolationPaneMarkerContent(bootId: string): string {

@@ -8572,6 +8572,18 @@ function printPluginServiceRunningError(err: unknown): boolean {
   return true;
 }
 
+function printPluginServiceDeleteError(err: unknown): boolean {
+  if (!err || typeof err !== 'object' || (err as any).code !== 'plugin_service_delete_failed') return false;
+  const failures = Array.isArray((err as any).failures) ? (err as any).failures : [];
+  const details = failures
+    .map((failure: any) => `${String(failure.pluginId ?? 'unknown')}: ${String(failure.warning ?? 'PM2 删除失败')}`)
+    .join('; ');
+  console.error('❌ 插件服务的 PM2 记录删除失败，插件未卸载。');
+  if (details) console.error(`   ${details}`);
+  console.error('   请确认 PM2 可用后重新执行卸载；Botmux 未清理插件文件、配置或绑定。');
+  return true;
+}
+
 async function cmdPlugin(args: string[]): Promise<void> {
   const sub = (args[0] ?? 'list').toLowerCase();
   if (sub === 'help' || sub === '--help' || sub === '-h') {
@@ -8691,7 +8703,7 @@ async function cmdPlugin(args: string[]): Promise<void> {
     assertPluginInstalled(pluginId);
     const {
       assertPluginServiceStopped,
-      deletePluginServicesUnlocked,
+      deletePluginServicesOrThrowUnlocked,
       withPluginServiceLock,
     } = await import('./core/plugins/service-manager.js');
     const { dematerializePlugin } = await import('./core/plugins/materializer.js');
@@ -8715,8 +8727,8 @@ async function cmdPlugin(args: string[]): Promise<void> {
           assertPluginServiceStopped(pluginId, 'uninstall');
         }
 
+        await deletePluginServicesOrThrowUnlocked([pluginId]);
         dematerializePlugin(pluginId);
-        await deletePluginServicesUnlocked([pluginId]);
         await removePluginSkillRegistryEntries(pluginId);
         removeInstalledPlugin(pluginId);
         removePluginBindingsEverywhere(pluginId);
@@ -8731,6 +8743,10 @@ async function cmdPlugin(args: string[]): Promise<void> {
         return;
       }
       if (printPluginServiceRunningError(err)) {
+        process.exitCode = 1;
+        return;
+      }
+      if (printPluginServiceDeleteError(err)) {
         process.exitCode = 1;
         return;
       }

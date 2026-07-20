@@ -6,6 +6,7 @@ import { atomicWriteFileSync } from '../../../utils/atomic-write.js';
 import { pluginRuntimeDir } from '../paths.js';
 import { sessionPluginManifestPath } from '../session-manifest.js';
 import type { PluginMcpServer } from '../types.js';
+import { isPluginMcpServer, readPluginMcpDescriptor } from './private-store.js';
 
 export interface SessionMcpRuntimeEntry {
   pluginId: string;
@@ -26,31 +27,6 @@ export function sessionMcpRuntimeManifestPath(
   dataDir: string = config.session.dataDir,
 ): string {
   return join(dirname(sessionPluginManifestPath(sessionId, dataDir)), 'plugin-mcp-runtime.json');
-}
-
-function isStringRecord(value: unknown): value is Record<string, string> {
-  return !!value
-    && typeof value === 'object'
-    && !Array.isArray(value)
-    && Object.values(value).every(item => typeof item === 'string');
-}
-
-function isMcpServer(value: unknown): value is PluginMcpServer {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
-  const server = value as Record<string, unknown>;
-  if (typeof server.name !== 'string' || !server.name) return false;
-  if (server.transport === 'stdio') {
-    return Array.isArray(server.command)
-      && server.command.length > 0
-      && server.command.every(part => typeof part === 'string' && part.length > 0)
-      && (server.env === undefined || isStringRecord(server.env));
-  }
-  if (server.transport === 'streamable-http') {
-    return typeof server.url === 'string'
-      && server.url.length > 0
-      && (server.headers === undefined || isStringRecord(server.headers));
-  }
-  return false;
 }
 
 export function readSessionMcpRuntimeManifest(
@@ -76,7 +52,7 @@ export function readSessionMcpRuntimeManifest(
         && enabled.has(value.pluginId)
         && typeof value.pluginDir === 'string'
         && isAbsolute(value.pluginDir)
-        && isMcpServer(value.server);
+        && isPluginMcpServer(value.server);
     })) return null;
     return parsed as SessionMcpRuntimeManifest;
   } catch {
@@ -94,8 +70,9 @@ export function refreshSessionMcpRuntimeManifest(opts: {
   const pluginIds = [...opts.pluginIds];
   const entries: SessionMcpRuntimeEntry[] = [];
   for (const pluginId of pluginIds) {
-    const server = registry.plugins[pluginId]?.contributions?.mcp;
-    if (!server) continue;
+    const contribution = registry.plugins[pluginId]?.contributions?.mcp;
+    if (!contribution) continue;
+    const server = readPluginMcpDescriptor(pluginId, contribution);
     entries.push({ pluginId, pluginDir: pluginRuntimeDir(pluginId), server });
   }
   const manifest: SessionMcpRuntimeManifest = {
@@ -119,4 +96,12 @@ export function sessionMcpRuntimeReadonlyRoots(
     sessionMcpRuntimeManifestPath(manifest.sessionId, dataDir),
     ...new Set(manifest.entries.map(entry => entry.pluginDir)),
   ];
+}
+
+/** Installation input may contain credentials, but the Gateway never reads it
+ * at runtime. Hide it after re-binding plugin runtime roots into a sandbox. */
+export function sessionMcpRuntimeSensitivePaths(
+  manifest: SessionMcpRuntimeManifest,
+): string[] {
+  return [...new Set(manifest.entries.map(entry => join(entry.pluginDir, 'mcp', 'index.json')))];
 }

@@ -85,6 +85,9 @@ describe('CLI plugin generation', () => {
       sessionMcpRuntimeManifestPath('same-session', dataDir),
       join(home, '.botmux', 'plugins', 'demo', 'dist'),
     ]);
+    expect(first.mcpHidePaths).toEqual([
+      join(home, '.botmux', 'plugins', 'demo', 'dist', 'mcp', 'index.json'),
+    ]);
 
     const refreshed = prepareCliPluginGeneration({
       sessionId: 'same-session',
@@ -111,5 +114,6 @@ describe('CLI plugin generation', () => {
     expect(refreshed.mcpReadonlyRoots).toEqual([
       sessionMcpRuntimeManifestPath('same-session', dataDir),
     ]);
+    expect(refreshed.mcpHidePaths).toEqual([]);
   });
 });

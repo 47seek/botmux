@@ -16,6 +16,8 @@ vi.mock('../src/core/plugins/pm2.js', () => ({
 
 import {
   assertPluginServiceStopped,
+  deletePluginServicesOrThrowUnlocked,
+  PluginServiceDeleteError,
   PluginServiceRunningError,
 } from '../src/core/plugins/service-manager.js';
 import { installLocalPlugin } from '../src/core/plugins/install.js';
@@ -115,6 +117,82 @@ describe('plugin service lifecycle guard', () => {
     expect(readFileSync(join(updated.runtimeDir, 'marker.txt'), 'utf8')).toBe('v2\n');
   });
 
+  it('fails closed when PM2 deletion fails and preserves every plugin-owned file', async () => {
+    writePluginSource(source, '0.1.0', 'v1');
+    const installed = installLocalPlugin(source);
+    const pluginRoot = join(home, '.botmux', 'plugins', 'service-demo');
+    const registryPath = join(home, '.botmux', 'plugins-registry.json');
+    const serviceStatePath = join(pluginRoot, 'service.json');
+    writeFileSync(serviceStatePath, '{"status":"stopped"}\n');
+    const registryBefore = readFileSync(registryPath, 'utf8');
+
+    pm2.capture.mockReturnValue(pm2List('stopped'));
+    pm2.run.mockImplementation(() => { throw new Error('simulated pm2 delete failure'); });
+
+    await expect(deletePluginServicesOrThrowUnlocked(['service-demo']))
+      .rejects.toBeInstanceOf(PluginServiceDeleteError);
+    expect(readFileSync(registryPath, 'utf8')).toBe(registryBefore);
+    expect(readFileSync(join(installed.runtimeDir, 'marker.txt'), 'utf8')).toBe('v1\n');
+    expect(existsSync(join(pluginRoot, 'config.json'))).toBe(true);
+    expect(existsSync(join(pluginRoot, 'settings.json'))).toBe(true);
+    expect(existsSync(serviceStatePath)).toBe(true);
+  });
+
+  it('treats a PM2 record that remains after delete as a failed deletion', async () => {
+    writePluginSource(source, '0.1.0', 'v1');
+    installLocalPlugin(source);
+    pm2.capture.mockReturnValue(pm2List('stopped'));
+
+    await expect(deletePluginServicesOrThrowUnlocked(['service-demo']))
+      .rejects.toMatchObject({
+        code: 'plugin_service_delete_failed',
+        failures: [expect.objectContaining({
+          pluginId: 'service-demo',
+          action: 'failed',
+          warning: expect.stringContaining('pm2_delete_not_applied'),
+        })],
+      });
+  });
+
+  it('deletes the PM2 app and service state after a verified successful deletion', async () => {
+    writePluginSource(source, '0.1.0', 'v1');
+    installLocalPlugin(source);
+    const serviceStatePath = join(home, '.botmux', 'plugins', 'service-demo', 'service.json');
+    writeFileSync(serviceStatePath, '{"status":"stopped"}\n');
+    pm2.capture
+      .mockReturnValueOnce(pm2List('stopped'))
+      .mockReturnValueOnce('[]');
+
+    await expect(deletePluginServicesOrThrowUnlocked(['service-demo']))
+      .resolves.toEqual([
+        expect.objectContaining({
+          pluginId: 'service-demo',
+          action: 'deleted',
+        }),
+      ]);
+    expect(pm2.run).toHaveBeenCalledWith(
+      ['delete', 'botmux-plugin-service-demo'],
+      { inherit: false, timeoutMs: 30_000 },
+    );
+    expect(existsSync(serviceStatePath)).toBe(false);
+  });
+
+  it('deletes the PM2 app even when the installed service entry is missing', async () => {
+    writePluginSource(source, '0.1.0', 'v1');
+    const installed = installLocalPlugin(source);
+    rmSync(join(installed.runtimeDir, 'service', 'index.js'));
+    pm2.capture
+      .mockReturnValueOnce(pm2List('stopped'))
+      .mockReturnValueOnce('[]');
+
+    await expect(deletePluginServicesOrThrowUnlocked(['service-demo']))
+      .resolves.toEqual([expect.objectContaining({ pluginId: 'service-demo', action: 'deleted' })]);
+    expect(pm2.run).toHaveBeenCalledWith(
+      ['delete', 'botmux-plugin-service-demo'],
+      { inherit: false, timeoutMs: 30_000 },
+    );
+  });
+
   it('keeps the uninstall service check and destructive cleanup in one service lock', () => {
     const cliSource = readFileSync(new URL('../src/cli.ts', import.meta.url), 'utf8');
     const branchStart = cliSource.indexOf("if (sub === 'uninstall' || sub === 'remove' || sub === 'rm')");
@@ -126,7 +204,8 @@ describe('plugin service lifecycle guard', () => {
     const uninstallBranch = cliSource.slice(branchStart, branchEnd);
     const lockStart = uninstallBranch.indexOf('withPluginServiceLock');
     const serviceCheck = uninstallBranch.indexOf("assertPluginServiceStopped(pluginId, 'uninstall')");
-    const serviceDelete = uninstallBranch.indexOf('deletePluginServicesUnlocked([pluginId])');
+    const serviceDelete = uninstallBranch.indexOf('deletePluginServicesOrThrowUnlocked([pluginId])');
+    const materializedDelete = uninstallBranch.indexOf('dematerializePlugin(pluginId)');
     const registryDelete = uninstallBranch.indexOf('removeInstalledPlugin(pluginId)');
     const runtimeDelete = uninstallBranch.indexOf('rmSync(pluginHome(pluginId)');
 
@@ -135,7 +214,8 @@ describe('plugin service lifecycle guard', () => {
     expect(lockStart).toBeGreaterThanOrEqual(0);
     expect(serviceCheck).toBeGreaterThan(lockStart);
     expect(serviceDelete).toBeGreaterThan(serviceCheck);
-    expect(registryDelete).toBeGreaterThan(serviceDelete);
+    expect(materializedDelete).toBeGreaterThan(serviceDelete);
+    expect(registryDelete).toBeGreaterThan(materializedDelete);
     expect(runtimeDelete).toBeGreaterThan(registryDelete);
   });
 });

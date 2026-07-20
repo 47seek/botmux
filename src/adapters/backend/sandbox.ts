@@ -161,6 +161,11 @@ export interface SandboxPlan {
    *  (daemon-produced, e.g. skill plugin dirs) — bound AFTER the privacy masks so
    *  a broad hideDir can't break skill delivery. */
   readonlyRoots?: string[];
+  /** Sensitive files inside readonlyRoots that must stay hidden. Applied after
+   * the readonly bind so that re-exposing a plugin runtime cannot reveal its
+   * install-time MCP descriptor. */
+  postReadonlyHideDirs?: string[];
+  postReadonlyHideFiles?: { path: string; empty: string }[];
   /** Daemon-generated private roots re-bound writable AFTER credential masks.
    * Used for the current bot's isolated CLI home only; never accepts user
    * config. */
@@ -221,6 +226,11 @@ export function buildSandboxArgs(plan: SandboxPlan): string[] {
   // Session-scoped TRUSTED runtime inputs, e.g. generated skill/plugin dirs —
   // after the masks so a broad hideDir can't blank skill delivery.
   for (const root of plan.readonlyRoots ?? []) a.push('--ro-bind', root, root);
+  // A readonly runtime root can contain install-time credentials that the child
+  // does not need. Re-mask those paths after the root bind so mount order cannot
+  // re-expose them.
+  for (const dir of plan.postReadonlyHideDirs ?? []) a.push('--tmpfs', dir);
+  for (const f of plan.postReadonlyHideFiles ?? []) a.push('--ro-bind', f.empty, f.path);
   // Outbox LAST so it wins even if a mask covers a parent dir.
   a.push('--bind', plan.outbox, plan.outbox);
   // Isolate namespaces (keep net unless explicitly disabled).
@@ -555,6 +565,9 @@ export function prepareSandbox(opts: {
   /** Runtime-generated roots that should be visible read-only inside bwrap.
    *  Trusted (daemon-produced) — bound after the privacy masks. */
   readonlyRoots?: readonly string[];
+  /** Sensitive descendants of readonlyRoots that are re-masked after those
+   * roots are mounted. */
+  postReadonlyHidePaths?: readonly string[];
   /** Absolute Botmux command paths already written into a CLI's MCP config.
    * When a target lives below the masked BOTMUX_HOME, bind the trusted relay
    * shim at that exact path so an absolute MCP command remains executable. */
@@ -714,6 +727,8 @@ export function prepareSandbox(opts: {
   const hideFiles: { path: string; empty: string }[] = [];
   const finalHideDirs: string[] = [];
   const finalHideFiles: { path: string; empty: string }[] = [];
+  const postReadonlyHideDirs: string[] = [];
+  const postReadonlyHideFiles: { path: string; empty: string }[] = [];
   let emptyIdx = 0;
   const customBotsConfig = process.env.BOTS_CONFIG?.trim();
   const credentialPaths = [
@@ -759,6 +774,7 @@ export function prepareSandbox(opts: {
   };
   classifyMasks([...credentialPaths, ...(opts.hidePaths ?? [])], hideDirs, hideFiles);
   classifyMasks(opts.finalHidePaths ?? [], finalHideDirs, finalHideFiles);
+  classifyMasks(opts.postReadonlyHidePaths ?? [], postReadonlyHideDirs, postReadonlyHideFiles);
 
   // CLI auth/login paths kept real+writable (token refresh / login must persist,
   // unlike isolated project edits). Resolve `~` and bind only existing paths — a
@@ -782,6 +798,8 @@ export function prepareSandbox(opts: {
     finalHideDirs,
     finalHideFiles,
     readonlyRoots,
+    postReadonlyHideDirs,
+    postReadonlyHideFiles,
     userReadonlyRoots,
     net: opts.net !== false,
   };
@@ -790,12 +808,22 @@ export function prepareSandbox(opts: {
   // read-only (`--ro-bind / /`), so bwrap can't mkdir a new mountpoint at the
   // root (/sbxbin) → it must live under a writable tmpfs (/run). PATH points here.
   args.push('--ro-bind', shimBin, '/run/sbxbin');
+  const trustedBotmuxRoots = [...new Set([
+    canonicalizeWithMissingTail(join(home, '.botmux')),
+    canonicalizeWithMissingTail(botmuxHome),
+  ])];
   for (const rawTarget of [...new Set(opts.trustedBotmuxCommandPaths ?? [])]) {
     if (!rawTarget || typeof rawTarget !== 'string') continue;
-    const target = resolve(expandTilde(rawTarget, home));
-    const rel = relative(botmuxHome, target);
-    if (!rel || rel === '..' || rel.startsWith('../') || isAbsolute(rel)) continue;
-    let current = botmuxHome;
+    const target = canonicalizeWithMissingTail(expandTilde(rawTarget, home));
+    const trustedRoot = trustedBotmuxRoots.find(root => {
+      const rel = relative(root, target);
+      return rel !== '' && rel !== '..' && !rel.startsWith('../') && !isAbsolute(rel);
+    });
+    // External commands stay visible through the initial read-only bind of `/`.
+    // Only replace commands below a masked Botmux root, and reject symlink escapes.
+    if (!trustedRoot) continue;
+    const rel = relative(trustedRoot, target);
+    let current = trustedRoot;
     for (const segment of dirname(rel).split('/').filter(segment => segment && segment !== '.')) {
       current = join(current, segment);
       args.push('--dir', current);

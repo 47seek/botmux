@@ -271,6 +271,7 @@ function refreshCliPluginGeneration(
   cfg.skillPluginDir = generation.skillPluginDir;
   cfg.skillReadonlyRoots = generation.skillReadonlyRoots;
   cfg.mcpReadonlyRoots = generation.mcpReadonlyRoots;
+  cfg.mcpHidePaths = generation.mcpHidePaths;
   deferredPluginSkillCatalog = generation.deferredSkillCatalog ?? null;
   log(`Plugin generation refreshed: ${generation.pluginManifest.pluginIds.join(', ') || '(none)'}`);
 }
@@ -6020,6 +6021,7 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
         }),
       ];
       finalDenyPaths = carve.finalDenyPaths.map(canonical);
+      finalDenyPaths.push(...(cfg.mcpHidePaths ?? []).map(canonical));
       traverseDirs = carve.traverseDirs.map(canonical);
       protectedWrites = buildReadIsolationProtectedWriteRules(profileCtx, {
         // Keep lexical roots as well as their canonical targets. Canonical
@@ -6208,6 +6210,7 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
             ...(cfg.mcpReadonlyRoots ?? []),
             ...(readIsoLinuxMasks?.ownReadOnlyPaths ?? []),
           ],
+          postReadonlyHidePaths: cfg.mcpHidePaths ?? [],
           trustedBotmuxCommandPaths: [defaultGatewayEntry().command],
           userReadonlyPaths: cfg.sandboxReadonlyPaths ?? [],
           net: cfg.sandboxNetwork !== false,

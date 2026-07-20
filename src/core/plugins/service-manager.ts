@@ -44,6 +44,18 @@ export class PluginServiceRunningError extends Error {
   }
 }
 
+export class PluginServiceDeleteError extends Error {
+  readonly code = 'plugin_service_delete_failed';
+  readonly failures: PluginServiceReport[];
+
+  constructor(readonly reports: PluginServiceReport[]) {
+    const failures = reports.filter(report => report.action === 'failed');
+    super(`plugin_service_delete_failed:${failures.map(report => report.pluginId).join(',')}`);
+    this.name = 'PluginServiceDeleteError';
+    this.failures = failures;
+  }
+}
+
 interface Pm2AppInfo {
   name: string;
   pid?: number;
@@ -394,15 +406,31 @@ export async function deletePluginServicesUnlocked(pluginIds?: readonly string[]
   const reports: PluginServiceReport[] = [];
   for (const record of selectedRecords(pluginIds)) {
     try {
-      const definition = await loadPluginServiceDefinition(record);
-      if (!definition) continue;
       const name = pluginPm2AppName(record.id);
-      if (findPm2App(name)) runPluginPm2(['delete', name], { inherit: false, timeoutMs: 30_000 });
+      if (findPm2App(name)) {
+        runPluginPm2(['delete', name], { inherit: false, timeoutMs: 30_000 });
+        const remaining = findPm2App(name);
+        if (remaining) {
+          throw new Error(`pm2_delete_not_applied:${name}:${remaining.status ?? 'unknown'}`);
+        }
+      }
       deleteServiceState(record.id);
       reports.push(reportFromState(record, 'deleted', undefined));
     } catch (err: any) {
       reports.push(reportFromState(record, 'failed', readServiceState(record.id), err?.message ?? String(err)));
     }
+  }
+  return reports;
+}
+
+/** Destructive lifecycle callers use the strict variant so a PM2 failure
+ * aborts before registry/runtime/binding cleanup can begin. */
+export async function deletePluginServicesOrThrowUnlocked(
+  pluginIds?: readonly string[],
+): Promise<PluginServiceReport[]> {
+  const reports = await deletePluginServicesUnlocked(pluginIds);
+  if (reports.some(report => report.action === 'failed')) {
+    throw new PluginServiceDeleteError(reports);
   }
   return reports;
 }

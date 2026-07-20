@@ -15,6 +15,14 @@ import type { InstalledPluginRecord, PluginPackageManifest, PluginSettingsFile }
 import { readPluginRegistry, upsertInstalledPlugin } from '../../services/plugin-registry-store.js';
 import { atomicWriteFileSync } from '../../utils/atomic-write.js';
 import { assertPluginServiceStopped, withPluginServiceLockSync } from './service-manager.js';
+import {
+  capturePluginMcpPrivateSnapshot,
+  publicPluginMcpContribution,
+  removePluginMcpDescriptor,
+  restorePluginMcpPrivateSnapshot,
+  writePluginMcpDescriptor,
+} from './mcp/private-store.js';
+import type { PluginMcpServer } from './types.js';
 
 export interface InstallPluginOptions {
   source?: 'auto' | 'npm' | 'local';
@@ -65,19 +73,34 @@ function copyRuntime(sourceDir: string, targetDir: string): void {
   cpSync(sourceDir, targetDir, { recursive: true });
 }
 
-function replacePluginRuntime(pluginId: string, stagedDir: string): string {
+interface PluginRuntimeReplacement {
+  runtimeDir: string;
+  commit(): void;
+  rollback(): void;
+}
+
+function replacePluginRuntime(pluginId: string, stagedDir: string): PluginRuntimeReplacement {
   const targetDir = pluginRuntimeDir(pluginId);
   const backupDir = join(pluginHome(pluginId), `.dist-previous-${process.pid}-${Date.now()}`);
   rmSync(backupDir, { recursive: true, force: true });
-  if (existsSync(targetDir)) renameSync(targetDir, backupDir);
+  const hadPrevious = existsSync(targetDir);
+  if (hadPrevious) renameSync(targetDir, backupDir);
   try {
     renameSync(stagedDir, targetDir);
   } catch (err) {
-    if (existsSync(backupDir)) renameSync(backupDir, targetDir);
+    if (hadPrevious && existsSync(backupDir)) renameSync(backupDir, targetDir);
     throw err;
   }
-  rmSync(backupDir, { recursive: true, force: true });
-  return targetDir;
+  return {
+    runtimeDir: targetDir,
+    commit() {
+      try { rmSync(backupDir, { recursive: true, force: true }); } catch { /* stale backup is recoverable */ }
+    },
+    rollback() {
+      rmSync(targetDir, { recursive: true, force: true });
+      if (hadPrevious && existsSync(backupDir)) renameSync(backupDir, targetDir);
+    },
+  };
 }
 
 function stageRuntime(pluginId: string, sourceDir: string, link: boolean): string {
@@ -92,19 +115,53 @@ function stageRuntime(pluginId: string, sourceDir: string, link: boolean): strin
   return stagedDir;
 }
 
-function makeRecord(pkg: PluginPackageManifest, source: InstalledPluginRecord['source'], runtimeDir: string): InstalledPluginRecord {
+interface StagedPluginRecord {
+  record: InstalledPluginRecord;
+  mcpServer?: PluginMcpServer;
+}
+
+function makeRecord(
+  pkg: PluginPackageManifest,
+  source: InstalledPluginRecord['source'],
+  runtimeDir: string,
+): StagedPluginRecord {
   const now = new Date().toISOString();
-  const contributions = scanPluginContributions(runtimeDir, pkg.botmux);
+  const scanned = scanPluginContributions(runtimeDir, pkg.botmux);
+  const { mcp: mcpServer, ...publicContributions } = scanned ?? {};
+  const contributions = scanned ? {
+    ...publicContributions,
+    ...(mcpServer ? { mcp: publicPluginMcpContribution(mcpServer) } : {}),
+  } : undefined;
   return {
-    id: pkg.botmux.id,
-    packageName: pkg.name,
-    version: pkg.version,
-    source,
-    manifest: pkg.botmux,
-    ...(contributions ? { contributions } : {}),
-    installedAt: now,
-    updatedAt: now,
+    record: {
+      id: pkg.botmux.id,
+      packageName: pkg.name,
+      version: pkg.version,
+      source,
+      manifest: pkg.botmux,
+      ...(contributions ? { contributions } : {}),
+      installedAt: now,
+      updatedAt: now,
+    },
+    ...(mcpServer ? { mcpServer } : {}),
   };
+}
+
+function commitPluginInstall(staged: StagedPluginRecord, stagedDir: string): InstallPluginResult {
+  const pluginId = staged.record.id;
+  const privateSnapshot = capturePluginMcpPrivateSnapshot(pluginId);
+  const replacement = replacePluginRuntime(pluginId, stagedDir);
+  try {
+    if (staged.mcpServer) writePluginMcpDescriptor(pluginId, staged.mcpServer);
+    else removePluginMcpDescriptor(pluginId);
+    const record = upsertInstalledPlugin(staged.record);
+    replacement.commit();
+    return { record, runtimeDir: replacement.runtimeDir };
+  } catch (error) {
+    try { restorePluginMcpPrivateSnapshot(pluginId, privateSnapshot); } catch { /* preserve the original error */ }
+    try { replacement.rollback(); } catch { /* preserve the original error */ }
+    throw error;
+  }
 }
 
 function assertExistingPluginServiceStopped(pluginId: string): void {
@@ -127,9 +184,7 @@ export function installLocalPlugin(spec: string, opts: InstallPluginOptions = {}
     return withPluginServiceLockSync(() => {
       assertExistingPluginServiceStopped(pkg.botmux.id);
       ensurePluginStateFiles(pkg.botmux.id);
-      const runtimeDir = replacePluginRuntime(pkg.botmux.id, stagedDir);
-      const record = upsertInstalledPlugin(stagedRecord);
-      return { record, runtimeDir };
+      return commitPluginInstall(stagedRecord, stagedDir);
     });
   } finally {
     rmSync(stagedDir, { recursive: true, force: true });
@@ -181,9 +236,7 @@ export function installNpmPlugin(spec: string): InstallPluginResult {
       return withPluginServiceLockSync(() => {
         assertExistingPluginServiceStopped(pkg.botmux.id);
         ensurePluginStateFiles(pkg.botmux.id);
-        const runtimeDir = replacePluginRuntime(pkg.botmux.id, stagedDir);
-        const record = upsertInstalledPlugin(stagedRecord);
-        return { record, runtimeDir };
+        return commitPluginInstall(stagedRecord, stagedDir);
       });
     } finally {
       rmSync(stagedDir, { recursive: true, force: true });

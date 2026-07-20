@@ -9,6 +9,7 @@ import { refreshSessionPluginManifest, type SessionPluginManifest } from './sess
 import {
   refreshSessionMcpRuntimeManifest,
   sessionMcpRuntimeReadonlyRoots,
+  sessionMcpRuntimeSensitivePaths,
 } from './mcp/session-runtime.js';
 import { resolvePluginSkillPackages } from './skills.js';
 
@@ -21,6 +22,7 @@ export interface CliPluginGenerationResult {
   skillPluginDir?: string;
   skillReadonlyRoots?: string[];
   mcpReadonlyRoots?: string[];
+  mcpHidePaths?: string[];
   deferredSkillCatalog?: string;
   diagnostics: string[];
   fatal?: boolean;
@@ -91,6 +93,7 @@ export function prepareCliPluginGeneration(opts: {
     skillPluginDir: delivery.pluginDir,
     skillReadonlyRoots: delivery.readonlyRoots.length > 0 ? delivery.readonlyRoots : undefined,
     mcpReadonlyRoots: sessionMcpRuntimeReadonlyRoots(mcpRuntimeManifest, opts.dataDir),
+    mcpHidePaths: sessionMcpRuntimeSensitivePaths(mcpRuntimeManifest),
     deferredSkillCatalog: prompt.trim().length === 0 && catalog ? catalog : undefined,
     diagnostics: [
       ...pluginSkills.diagnostics.map(value => `plugin_skill:${value}`),

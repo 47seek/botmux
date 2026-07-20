@@ -46,6 +46,7 @@ import {
   readSessionMcpRuntimeManifest,
   type SessionMcpRuntimeManifest,
 } from './session-runtime.js';
+import { readPluginMcpDescriptor } from './private-store.js';
 import type { PluginMcpServer } from '../types.js';
 
 const GATEWAY_VERSION = '1.0.0';
@@ -149,8 +150,9 @@ function gatewayDescriptors(pluginIds: readonly string[]): GatewayDescriptor[] {
   for (const pluginId of pluginIds) {
     const record = registry.plugins[pluginId];
     if (!record) continue;
-    const server = record.contributions?.mcp;
-    if (!server) continue;
+    const contribution = record.contributions?.mcp;
+    if (!contribution) continue;
+    const server = readPluginMcpDescriptor(pluginId, contribution);
     descriptors.push({
       key: pluginId,
       pluginId,
