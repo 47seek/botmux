@@ -30,12 +30,19 @@ export const RPC_CAPABLE_CLIS = new Set(['codex', 'traex']);
  *     would be misjudged as native and reattached, and pty has no persistent
  *     pane at all — so restrict RPC to tmux until each backend's replace path is
  *     built + verified. */
-export function codexRpcEligible(cfg: InitCfg): boolean {
+export interface CodexRpcRuntimeGates {
+  /** Process-wide BOTMUX_SANDBOX=1 force. It is not represented in InitCfg but
+   *  must gate RPC too: the app-server owns model execution and otherwise runs
+   *  outside the sandbox wrapped around the viewer pane. */
+  sandboxForced?: boolean;
+}
+
+export function codexRpcEligible(cfg: InitCfg, runtime: CodexRpcRuntimeGates = {}): boolean {
   const wantResume = cfg.resume === true && !!cfg.cliSessionId;
   return (
     cfg.codexRpcInput === true && RPC_CAPABLE_CLIS.has(cfg.cliId) &&
     cfg.backendType === 'tmux' &&
-    cfg.adoptMode !== true && cfg.readIsolation !== true && cfg.sandbox !== true &&
+    cfg.adoptMode !== true && cfg.readIsolation !== true && cfg.sandbox !== true && runtime.sandboxForced !== true &&
     cfg.disableCliBypass !== true &&
     !cfg.startupCommands?.length &&
     !cfg.wrapperCli && !cfg.cliPathOverride &&
@@ -108,6 +115,10 @@ export function shouldPreMarkFirstTurn(outcome: EngageOutcome): boolean {
 export interface RpcInitEffects {
   paneInfo: (sessionId: string) => { name: string; live: boolean } | null;
   paneIsRemote: (sessionName: string) => boolean;
+  /** Refresh the session-scoped Skill/MCP generation and start its trusted MCP
+   *  host before the app-server starts. For fresh RPC, this also mutates the
+   *  first prompt to include the current Skill catalog. */
+  prepare: () => Promise<void>;
   engage: () => Promise<EngageOutcome>;    // engageCodexRpc(cfg) — sets the module engine on success
   killVerify: (sessionName: string) => Promise<boolean>; // kill stale pane, VERIFY gone
   teardownEngine: () => void;              // stop engine + clear remote vars
@@ -150,20 +161,26 @@ export interface RpcInitDecision {
  *  fresh/resume/kill-failure ORDERING is unit-testable (the worker only wires
  *  real effects + acts on the decision). Mirrors the four cases:
  *   - not eligible                     → nothing (paste).
- *   - no live pane (fresh or resume-  → engage; fresh pre-sends the first turn
- *     without a surviving pane)          inside engage, resume must queue it.
- *   - live RPC-owned pane              → engage, then kill+VERIFY the stale pane;
+ *   - no live pane (fresh or resume-  → prepare Skill/MCP state, then engage;
+ *     without a surviving pane)          fresh pre-sends the first turn inside
+ *                                         engage, resume must queue it.
+ *   - live RPC-owned pane              → prepare, engage, then kill+VERIFY the stale pane;
  *                                         on success respawn (queue the prompt),
  *                                         on failure tear the engine down + abort
  *                                         spawn (never attach a stale remote pane
  *                                         to a fresh-port engine — Codex P0-2).
  *   - live native paste pane           → leave it (fail-closed paste, boundary #3). */
-export async function orchestrateCodexRpcInit(cfg: InitCfg, fx: RpcInitEffects): Promise<RpcInitDecision> {
+export async function orchestrateCodexRpcInit(
+  cfg: InitCfg,
+  fx: RpcInitEffects,
+  runtime: CodexRpcRuntimeGates = {},
+): Promise<RpcInitDecision> {
   const NONE: RpcInitDecision = { engaged: false, queuePrompt: false, abortSpawn: false };
-  if (!codexRpcEligible(cfg)) return NONE;
+  if (!codexRpcEligible(cfg, runtime)) return NONE;
   const pane = fx.paneInfo(cfg.sessionId);
   if (!pane || !pane.live) {
     // Fresh session, or a resume whose pane didn't survive.
+    await fx.prepare();
     const outcome = await fx.engage();
     switch (outcome) {
       case 'accepted':
@@ -186,8 +203,18 @@ export async function orchestrateCodexRpcInit(cfg: InitCfg, fx: RpcInitEffects):
   if (fx.paneIsRemote(pane.name)) {
     // Surviving RPC `--remote` pane on the now-dead prior app-server (always a
     // resume). Re-engage, then replace the stale pane.
+    await fx.prepare();
     const outcome = await fx.engage();
-    if (outcome === 'not-engaged') return NONE; // engine didn't come up → paste (nothing touched)
+    if (outcome === 'not-engaged') {
+      // The pane is still a viewer for the prior incarnation's dead app-server;
+      // merely returning to the paste path would reattach that pane and silently
+      // drop input. Remove it first so spawnCli can create a native paste pane.
+      const gone = await fx.killVerify(pane.name);
+      if (gone) return NONE;
+      fx.notify('Codex RPC 会话恢复失败：新引擎未启动，且无法替换旧 --remote 面板。请重试，或 /close 后重开会话。');
+      fx.log(`Codex RPC resume: engine unavailable and FAILED to kill stale --remote pane ${pane.name}; aborting init`);
+      return { engaged: false, queuePrompt: false, abortSpawn: true };
+    }
     const gone = await fx.killVerify(pane.name);
     if (gone) return { engaged: true, queuePrompt: true, abortSpawn: false };
     fx.teardownEngine();
@@ -197,6 +224,30 @@ export async function orchestrateCodexRpcInit(cfg: InitCfg, fx: RpcInitEffects):
   }
   fx.log('Codex RPC: surviving pane is native paste (not RPC-owned) — keeping paste for this restore');
   return NONE;
+}
+
+export interface PersistentPaneKillEffects {
+  kill: (sessionName: string) => void;
+  isLive: (sessionName: string) => boolean;
+  wait: (ms: number) => Promise<void>;
+}
+
+/** Kill a resolved persistent-session name and verify that exact name is gone.
+ *  Keeping the resolved name opaque avoids accidentally applying sessionName()
+ *  twice (`bmx-1234` -> `bmx-bmx-`), which would turn every failed kill into a
+ *  false success and reattach the stale RPC pane. */
+export async function killAndVerifyPersistentPane(
+  sessionName: string,
+  fx: PersistentPaneKillEffects,
+  attempts = 4,
+  retryMs = 250,
+): Promise<boolean> {
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    try { fx.kill(sessionName); } catch { /* verify below */ }
+    if (!fx.isLive(sessionName)) return true;
+    if (attempt + 1 < attempts) await fx.wait(retryMs);
+  }
+  return !fx.isLive(sessionName);
 }
 
 function tmuxPanePid(sessionName: string): number | undefined {

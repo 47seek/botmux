@@ -149,7 +149,7 @@ import { createCliAdapterSync, locateOnPath } from './adapters/cli/registry.js';
 import { buildWrappedLaunch, parseWrapperCli, isTtadkWrapper } from './setup/cli-selection.js';
 import { cliUnavailableMessage } from './setup/cli-availability.js';
 import { findLaunchedCliPid, scheduleWrapperRealCliPid, readComm, isBareShellComm, bareShellLaunchKind } from './core/session-discovery.js';
-import { codexRpcEligible, paneRunsRemoteTui, orchestrateCodexRpcInit, rolloutUserTurnMatches, decideStartupDialogAction, shouldQueueInitialPrompt, shouldPreMarkFirstTurn, type EngageOutcome } from './codex-rpc-lifecycle.js';
+import { codexRpcEligible, paneRunsRemoteTui, orchestrateCodexRpcInit, rolloutUserTurnMatches, decideStartupDialogAction, shouldQueueInitialPrompt, shouldPreMarkFirstTurn, killAndVerifyPersistentPane, type EngageOutcome } from './codex-rpc-lifecycle.js';
 import { delay } from './utils/timing.js';
 import { claudeJsonlPathForSession, resolveJsonlFromPid, findOpenClaudeSessionIds, syncClaudeResumeTargetToCwd, DEFAULT_CLAUDE_DATA_DIR } from './adapters/cli/claude-code.js';
 import { sessionReadyHookCommand } from './adapters/hook-command.js';
@@ -225,6 +225,16 @@ let codexRpcEngine: CodexRpcEngine | undefined;
 let remoteWsUrl: string | undefined;
 let remoteThreadId: string | undefined;
 let rpcDialogDismissTimer: ReturnType<typeof setTimeout> | null = null;
+let rpcEnginePidMarker: string | null = null;
+
+function stopCodexRpcEngine(): void {
+  const engine = codexRpcEngine;
+  codexRpcEngine = undefined;
+  remoteWsUrl = undefined;
+  remoteThreadId = undefined;
+  clearRpcEnginePidMarker();
+  try { engine?.stop(); } catch { /* best effort */ }
+}
 
 /** Resolve the persistent pane name + liveness for a backend type, mirroring
  *  spawnCli's willReattachPersistent probe (worker.ts) but callable from the init
@@ -243,6 +253,13 @@ function persistentPaneInfo(backendType: string, sessionId: string): { name: str
   return { name, live };
 }
 
+function persistentPaneLive(backendType: PersistentBackendType, name: string): boolean {
+  if (backendType === 'tmux') return TmuxBackend.hasSession(name);
+  if (backendType === 'zellij') return ZellijBackend.hasSession(name);
+  if (backendType === 'herdr') return HerdrBackend.hasSession(name);
+  return false;
+}
+
 /** Kill a persistent session and VERIFY it is gone (bounded retry). killSession
  *  swallows exceptions and killPersistentSession returns void, so a plain
  *  try/catch can never observe a failed kill — and a surviving (dead-`--remote`)
@@ -250,12 +267,11 @@ function persistentPaneInfo(backendType: string, sessionId: string): { name: str
  *  re-triggering the exact P0 freeze. Returns true only when the session is
  *  confirmed absent (Codex delta point 1). */
 async function killPersistentSessionVerified(backendType: PersistentBackendType, name: string): Promise<boolean> {
-  for (let attempt = 0; attempt < 4; attempt++) {
-    try { killPersistentSession(backendType, name); } catch { /* returns void anyway */ }
-    if (!persistentPaneInfo(backendType, name)?.live) return true;
-    await delay(250);
-  }
-  return !persistentPaneInfo(backendType, name)?.live;
+  return killAndVerifyPersistentPane(name, {
+    kill: (resolvedName) => killPersistentSession(backendType, resolvedName),
+    isLive: (resolvedName) => persistentPaneLive(backendType, resolvedName),
+    wait: delay,
+  });
 }
 
 /** Poll the codex/traex rollout for POSITIVE evidence that the fresh first turn's
@@ -296,9 +312,9 @@ async function codexRolloutProbe(cliId: string, threadId: string, promptText: st
  *  spawns; it renders as history and later turns stream live. "thread ready" is
  *  thus a distinct step from "first turn sent". */
 async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): Promise<EngageOutcome> {
-  if (!codexRpcEligible(cfg)) return 'not-engaged';
+  if (!codexRpcEligible(cfg, { sandboxForced: sandboxEnabled() })) return 'not-engaged';
   const wantResume = cfg.resume === true && !!cfg.cliSessionId;
-  if (codexRpcEngine) { try { codexRpcEngine.stop(); } catch { /* */ } codexRpcEngine = undefined; remoteWsUrl = undefined; remoteThreadId = undefined; }
+  stopCodexRpcEngine();
   let engine: CodexRpcEngine | undefined;
   try {
     const cliBin = createCliAdapterSync(cfg.cliId as CliId, cfg.cliPathOverride).resolvedBin;
@@ -306,6 +322,15 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
     engineEnv.PATH = `${join(homedir(), '.botmux', 'bin')}:${engineEnv.PATH ?? ''}`;
     engineEnv.BOTMUX_SESSION_ID = cfg.sessionId;
     engineEnv.BOTMUX_LARK_APP_ID = cfg.larkAppId;
+    // The app-server owns model execution in RPC mode. Its MCP gateway child
+    // must inherit the trusted host socket just like a native CLI process does.
+    if (sessionMcpGatewayHost) {
+      engineEnv[MCP_GATEWAY_SOCKET_ENV] = sessionMcpGatewayHost.socketPath;
+      engineEnv[MCP_GATEWAY_REQUIRED_ENV] = '1';
+    } else {
+      delete engineEnv[MCP_GATEWAY_SOCKET_ENV];
+      delete engineEnv[MCP_GATEWAY_REQUIRED_ENV];
+    }
     // P1-2: the app-server is where the model actually runs, so it needs the SAME
     // per-bot provider env (base-url + token, proxy, feature flags) spawnCli
     // injects into the TUI — else a 3rd-party-provider bot's app-server silently
@@ -316,12 +341,25 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
       model: cfg.model, log: (m: string) => log(m),
       onDead: () => {
         if (codexRpcEngine === engine) {
-          log('Codex RPC app-server died; killing pane to trigger resume-restart');
-          try { killCli(); } catch { /* best effort */ }
+          log('Codex RPC app-server died; replacing the tmux session and re-engaging the thread');
+          // failAll() rejects the active sendTurn promise immediately after this
+          // callback returns. Let that microtask classify/notify the ambiguous
+          // submit while the old backend still exists, then replace the paired
+          // viewer on the next timer turn. Restarting synchronously here nulls
+          // backend first and suppresses the submit-failure notice.
+          const restartTimer = setTimeout(() => {
+            if (codexRpcEngine !== engine) return; // close/restart won the race
+            void restartCliProcess('Codex RPC app-server died', { immediate: true, preservePending: true });
+          }, 0);
+          restartTimer.unref?.();
         }
       },
     });
     await engine.start();
+    // Shell tools run under the app-server process tree, not the viewer TUI.
+    // Mark its pid before the first turn so `botmux send` resolves the current
+    // per-turn identity instead of falling back to a stale/session-only env.
+    registerRpcEnginePidMarker(engine.appServerPid);
     const threadId = wantResume ? await engine.resumeThread(cfg.cliSessionId!) : await engine.startThread();
     let outcome: EngageOutcome = wantResume ? 'resumed' : 'accepted';
     if (!wantResume && cfg.prompt) {
@@ -336,6 +374,7 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
         // on the paste path — we must NOT pre-mark here or that would double-mark
         // the same turnId and leave a stale, never-consumed queue head (Codex P1).
         log('Codex RPC fresh first turn: frame not dispatched → falling back to paste (safe, single execution)');
+        clearRpcEnginePidMarker();
         try { engine.stop(); } catch { /* best effort */ }
         return 'not-engaged';
       }
@@ -357,6 +396,7 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
     return outcome;
   } catch (err: any) {
     log(`Codex RPC input failed to start (${err?.message ?? err}); falling back to paste mode`);
+    clearRpcEnginePidMarker();
     try { engine?.stop(); } catch { /* best effort */ }   // P1-3a: stop the LOCAL ref (codexRpcEngine may be unassigned)
     codexRpcEngine = undefined; remoteWsUrl = undefined; remoteThreadId = undefined;
     return 'not-engaged';
@@ -488,6 +528,29 @@ function refreshCliPluginGeneration(
   cfg.skillReadonlyRoots = generation.skillReadonlyRoots;
   deferredPluginSkillCatalog = generation.deferredSkillCatalog ?? null;
   log(`Plugin generation refreshed: ${generation.pluginManifest.pluginIds.join(', ') || '(none)'}`);
+}
+
+/** Refresh the process-scoped Skill/MCP snapshot and bring up the trusted MCP
+ * host before the process that owns model execution starts. Native paste mode
+ * calls this from spawnCli; RPC mode calls it before starting the app-server so
+ * the fresh first turn includes the catalog and the gateway socket already
+ * exists when Codex reads its MCP config. */
+async function prepareCliPluginGenerationAndGateway(
+  cfg: Extract<DaemonToWorker, { type: 'init' }>,
+  adapter: CliAdapter,
+): Promise<SessionMcpRuntimeManifest | null> {
+  refreshCliPluginGeneration(cfg, adapter);
+  const manifest = readSessionMcpRuntimeManifest(cfg.sessionId, config.session.dataDir);
+  stopSessionMcpGatewayHost();
+  if (adapter.mcpGateway && manifest?.entries.length) {
+    sessionMcpGatewayHost = await startSessionMcpGatewayHost({
+      sessionId: cfg.sessionId,
+      dataDir: config.session.dataDir,
+      onError: error => log(`[mcp-gateway] host error: ${error.message}`),
+    });
+    log(`[mcp-gateway] trusted host listening for ${manifest.entries.length} plugin server(s)`);
+  }
+  return manifest;
 }
 
 /** v2 read isolation — provision a bot's PER-BOT config dir under its BOT_HOME so the
@@ -1280,22 +1343,46 @@ function authorizeManagedSend(
     : { ok: false, error: `${decision.errorCode}: ${decision.error}` };
 }
 
-function writeCliPidMarker(): void {
-  if (!cliPidMarker || !sessionId) return;
+function clearRpcEnginePidMarker(): void {
+  if (!rpcEnginePidMarker) return;
+  try { unlinkSync(rpcEnginePidMarker); } catch { /* already gone */ }
+  rpcEnginePidMarker = null;
+}
+
+function registerRpcEnginePidMarker(pid: number | undefined): void {
+  clearRpcEnginePidMarker();
+  if (!pid || !process.env.SESSION_DATA_DIR) return;
   try {
-    // 原子写：daemon 侧（killStalePids 等）随时读这个 marker JSON。
-    const markerPid = Number(basename(cliPidMarker));
-    const procStart = Number.isInteger(markerPid) && markerPid > 0
-      ? readProcessStartIdentity(markerPid)
-      : undefined;
-    atomicWriteFileSync(cliPidMarker, JSON.stringify({
-      sessionId,
-      turnId: currentBotmuxTurnId ?? null,
-      dispatchAttempt: currentBotmuxDispatchAttempt ?? null,
-      ...(procStart ? { procStart } : {}),
-    }));
+    const markersDir = join(process.env.SESSION_DATA_DIR, '.botmux-cli-pids');
+    mkdirSync(markersDir, { recursive: true });
+    rpcEnginePidMarker = join(markersDir, String(pid));
+    writeCliPidMarker();
+    log(`Codex RPC app-server PID marker written: ${pid}`);
   } catch (err: any) {
-    log(`Failed to update CLI PID marker: ${err?.message ?? err}`);
+    rpcEnginePidMarker = null;
+    log(`Failed to write Codex RPC app-server PID marker: ${err?.message ?? err}`);
+  }
+}
+
+function writeCliPidMarker(): void {
+  if (!sessionId) return;
+  for (const markerPath of [cliPidMarker, rpcEnginePidMarker]) {
+    if (!markerPath) continue;
+    try {
+      // 原子写：daemon 侧（killStalePids 等）随时读这个 marker JSON。
+      const markerPid = Number(basename(markerPath));
+      const procStart = Number.isInteger(markerPid) && markerPid > 0
+        ? readProcessStartIdentity(markerPid)
+        : undefined;
+      atomicWriteFileSync(markerPath, JSON.stringify({
+        sessionId,
+        turnId: currentBotmuxTurnId ?? null,
+        dispatchAttempt: currentBotmuxDispatchAttempt ?? null,
+        ...(procStart ? { procStart } : {}),
+      }));
+    } catch (err: any) {
+      log(`Failed to update CLI PID marker ${markerPath}: ${err?.message ?? err}`);
+    }
   }
 }
 let lastStructuredBridgeActivityAtMs = 0;
@@ -5395,7 +5482,10 @@ function scheduleBusyPatternIdleProbe(source: string): void {
   busyPatternIdleProbeTimer.unref?.();
 }
 
-async function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): Promise<void> {
+async function spawnCli(
+  cfg: Extract<DaemonToWorker, { type: 'init' }>,
+  opts: { pluginGenerationPrepared?: boolean } = {},
+): Promise<void> {
   clearSessionRenameInFlight();
   // (startupCommands one-shot is re-armed below, AFTER the reattach-vs-fresh
   // prediction — only a genuinely fresh CLI process replays them; see
@@ -5888,17 +5978,9 @@ async function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): Promise
   // A warm worker reattach keeps the existing Gateway and catalog untouched;
   // every fresh/resumed CLI spawn atomically refreshes both from current Bot config.
   if (!willReattachPersistent) {
-    refreshCliPluginGeneration(cfg, cliAdapter);
-    mcpRuntimeManifest = readSessionMcpRuntimeManifest(cfg.sessionId, config.session.dataDir);
-    stopSessionMcpGatewayHost();
-    if (cliAdapter.mcpGateway && mcpRuntimeManifest?.entries.length) {
-      sessionMcpGatewayHost = await startSessionMcpGatewayHost({
-        sessionId: cfg.sessionId,
-        dataDir: config.session.dataDir,
-        onError: error => log(`[mcp-gateway] host error: ${error.message}`),
-      });
-      log(`[mcp-gateway] trusted host listening for ${mcpRuntimeManifest.entries.length} plugin server(s)`);
-    }
+    mcpRuntimeManifest = opts.pluginGenerationPrepared
+      ? readSessionMcpRuntimeManifest(cfg.sessionId, config.session.dataDir)
+      : await prepareCliPluginGenerationAndGateway(cfg, cliAdapter);
   }
 
   // Re-arm the startup-commands one-shot ONLY for a genuinely fresh CLI process.
@@ -7009,10 +7091,7 @@ async function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): Promise
     // paired app-server so it can't outlive the pane. A fresh spawn re-engages
     // the engine from scratch (or falls back to paste mode).
     if (codexRpcEngine) {
-      try { codexRpcEngine.stop(); } catch { /* best effort */ }
-      codexRpcEngine = undefined;
-      remoteWsUrl = undefined;
-      remoteThreadId = undefined;
+      stopCodexRpcEngine();
       if (rpcDialogDismissTimer) { clearTimeout(rpcDialogDismissTimer); rpcDialogDismissTimer = null; }
     }
     const logTail = recentTerminalLogTail();
@@ -7106,6 +7185,7 @@ async function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): Promise
 
 function killCli(opts: { preservePending?: boolean } = {}): void {
   stopSessionMcpGatewayHost();
+  stopCodexRpcEngine();
   destroyCrashDiagnosticTerminal('killCli');
   idleDetector?.dispose();
   idleDetector = null;
@@ -7202,6 +7282,10 @@ async function restartCliProcess(
   const restart = async (): Promise<void> => {
     try {
       tmuxRestartTimer = null;
+      // Capture the RPC thread id before destroySession()/killCli() tears down
+      // the engine and clears remoteThreadId. The replacement app-server must
+      // resume this exact thread on its fresh port.
+      const rpcThreadId = remoteThreadId;
       const restartingBackend = backend;
       if (restartingBackend) intentionalRestartBackend = restartingBackend;
       // Riff teardown cancels a remote task asynchronously. Wait for the cancel
@@ -7221,10 +7305,6 @@ async function restartCliProcess(
       }
       killCli({ preservePending: opts.preservePending });
       awaitingFirstPrompt = true;
-      // Capture the RPC thread id BEFORE killCli() — backend.onExit tears the
-      // engine down and clears remoteThreadId, but the in-worker respawn must
-      // resume that same thread against a FRESH app-server.
-      const rpcThreadId = remoteThreadId;
       setTimeout(async () => {
         if (lastInitConfig) {
           startScreenUpdates();
@@ -7234,8 +7314,14 @@ async function restartCliProcess(
             // Re-engage RPC so the new --remote pane binds to the CURRENT app-server
             // (a fresh port), not the dead prior one. engageCodexRpc only sets
             // remote* on success, else spawnCli falls back to paste.
-            if (codexRpcEligible(restartCfg)) await engageCodexRpc(restartCfg);
-            await spawnCli(restartCfg);
+            let rpcPluginGenerationPrepared = false;
+            if (codexRpcEligible(restartCfg, { sandboxForced: sandboxEnabled() })) {
+              const adapter = createCliAdapterSync(restartCfg.cliId as CliId, restartCfg.cliPathOverride);
+              await prepareCliPluginGenerationAndGateway(restartCfg, adapter);
+              rpcPluginGenerationPrepared = true;
+              await engageCodexRpc(restartCfg);
+            }
+            await spawnCli(restartCfg, { pluginGenerationPrepared: rpcPluginGenerationPrepared });
             if (codexRpcEngine) armRpcStartupDialogDismiss();
           } catch (err) {
             cliRestartInProgress = false;
@@ -8512,22 +8598,28 @@ process.on('message', async (raw: unknown) => {
         // then launched/respawned as `codex --remote resume` (codex.ts buildArgs)
         // against the CURRENT app-server (a fresh port each incarnation).
         const rpcBackendType = msg.backendType ?? config.daemon.backendType;
+        let rpcPluginGenerationPrepared = false;
         const rpcDecision = await orchestrateCodexRpcInit(msg, {
           paneInfo: (sid) => persistentPaneInfo(rpcBackendType, sid),
           paneIsRemote: (name) => paneRunsRemoteTui(name),
+          prepare: async () => {
+            const adapter = createCliAdapterSync(msg.cliId as CliId, msg.cliPathOverride);
+            await prepareCliPluginGenerationAndGateway(msg, adapter);
+            rpcPluginGenerationPrepared = true;
+          },
           engage: () => engageCodexRpc(msg),
           killVerify: (name) => killPersistentSessionVerified(rpcBackendType as PersistentBackendType, name),
-          teardownEngine: () => { try { codexRpcEngine?.stop(); } catch { /* */ } codexRpcEngine = undefined; remoteWsUrl = undefined; remoteThreadId = undefined; },
+          teardownEngine: () => stopCodexRpcEngine(),
           log: (m) => log(m),
           notify: (m) => send({ type: 'user_notify', message: m, turnId: msg.turnId }),
-        });
+        }, { sandboxForced: sandboxEnabled() });
         if (rpcDecision.engaged) log(`Codex RPC resume: pane bound to ${remoteWsUrl}`);
         if (rpcDecision.abortSpawn) {
           // Stale --remote pane couldn't be replaced — refuse to attach it. Abort
           // init so the daemon retries a clean incarnation instead of freezing.
           throw new Error('codex RPC resume: could not replace stale --remote pane; aborting init');
         }
-        await spawnCli(msg);
+        await spawnCli(msg, { pluginGenerationPrepared: rpcPluginGenerationPrepared });
         if (codexRpcEngine) armRpcStartupDialogDismiss(); // boundary #4: keep the --remote pane from freezing on a startup dialog
 
         // Queue the initial prompt — flushed when CLI shows idle.
@@ -9098,7 +9190,7 @@ function teardownSandboxBestEffort(): void {
 // and process.exit(1), killing a live session over a dropped log write. Install
 // the guard before any further stdout writes (log() writes to process.stdout).
 installStdioEpipeGuard();
-process.on('exit', () => { teardownSandboxBestEffort(); try { codexRpcEngine?.stop(); } catch { /* best effort */ } });
+process.on('exit', () => { teardownSandboxBestEffort(); stopCodexRpcEngine(); });
 process.on('uncaughtException', (err: NodeJS.ErrnoException) => {
   // A broken pipe on stdout/stderr (or any socket) must not tear down a live
   // session — the stdio guard handles those it can; this is the backstop.

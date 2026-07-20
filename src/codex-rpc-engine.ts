@@ -390,8 +390,8 @@ export class CodexRpcEngine {
           // A connected-but-wedged app-server is FATAL for live turns: rejecting
           // just this request would leave the engine + pane alive and every later
           // turn/start would time out again. Route through failAll so ALL inflight
-          // requests reject AND onDead fires — the worker then kills the pane →
-          // exit → restart → re-engage on a fresh app-server (P1-5).
+          // requests reject AND onDead fires — the worker then replaces the pane
+          // and re-engages on a fresh app-server (P1-5).
           this.failAll(err);
         } else {
           // Non-fatal (the fresh first turn): reject only THIS request and keep

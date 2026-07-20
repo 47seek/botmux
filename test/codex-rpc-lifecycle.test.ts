@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { codexRpcEligible, paneRunsRemoteTui, orchestrateCodexRpcInit, shouldQueueInitialPrompt, rolloutUserTurnMatches, decideStartupDialogAction, RPC_CAPABLE_CLIS, type PaneProbes, type RpcInitEffects } from '../src/codex-rpc-lifecycle.js';
+import { codexRpcEligible, paneRunsRemoteTui, orchestrateCodexRpcInit, shouldQueueInitialPrompt, rolloutUserTurnMatches, decideStartupDialogAction, killAndVerifyPersistentPane, RPC_CAPABLE_CLIS, type PaneProbes, type RpcInitEffects } from '../src/codex-rpc-lifecycle.js';
 import type { DaemonToWorker } from '../src/types.js';
 
 type InitCfg = Extract<DaemonToWorker, { type: 'init' }>;
@@ -51,6 +51,9 @@ describe('codexRpcEligible — every fail-closed gate degrades to paste', () => 
       expect(codexRpcEligible(baseCfg(over))).toBe(false);
     });
   }
+  it('fails closed when BOTMUX_SANDBOX=1 forces sandbox outside InitCfg', () => {
+    expect(codexRpcEligible(baseCfg(), { sandboxForced: true })).toBe(false);
+  });
 });
 
 describe('paneRunsRemoteTui — RPC-owned detection via leaf argv (not pane_current_command)', () => {
@@ -116,6 +119,7 @@ describe('orchestrateCodexRpcInit — three-state fresh / resume / kill-failure 
     const effects: RpcInitEffects = {
       paneInfo: () => { calls.push('paneInfo'); return over.pane ?? null; },
       paneIsRemote: () => { calls.push('paneIsRemote'); return over.isRemote ?? false; },
+      prepare: async () => { calls.push('prepare'); },
       engage: async () => { calls.push('engage'); return over.outcome ?? 'accepted'; },
       killVerify: async () => { calls.push('killVerify'); return over.killGone ?? true; },
       teardownEngine: () => { calls.push('teardownEngine'); },
@@ -137,6 +141,7 @@ describe('orchestrateCodexRpcInit — three-state fresh / resume / kill-failure 
     const d = await orchestrateCodexRpcInit(baseCfg(), effects);
     expect(d).toEqual({ engaged: true, queuePrompt: false, abortSpawn: false });
     expect(calls).toContain('engage');
+    expect(calls.indexOf('prepare')).toBeLessThan(calls.indexOf('engage'));
     expect(calls).not.toContain('notify');
   });
 
@@ -163,7 +168,7 @@ describe('orchestrateCodexRpcInit — three-state fresh / resume / kill-failure 
     const { effects, calls } = fx({ pane: { name: 'bmx-1', live: true }, isRemote: true, outcome: 'resumed', killGone: true });
     const d = await orchestrateCodexRpcInit(baseCfg({ prompt: 'hi', resume: true, cliSessionId: 't1' }), effects);
     expect(d).toEqual({ engaged: true, queuePrompt: true, abortSpawn: false });
-    expect(calls).toEqual(['paneInfo', 'paneIsRemote', 'engage', 'killVerify']);
+    expect(calls).toEqual(['paneInfo', 'paneIsRemote', 'prepare', 'engage', 'killVerify']);
   });
 
   it('live RPC-owned pane + kill FAILS → tear engine down + ABORT spawn, notify (P0-2)', async () => {
@@ -174,19 +179,54 @@ describe('orchestrateCodexRpcInit — three-state fresh / resume / kill-failure 
     expect(calls).toContain('notify');
   });
 
-  it('live RPC-owned pane but engage FAILS → no kill attempted, falls back to paste', async () => {
+  it('live RPC-owned pane but engage FAILS → kill stale viewer, then fall back to native paste', async () => {
     const { effects, calls } = fx({ pane: { name: 'bmx-1', live: true }, isRemote: true, outcome: 'not-engaged' });
     const d = await orchestrateCodexRpcInit(baseCfg({ resume: true, cliSessionId: 't1' }), effects);
     expect(d).toEqual({ engaged: false, queuePrompt: false, abortSpawn: false });
-    expect(calls).not.toContain('killVerify');
+    expect(calls).toEqual(['paneInfo', 'paneIsRemote', 'prepare', 'engage', 'killVerify']);
+  });
+
+  it('live RPC-owned pane + engage failure + kill failure → abort instead of reattaching stale viewer', async () => {
+    const { effects, calls } = fx({ pane: { name: 'bmx-1', live: true }, isRemote: true, outcome: 'not-engaged', killGone: false });
+    const d = await orchestrateCodexRpcInit(baseCfg({ resume: true, cliSessionId: 't1' }), effects);
+    expect(d).toEqual({ engaged: false, queuePrompt: false, abortSpawn: true });
+    expect(calls).toContain('notify');
   });
 
   it('live NATIVE paste pane (possibly mid-turn) → left untouched, no engage (boundary #3)', async () => {
     const { effects, calls } = fx({ pane: { name: 'bmx-1', live: true }, isRemote: false });
     const d = await orchestrateCodexRpcInit(baseCfg({ resume: true, cliSessionId: 't1' }), effects);
     expect(d).toEqual({ engaged: false, queuePrompt: false, abortSpawn: false });
+    expect(calls).not.toContain('prepare');
     expect(calls).not.toContain('engage');
     expect(calls).not.toContain('killVerify');
+  });
+});
+
+describe('killAndVerifyPersistentPane — verifies the resolved name without re-prefixing', () => {
+  it('passes the exact bmx-* name to every kill and liveness probe', async () => {
+    const killed: string[] = [];
+    const probed: string[] = [];
+    const gone = await killAndVerifyPersistentPane('bmx-12345678', {
+      kill: (name) => { killed.push(name); },
+      isLive: (name) => { probed.push(name); return true; },
+      wait: async () => {},
+    }, 2, 0);
+    expect(gone).toBe(false);
+    expect(killed).toEqual(['bmx-12345678', 'bmx-12345678']);
+    expect(probed.every(name => name === 'bmx-12345678')).toBe(true);
+  });
+
+  it('returns true only after the exact session is observed gone', async () => {
+    let live = true;
+    let kills = 0;
+    const gone = await killAndVerifyPersistentPane('bmx-abcdef12', {
+      kill: () => { kills += 1; if (kills === 2) live = false; },
+      isLive: () => live,
+      wait: async () => {},
+    }, 4, 0);
+    expect(gone).toBe(true);
+    expect(kills).toBe(2);
   });
 });
 

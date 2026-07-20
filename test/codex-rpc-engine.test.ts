@@ -9,7 +9,7 @@ import { CodexRpcEngine } from '../src/codex-rpc-engine.js';
 const isAlive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
 
 // A real subprocess app-server stand-in (HTTP /readyz + JSON-RPC WS on one port).
-const FIXTURE = fileURLToPath(new URL('./fixtures/fake-codex-app-server.mjs', import.meta.url));
+const FIXTURE = fileURLToPath(new URL('./fixtures/fake-codex-rpc-server.mjs', import.meta.url));
 beforeAll(() => { chmodSync(FIXTURE, 0o755); });
 
 function makeEngine(over: Partial<ConstructorParameters<typeof CodexRpcEngine>[0]> = {}) {
