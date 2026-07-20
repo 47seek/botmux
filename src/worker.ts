@@ -3460,7 +3460,12 @@ function startScreenAnalyzer(): void {
       },
       onTuiPromptResolved: (selectedText) => {
         tuiPromptBlocking = false;
-        send({ type: 'tui_prompt_resolved', selectedText });
+        send({
+          type: 'tui_prompt_resolved',
+          selectedText,
+          turnId: currentBotmuxTurnId,
+          dispatchAttempt: currentBotmuxDispatchAttempt,
+        });
         // Flush any messages that were queued during the prompt
         flushPending();
       },
@@ -3592,7 +3597,13 @@ async function captureAndUpload(): Promise<void> {
 
   let status: RuntimeScreenStatus = isPromptReady ? 'idle' : 'working';
   if (screenAnalyzer?.isAnalyzing) status = 'analyzing';
-  send({ type: 'screenshot_uploaded', imageKey, ...usageLimitTracker.classify(usageLimitContent, status) });
+  send({
+    type: 'screenshot_uploaded',
+    imageKey,
+    ...usageLimitTracker.classify(usageLimitContent, status),
+    turnId: currentBotmuxTurnId,
+    dispatchAttempt: currentBotmuxDispatchAttempt,
+  });
 }
 
 function applyDisplayMode(mode: DisplayMode): void {
@@ -4207,7 +4218,12 @@ function markPromptReady(): void {
 function persistCliSessionId(cliSessionId: string): void {
   if (!cliSessionId || !sessionId) return;
   if (lastInitConfig) lastInitConfig.cliSessionId = cliSessionId;
-  send({ type: 'cli_session_id', cliSessionId });
+  send({
+    type: 'cli_session_id',
+    cliSessionId,
+    turnId: currentBotmuxTurnId,
+    dispatchAttempt: currentBotmuxDispatchAttempt,
+  });
   try {
     const session = sessionStore.getSession(sessionId);
     if (!session || session.cliSessionId === cliSessionId) return;
@@ -4801,7 +4817,12 @@ function sendToPty(
     tuiPromptBlocking = false;
     screenAnalyzer?.notifySelection('lark-input');
     // Tear down the prompt card so the user doesn't see stale options.
-    send({ type: 'tui_prompt_resolved', selectedText: 'user-override' });
+    send({
+      type: 'tui_prompt_resolved',
+      selectedText: 'user-override',
+      turnId: currentBotmuxTurnId,
+      dispatchAttempt: currentBotmuxDispatchAttempt,
+    });
   }
   // See flushPending: type-ahead adapters flush even while the CLI is busy.
   // Claude attributes `attachment(queued_command)` identically to `role:user`;
@@ -5221,7 +5242,12 @@ async function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): Promise
 
     backend.onData(onPtyData);
     backend.onAccessUrl?.((url) => {
-      send({ type: 'riff_access_url', accessUrl: url });
+      send({
+        type: 'riff_access_url',
+        accessUrl: url,
+        turnId: currentBotmuxTurnId,
+        dispatchAttempt: currentBotmuxDispatchAttempt,
+      });
     });
     backend.onExit((code, signal) => {
       log(`Adopted herdr stream ended (code: ${code}, signal: ${signal})`);
@@ -5279,7 +5305,12 @@ async function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): Promise
 
     backend.onData(onPtyData);
     backend.onAccessUrl?.((url) => {
-      send({ type: 'riff_access_url', accessUrl: url });
+      send({
+        type: 'riff_access_url',
+        accessUrl: url,
+        turnId: currentBotmuxTurnId,
+        dispatchAttempt: currentBotmuxDispatchAttempt,
+      });
     });
     backend.onExit((code, signal) => {
       log(`Adopted pipe-pane stream ended (code: ${code}, signal: ${signal})`);
@@ -6686,7 +6717,12 @@ async function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): Promise
   backend.onData(onPtyData);
   const observedBackend = backend;
   backend.onAccessUrl?.((url) => {
-    send({ type: 'riff_access_url', accessUrl: url });
+    send({
+      type: 'riff_access_url',
+      accessUrl: url,
+      turnId: currentBotmuxTurnId,
+      dispatchAttempt: currentBotmuxDispatchAttempt,
+    });
   });
   // Remote-task turn boundary (riff): flushPending() marks the session busy on
   // every write and riff has no PTY output, so the idle detector never re-arms
