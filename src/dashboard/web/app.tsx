@@ -28,6 +28,7 @@ import { requestOpenCreateSession } from './create-session-entry.js';
 import { InfoTip } from './dashboard-components.js';
 import { initFloatingScrollbars } from './floating-scrollbars.js';
 import { PLUGIN_PINS_CHANGED_EVENT } from './plugin-events.js';
+import { updateAndRestartBotmux, type BotmuxUpdatePhase } from './update-action.js';
 
 type OwnerAvatar = { avatarUrl: string; name?: string };
 type TopbarAttentionNotice = { count: number; time: string; bot: string; reason: string };
@@ -37,6 +38,16 @@ type TopbarStatusSummary = {
   idle: number;
   onlineBots: number;
   attentionNotice: TopbarAttentionNotice | null;
+};
+type BotmuxUpdateStatus = {
+  current: string;
+  latest: string | null;
+  behind: boolean;
+  localDevInstall: boolean;
+  updateSupported: boolean;
+  updateCommand: string | null;
+  node: { version: string; required: number; ok: boolean };
+  installs: { entries: Array<{ binPath: string }>; multiple: boolean };
 };
 
 type NavItem = {
@@ -142,6 +153,7 @@ let ownerAvatar: OwnerAvatar | null = null;
 let updateBehind = false;
 let latestVersion: string | null = null;
 let updateBadgeKind: 'botmux' | 'codex' | null = null;
+let botmuxUpdateStatus: BotmuxUpdateStatus | null = null;
 let routeRoot: HTMLElement | null = null;
 let appRoot: ReturnType<typeof createRoot> | null = null;
 
@@ -475,6 +487,217 @@ function AuthExpiredOverlay(props: { open: boolean; onClose(): void }): JSX.Elem
   );
 }
 
+type TopbarUpdatePhase = 'idle' | BotmuxUpdatePhase | 'error';
+
+async function dashboardInstance(): Promise<string> {
+  const response = await fetch('/__selfcheck', { cache: 'no-store' });
+  const instance = await response.text();
+  if (!response.ok || !instance) {
+    throw new Error(t('update.healthCheckFailed'));
+  }
+  return instance;
+}
+
+function TopbarVersionControl(props: { status: BotmuxUpdateStatus | null }): JSX.Element | null {
+  const { status } = props;
+  const [open, setOpen] = useState(false);
+  const [phase, setPhase] = useState<TopbarUpdatePhase>('idle');
+  const [errorDetail, setErrorDetail] = useState('');
+  const actionInFlightRef = useRef(false);
+  const reconnectTimerRef = useRef<number | null>(null);
+  const rootRef = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+
+  const clearReconnectTimer = () => {
+    if (reconnectTimerRef.current === null) return;
+    window.clearTimeout(reconnectTimerRef.current);
+    reconnectTimerRef.current = null;
+  };
+
+  useEffect(() => {
+    actionInFlightRef.current = false;
+    setOpen(false);
+    setPhase('idle');
+    setErrorDetail('');
+  }, [status?.current, status?.latest]);
+
+  useEffect(() => () => clearReconnectTimer(), []);
+
+  useEffect(() => {
+    if (!open) return;
+    const closeOnPointerDown = (event: PointerEvent) => {
+      if (!rootRef.current?.contains(event.target as Node)) setOpen(false);
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return;
+      setOpen(false);
+      triggerRef.current?.focus();
+    };
+    document.addEventListener('pointerdown', closeOnPointerDown);
+    document.addEventListener('keydown', closeOnEscape);
+    return () => {
+      document.removeEventListener('pointerdown', closeOnPointerDown);
+      document.removeEventListener('keydown', closeOnEscape);
+    };
+  }, [open]);
+
+  if (!status) return null;
+
+  const behind = status.behind && !!status.latest;
+  const unknown = !status.latest;
+  const automatic = behind && status.updateSupported && !status.localDevInstall && status.node.ok;
+  const command = status.updateCommand ?? 'botmux update';
+  const currentVersion = `v${status.current}`;
+  const latestVersion = status.latest ? `v${status.latest}` : '';
+  const unavailableReason = status.localDevInstall
+    ? t('update.localDev')
+    : !status.updateSupported
+      ? t('update.unsupportedInstall')
+      : !status.node.ok
+        ? t('update.nodeWarn', { version: status.node.version, required: status.node.required })
+        : '';
+
+  const pollReconnect = (previousInstance: string) => {
+    const startedAt = Date.now();
+    const tick = async (): Promise<void> => {
+      try {
+        const response = await fetch('/__selfcheck', { cache: 'no-store' });
+        const instance = await response.text();
+        if (response.ok && instance && instance !== previousInstance) {
+          location.reload();
+          return;
+        }
+      } catch { /* dashboard is still restarting */ }
+      if (Date.now() - startedAt > 90_000) {
+        actionInFlightRef.current = false;
+        setPhase('error');
+        setErrorDetail(t('update.restartSlow'));
+        return;
+      }
+      reconnectTimerRef.current = window.setTimeout(() => void tick(), 2_000);
+    };
+    reconnectTimerRef.current = window.setTimeout(() => void tick(), 3_000);
+  };
+
+  const run = async () => {
+    if (!behind) return;
+    if (!automatic) {
+      setOpen(false);
+      location.hash = '#/settings';
+      return;
+    }
+    if (actionInFlightRef.current) return;
+
+    actionInFlightRef.current = true;
+    setErrorDetail('');
+    try {
+      const previousInstance = await dashboardInstance();
+      await updateAndRestartBotmux(fetch, setPhase);
+      pollReconnect(previousInstance);
+    } catch (error) {
+      actionInFlightRef.current = false;
+      setPhase('error');
+      setErrorDetail(error instanceof Error ? error.message : String(error));
+    }
+  };
+
+  const message = phase === 'updating'
+    ? t('update.updating', { command })
+    : phase === 'restarting'
+      ? t('update.restarting')
+      : phase === 'error'
+        ? t('update.updateFailed', { detail: errorDetail })
+        : behind
+          ? automatic
+            ? t('update.versionUpgradePrompt', { version: latestVersion })
+            : unavailableReason
+          : status.latest
+            ? t('update.upToDate')
+            : t('update.checkUnavailable');
+  const action = !automatic
+    ? t('update.topbarReview')
+    : phase === 'error'
+      ? t('update.topbarRetry')
+      : phase === 'idle'
+        ? t('update.topbarAction')
+        : t('update.topbarWorking');
+  const busy = phase === 'updating' || phase === 'restarting';
+
+  return (
+    <div ref={rootRef} className={`dashboard-version-control${open ? ' is-open' : ''}`}>
+      <button
+        ref={triggerRef}
+        type="button"
+        className={`dashboard-version-chip${behind ? ' has-update' : ''}${unknown ? ' is-unknown' : ''}${phase === 'error' ? ' is-error' : ''}`}
+        aria-haspopup="dialog"
+        aria-expanded={open}
+        title={message}
+        onClick={() => setOpen(value => !value)}
+      >
+        <span>{currentVersion}</span>
+        {busy
+          ? <span className="dashboard-update-spinner" aria-hidden="true" />
+          : behind
+            ? <span className="dashboard-version-dot" aria-hidden="true" />
+            : null}
+      </button>
+      {open ? (
+        <section
+          className="dashboard-version-popover"
+          role="dialog"
+          aria-modal="false"
+          aria-labelledby="dashboard-version-title"
+        >
+          <header className="dashboard-version-popover-head">
+            <strong id="dashboard-version-title">{t('update.current')}</strong>
+            <button
+              type="button"
+              className="dashboard-version-close"
+              aria-label={t('update.topbarClose')}
+              onClick={() => setOpen(false)}
+            >×</button>
+          </header>
+          <div className="dashboard-version-popover-body">
+            <div className="dashboard-version-current">
+              <strong>{currentVersion}</strong>
+              <span className={behind ? 'has-update' : unknown ? 'is-unknown' : 'is-current'} aria-hidden="true">
+                {busy ? <span className="dashboard-update-spinner" /> : behind ? '↑' : unknown ? '?' : '✓'}
+              </span>
+            </div>
+            <p
+              className={`dashboard-version-message${phase === 'error' ? ' is-error' : ''}`}
+              role={phase === 'error' ? 'alert' : 'status'}
+              aria-live="polite"
+            >{message}</p>
+            {behind && status.installs.multiple ? (
+              <details className="dashboard-version-installs">
+                <summary>{t('update.multiInstallWarn')}</summary>
+                <ul>{status.installs.entries.map(entry => <li key={entry.binPath}>{entry.binPath}</li>)}</ul>
+              </details>
+            ) : null}
+          </div>
+          {behind ? (
+            <footer className="dashboard-version-popover-actions">
+              <button type="button" className="dashboard-version-secondary" onClick={() => setOpen(false)}>
+                {busy ? t('update.topbarClose') : t('update.topbarLater')}
+              </button>
+              <button
+                type="button"
+                className="dashboard-version-primary"
+                disabled={busy}
+                onClick={() => void run()}
+              >
+                {busy ? <span className="dashboard-update-spinner" aria-hidden="true" /> : null}
+                {action}
+              </button>
+            </footer>
+          ) : null}
+        </section>
+      ) : null}
+    </div>
+  );
+}
+
 function DashboardShell(): JSX.Element {
   const statusSummary = dashboardStatusSummary();
   const [botOnboardingOpen, setBotOnboardingOpen] = useState(false);
@@ -533,13 +756,16 @@ function DashboardShell(): JSX.Element {
       <div className="app-shell">
         <header className="topbar">
           <div className="topbar-left">
-            <a className="brand" href="#/">
-              <span className="brand-mark" aria-hidden="true">
-                <img className="brand-logo-img" src="/assets/brand-logo.png" alt="" decoding="sync" loading="eager" fetchPriority="high" />
-              </span>
-              <strong className="brand-wordmark">Botmux</strong>
-              <span className="brand-product">Dashboard</span>
-            </a>
+            <div className="topbar-brand-block">
+              <a className="brand" href="#/">
+                <span className="brand-mark" aria-hidden="true">
+                  <img className="brand-logo-img" src="/assets/brand-logo.png" alt="" decoding="sync" loading="eager" fetchPriority="high" />
+                </span>
+                <strong className="brand-wordmark">Botmux</strong>
+                <span className="brand-product">Dashboard</span>
+              </a>
+              <TopbarVersionControl status={botmuxUpdateStatus} />
+            </div>
           </div>
           <div className="topbar-actions">
             <TopbarStatusMenu summary={statusSummary} autoOpen={statusAutoOpen} />
@@ -738,6 +964,7 @@ async function checkUpdateBadge(): Promise<void> {
     const r = await fetch('/api/update/status');
     if (!r.ok) return;
     const j = await r.json();
+    botmuxUpdateStatus = j as BotmuxUpdateStatus;
     const runtime = Array.isArray(j.cliUpdates)
       ? j.cliUpdates.find((entry: any) => entry?.updateAvailable === true && entry?.latest)
       : null;
@@ -871,6 +1098,7 @@ void (async () => {
   window.addEventListener(PLUGIN_PINS_CHANGED_EVENT, () => { void loadPinnedPluginNavItems(); });
   void loadPinnedPluginNavItems();
   void checkUpdateBadge();
+  window.setInterval(() => void checkUpdateBadge(), 30 * 60_000);
   initOwnerAvatar();
   try {
     await bootstrap();

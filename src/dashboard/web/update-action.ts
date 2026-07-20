@@ -1,0 +1,59 @@
+export type BotmuxUpdatePhase = 'updating' | 'restarting';
+
+export interface BotmuxUpdateResult {
+  oldVersion: string;
+  newVersion: string;
+  changed: boolean;
+  restarted: boolean;
+}
+
+type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
+
+async function responseBody(response: Response): Promise<Record<string, unknown>> {
+  const body = await response.json().catch(() => null);
+  return body && typeof body === 'object' ? body as Record<string, unknown> : {};
+}
+
+function responseError(response: Response, body: Record<string, unknown>): Error {
+  const detail = body.detail ?? body.error;
+  return new Error(typeof detail === 'string' ? detail : `HTTP ${response.status}`);
+}
+
+/** Install the latest botmux package, then restart to apply or reconcile it. */
+export async function updateAndRestartBotmux(
+  fetchImpl: FetchLike,
+  onPhase: (phase: BotmuxUpdatePhase) => void = () => {},
+): Promise<BotmuxUpdateResult> {
+  onPhase('updating');
+  const updateResponse = await fetchImpl('/api/update/run', { method: 'POST' });
+  const update = await responseBody(updateResponse);
+  if (!updateResponse.ok || update.ok === false) throw responseError(updateResponse, update);
+  if (
+    update.ok !== true ||
+    typeof update.oldVersion !== 'string' ||
+    typeof update.newVersion !== 'string' ||
+    typeof update.changed !== 'boolean'
+  ) {
+    throw new Error('Invalid update response');
+  }
+
+  const result: BotmuxUpdateResult = {
+    oldVersion: update.oldVersion,
+    newVersion: update.newVersion,
+    changed: update.changed,
+    restarted: false,
+  };
+
+  onPhase('restarting');
+  const restartResponse = await fetchImpl('/api/update/restart', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      update: { oldVersion: result.oldVersion, newVersion: result.newVersion },
+    }),
+  });
+  const restart = await responseBody(restartResponse);
+  if (!restartResponse.ok || restart.ok === false) throw responseError(restartResponse, restart);
+  if (restart.ok !== true) throw new Error('Invalid restart response');
+  return { ...result, restarted: true };
+}

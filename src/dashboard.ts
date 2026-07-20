@@ -69,7 +69,13 @@ import {
   type GlobalInstallPlan,
 } from './utils/global-install.js';
 import { listCliRuntimeUpdateEntries } from './core/cli-runtime-update.js';
-import { writeRestartIntent } from './services/restart-intent-store.js';
+import {
+  claimRestartLease,
+  clearRestartLease,
+  hasActiveRestartLease,
+  writeManualIntentIfAbsent,
+  writeRestartIntent,
+} from './services/restart-intent-store.js';
 import { withFileLock } from './utils/file-lock.js';
 import { spawn } from 'node:child_process';
 import {
@@ -2496,9 +2502,14 @@ const server = createServer(async (req, res) => {
       // maintenance" (409) from "the package manager failed" (500). Short wait:
       // don't block the request on a full in-progress install — report busy fast.
       let acquired = false;
+      let blockedByRestart = false;
       try {
         await withFileLock(globalInstallUpdateLockTarget(), async () => {
           acquired = true;
+          if (hasActiveRestartLease()) {
+            blockedByRestart = true;
+            return;
+          }
           await runGlobalInstallLatest(installPlan);
         }, { maxWaitMs: 2_000 });
       } catch (e) {
@@ -2507,6 +2518,7 @@ const server = createServer(async (req, res) => {
       } finally {
         updateInFlight = false;
       }
+      if (blockedByRestart) return jsonRes(res, 409, { ok: false, error: 'restart_in_flight' });
       const newVersion = botmuxVersionAt(installPlan.activePackageRoot);
       lastSuccessfulUpdatePlan = installPlan;
       return jsonRes(res, 200, {
@@ -2520,22 +2532,69 @@ const server = createServer(async (req, res) => {
 
     if (req.method === 'POST' && url.pathname === '/api/update/restart') {
       if (!authed) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
+      if (updateInFlight) return jsonRes(res, 409, { ok: false, error: 'update_in_flight' });
       let body: Record<string, unknown> = {};
       try {
         const parsed = await readJsonBody(req);
         if (parsed && typeof parsed === 'object') body = parsed as Record<string, unknown>;
       } catch { /* empty / bad body → plain restart */ }
       const upd = body.update && typeof body.update === 'object' ? body.update as Record<string, unknown> : null;
-      // After a manual update, leave an `update` breadcrumb so the fresh daemon
-      // DMs the owner the changelog (reuses the restart-report pipeline). A plain
-      // restart leaves none here; cmdRestart writes a `manual` breadcrumb itself.
-      if (upd && typeof upd.oldVersion === 'string' && typeof upd.newVersion === 'string' && upd.oldVersion !== upd.newVersion) {
-        try {
-          writeRestartIntent({ kind: 'update', oldVersion: upd.oldVersion, newVersion: upd.newVersion, at: new Date().toISOString() });
-        } catch { /* breadcrumb is best-effort */ }
+      let acquired = false;
+      try {
+        await withFileLock(globalInstallUpdateLockTarget(), async () => {
+          acquired = true;
+          const leaseId = claimRestartLease();
+          if (!leaseId) {
+            jsonRes(res, 202, { ok: true, alreadyScheduled: true });
+            return;
+          }
+          try {
+            if (upd && typeof upd.oldVersion === 'string' && typeof upd.newVersion === 'string' && upd.oldVersion !== upd.newVersion) {
+              writeRestartIntent({ kind: 'update', oldVersion: upd.oldVersion, newVersion: upd.newVersion, at: new Date().toISOString() });
+            } else {
+              writeManualIntentIfAbsent();
+            }
+          } catch (error) {
+            clearRestartLease(leaseId);
+            jsonRes(res, 500, {
+              ok: false,
+              error: 'restart_intent_failed',
+              detail: error instanceof Error ? error.message : String(error),
+            });
+            return;
+          }
+          const activePackageRoot = (lastSuccessfulUpdatePlan ?? tryResolveGlobalInstallPlan())?.activePackageRoot;
+          // Finish the acknowledgement before the detached driver tears down
+          // this process, while retaining the update lock until launch.
+          await new Promise<void>((resolveLaunch) => {
+            let launched = false;
+            const launch = () => {
+              if (launched) return;
+              launched = true;
+              try {
+                const child = spawnDetachedRestart('dashboard', activePackageRoot, leaseId);
+                if (!child.pid) throw new Error('restart driver did not start');
+              } catch (error) {
+                clearRestartLease(leaseId);
+                logger.error(`[dashboard] restart launch failed: ${error instanceof Error ? error.message : error}`);
+              } finally {
+                resolveLaunch();
+              }
+            };
+            res.once('finish', launch);
+            res.once('close', launch);
+            try {
+              jsonRes(res, 202, { ok: true });
+            } finally {
+              if (res.destroyed || res.writableFinished) launch();
+            }
+          });
+        }, { maxWaitMs: 2_000 });
+        return;
+      } catch (error) {
+        if (!acquired) return jsonRes(res, 409, { ok: false, error: 'update_in_flight' });
+        throw error;
       }
-      spawnDetachedRestart('dashboard', lastSuccessfulUpdatePlan?.activePackageRoot);
-      return jsonRes(res, 200, { ok: true });
     }
 
     if (req.method === 'GET' && url.pathname === '/api/skills') {
