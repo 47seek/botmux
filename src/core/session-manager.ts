@@ -1372,6 +1372,11 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
     // Queued（待办池）会话从没起过 CLI，没有任何后端会话——别去探它，否则 tmux 后端
     // 会把「找不到 backing」误判成僵尸而关掉它。
     if (ds.session.queued) continue;
+    // External /adopt sessions were already validated and re-forked above
+    // against their real tmux/zellij target. They never own Botmux's
+    // deterministic bmx-<sessionId> backing session, so probing that name here
+    // would immediately zombie-close the session we just restored.
+    if (ds.adoptedFrom) continue;
     const backendType = getSessionPersistentBackendType(ds);
     if (!backendType) continue;
     if (!shouldAutoForkOnRestore(backendType)) continue;
