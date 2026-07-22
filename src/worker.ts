@@ -49,6 +49,7 @@ import {
   pendingInputMayFlush,
   pendingInputAllowsTypeAhead,
   shouldDeferArgsBakedDurablePrompt,
+  shouldDeferInitialPromptForArgLimit,
   shouldStopPendingBatch,
   terminalReleasesDurableTurn,
   type PendingCliInput,
@@ -6107,6 +6108,8 @@ async function spawnCli(
   // Also defer on RESUME for adapters whose initial-prompt launch flag is
   // silently ignored when continuing a session (OpenCode `--prompt` + `-s`):
   // baking it into args would drop the message that triggered the resume.
+  // Finally, defer adapter-declared over-limit prompts to avoid backend command
+  // string limits (tmux "command too long") while preserving short argv prompts.
   const deferInitialPrompt = shouldDeferInitialPromptForStartup({
     hasStartupCommands: !!cfg.startupCommands?.length,
     adoptMode: cfg.adoptMode === true,
@@ -6115,7 +6118,12 @@ async function spawnCli(
     passesInitialPromptViaArgs: cliAdapter.passesInitialPromptViaArgs === true,
     adoptMode: cfg.adoptMode === true,
     dispatchAttempt: cfg.dispatchAttempt,
-  }) || (effectiveResume && cliAdapter.initialPromptArgsIgnoredOnResume === true);
+  }) || (effectiveResume && cliAdapter.initialPromptArgsIgnoredOnResume === true)
+    || shouldDeferInitialPromptForArgLimit({
+      passesInitialPromptViaArgs: cliAdapter.passesInitialPromptViaArgs === true,
+      prompt: cfg.prompt,
+      maxInitialPromptArgBytes: cliAdapter.maxInitialPromptArgBytes,
+    });
   kiroSessionIdCaptureArmed = cfg.cliId === 'kiro-cli' && !effectiveCliSessionId && !willReattachPersistent;
   kiroSessionIdCaptureBuffer = '';
   // Per-bot local read isolation: assemble the Seatbelt profile context (the gate
@@ -8642,7 +8650,12 @@ process.on('message', async (raw: unknown) => {
           passesInitialPromptViaArgs: cliAdapter?.passesInitialPromptViaArgs === true,
           adoptMode: msg.adoptMode === true,
           dispatchAttempt: msg.dispatchAttempt,
-        }) || (msg.adoptMode !== true && lastSpawnEffectiveResume && cliAdapter?.initialPromptArgsIgnoredOnResume === true);
+        }) || (msg.adoptMode !== true && lastSpawnEffectiveResume && cliAdapter?.initialPromptArgsIgnoredOnResume === true)
+          || shouldDeferInitialPromptForArgLimit({
+            passesInitialPromptViaArgs: cliAdapter?.passesInitialPromptViaArgs === true,
+            prompt: msg.prompt,
+            maxInitialPromptArgBytes: cliAdapter?.maxInitialPromptArgBytes,
+          });
         if (msg.prompt && cliAdapter?.passesInitialPromptViaArgs && !deferInitialPrompt && codexBridgeFallbackActive()) {
           // Args-baked first prompts (notably Pi) never pass through the normal
           // 'message' IPC path, so the structured bridge would otherwise see the
