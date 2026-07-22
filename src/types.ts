@@ -602,6 +602,7 @@ export type WorkerToDaemon =
   | { type: 'bridge_source_session'; bridge: 'hermes'; sourceSessionId: string }
   | { type: 'tui_prompt'; description: string; options: Array<{ label?: string; text: string; selected: boolean; type?: string; keys?: string[] }>; multiSelect?: boolean; turnId?: string; dispatchAttempt?: number }
   | { type: 'tui_prompt_resolved'; selectedText?: string; turnId?: string; dispatchAttempt?: number }
+  | { type: 'stuck_warning'; elapsedMs: number; snapshot: string; matchedPattern?: string; turnId?: string; dispatchAttempt?: number }
   | { type: 'screenshot_uploaded'; imageKey: string; status: ScreenStatus; usageLimit?: CliUsageLimitState; turnId?: string; dispatchAttempt?: number }
   | { type: 'user_notify'; message: string; turnId?: string; dispatchAttempt?: number }
   | { type: 'receiver_reset_ready'; sessionId: string; turnId: string; dispatchAttempt: number }
