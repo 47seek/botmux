@@ -1824,11 +1824,15 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         allKeys.push(...keys);
 
         if (allKeys.length > 0) {
-          // Only the stuck-warning card's Enter (confirm) action re-arms the
-          // detector — t/Esc and all ScreenAnalyzer cards never set this flag.
-          const isStuckWarningEnter = optionType === 'confirm'
-            && !!ds.stuckWarningCardId
-            && cardMessageId === ds.stuckWarningCardId;
+          // Only the stuck-warning card's Enter action re-arms the detector
+          // (Enter advances from the hook list to a per-hook review). Match by
+          // the actual keys sent — NOT by optionType, since t is typed 'confirm'
+          // in the card definition. t/Esc and all ScreenAnalyzer cards never
+          // set this flag. Also require the source card to be our own.
+          const isStuckWarningEnter = !!ds.stuckWarningCardId
+            && cardMessageId === ds.stuckWarningCardId
+            && keys.length === 1
+            && keys[0] === 'Enter';
           ds.worker.send({ type: 'tui_keys', keys: allKeys, isFinal, rearmStuckDetector: isStuckWarningEnter } as DaemonToWorker);
           logger.info(`[${tag(ds)}] TUI keys: [${allKeys.join(',')}] final=${isFinal} rearmStuck=${isStuckWarningEnter} — "${selectedText}"`);
         }

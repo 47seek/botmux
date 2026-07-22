@@ -3793,6 +3793,11 @@ function startStuckDetector(): void {
   stopStuckDetector();
   stuckDetector = new StuckDetector(sd.timeoutMs, {
     isActuallyStuck: () => {
+      // Scope gate: this PR only handles the Codex PreToolUse hook-review
+      // screen. Other CLIs (Claude Code, Gemini, ...) must never see the
+      // Codex-specific t/Enter/Esc card, even if their output happens to
+      // contain the same strings.
+      if (lastInitConfig?.cliId !== 'codex') return false;
       // Only warn if the CLI is not at its idle prompt AND no TUI prompt card
       // is already posted. A long legitimate turn (model thinking, tool calls)
       // must not trigger this.

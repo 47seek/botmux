@@ -2628,7 +2628,15 @@ function setupWorkerHandlers(
           }, { codexAppInputAccepted: !!followUpCodexAppInput });
         }
         // CLI reached its prompt — any previously posted stuck warning is stale.
-        // Clear it so the next unresolved turn can fire a fresh warning.
+        // Disable the card first so a late click can't inject keys into the
+        // now-idle CLI, then clear the markers.
+        if (ds.stuckWarningCardId) {
+          const locDs = localeForBot(ds.larkAppId);
+          const resolvedCard = buildTuiPromptResolvedCard(tr('card.action.tui_done', undefined, locDs), locDs);
+          updateMessage(ds.larkAppId, ds.stuckWarningCardId, resolvedCard).catch(err =>
+            logger.debug(`[${t}] Failed to resolve stale stuck-warning card: ${err}`),
+          );
+        }
         ds.stuckWarningTurnId = undefined;
         ds.stuckWarningCardId = undefined;
         break;
@@ -2931,7 +2939,10 @@ function setupWorkerHandlers(
         // screen gets an interactive card with safe, known-good keys (t/Enter/
         // Esc). Unknown stalls get a plain text warning WITHOUT the terminal
         // snapshot (to avoid leaking content) and WITHOUT guessed keys.
-        if (ds.stuckWarningTurnId === msg.turnId) {
+        // Dedup: only skip if we already posted a warning for THIS turn.
+        // Both undefined (no turnId assigned yet) must NOT dedup — the first
+        // warning for a turnless stall should still fire.
+        if (msg.turnId !== undefined && ds.stuckWarningTurnId === msg.turnId) {
           logger.debug(`[${t}] Stuck warning already posted for turn ${msg.turnId}, skipping duplicate`);
           break;
         }
