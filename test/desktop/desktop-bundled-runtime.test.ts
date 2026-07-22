@@ -44,4 +44,13 @@ describe('bundled desktop runtime', () => {
 
     expect(config).toContain("x64ArchFiles: 'Contents/Resources/{node/**,runtime/node_modules/.pnpm/**}'");
   });
+
+  it('stages both native canvas architectures using pnpm workspace settings', () => {
+    const script = readFileSync(resolve(import.meta.dirname, '../../scripts/prepare-desktop-runtime.mjs'), 'utf8');
+
+    expect(script).toContain("join(runtimeDir, 'pnpm-workspace.yaml')");
+    expect(script).toContain("supportedArchitectures: { os: ['darwin'], cpu: ['arm64', 'x64'] }");
+    expect(script).toContain("for (const arch of ['arm64', 'x64'])");
+    expect(script).toContain('Bundled runtime is missing @napi-rs/canvas-darwin-${arch}');
+  });
 });

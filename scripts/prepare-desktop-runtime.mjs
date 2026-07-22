@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { createHash } from 'node:crypto';
 import { createWriteStream } from 'node:fs';
-import { cp, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { cp, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join, relative, resolve, sep } from 'node:path';
 import { pipeline } from 'node:stream/promises';
@@ -29,6 +29,9 @@ async function stageBotmuxRuntime() {
   const pkg = JSON.parse(await readFile(join(root, 'package.json'), 'utf8'));
   const stagedVersion = normalizeVersion(process.env.BOTMUX_DESKTOP_VERSION);
   if (stagedVersion) pkg.version = stagedVersion;
+  // pnpm 9 reads supportedArchitectures from package.json. Keep this mirror in
+  // addition to pnpm-workspace.yaml below so both pnpm 9 and 11 stage the same
+  // Universal runtime dependency set.
   pkg.pnpm = {
     ...(pkg.pnpm ?? {}),
     supportedArchitectures: { os: ['darwin'], cpu: ['arm64', 'x64'] },
@@ -36,8 +39,23 @@ async function stageBotmuxRuntime() {
   delete pkg.scripts;
   await writeFile(join(runtimeDir, 'package.json'), `${JSON.stringify(pkg, null, 2)}\n`);
   await cp(join(root, 'pnpm-lock.yaml'), join(runtimeDir, 'pnpm-lock.yaml'));
+  // pnpm 11 reads project settings from pnpm-workspace.yaml. Install both
+  // macOS optional dependency variants so the Universal app's bundled runtime
+  // works natively on Intel and ARM Macs.
+  await writeFile(join(runtimeDir, 'pnpm-workspace.yaml'), [
+    'packages:',
+    "  - '.'",
+    'supportedArchitectures:',
+    '  os:',
+    '    - darwin',
+    '  cpu:',
+    '    - arm64',
+    '    - x64',
+    '',
+  ].join('\n'));
 
   run('pnpm', ['install', '--prod', '--frozen-lockfile', '--ignore-scripts'], runtimeDir);
+  await assertBundledCanvasArchitectures();
   // electron-builder applies the app-level `!node_modules/**` exclusion to
   // extraResources and expands pnpm symlinks into duplicate dependency trees.
   // A single archive crosses that boundary intact; afterPack expands it before
@@ -49,6 +67,16 @@ async function stageBotmuxRuntime() {
     recursive: true,
     filter: source => isRuntimeDistPath(distDir, source),
   });
+}
+
+async function assertBundledCanvasArchitectures() {
+  const entries = await readdir(join(runtimeDir, 'node_modules', '.pnpm'));
+  for (const arch of ['arm64', 'x64']) {
+    const prefix = `@napi-rs+canvas-darwin-${arch}@`;
+    if (!entries.some(entry => entry.startsWith(prefix))) {
+      throw new Error(`Bundled runtime is missing @napi-rs/canvas-darwin-${arch}`);
+    }
+  }
 }
 
 function normalizeVersion(value) {
