@@ -153,6 +153,7 @@ import { tmuxEnv, probeTmuxFunctionalWithRetry } from './setup/ensure-tmux.js';
 import { tmuxRestartJitterMs } from './core/tmux-recovery.js';
 import { IdleDetector } from './utils/idle-detector.js';
 import { ScreenAnalyzer } from './utils/screen-analyzer.js';
+import { StuckDetector } from './utils/stuck-detector.js';
 import { captureToPng } from './utils/screenshot-renderer.js';
 import { snapshotToPng, snapshotToText, shouldCaptureScreen, isScreenSelfDriven } from './utils/transient-snapshot.js';
 import { chooseWebTerminalSeed } from './utils/web-terminal-seed.js';
@@ -3191,6 +3192,7 @@ function parkCrashDiagnosticTerminal(code: number | null, signal: string | null)
   // both when the next message respawns the CLI.
   stopScreenUpdates();
   stopScreenAnalyzer();
+  stopStuckDetector();
   log(`Crash diagnostic tmux session parked at ${TmuxBackend.diagnosticSessionName(sessionId)}`);
   return true;
 }
@@ -3305,6 +3307,54 @@ function stopScreenAnalyzer(): void {
   screenAnalyzer?.dispose();
   screenAnalyzer = null;
   tuiPromptBlocking = false;
+}
+
+// ─── Stuck Detector (AI-free fallback for blocked CLI states) ───────────────
+
+let stuckDetector: StuckDetector | null = null;
+
+function startStuckDetector(): void {
+  const sd = config.stuckDetector;
+  if (!sd.enabled) return;
+  stopStuckDetector();
+  stuckDetector = new StuckDetector(sd.timeoutMs, {
+    isActuallyStuck: () => {
+      // Only warn if there are genuinely unconsumed inputs AND the CLI is not
+      // at its idle prompt AND no TUI prompt card is already posted. A long
+      // legitimate turn (model thinking, tool calls) must not trigger this.
+      if (isPromptReady) return false;
+      if (tuiPromptBlocking) return false;
+      // InflightInputTracker doesn't expose its queue length; peek via the
+      // durable-turn gate which is set when a tracked write is in flight.
+      if (!durableTurnInFlight && inflightInputsEmpty()) return false;
+      return true;
+    },
+    onStuck: (elapsedMs, matchedLabel) => {
+      const snapshot = renderer?.rawSnapshot() || lastAnalyzerSnapshot || '';
+      log(`StuckDetector: turn unresolved for ${Math.round(elapsedMs / 1000)}s${matchedLabel ? ` (${matchedLabel})` : ''}`);
+      send({
+        type: 'stuck_warning',
+        elapsedMs,
+        snapshot: snapshot.slice(-3000),
+        matchedPattern: matchedLabel,
+        turnId: currentBotmuxTurnId,
+        dispatchAttempt: currentBotmuxDispatchAttempt,
+      });
+    },
+    getSnapshot: () => renderer?.rawSnapshot() || lastAnalyzerSnapshot || '',
+  });
+}
+
+function stopStuckDetector(): void {
+  stuckDetector?.dispose();
+  stuckDetector = null;
+}
+
+/** InflightInputTracker doesn't expose queue length; infer emptiness from the
+ *  durable-turn gate. Non-durable writes are rare (adopt/raw input) and the
+ *  detector is a best-effort fallback anyway. */
+function inflightInputsEmpty(): boolean {
+  return !durableTurnInFlight;
 }
 
 // ─── Screenshot Capture (PNG → Feishu image_key) ────────────────────────────
@@ -3936,6 +3986,7 @@ function markPromptReady(): void {
   // CLI exits, onCliExit still reports ambiguous while deliberately declining
   // worker-local replay of the durable attempt.
   if (!durableTurnInFlight) inflightInputs.onTurnComplete();
+  stuckDetector?.disarm();
   maybeEmitWorkflowTranscriptOutput();
   if (awaitingFirstPrompt) {
     awaitingFirstPrompt = false;
@@ -4359,6 +4410,7 @@ async function flushPending(): Promise<void> {
       // Track as in-flight until the CLI returns to idle (markPromptReady).
       // If the CLI exits first, onExit stashes these for re-queue on respawn.
       inflightInputs.onWrite(item);
+      stuckDetector?.arm();
       const msg = item.content;
       currentBotmuxTurnId = item.turnId;
       currentBotmuxDispatchAttempt = item.dispatchAttempt;
@@ -6434,6 +6486,7 @@ function killCli(opts: { preservePending?: boolean } = {}): void {
   isSettlingFirstFlush = false;
   promptReadyDetectedDuringSettle = false;
   stopScreenAnalyzer();
+  stopStuckDetector();
   stopScreenUpdates();
   backend?.kill();
   backend = null;
@@ -6534,6 +6587,7 @@ async function restartCliProcess(
         if (lastInitConfig) {
           startScreenUpdates();
           startScreenAnalyzer();
+          startStuckDetector();
           try {
             spawnCli({ ...lastInitConfig, resume: true, prompt: '' });
           } catch (err) {
@@ -7700,6 +7754,7 @@ process.on('message', async (raw: unknown) => {
           port = await startWebServer(config.web.workerHost, msg.webPort);
           startScreenUpdates();
           startScreenAnalyzer();
+          startStuckDetector();
         } else {
           // Workflow attempts still expose a read-only web terminal so the
           // workflow dashboard can observe in-flight subagents.  Keep the
@@ -7799,6 +7854,7 @@ process.on('message', async (raw: unknown) => {
         log('Message received after crash-loop stop; retrying CLI start');
         destroyCrashDiagnosticTerminal('retry after message');
         stopScreenAnalyzer();
+        stopStuckDetector();
         stopScreenUpdates();
         awaitingFirstPrompt = true;
         startScreenUpdates();

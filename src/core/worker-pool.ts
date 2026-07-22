@@ -2501,6 +2501,9 @@ function setupWorkerHandlers(
 
       case 'prompt_ready': {
         logger.info(`[${t}] ${getCliDisplayName(effectiveCliId)} is ready for input`);
+        // CLI reached its prompt — any previously posted stuck warning is stale.
+        // Clear it so the next unresolved turn can fire a fresh warning.
+        ds.stuckWarningTurnId = undefined;
         // A live prompt means a (re)spawn reached a working CLI — clear the lazy
         // cold-resume marker set when we parked a crash diagnostic shell. The
         // common retry path respawns IN-PLACE (worker.ts case 'message'), not via
@@ -2817,6 +2820,35 @@ function setupWorkerHandlers(
           ds.tuiPromptCardId = undefined;
           ds.tuiPromptOptions = undefined;
           publishAttentionPatch(ds);
+        }
+        break;
+      }
+
+      case 'stuck_warning': {
+        // AI-free StuckDetector fired: a written input hasn't produced a
+        // completed turn within the timeout. Warn the user in-thread so they
+        // know the message was delivered but the CLI may be blocked (e.g.
+        // PreToolUse hook review, a [Y/n] prompt, a "Press any key" pause).
+        if (ds.stuckWarningTurnId === msg.turnId) {
+          logger.debug(`[${t}] Stuck warning already posted for turn ${msg.turnId}, skipping duplicate`);
+          break;
+        }
+        ds.stuckWarningTurnId = msg.turnId;
+        const secs = Math.round(msg.elapsedMs / 1000);
+        const pattern = msg.matchedPattern ? `\n检测到：${msg.matchedPattern}` : '';
+        const preview = msg.snapshot ? `\n\n终端快照（最近内容）：\n\`\`\`\n${msg.snapshot.slice(-1500)}\n\`\`\`` : '';
+        const text = `⚠️ CLI 似乎卡住了——消息已写入但 ${secs}s 未完成处理，可能在等确认。${pattern}${preview}\n\n可打开终端查看，或直接回复消息继续（会清除此告警）。`;
+        logger.info(`[${t}] Stuck warning: turn unresolved for ${secs}s${msg.matchedPattern ? ` (${msg.matchedPattern})` : ''}`);
+        emitSessionLifecycleHook(ds, 'session.requires_attention', {
+          reason: 'stuck_warning',
+          elapsedMs: msg.elapsedMs,
+          matchedPattern: msg.matchedPattern,
+        });
+        if (managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) break;
+        try {
+          await scopedReply(text, 'text', msg.turnId);
+        } catch (err: any) {
+          logger.warn(`[${t}] Failed to post stuck warning: ${err}`);
         }
         break;
       }
