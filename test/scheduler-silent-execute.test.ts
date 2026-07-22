@@ -259,6 +259,29 @@ describe('executeScheduledTask — silent chat-scope fire', () => {
 });
 
 describe('executeScheduledTask — chat-scope regular-group mode', () => {
+  it('cross-chat loud execution notifies the creator and still uses a target-chat trigger', async () => {
+    (BOT.config as typeof BOT.config & { regularGroupReplyMode?: string }).regularGroupReplyMode = 'new-topic';
+    const active = new Map<string, DaemonSession>();
+
+    await executeScheduledTask(baseTask({
+      scope: 'chat',
+      chatType: 'group',
+      creatorChatId: 'oc_creator_chat',
+      creatorRootMessageId: 'om_creator_root',
+    }), active, refreshCliVersion);
+
+    expect(replyMessageMock).toHaveBeenCalledWith(
+      APP,
+      'om_creator_root',
+      expect.any(String),
+      'text',
+      true,
+    );
+    expect(sendMessageMock).toHaveBeenCalledWith(APP, CHAT, expect.any(String));
+    expect(active.get(sessionKey(CHAT, APP))).toBeUndefined();
+    expect(active.get(sessionKey('om_banner_123', APP))?.scope).toBe('thread');
+  });
+
   it('new-topic mode uses the top-level banner as a fresh thread/session anchor', async () => {
     (BOT.config as typeof BOT.config & { regularGroupReplyMode?: string }).regularGroupReplyMode = 'new-topic';
     const active = new Map<string, DaemonSession>();

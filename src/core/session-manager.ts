@@ -1809,19 +1809,23 @@ export async function executeScheduledTask(
     let topLevelTriggerId: string | undefined;
     if (silent) {
       // No banner / creator notice — the chat itself is the anchor.
-    } else if (task.creatorRootMessageId && task.creatorChatId !== task.chatId) {
-      const creatorAppId = task.creatorLarkAppId ?? larkAppId;
-      replyMessage(
-        creatorAppId,
-        task.creatorRootMessageId,
-        t('scheduler.task_triggered_target_chat', { name: task.name }, localeForBot(creatorAppId)),
-        'text',
-        true,
-      ).catch((err: any) => {
-        logger.warn(`[scheduler] Failed to notify creator thread ${task.creatorRootMessageId} (${err.message})`);
-      });
     } else {
-      // Same-chat: post the start banner to the chat as a plain message.
+      // A cross-chat task keeps the creator informed, but the target chat must
+      // still receive its own top-level trigger. Besides making the execution
+      // visible where it runs, that message is the anchor required by the
+      // target bot/chat's shared or independent-topic regular-group mode.
+      if (task.creatorRootMessageId && task.creatorChatId !== task.chatId) {
+        const creatorAppId = task.creatorLarkAppId ?? larkAppId;
+        replyMessage(
+          creatorAppId,
+          task.creatorRootMessageId,
+          t('scheduler.task_triggered_target_chat', { name: task.name }, localeForBot(creatorAppId)),
+          'text',
+          true,
+        ).catch((err: any) => {
+          logger.warn(`[scheduler] Failed to notify creator thread ${task.creatorRootMessageId} (${err.message})`);
+        });
+      }
       try {
         topLevelTriggerId = await sendMessage(larkAppId, task.chatId, t('scheduler.task_started', { name: task.name }, localeForBot(larkAppId)));
       } catch (err: any) {
