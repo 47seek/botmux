@@ -23,7 +23,7 @@ describe('StuckDetector', () => {
     const detector = new StuckDetector(1000, {
       isActuallyStuck: () => true,
       onStuck,
-      getSnapshot: () => 'PreToolUse hooks\n1 hook needs review before it can run.',
+      getSnapshot: () => 'PreToolUse hooks\n1 hook needs review before it can run.\nPress t to trust all; enter to review hooks; esc to close',
     });
 
     detector.arm();
@@ -57,7 +57,7 @@ describe('StuckDetector', () => {
     const detector = new StuckDetector(1000, {
       isActuallyStuck: () => stuck,
       onStuck,
-      getSnapshot: () => 'PreToolUse hooks\n1 hook needs review before it can run.',
+      getSnapshot: () => 'PreToolUse hooks\n1 hook needs review before it can run.\nPress t to trust all; enter to review hooks; esc to close',
     });
 
     detector.arm();
@@ -93,7 +93,7 @@ describe('StuckDetector', () => {
     const detector = new StuckDetector(1000, {
       isActuallyStuck: () => true,
       onStuck,
-      getSnapshot: () => 'PreToolUse hooks\n1 hook needs review before it can run.',
+      getSnapshot: () => 'PreToolUse hooks\n1 hook needs review before it can run.\nPress t to trust all; enter to review hooks; esc to close',
     });
 
     detector.arm();
@@ -112,7 +112,7 @@ describe('StuckDetector', () => {
     const detector = new StuckDetector(1000, {
       isActuallyStuck: () => true,
       onStuck,
-      getSnapshot: () => 'PreToolUse hooks\n1 hook needs review before it can run.',
+      getSnapshot: () => 'PreToolUse hooks\n1 hook needs review before it can run.\nPress t to trust all; enter to review hooks; esc to close',
     });
 
     detector.arm();
@@ -128,7 +128,7 @@ describe('StuckDetector', () => {
     const detector = new StuckDetector(1000, {
       isActuallyStuck: () => true,
       onStuck,
-      getSnapshot: () => 'PreToolUse hooks\n1 hook needs review before it can run.',
+      getSnapshot: () => 'PreToolUse hooks\n1 hook needs review before it can run.\nPress t to trust all; enter to review hooks; esc to close',
     });
 
     detector.arm();
@@ -158,6 +158,25 @@ describe('StuckDetector', () => {
     detector.dispose();
   });
 
+  it.each([
+    ['ordinary chat quoting the title', 'I am investigating PreToolUse hooks today.'],
+    ['pasted incident text without controls', 'PreToolUse hooks\n1 hook needs review before it can run.'],
+    ['control hint without title and pending state', 'Press t to trust all; enter to review hooks; esc to close'],
+  ])('does not fire for %s', (_name, snapshot) => {
+    const onStuck = vi.fn();
+    const detector = new StuckDetector(1000, {
+      isActuallyStuck: () => true,
+      onStuck,
+      getSnapshot: () => snapshot,
+    });
+
+    detector.arm();
+    vi.advanceTimersByTime(1000);
+
+    expect(onStuck).not.toHaveBeenCalled();
+    detector.dispose();
+  });
+
   it('dispose prevents any further firing', () => {
     const onStuck = vi.fn();
     const detector = new StuckDetector(1000, {
@@ -178,7 +197,7 @@ describe('StuckDetector', () => {
     const detector = new StuckDetector(1000, {
       isActuallyStuck: () => true,
       onStuck,
-      getSnapshot: () => 'PreToolUse hooks\n1 hook needs review before it can run.',
+      getSnapshot: () => 'PreToolUse hooks\n1 hook needs review before it can run.\nPress t to trust all; enter to review hooks; esc to close',
     });
 
     detector.arm();

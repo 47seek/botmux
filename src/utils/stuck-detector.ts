@@ -15,13 +15,19 @@
  * quiet. This avoids false positives from legitimately long turns.
  */
 
-/** Patterns identifying the Codex PreToolUse hook-review screen. Matched
- *  against a recent terminal snapshot (ANSI-stripped). The label doubles as the
- *  card's human-readable description. */
-const HOOK_REVIEW_PATTERNS: Array<{ re: RegExp; label: string }> = [
-  { re: /hook needs review|needs review before it can run|PreToolUse hooks/i, label: 'hook review prompt' },
-  { re: /Press t to trust all/i, label: 'hook review prompt' },
-];
+/** Identifies the complete Codex PreToolUse hook-review screen. A keyword by
+ * itself is not enough: users and model output can legitimately quote the
+ * incident text. We require all three contemporaneous UI signals:
+ * - the PreToolUse hooks title,
+ * - a pending review state, and
+ * - the control hint documenting t / Enter / Esc.
+ */
+function isHookReviewScreen(snapshot: string): boolean {
+  const hasTitle = /PreToolUse hooks/i.test(snapshot);
+  const hasPendingReview = /hook needs review|needs review before it can run/i.test(snapshot);
+  const hasControls = /Press t to trust all; enter to review hooks; esc to close/i.test(snapshot);
+  return hasTitle && hasPendingReview && hasControls;
+}
 
 export interface StuckDetectorCallbacks {
   /** Called when the timeout elapses. Return true to fire the warning; false
@@ -96,10 +102,6 @@ export class StuckDetector {
 
   private matchSnapshot(): string | undefined {
     const snap = this.callbacks.getSnapshot?.();
-    if (!snap) return undefined;
-    for (const { re, label } of HOOK_REVIEW_PATTERNS) {
-      if (re.test(snap)) return label;
-    }
-    return undefined;
+    return snap && isHookReviewScreen(snap) ? 'hook review prompt' : undefined;
   }
 }
