@@ -237,6 +237,32 @@ describe('driveV3Run — suspend gate → 发卡 → 点击 redrive', () => {
       rmSync(base, { recursive: true, force: true });
     }
   });
+
+  it('runNode 收到 run 的 chatBinding（真实 BOTMUX_* 身份 env 透传链路）', async () => {
+    const base = freshBase();
+    try {
+      const runDir = seedApprovedRun(base, 'bind-run', { binding: BINDING });
+      const seen: unknown[] = [];
+      const shared = stubDeps(base, {
+        makeRunNode: () => async (req) => {
+          seen.push(req.chatBinding);
+          return { status: 'ok', manifestPath: join(req.outputDir, 'manifest.json') };
+        },
+      });
+
+      await driveV3Run('bind-run', shared.deps); // → awaitingGate
+      resolveWait(runDir, 'deploy#001-gate', 'approved', 'ou_user');
+      appendEvent(join(runDir, 'journal.ndjson'), {
+        type: 'gateResolved', nodeId: 'deploy', waitId: 'deploy#001-gate', resolution: 'approved', by: 'ou_user',
+      } as any);
+      const outcome = await driveV3Run('bind-run', shared.deps); // redrive
+
+      expect(outcome.reason).toBe('terminal');
+      expect(seen).toEqual([BINDING]);
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('driveV3Run — 错误路径', () => {
