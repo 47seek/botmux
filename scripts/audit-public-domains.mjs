@@ -11,7 +11,7 @@ import { extname, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const repoRoot = resolve(fileURLToPath(new URL('..', import.meta.url)));
-const roots = ['src', 'test', 'scripts', 'docs', '.github'];
+const roots = ['src', 'test', 'scripts', 'docs', 'docs-site', '.github'];
 const rootFiles = ['README.md', 'README.en.md', 'package.json'];
 const textExtensions = new Set([
   '.ts', '.tsx', '.js', '.mjs', '.cjs', '.json', '.md', '.yml', '.yaml',
@@ -23,8 +23,6 @@ const allowedHosts = new Set([
   'riff-infra-boe.bytedance.net',
   'code.byted.org',
   'tosv.byted.org',
-  // Public docs / install scripts reference these hosts.
-  'bnpm.byted.org',
 ]);
 // Require at least one label so bare corporate TLD mentions in assertions/comments
 // do not trip the gate; catch accidental private subdomains under either suffix.
