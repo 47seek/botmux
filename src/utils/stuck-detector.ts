@@ -80,9 +80,17 @@ export class StuckDetector {
       this.arm();
       return;
     }
+    // Only fire when the snapshot matches a known hook-review pattern.
+    // A 15s PTY silence alone does NOT prove the turn is stuck — long model
+    // thinking or tool calls can be quiet. Without a pattern match we silently
+    // re-arm and keep waiting, never posting a false "CLI stuck" warning.
+    const matched = this.matchSnapshot();
+    if (!matched) {
+      this.arm();
+      return;
+    }
     this.firedThisWindow = true;
     const elapsed = Date.now() - this.armedAt;
-    const matched = this.matchSnapshot();
     this.callbacks.onStuck(elapsed, matched);
   }
 

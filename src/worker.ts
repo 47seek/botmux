@@ -3786,6 +3786,9 @@ function stopScreenAnalyzer(): void {
 // ─── Stuck Detector (AI-free fallback for blocked CLI states) ───────────────
 
 let stuckDetector: StuckDetector | null = null;
+/** True while a stuck-warning card is active — gates tui_keys re-arming so we
+ *  only re-arm for our own card's Enter-review path, not ScreenAnalyzer cards. */
+let stuckWarningActive = false;
 
 function startStuckDetector(): void {
   const sd = config.stuckDetector;
@@ -3813,6 +3816,7 @@ function startStuckDetector(): void {
     onStuck: (elapsedMs, matchedLabel) => {
       const snapshot = renderer?.rawSnapshot() || lastAnalyzerSnapshot || '';
       log(`StuckDetector: turn unresolved for ${Math.round(elapsedMs / 1000)}s${matchedLabel ? ` (${matchedLabel})` : ''}`);
+      stuckWarningActive = true;
       send({
         type: 'stuck_warning',
         elapsedMs,
@@ -3829,14 +3833,6 @@ function startStuckDetector(): void {
 function stopStuckDetector(): void {
   stuckDetector?.dispose();
   stuckDetector = null;
-}
-
-/** True if no unacked inputs are currently in flight. Uses the tracker's
- *  real queue length so both durable and non-durable (ordinary IM) turns
- *  are covered — the original hook-review incident ran on a non-durable
- *  turn, so gating on durableTurnInFlight alone would never fire. */
-function inflightInputsEmpty(): boolean {
-  return inflightInputs.isEmpty();
 }
 
 // ─── Screenshot Capture (PNG → Feishu image_key) ────────────────────────────
@@ -4588,6 +4584,7 @@ function markPromptReady(): void {
   // worker-local replay of the durable attempt.
   if (!durableTurnInFlight) inflightInputs.onTurnComplete();
   stuckDetector?.disarm();
+  stuckWarningActive = false;
   maybeEmitWorkflowTranscriptOutput();
   if (awaitingFirstPrompt) {
     awaitingFirstPrompt = false;
@@ -9133,10 +9130,10 @@ process.on('message', async (raw: unknown) => {
 
     case 'tui_keys': {
       handleTuiKeys(msg.keys, msg.isFinal);
-      // Re-arm the stuck detector: a key press may advance the CLI to another
-      // blocking screen (e.g. Enter moves from the hook list to a per-hook
-      // review). Without re-arming, the next stall would not warn the user.
-      stuckDetector?.arm();
+      // Re-arm the stuck detector ONLY if this key press came from our own
+      // stuck-warning card (Enter moves from the hook list to a per-hook review).
+      // ScreenAnalyzer TUI cards must not be affected.
+      if (stuckWarningActive) stuckDetector?.arm();
       break;
     }
 

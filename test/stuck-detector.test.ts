@@ -23,7 +23,7 @@ describe('StuckDetector', () => {
     const detector = new StuckDetector(1000, {
       isActuallyStuck: () => true,
       onStuck,
-      getSnapshot: () => '',
+      getSnapshot: () => 'PreToolUse hooks\n1 hook needs review before it can run.',
     });
 
     detector.arm();
@@ -32,7 +32,7 @@ describe('StuckDetector', () => {
     expect(onStuck).toHaveBeenCalledTimes(1);
     const [elapsedMs, matchedLabel] = onStuck.mock.calls[0];
     expect(elapsedMs).toBeGreaterThanOrEqual(1000);
-    expect(matchedLabel).toBeUndefined();
+    expect(matchedLabel).toBe('hook review prompt');
     detector.dispose();
   });
 
@@ -57,7 +57,7 @@ describe('StuckDetector', () => {
     const detector = new StuckDetector(1000, {
       isActuallyStuck: () => stuck,
       onStuck,
-      getSnapshot: () => '',
+      getSnapshot: () => 'PreToolUse hooks\n1 hook needs review before it can run.',
     });
 
     detector.arm();
@@ -93,7 +93,7 @@ describe('StuckDetector', () => {
     const detector = new StuckDetector(1000, {
       isActuallyStuck: () => true,
       onStuck,
-      getSnapshot: () => '',
+      getSnapshot: () => 'PreToolUse hooks\n1 hook needs review before it can run.',
     });
 
     detector.arm();
@@ -139,7 +139,7 @@ describe('StuckDetector', () => {
     detector.dispose();
   });
 
-  it('does not match generic [Y/n] or Press prompts (out of scope for this PR)', () => {
+  it('silently re-arms when snapshot does not match hook-review (no false warning)', () => {
     const onStuck = vi.fn();
     const detector = new StuckDetector(1000, {
       isActuallyStuck: () => true,
@@ -148,11 +148,13 @@ describe('StuckDetector', () => {
     });
 
     detector.arm();
+    // First tick: isActuallyStuck=true but no pattern match → silently re-arms
     vi.advanceTimersByTime(1000);
+    expect(onStuck).not.toHaveBeenCalled();
 
-    expect(onStuck).toHaveBeenCalledTimes(1);
-    // No pattern match — label is undefined (unknown stall)
-    expect(onStuck.mock.calls[0][1]).toBeUndefined();
+    // Second tick: still no match → still no warning
+    vi.advanceTimersByTime(1000);
+    expect(onStuck).not.toHaveBeenCalled();
     detector.dispose();
   });
 
@@ -176,7 +178,7 @@ describe('StuckDetector', () => {
     const detector = new StuckDetector(1000, {
       isActuallyStuck: () => true,
       onStuck,
-      getSnapshot: () => '',
+      getSnapshot: () => 'PreToolUse hooks\n1 hook needs review before it can run.',
     });
 
     detector.arm();
