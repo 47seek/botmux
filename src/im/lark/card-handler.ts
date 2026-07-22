@@ -1773,6 +1773,17 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     }
 
     if (actionType === 'tui_keys' && ds) {
+      // Fail-closed: only act on a currently-active card (either the
+      // ScreenAnalyzer TUI prompt card or our stuck-warning card). A stale
+      // click from a resolved/replaced card must NOT send any IPC to the
+      // worker — the CLI may have moved on or recovered. PATCH is UI only,
+      // not an authorization check.
+      const isActiveTuiCard = !!ds.tuiPromptCardId && cardMessageId === ds.tuiPromptCardId;
+      const isActiveStuckCard = !!ds.stuckWarningCardId && cardMessageId === ds.stuckWarningCardId;
+      if (!isActiveTuiCard && !isActiveStuckCard) {
+        logger.info(`[${tag(ds)}] tui_keys from stale card ${cardMessageId} — ignored (active tui=${ds.tuiPromptCardId ?? 'none'} stuck=${ds.stuckWarningCardId ?? 'none'})`);
+        return;
+      }
       let keys: string[] = [];
       try { keys = JSON.parse(value?.keys ?? '[]'); } catch { /* bad json */ }
       const isFinal = value?.is_final === '1';
@@ -1851,10 +1862,15 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
               );
             }, allKeys.length * 100 + 500);
           }
-          ds.tuiPromptCardId = undefined;
-          ds.tuiPromptOptions = undefined;
-          ds.tuiPromptMultiSelect = undefined;
-          ds.tuiToggledIndices = undefined;
+          // Clear state only for the card that was actually clicked — a stuck
+          // card click must NOT wipe the ScreenAnalyzer TUI prompt state (or
+          // vice versa) if both coexist / race.
+          if (cardMessageId === ds.tuiPromptCardId) {
+            ds.tuiPromptCardId = undefined;
+            ds.tuiPromptOptions = undefined;
+            ds.tuiPromptMultiSelect = undefined;
+            ds.tuiToggledIndices = undefined;
+          }
           // If this click resolved a stuck-warning card, clear both the card
           // marker AND the turn dedup marker so the next review layer can
           // re-trigger a fresh warning.

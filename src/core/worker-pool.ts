@@ -2939,11 +2939,13 @@ function setupWorkerHandlers(
         // screen gets an interactive card with safe, known-good keys (t/Enter/
         // Esc). Unknown stalls get a plain text warning WITHOUT the terminal
         // snapshot (to avoid leaking content) and WITHOUT guessed keys.
-        // Dedup: only skip if we already posted a warning for THIS turn.
-        // Both undefined (no turnId assigned yet) must NOT dedup — the first
-        // warning for a turnless stall should still fire.
-        if (msg.turnId !== undefined && ds.stuckWarningTurnId === msg.turnId) {
-          logger.debug(`[${t}] Stuck warning already posted for turn ${msg.turnId}, skipping duplicate`);
+        // Dedup: skip if we already posted a warning for THIS turn, OR if a
+        // stuck-warning card is already active (covers the no-turnId case where
+        // a second stall fires before the first card is resolved).
+        const isDuplicateTurn = msg.turnId !== undefined && ds.stuckWarningTurnId === msg.turnId;
+        const hasActiveCard = !!ds.stuckWarningCardId;
+        if (isDuplicateTurn || hasActiveCard) {
+          logger.debug(`[${t}] Stuck warning dedup skipped (turn=${msg.turnId ?? 'none'}, activeCard=${hasActiveCard})`);
           break;
         }
         ds.stuckWarningTurnId = msg.turnId;

@@ -8888,6 +8888,7 @@ process.on('message', async (raw: unknown) => {
         awaitingFirstPrompt = true;
         startScreenUpdates();
         startScreenAnalyzer();
+        startStuckDetector();
         try {
           await spawnCli({ ...lastInitConfig, resume: true, prompt: '' });
         } catch (err) {
