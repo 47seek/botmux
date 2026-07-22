@@ -22,6 +22,14 @@ export interface BuildExternalBotmuxCommandInput {
   pathEnv?: string;
 }
 
+export interface BuildBundledBotmuxCommandInput {
+  nodePath: string;
+  cliPath: string;
+  botmuxHome: string;
+  args: string[];
+  baseEnv: NodeJS.ProcessEnv;
+}
+
 export function buildBotmuxCommand(input: BuildBotmuxCommandInput): BotmuxCommand {
   return {
     command: input.electronExecPath,
@@ -34,6 +42,21 @@ export function buildBotmuxCommand(input: BuildBotmuxCommandInput): BotmuxComman
       PM2_HOME: join(input.botmuxHome, 'pm2'),
       SESSION_DATA_DIR: join(input.botmuxHome, 'data'),
     },
+  };
+}
+
+export function buildBundledBotmuxCommand(input: BuildBundledBotmuxCommandInput): BotmuxCommand {
+  const env: NodeJS.ProcessEnv = {
+    ...input.baseEnv,
+    PM2_HOME: join(input.botmuxHome, 'pm2'),
+    SESSION_DATA_DIR: join(input.botmuxHome, 'data'),
+  };
+  delete env.ELECTRON_RUN_AS_NODE;
+
+  return {
+    command: input.nodePath,
+    args: [input.cliPath, ...input.args],
+    env,
   };
 }
 

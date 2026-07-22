@@ -10,15 +10,16 @@ const paths = {
   pm2Home: '/home/.botmux/pm2',
 };
 
-describe('desktop external CLI runtime wiring', () => {
-  it('wires external CLI discovery into the runtime service', () => {
+describe('desktop external CLI runtime discovery', () => {
+  it('wires the bundled runtime into the production Desktop service', () => {
     const mainSource = readFileSync(
       fileURLToPath(new URL('../../src/desktop/main.ts', import.meta.url)),
       'utf-8',
     );
 
-    expect(mainSource).toContain('discoverExternalRuntimeCandidate');
-    expect(mainSource).toContain('discoverExternalRuntime: () => discoverExternalRuntimeCandidate(paths)');
+    expect(mainSource).toContain('resolveBundledRuntimeCandidate');
+    expect(mainSource).toContain('bundledRuntime,');
+    expect(mainSource).not.toContain('discoverExternalRuntime:');
   });
 
   it('selects an npm-installed botmux runtime outside the bundled app', () => {

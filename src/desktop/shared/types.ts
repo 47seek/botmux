@@ -5,7 +5,7 @@ export type RuntimeStatus =
   | 'running'
   | 'degraded';
 
-export type RuntimeSource = 'global-cli' | 'none';
+export type RuntimeSource = 'bundled' | 'global-cli' | 'none';
 
 export interface DesktopPaths {
   // User-owned CLI/dashboard state remains in ~/.botmux across app upgrades.

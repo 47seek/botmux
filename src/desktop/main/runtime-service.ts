@@ -2,7 +2,7 @@ import { spawn } from 'node:child_process';
 import { join } from 'node:path';
 import { callDashboard, type DashboardResult } from '../../cli/dashboard-endpoint.js';
 import type { DesktopPaths, DesktopRuntimeState, RuntimeSource } from '../shared/types.js';
-import { buildExternalBotmuxCommand, type BotmuxCommand } from './node-command.js';
+import { buildBundledBotmuxCommand, buildExternalBotmuxCommand, type BotmuxCommand } from './node-command.js';
 import { classifyRuntimeSource, countActiveBotmuxDaemonApps, type Pm2AppSummary } from './runtime-source.js';
 
 export interface RunResult {
@@ -23,10 +23,19 @@ export interface ExternalRuntimeCandidate {
   binPath: string;
   pathEnv?: string;
   version: string;
-  runtimeSource?: Exclude<RuntimeSource, 'none'>;
+  runtimeSource?: 'global-cli';
 }
 
-export type RuntimeLaunchTarget = ExternalRuntimeCandidate;
+export interface BundledRuntimeCandidate {
+  kind: 'bundled';
+  root: string;
+  cliPath: string;
+  nodePath: string;
+  version: string;
+  runtimeSource: 'bundled';
+}
+
+export type RuntimeLaunchTarget = ExternalRuntimeCandidate | BundledRuntimeCandidate;
 
 function defaultRun(cmd: BotmuxCommand, timeoutMs = defaultCommandTimeoutMs): Promise<RunResult> {
   return new Promise(resolve => {
@@ -101,15 +110,27 @@ export interface RuntimeServiceDeps {
   commandTimeoutMs?: number;
   externalRuntime?: ExternalRuntimeCandidate | null;
   discoverExternalRuntime?: () => ExternalRuntimeCandidate | null;
-  pm2Apps?: (runtime: ExternalRuntimeCandidate) => Promise<Pm2AppSummary[]>;
+  bundledRuntime?: BundledRuntimeCandidate;
+  pm2Apps?: (runtime: RuntimeLaunchTarget) => Promise<Pm2AppSummary[]>;
 }
 
 export function createRuntimeService(deps: RuntimeServiceDeps) {
   const run = deps.run ?? ((cmd: BotmuxCommand) => defaultRun(cmd, deps.commandTimeoutMs));
   const botsPath = join(deps.paths.botmuxHome, 'bots.json');
-  const installCliMessage = 'Install the global botmux CLI with `npm install -g botmux`, then reopen Botmux Desktop.';
+  const installCliMessage = deps.bundledRuntime
+    ? 'The bundled botmux runtime is unavailable. Reinstall Botmux Desktop.'
+    : 'Install the global botmux CLI with `npm install -g botmux`, then reopen Botmux Desktop.';
 
-  function command(runtime: ExternalRuntimeCandidate, args: string[]): BotmuxCommand {
+  function command(runtime: RuntimeLaunchTarget, args: string[]): BotmuxCommand {
+    if (runtime.kind === 'bundled') {
+      return buildBundledBotmuxCommand({
+        nodePath: runtime.nodePath,
+        cliPath: runtime.cliPath,
+        botmuxHome: deps.paths.botmuxHome,
+        args,
+        baseEnv: deps.env,
+      });
+    }
     return buildExternalBotmuxCommand({
       binPath: runtime.binPath,
       botmuxHome: deps.paths.botmuxHome,
@@ -123,8 +144,8 @@ export function createRuntimeService(deps: RuntimeServiceDeps) {
     return deps.discoverExternalRuntime ? deps.discoverExternalRuntime() : deps.externalRuntime ?? null;
   }
 
-  function activeRuntime(): ExternalRuntimeCandidate | null {
-    return currentExternalRuntime();
+  function activeRuntime(): RuntimeLaunchTarget | null {
+    return deps.bundledRuntime ?? currentExternalRuntime();
   }
 
   function rejectedCliRequired(): RunResult {
@@ -152,8 +173,14 @@ export function createRuntimeService(deps: RuntimeServiceDeps) {
     return run(command(runtime, args));
   }
 
-  function externalSource(runtime: ExternalRuntimeCandidate): RuntimeSource {
+  function externalSource(runtime: RuntimeLaunchTarget): RuntimeSource {
     return runtime.runtimeSource ?? 'global-cli';
+  }
+
+  function isRuntimeOwned(runtime: RuntimeLaunchTarget, sourcePath: string | null, sourceVersion: string | null): boolean {
+    if (runtime.kind !== 'bundled') return true;
+    const ownedPath = Boolean(sourcePath && (sourcePath === runtime.cliPath || sourcePath.startsWith(`${runtime.root}/`)));
+    return ownedPath && (!sourceVersion || sourceVersion === runtime.version);
   }
 
   function readBotConfig(): { status: 'not_configured'; count: 0 } | { status: 'configured'; count: number } | { status: 'invalid'; message: string } {
@@ -182,7 +209,7 @@ export function createRuntimeService(deps: RuntimeServiceDeps) {
 
   async function computeState(): Promise<DesktopRuntimeState> {
     const config = readBotConfig();
-    const active = currentExternalRuntime();
+    const active = activeRuntime();
     const selectedSource = active ? externalSource(active) : 'none';
 
     if (config.status === 'invalid') {
@@ -240,6 +267,21 @@ export function createRuntimeService(deps: RuntimeServiceDeps) {
         const source = classifyRuntimeSource({ pm2Apps });
         const onlineDaemonCount = countActiveBotmuxDaemonApps(pm2Apps);
         if (source.running) {
+          if (!isRuntimeOwned(active, source.sourcePath, source.sourceVersion)) {
+            return {
+              status: 'degraded',
+              appVersion: deps.appVersion,
+              runtimeVersion: active.version,
+              runtimeSource: 'global-cli',
+              runtimeManaged: false,
+              runtimePath: source.sourcePath,
+              botCount: config.count,
+              onlineDaemonCount,
+              attentionCount: 1,
+              dashboardUrl: null,
+              message: '检测到由外置 botmux 启动的运行时，Desktop 正在切换到内置运行时。',
+            };
+          }
           return {
             status: 'running',
             appVersion: deps.appVersion,
@@ -308,8 +350,13 @@ export function createRuntimeService(deps: RuntimeServiceDeps) {
     },
     async takeover(): Promise<RunResult> {
       const state = await this.getState();
-      // Compatibility shim for the old IPC name: "takeover" now means adopt
-      // the selected global CLI runtime. It never stops or replaces a runtime.
+      const runtime = activeRuntime();
+      if (!runtime) return rejectedCliRequired();
+      if (runtime.kind === 'bundled') {
+        // Replace core processes only. The generated ecosystem pins their
+        // interpreter to bundled Node, while unrelated plugin services survive.
+        return run(command(runtime, ['restart']));
+      }
       return {
         code: state.runtimeManaged ? 0 : 1,
         stdout: '',

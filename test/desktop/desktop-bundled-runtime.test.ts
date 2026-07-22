@@ -1,0 +1,39 @@
+import { describe, expect, it } from 'vitest';
+import { resolveBundledRuntimeCandidate } from '../../src/desktop/main/bundled-runtime.js';
+
+describe('bundled desktop runtime', () => {
+  it('selects the architecture-matched packaged Node and runtime', () => {
+    const candidate = resolveBundledRuntimeCandidate({
+      resourcesPath: '/Applications/Botmux.app/Contents/Resources',
+      repoRoot: '/repo',
+      isPackaged: true,
+      arch: 'arm64',
+      appVersion: '3.0.0',
+      env: {},
+      existsSync: () => true,
+    });
+
+    expect(candidate).toMatchObject({
+      kind: 'bundled',
+      root: '/Applications/Botmux.app/Contents/Resources/runtime',
+      nodePath: '/Applications/Botmux.app/Contents/Resources/node/darwin-arm64/bin/node',
+      cliPath: '/Applications/Botmux.app/Contents/Resources/runtime/dist/cli.js',
+      version: '3.0.0',
+      runtimeSource: 'bundled',
+    });
+  });
+
+  it('uses the package-manager Node for development', () => {
+    const candidate = resolveBundledRuntimeCandidate({
+      resourcesPath: '/unused',
+      repoRoot: '/repo',
+      isPackaged: false,
+      arch: 'arm64',
+      appVersion: '3.0.0',
+      env: { npm_node_execpath: process.execPath },
+    });
+
+    expect(candidate.nodePath).toBe(process.execPath);
+    expect(candidate.root).toBe('/repo');
+  });
+});

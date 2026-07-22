@@ -405,6 +405,10 @@ function ecosystemConfig(): string {
 
   const baseApp = {
     script: daemonScript,
+    // Pin every managed core process to the Node that invoked this CLI. This
+    // keeps GUI/launchd starts independent from PATH and lets Desktop replace
+    // an external fleet without also killing unrelated plugin services.
+    interpreter: process.execPath,
     cwd: CONFIG_DIR,
     autorestart: true,
     max_restarts: 10,
@@ -452,6 +456,7 @@ function ecosystemConfig(): string {
   apps.push({
     name: 'botmux-dashboard',
     script: join(PKG_ROOT, 'dist', 'dashboard.js'),
+    interpreter: process.execPath,
     cwd: PKG_ROOT,
     autorestart: true,
     max_restarts: 10,

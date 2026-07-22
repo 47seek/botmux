@@ -2,7 +2,7 @@ import { spawn as spawnProcess, type ChildProcessWithoutNullStreams } from 'node
 import { existsSync as pathExistsSync } from 'node:fs';
 import { delimiter, dirname, join } from 'node:path';
 import type { DesktopPaths } from '../shared/types.js';
-import type { ExternalRuntimeCandidate } from './runtime-service.js';
+import type { RuntimeLaunchTarget } from './runtime-service.js';
 import { parsePm2Apps, type Pm2AppSummary } from './runtime-source.js';
 
 interface Pm2ListDeps {
@@ -17,7 +17,7 @@ export const defaultPm2ListTimeoutMs = 25_000;
 
 export function listPm2Apps(
   paths: DesktopPaths,
-  runtime: ExternalRuntimeCandidate,
+  runtime: RuntimeLaunchTarget,
   deps: Pm2ListDeps = {},
 ): Promise<Pm2AppSummary[]> {
   const existsSync = deps.existsSync ?? pathExistsSync;
@@ -27,14 +27,16 @@ export function listPm2Apps(
     return Promise.reject(new Error(`PM2 binary not found: ${pm2Bin}`));
   }
 
-  const command = pm2Bin;
-  const args = ['jlist'];
+  const command = runtime.kind === 'bundled' ? runtime.nodePath : pm2Bin;
+  const args = runtime.kind === 'bundled' ? [pm2Bin, 'jlist'] : ['jlist'];
   const baseEnv = deps.env ?? process.env;
   const env: NodeJS.ProcessEnv = {
     ...baseEnv,
     // External PM2 bins use /usr/bin/env node; Finder-launched apps need a
     // repaired PATH so discovery does not depend on the user's shell startup.
-    PATH: withRuntimePath(baseEnv.PATH, runtime.binPath, runtime.pathEnv),
+    PATH: runtime.kind === 'bundled'
+      ? withRuntimePath(baseEnv.PATH, runtime.nodePath, undefined)
+      : withRuntimePath(baseEnv.PATH, runtime.binPath, runtime.pathEnv),
     PM2_HOME: paths.pm2Home,
     SESSION_DATA_DIR: paths.dataDir,
   };

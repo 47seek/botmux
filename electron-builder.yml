@@ -8,8 +8,14 @@ asar: true
 files:
   - dist/desktop/**
   - '!node_modules/**'
+extraResources:
+  - from: build/desktop-runtime
+    to: runtime
+  - from: build/desktop-node
+    to: node
 afterPack: build/after-pack.cjs
 mac:
+  icon: build/icon.png
   category: public.app-category.developer-tools
   hardenedRuntime: true
   gatekeeperAssess: false

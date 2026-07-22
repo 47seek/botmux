@@ -9,6 +9,7 @@ function makeDeps(
   const output: string[] = [];
   return {
     platform: 'darwin',
+    arch: 'arm64',
     env: { BOTMUX_DASHBOARD_URL: 'http://127.0.0.1:7891' },
     homeDir: '/Users/me',
     exists: path => paths.includes(path),
@@ -33,7 +34,9 @@ describe('desktop smoke', () => {
   ];
 
   it('passes when the installed app, CLI, and dashboard compat endpoint are healthy', async () => {
-    const deps = makeDeps(appPaths, {
+    const bundledNode = '/Applications/Botmux.app/Contents/Resources/node/darwin-arm64/bin/node';
+    const bundledCli = '/Applications/Botmux.app/Contents/Resources/runtime/dist/cli.js';
+    const deps = makeDeps([...appPaths, bundledNode, bundledCli], {
       'plutil -extract CFBundleShortVersionString raw -o - /Applications/Botmux.app/Contents/Info.plist': {
         status: 0,
         stdout: '2.96.0\n',
@@ -44,7 +47,7 @@ describe('desktop smoke', () => {
         stdout: '',
         stderr: '',
       },
-      'botmux status': {
+      [`${bundledNode} ${bundledCli} status`]: {
         status: 0,
         stdout: 'botmux running\n',
         stderr: '',

@@ -2,7 +2,7 @@ import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
-import { createRuntimeService, type ExternalRuntimeCandidate } from '../../src/desktop/main/runtime-service.js';
+import { createRuntimeService, type BundledRuntimeCandidate, type ExternalRuntimeCandidate } from '../../src/desktop/main/runtime-service.js';
 
 const paths = {
   botmuxHome: '/home/.botmux',
@@ -24,7 +24,119 @@ function globalCli(version = '2.9.0'): ExternalRuntimeCandidate {
   };
 }
 
+function bundledRuntime(version = '3.0.0'): BundledRuntimeCandidate {
+  return {
+    kind: 'bundled',
+    root: '/Applications/Botmux.app/Contents/Resources/runtime',
+    cliPath: '/Applications/Botmux.app/Contents/Resources/runtime/dist/cli.js',
+    nodePath: '/Applications/Botmux.app/Contents/Resources/node/darwin-arm64/bin/node',
+    version,
+    runtimeSource: 'bundled',
+  };
+}
+
 describe('runtime service', () => {
+  it('uses the bundled runtime without requiring a global botmux installation', async () => {
+    const run = vi.fn().mockResolvedValue({ code: 0, stdout: 'ok', stderr: '' });
+    const svc = createRuntimeService({
+      paths,
+      appVersion: '3.0.0',
+      execPath: '/Electron',
+      env: { PATH: '/usr/bin:/bin', ELECTRON_RUN_AS_NODE: '1' },
+      fs: { existsSync: () => true, readFileSync: () => configuredBots },
+      run,
+      bundledRuntime: bundledRuntime(),
+      pm2Apps: async () => [],
+    });
+
+    expect(await svc.getState()).toMatchObject({
+      status: 'stopped',
+      runtimeSource: 'bundled',
+      runtimeManaged: true,
+      runtimeVersion: '3.0.0',
+    });
+    await svc.start();
+    expect(run).toHaveBeenCalledWith(expect.objectContaining({
+      command: bundledRuntime().nodePath,
+      args: [bundledRuntime().cliPath, 'start'],
+    }));
+    expect(run.mock.calls[0]![0].env).not.toHaveProperty('ELECTRON_RUN_AS_NODE');
+  });
+
+  it('detects an external fleet and replaces it through the bundled runtime', async () => {
+    const run = vi.fn().mockResolvedValue({ code: 0, stdout: 'ok', stderr: '' });
+    const svc = createRuntimeService({
+      paths,
+      appVersion: '3.0.0',
+      execPath: '/Electron',
+      env: {},
+      fs: { existsSync: () => true, readFileSync: () => configuredBots },
+      run,
+      bundledRuntime: bundledRuntime(),
+      pm2Apps: async () => [{
+        name: 'botmux-dashboard',
+        script: '/usr/local/lib/node_modules/botmux/dist/dashboard.js',
+        status: 'online',
+      }],
+    });
+
+    expect(await svc.getState()).toMatchObject({
+      status: 'degraded',
+      runtimeSource: 'global-cli',
+      runtimeManaged: false,
+      runtimePath: '/usr/local/lib/node_modules/botmux/dist/dashboard.js',
+    });
+    await svc.takeover();
+    expect(run).toHaveBeenCalledWith(expect.objectContaining({
+      command: bundledRuntime().nodePath,
+      args: [bundledRuntime().cliPath, 'restart'],
+    }));
+  });
+
+  it('recognises PM2 processes launched from the bundled runtime', async () => {
+    const svc = createRuntimeService({
+      paths,
+      appVersion: '3.0.0',
+      execPath: '/Electron',
+      env: {},
+      fs: { existsSync: () => true, readFileSync: () => configuredBots },
+      bundledRuntime: bundledRuntime(),
+      pm2Apps: async () => [{
+        name: 'botmux-dashboard',
+        script: `${bundledRuntime().root}/dist/dashboard.js`,
+        status: 'online',
+      }],
+    });
+
+    expect(await svc.getState()).toMatchObject({
+      status: 'running',
+      runtimeSource: 'bundled',
+      runtimeManaged: true,
+    });
+  });
+
+  it('reclaims same-path processes left behind by an older Desktop version', async () => {
+    const svc = createRuntimeService({
+      paths,
+      appVersion: '3.0.0',
+      execPath: '/Electron',
+      env: {},
+      fs: { existsSync: () => true, readFileSync: () => configuredBots },
+      bundledRuntime: bundledRuntime('3.0.0'),
+      pm2Apps: async () => [{
+        name: 'botmux-dashboard',
+        script: `${bundledRuntime().root}/dist/dashboard.js`,
+        status: 'online',
+        version: '2.99.0',
+      }],
+    });
+
+    expect(await svc.getState()).toMatchObject({
+      status: 'degraded',
+      runtimeSource: 'global-cli',
+      runtimeManaged: false,
+    });
+  });
   it('reports not_configured without binding a private runtime when no global CLI exists', async () => {
     const svc = createRuntimeService({
       paths,
@@ -291,7 +403,7 @@ describe('runtime service', () => {
     await expect(svc.start()).resolves.toMatchObject({ code: 1, stderr: expect.stringContaining('Install the global botmux CLI') });
     await expect(svc.stop()).resolves.toMatchObject({ code: 1, stderr: expect.stringContaining('Install the global botmux CLI') });
     await expect(svc.restart()).resolves.toMatchObject({ code: 1, stderr: expect.stringContaining('Install the global botmux CLI') });
-    await expect(svc.takeover()).resolves.toMatchObject({ code: 1, stderr: expect.stringContaining('not controlled') });
+    await expect(svc.takeover()).resolves.toMatchObject({ code: 1, stderr: expect.stringContaining('Install the global botmux CLI') });
     expect(run).not.toHaveBeenCalled();
   });
 

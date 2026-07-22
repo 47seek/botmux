@@ -19,6 +19,7 @@ export interface RunCaptureResult {
 
 export interface AppSmokeDeps {
   platform: NodeJS.Platform;
+  arch: NodeJS.Architecture;
   env: NodeJS.ProcessEnv;
   homeDir: string;
   exists: (path: string) => boolean;
@@ -44,6 +45,7 @@ const CODESIGN_VERIFY_TIMEOUT_MS = 60_000;
 export function createDefaultAppSmokeDeps(): AppSmokeDeps {
   return {
     platform: process.platform,
+    arch: process.arch,
     env: process.env,
     homeDir: homedir(),
     exists: existsSync,
@@ -120,7 +122,7 @@ export async function runAppSmokeCommand(args: string[], deps: AppSmokeDeps): Pr
   record('codesign verify', sign.status === 0, commandError(sign));
 
   if (!options.skipCliStatus) {
-    const status = runBotmuxStatus(deps);
+    const status = runBotmuxStatus(deps, appPath);
     record('botmux CLI status', status.status === 0, commandError(status));
   }
 
@@ -263,7 +265,13 @@ function runCaptureText(
   return { ok: false, error: commandError(result) };
 }
 
-function runBotmuxStatus(deps: AppSmokeDeps): RunCaptureResult {
+function runBotmuxStatus(deps: AppSmokeDeps, appPath: string): RunCaptureResult {
+  const resources = join(appPath, 'Contents', 'Resources');
+  const bundledNode = join(resources, 'node', `darwin-${deps.arch}`, 'bin', 'node');
+  const bundledCli = join(resources, 'runtime', 'dist', 'cli.js');
+  if (deps.exists(bundledNode) && deps.exists(bundledCli)) {
+    return deps.runCapture(bundledNode, [bundledCli, 'status'], { timeout: 25000, env: deps.env });
+  }
   const direct = deps.runCapture('botmux', ['status'], { timeout: 25000, env: deps.env });
   if (direct.status === 0 || deps.platform !== 'darwin' || !direct.error) return direct;
 

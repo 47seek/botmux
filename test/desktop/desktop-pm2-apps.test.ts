@@ -31,6 +31,33 @@ function childProcessStub() {
 }
 
 describe('desktop PM2 app listing', () => {
+  it('runs PM2 through the bundled Node absolute path', async () => {
+    const child = childProcessStub();
+    const spawn = vi.fn(() => child);
+    const bundled: RuntimeLaunchTarget = {
+      kind: 'bundled',
+      root: '/Applications/Botmux.app/Contents/Resources/runtime',
+      cliPath: '/Applications/Botmux.app/Contents/Resources/runtime/dist/cli.js',
+      nodePath: '/Applications/Botmux.app/Contents/Resources/node/darwin-arm64/bin/node',
+      version: '3.0.0',
+      runtimeSource: 'bundled',
+    };
+    const promise = listPm2Apps(paths, bundled, {
+      existsSync: () => true,
+      spawn: spawn as any,
+      env: { PATH: '/usr/bin:/bin', ELECTRON_RUN_AS_NODE: '1' },
+    });
+
+    child.stdout.emit('data', '[]');
+    child.emit('close', 0);
+    await expect(promise).resolves.toEqual([]);
+    expect(spawn).toHaveBeenCalledWith(
+      bundled.nodePath,
+      [`${bundled.root}/node_modules/pm2/bin/pm2`, 'jlist'],
+      expect.objectContaining({ env: expect.not.objectContaining({ ELECTRON_RUN_AS_NODE: expect.anything() }) }),
+    );
+  });
+
   it('rejects when the selected runtime does not contain a PM2 binary', async () => {
     await expect(listPm2Apps(paths, runtime, {
       existsSync: () => false,
