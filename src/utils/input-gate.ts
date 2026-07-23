@@ -33,6 +33,31 @@ export function shouldWriteNow(state: {
   return state.supportsTypeAhead && !state.awaitingFirstPrompt;
 }
 
+/**
+ * Claude runs every matching SessionStart hook in parallel and waits for all of
+ * them before it renders the real input prompt. Botmux's own hook can therefore
+ * finish while a slower project hook is still running. During the first prompt,
+ * treat the signal as an outer-selector boundary only and wait for fresh prompt
+ * evidence emitted after that boundary.
+ *
+ * Other ready-integrated CLIs (notably Hermes) emit their signal only once their
+ * prompt is usable, so their established authoritative-signal behavior stays
+ * unchanged.
+ */
+export function shouldWaitForPostSessionStartPromptEvidence(state: {
+  isClaudeFamily: boolean;
+  hasReadyPattern: boolean;
+  awaitingFirstPrompt: boolean;
+  isPromptReady: boolean;
+  alreadyWaiting: boolean;
+}): boolean {
+  return state.isClaudeFamily
+    && state.hasReadyPattern
+    && state.awaitingFirstPrompt
+    && !state.isPromptReady
+    && !state.alreadyWaiting;
+}
+
 export function shouldReleaseFirstPromptTimeout(state: {
   /** Adapter wants the soft timeout to wait for a real readyPattern. */
   deferFirstPromptTimeoutUntilReady: boolean;
@@ -49,13 +74,14 @@ export function shouldReleaseFirstPromptTimeout(state: {
 }
 
 /**
- * After the ready-gate releases (real SessionStart signal OR the timeout
+ * After the ready-gate releases (SessionStart/direct-ready signal OR the timeout
  * fallback), the worker settles for PTY quiescence and then decides whether to
  * mark the prompt ready (which flushes for ALL adapters) vs. just calling
  * flushPending() (which only flushes for type-ahead adapters). Marking ready is
  * correct when ANY of these hold:
- *   - promptReadyAfterSettle         — the real SessionStart/BOTMUX_READY_COMMAND
- *                                      signal fired (authoritative: input box exists).
+ *   - promptReadyAfterSettle         — an authoritative direct ready command
+ *                                      fired (Hermes). Claude passes false here
+ *                                      and waits for post-hook PTY evidence.
  *   - promptReadyDetectedDuringSettle — the idle detector fired during the
  *                                      settle (a readyPattern/idle proved readiness).
  *   - readyPatternSeenDuringHold      — a readyPattern fired WHILE the gate was
