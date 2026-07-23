@@ -178,6 +178,7 @@ import { ZellijObserveBackend } from './adapters/backend/zellij-observe-backend.
 import { zellijEnv } from './setup/ensure-zellij.js';
 import { isObserveBackend, type ObserveBackend } from './adapters/backend/types.js';
 import { selectSessionBackend, decideBackendGate, backendGateUserMessage } from './adapters/backend/session-backend-selector.js';
+import { buildReproduceCommand } from './adapters/backend/reproduce-command.js';
 import {
   deriveRiffReposFromDirs,
   deriveRiffRepoFromWorkingDir,
@@ -7080,6 +7081,12 @@ async function spawnCli(
     }
   }
 
+  // Dashboard「复现命令」：在任何 sandbox（bwrap/seatbelt/credential）包装之前，先
+  // 记下 CLI 自身的 bin/args（含 wrapperCli 改写）。sandbox 包装是机器相关的外层，
+  // 粘进裸 bash 也跑不起来、且会掩盖真正要复现的 CLI 行为，故复现命令刻意省略它。
+  const reproduceBinPristine = spawnBin;
+  const reproduceArgsPristine = [...spawnArgs];
+
   // Mandatory credential-only confinement is the OUTERMOST launch wrapper so
   // wrapperCli and every descendant it starts inherit the boundary. Full
   // Seatbelt/bwrap sessions were already wrapped above and never enter these
@@ -7214,23 +7221,21 @@ async function spawnCli(
     );
   }
 
-  // Dashboard「复现命令」：把最终交给 backend.spawn 的真实调用组装成一条可粘贴的
-  // shell 命令（bin + argv + cwd + 关键 per-bot env）。原样保留，供用户复制到调试终端
-  // 复现问题。此处 spawnBin/spawnArgs 已经过 wrapperCli / sandbox / credential 等全部
-  // 改写，是子进程真正 exec 的形态。
+  // Dashboard「复现命令」：算出本次冷启的**近似**可复现命令（bin + argv + cwd +
+  // 权威注入 env），随 ready 上报、只驻 daemon 内存（含凭证，绝不落盘）。用 sandbox
+  // 包装前的 pristine bin/args；riff 后端返回 null（无本地命令）；见 reproduce-command.ts。
   try {
-    const shq = (v: string): string => `'${v.replace(/'/g, `'\\''`)}'`;
-    const parts: string[] = [];
-    const injectKeys = Object.keys(perBotInjectEnv);
-    if (injectKeys.length) {
-      for (const k of injectKeys) parts.push(`${k}=${shq(perBotInjectEnv[k] ?? '')}`);
-    }
-    parts.push(shq(spawnBin), ...spawnArgs.map(shq));
-    const cmd = parts.join(' ');
-    capturedSpawnCommand = spawnCwd ? `cd ${shq(spawnCwd)} && ${cmd}` : cmd;
+    capturedSpawnCommand = buildReproduceCommand({
+      backendType: effectiveBackendType,
+      bin: reproduceBinPristine,
+      args: reproduceArgsPristine,
+      cwd: spawnCwd,
+      env: childEnv,
+      injectEnv: perBotInjectKeys.length ? perBotInjectEnv : undefined,
+    });
   } catch (err: any) {
     capturedSpawnCommand = null;
-    log(`Failed to capture spawn command: ${err?.message ?? err}`);
+    log(`Failed to capture reproduce command: ${err?.message ?? err}`);
   }
 
   backend.spawn(spawnBin, spawnArgs, {
