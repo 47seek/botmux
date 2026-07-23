@@ -13,7 +13,13 @@
  * Run: pnpm vitest run test/input-gate.test.ts
  */
 import { describe, it, expect } from 'vitest';
-import { decideHardTimeoutAction, decideSettleMarkReady, shouldReleaseFirstPromptTimeout, shouldWriteNow } from '../src/utils/input-gate.js';
+import {
+  decideHardTimeoutAction,
+  decideSettleMarkReady,
+  shouldReleaseFirstPromptTimeout,
+  shouldWaitForPostSessionStartPromptEvidence,
+  shouldWriteNow,
+} from '../src/utils/input-gate.js';
 
 const base = {
   isPromptReady: false,
@@ -84,8 +90,51 @@ describe('shouldReleaseFirstPromptTimeout', () => {
   });
 });
 
+describe('shouldWaitForPostSessionStartPromptEvidence', () => {
+  const sessionStartBase = {
+    isClaudeFamily: true,
+    hasReadyPattern: true,
+    awaitingFirstPrompt: true,
+    isPromptReady: false,
+    alreadyWaiting: false,
+  };
+
+  it('requires fresh prompt evidence for a Claude-family first prompt', () => {
+    expect(shouldWaitForPostSessionStartPromptEvidence(sessionStartBase)).toBe(true);
+  });
+
+  it('keeps Hermes and other non-Claude ready signals authoritative', () => {
+    expect(shouldWaitForPostSessionStartPromptEvidence({
+      ...sessionStartBase,
+      isClaudeFamily: false,
+    })).toBe(false);
+  });
+
+  it('does not create an unprovable fence without a readyPattern', () => {
+    expect(shouldWaitForPostSessionStartPromptEvidence({
+      ...sessionStartBase,
+      hasReadyPattern: false,
+    })).toBe(false);
+  });
+
+  it('ignores duplicate and mid-session SessionStart signals', () => {
+    expect(shouldWaitForPostSessionStartPromptEvidence({
+      ...sessionStartBase,
+      alreadyWaiting: true,
+    })).toBe(false);
+    expect(shouldWaitForPostSessionStartPromptEvidence({
+      ...sessionStartBase,
+      awaitingFirstPrompt: false,
+    })).toBe(false);
+    expect(shouldWaitForPostSessionStartPromptEvidence({
+      ...sessionStartBase,
+      isPromptReady: true,
+    })).toBe(false);
+  });
+});
+
 describe('decideSettleMarkReady', () => {
-  it('marks ready when the real SessionStart signal fired (promptReadyAfterSettle)', () => {
+  it('marks ready when an authoritative direct ready signal fired', () => {
     expect(decideSettleMarkReady({
       promptReadyAfterSettle: true,
       promptReadyDetectedDuringSettle: false,
