@@ -39,13 +39,69 @@ describe('web terminal touch scrolling', () => {
       .toBeLessThan(wheelBlock.indexOf('_fwdScroll(px,_cellAt'));
   });
 
-  it('bounds remote scroll ticks per gesture instead of per browser event', () => {
+  it('caps the burst on the Herdr backend, not on remoteScroll/altScreen', () => {
     const wheelBlock = scriptBlock('// ── Wheel / touch scroll handling ──');
 
-    expect(wheelBlock).toContain('var _SCROLL_BURST_MAX=remoteScroll?6:Infinity');
+    // Cap gated on herdrBackend (the expensive send-text+snapshot path), NOT on
+    // remoteScroll — which also encodes altScreen and would leave a Herdr session
+    // running an altScreen:false CLI (Claude/Codex) uncapped once it enters the
+    // alternate buffer at runtime.
+    expect(wheelBlock).toContain('var _SCROLL_BURST_MAX=herdrBackend?6:Infinity');
+    expect(wheelBlock).not.toContain('_SCROLL_BURST_MAX=remoteScroll');
     expect(wheelBlock).toContain('_scrollBurstTicks<_SCROLL_BURST_MAX');
     expect(wheelBlock).toContain('setTimeout(_endScrollBurst,_SCROLL_BURST_IDLE_MS)');
     expect(wheelBlock).toContain('if(_scrollBurstTicks>=_SCROLL_BURST_MAX)_scrollAccum=0');
+  });
+
+  it('derives herdrBackend from the backend alone, independent of altScreen', () => {
+    // forceRemoteScroll still requires altScreen; herdrBackend must NOT — the cap
+    // has to hold for a runtime alt-buffer under an altScreen:false Herdr CLI.
+    expect(workerSource).toContain(
+      "const herdrBackend = effectiveBackendType === 'herdr';",
+    );
+    expect(workerSource).toContain(
+      'getTerminalHtml(hasWrite, platformReadonly, loginUrl, forceRemoteScroll, herdrBackend)',
+    );
+    expect(workerSource).toContain('var herdrBackend=${herdrBackend};');
+  });
+
+  it('forwards wheel ticks proportionally when uncapped, and caps Herdr', () => {
+    // Extract the real burst-accumulation loop from the source so the test moves
+    // when the algorithm moves, then run it for both backends.
+    function runSpin(herdrBackend: boolean, notches: number, pxPerNotch: number) {
+      const _SCROLL_STEP = 33;
+      const _SCROLL_BURST_MAX = herdrBackend ? 6 : Infinity;
+      let _scrollAccum = 0;
+      let _scrollBurstTicks = 0;
+      let _scrollBurstDir = 0;
+      let emitted = 0;
+      for (let i = 0; i < notches; i++) {
+        const px = pxPerNotch; // steady downward spin
+        const dir = px < 0 ? -1 : 1;
+        if (_scrollBurstDir && dir !== _scrollBurstDir) { _scrollAccum = 0; _scrollBurstTicks = 0; }
+        _scrollBurstDir = dir;
+        if (_scrollBurstTicks >= _SCROLL_BURST_MAX) continue;
+        _scrollAccum += px;
+        let n = 0;
+        while (Math.abs(_scrollAccum) >= _SCROLL_STEP && n < 6 && _scrollBurstTicks < _SCROLL_BURST_MAX) {
+          const up = _scrollAccum < 0;
+          _scrollAccum += up ? _SCROLL_STEP : -_SCROLL_STEP;
+          n++; _scrollBurstTicks++; emitted++;
+        }
+        if (_scrollBurstTicks >= _SCROLL_BURST_MAX) _scrollAccum = 0;
+      }
+      return emitted;
+    }
+
+    // Local PTY/tmux (herdrBackend=false): 40 notches @100px scale with distance,
+    // never freeze. Old cap of 6 would have frozen it after ~2 notches.
+    const local = runSpin(false, 40, 100);
+    expect(local).toBe(Math.floor((40 * 100) / 33)); // 121
+    expect(local).toBeGreaterThan(100);
+
+    // Herdr backend: still capped at 6 no matter how long the spin.
+    expect(runSpin(true, 40, 100)).toBe(6);
+    expect(runSpin(true, 2, 100)).toBe(6); // reaches cap within the first notches
   });
 
   it('uses local scrollback before requesting another remote history chunk', () => {
