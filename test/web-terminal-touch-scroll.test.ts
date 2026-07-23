@@ -42,7 +42,7 @@ describe('web terminal touch scrolling', () => {
   it('bounds remote scroll ticks per gesture instead of per browser event', () => {
     const wheelBlock = scriptBlock('// ── Wheel / touch scroll handling ──');
 
-    expect(wheelBlock).toContain('var _SCROLL_BURST_MAX=6');
+    expect(wheelBlock).toContain('var _SCROLL_BURST_MAX=remoteScroll?6:Infinity');
     expect(wheelBlock).toContain('_scrollBurstTicks<_SCROLL_BURST_MAX');
     expect(wheelBlock).toContain('setTimeout(_endScrollBurst,_SCROLL_BURST_IDLE_MS)');
     expect(wheelBlock).toContain('if(_scrollBurstTicks>=_SCROLL_BURST_MAX)_scrollAccum=0');

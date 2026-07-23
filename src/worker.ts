@@ -8538,8 +8538,15 @@ window.addEventListener('resize',onViewportResize);
 // A high-resolution trackpad emits dozens of wheel events for one gesture, so
 // cap the whole continuous burst — not each browser event — then require an idle
 // gap (or direction reversal) before loading the next history chunk.
+//
+// The burst ceiling exists ONLY to throttle Herdr's EXPENSIVE remote history-chunk
+// loading (remoteScroll): each forwarded wheel there can trigger a network round
+// trip + snapshot re-render, so a fast spin must not fire hundreds of them. A local
+// PTY/tmux CLI (Claude Code etc.) repaints its own alt-screen cheaply, so capping it
+// at 6 ticks is what froze a continuous wheel spin after ~2 notches — the "not smooth
+// / stuck" symptom. Gate the cap on remoteScroll: unlimited ticks for local CLIs.
 var _scrollAccum=0,_scrollBurstTicks=0,_scrollBurstDir=0,_scrollBurstT=0;
-var _SCROLL_STEP=33;var _SCROLL_BURST_MAX=6;var _SCROLL_BURST_IDLE_MS=250;
+var _SCROLL_STEP=33;var _SCROLL_BURST_MAX=remoteScroll?6:Infinity;var _SCROLL_BURST_IDLE_MS=250;
 function _endScrollBurst(){
   clearTimeout(_scrollBurstT);_scrollBurstT=0;
   _scrollAccum=0;_scrollBurstTicks=0;_scrollBurstDir=0;
