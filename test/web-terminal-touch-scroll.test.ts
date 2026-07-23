@@ -39,38 +39,65 @@ describe('web terminal touch scrolling', () => {
       .toBeLessThan(wheelBlock.indexOf('_fwdScroll(px,_cellAt'));
   });
 
-  it('caps the burst on the Herdr backend, not on remoteScroll/altScreen', () => {
+  it('caps the burst on non-local backends, not on remoteScroll/altScreen', () => {
     const wheelBlock = scriptBlock('// ── Wheel / touch scroll handling ──');
 
-    // Cap gated on herdrBackend (the expensive send-text+snapshot path), NOT on
-    // remoteScroll — which also encodes altScreen and would leave a Herdr session
-    // running an altScreen:false CLI (Claude/Codex) uncapped once it enters the
-    // alternate buffer at runtime.
-    expect(wheelBlock).toContain('var _SCROLL_BURST_MAX=herdrBackend?6:Infinity');
+    // Cap gated on localTerminalBackend (a positive allowlist of cheap, locally-
+    // drivable backends), NOT on remoteScroll — which also encodes altScreen and
+    // would leave a Herdr session running an altScreen:false CLI (Claude/Codex)
+    // uncapped once it enters the alternate buffer at runtime. Herdr AND Riff
+    // (no drivable terminal → remote task floods) must stay capped.
+    expect(wheelBlock).toContain('var _SCROLL_BURST_MAX=localTerminalBackend?Infinity:6');
     expect(wheelBlock).not.toContain('_SCROLL_BURST_MAX=remoteScroll');
+    expect(wheelBlock).not.toContain('_SCROLL_BURST_MAX=herdrBackend');
     expect(wheelBlock).toContain('_scrollBurstTicks<_SCROLL_BURST_MAX');
     expect(wheelBlock).toContain('setTimeout(_endScrollBurst,_SCROLL_BURST_IDLE_MS)');
     expect(wheelBlock).toContain('if(_scrollBurstTicks>=_SCROLL_BURST_MAX)_scrollAccum=0');
   });
 
-  it('derives herdrBackend from the backend alone, independent of altScreen', () => {
-    // forceRemoteScroll still requires altScreen; herdrBackend must NOT — the cap
-    // has to hold for a runtime alt-buffer under an altScreen:false Herdr CLI.
+  it('derives localTerminalBackend as a positive pty/tmux/zellij allowlist', () => {
+    // forceRemoteScroll still requires altScreen; the cap gate must NOT — it has
+    // to hold for a runtime alt-buffer under any non-local backend. Herdr and Riff
+    // are deliberately EXCLUDED (expensive / no drivable terminal), so a new or
+    // unknown backend defaults to safely capped.
     expect(workerSource).toContain(
-      "const herdrBackend = effectiveBackendType === 'herdr';",
+      "const localTerminalBackend = effectiveBackendType === 'pty'\n"
+      + "        || effectiveBackendType === 'tmux'\n"
+      + "        || effectiveBackendType === 'zellij';",
     );
     expect(workerSource).toContain(
-      'getTerminalHtml(hasWrite, platformReadonly, loginUrl, forceRemoteScroll, herdrBackend)',
+      'getTerminalHtml(hasWrite, platformReadonly, loginUrl, forceRemoteScroll, localTerminalBackend)',
     );
-    expect(workerSource).toContain('var herdrBackend=${herdrBackend};');
+    expect(workerSource).toContain('var localTerminalBackend=${localTerminalBackend};');
+    // Guard the exclusion explicitly: neither Herdr nor Riff may appear in the gate.
+    const gate = workerSource.slice(
+      workerSource.indexOf('const localTerminalBackend ='),
+      workerSource.indexOf('res.writeHead', workerSource.indexOf('const localTerminalBackend =')),
+    );
+    expect(gate).not.toContain("=== 'herdr'");
+    expect(gate).not.toContain("=== 'riff'");
   });
 
-  it('forwards wheel ticks proportionally when uncapped, and caps Herdr', () => {
-    // Extract the real burst-accumulation loop from the source so the test moves
-    // when the algorithm moves, then run it for both backends.
-    function runSpin(herdrBackend: boolean, notches: number, pxPerNotch: number) {
+  it('forwards wheel ticks proportionally when uncapped, and caps non-local backends', () => {
+    // Pull the cap EXPRESSION straight from the generated client JS so the test
+    // fails if the gate changes, then evaluate it per backend rather than
+    // re-hardcoding "6 : Infinity".
+    const wheelBlock = scriptBlock('// ── Wheel / touch scroll handling ──');
+    const capExpr = /_SCROLL_BURST_MAX=([^;]+);/.exec(wheelBlock)?.[1];
+    expect(capExpr).toBe('localTerminalBackend?Infinity:6');
+    const capFor = (localTerminalBackend: boolean): number =>
+      // eslint-disable-next-line no-new-func
+      Function('localTerminalBackend', `return ${capExpr}`)(localTerminalBackend);
+
+    // Which backends count as local (cheap) is decided by the server-side gate.
+    const localBackend: Record<string, boolean> = {
+      pty: true, tmux: true, zellij: true, herdr: false, riff: false,
+    };
+
+    // Replays the same burst-accumulation loop the client runs, parameterised by
+    // the cap the gate above yields for each backend.
+    function runSpin(cap: number, notches: number, pxPerNotch: number) {
       const _SCROLL_STEP = 33;
-      const _SCROLL_BURST_MAX = herdrBackend ? 6 : Infinity;
       let _scrollAccum = 0;
       let _scrollBurstTicks = 0;
       let _scrollBurstDir = 0;
@@ -80,28 +107,33 @@ describe('web terminal touch scrolling', () => {
         const dir = px < 0 ? -1 : 1;
         if (_scrollBurstDir && dir !== _scrollBurstDir) { _scrollAccum = 0; _scrollBurstTicks = 0; }
         _scrollBurstDir = dir;
-        if (_scrollBurstTicks >= _SCROLL_BURST_MAX) continue;
+        if (_scrollBurstTicks >= cap) continue;
         _scrollAccum += px;
         let n = 0;
-        while (Math.abs(_scrollAccum) >= _SCROLL_STEP && n < 6 && _scrollBurstTicks < _SCROLL_BURST_MAX) {
+        while (Math.abs(_scrollAccum) >= _SCROLL_STEP && n < 6 && _scrollBurstTicks < cap) {
           const up = _scrollAccum < 0;
           _scrollAccum += up ? _SCROLL_STEP : -_SCROLL_STEP;
           n++; _scrollBurstTicks++; emitted++;
         }
-        if (_scrollBurstTicks >= _SCROLL_BURST_MAX) _scrollAccum = 0;
+        if (_scrollBurstTicks >= cap) _scrollAccum = 0;
       }
       return emitted;
     }
 
-    // Local PTY/tmux (herdrBackend=false): 40 notches @100px scale with distance,
-    // never freeze. Old cap of 6 would have frozen it after ~2 notches.
-    const local = runSpin(false, 40, 100);
-    expect(local).toBe(Math.floor((40 * 100) / 33)); // 121
-    expect(local).toBeGreaterThan(100);
+    // Local pty/tmux/zellij: 40 notches @100px scale with distance, never freeze.
+    // The old cap of 6 would have frozen them after ~2 notches.
+    for (const be of ['pty', 'tmux', 'zellij']) {
+      const emitted = runSpin(capFor(localBackend[be]), 40, 100);
+      expect(emitted, `${be} should scroll proportionally`).toBe(Math.floor((40 * 100) / 33)); // 121
+      expect(emitted).toBeGreaterThan(100);
+    }
 
-    // Herdr backend: still capped at 6 no matter how long the spin.
-    expect(runSpin(true, 40, 100)).toBe(6);
-    expect(runSpin(true, 2, 100)).toBe(6); // reaches cap within the first notches
+    // Herdr AND Riff: still capped at 6 no matter how long the spin — Riff would
+    // otherwise flood remote task creation.
+    for (const be of ['herdr', 'riff']) {
+      expect(runSpin(capFor(localBackend[be]), 40, 100), `${be} must stay capped`).toBe(6);
+      expect(runSpin(capFor(localBackend[be]), 2, 100)).toBe(6); // reaches cap within first notches
+    }
   });
 
   it('uses local scrollback before requesting another remote history chunk', () => {

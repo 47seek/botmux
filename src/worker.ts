@@ -7913,16 +7913,24 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
       // normal buffer until resize causes a redraw. Preserve that mode so
       // scroll gestures continue to target the CLI's own transcript.
       const forceRemoteScroll = effectiveBackendType === 'herdr' && cliAdapter?.altScreen === true;
-      // The wheel burst cap throttles Herdr's EXPENSIVE forwarding path (each
-      // forwarded wheel → pane send-text + snapshot re-render). That cost is a
-      // property of the BACKEND, not of the adapter's declared altScreen: a
-      // Herdr session with an altScreen:false CLI (Claude/Codex) that enters the
-      // alternate buffer at runtime (vim/less, or the CLI's own alt-screen)
-      // still forwards via _fwdScroll and must stay capped. So gate the cap on
-      // the backend itself, independent of forceRemoteScroll.
-      const herdrBackend = effectiveBackendType === 'herdr';
+      // The wheel burst cap throttles backends where a forwarded wheel is
+      // EXPENSIVE or has no local terminal to drive:
+      //   • Herdr — each forwarded wheel → pane send-text + snapshot re-render.
+      //   • Riff  — has NO drivable terminal; writes become remote task/follow-up
+      //             creations (handleTermAction even rejects ANSI to Riff), so an
+      //             uncapped spin would flood remote task creation.
+      // This is a BACKEND property, independent of the adapter's declared
+      // altScreen: an altScreen:false CLI (Claude/Codex) that enters the
+      // alternate buffer at runtime (vim/less, or the CLI's own alt-screen) still
+      // forwards via _fwdScroll and must inherit its backend's cap. So gate the
+      // cap on a POSITIVE allowlist of cheap, locally-drivable terminal backends
+      // (pty/tmux/zellij); every other backend — Herdr, Riff, and any future one
+      // — stays safely capped by default.
+      const localTerminalBackend = effectiveBackendType === 'pty'
+        || effectiveBackendType === 'tmux'
+        || effectiveBackendType === 'zellij';
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-      res.end(getTerminalHtml(hasWrite, platformReadonly, loginUrl, forceRemoteScroll, herdrBackend));
+      res.end(getTerminalHtml(hasWrite, platformReadonly, loginUrl, forceRemoteScroll, localTerminalBackend));
     });
 
     wss = new WebSocketServer({
@@ -8203,7 +8211,7 @@ function getTerminalHtml(
   platformReadonly = false,
   loginUrl = '',
   forceRemoteScroll = false,
-  herdrBackend = false,
+  localTerminalBackend = false,
 ): string {
   const label = sessionId.substring(0, 8);
   return `<!DOCTYPE html>
@@ -8341,7 +8349,7 @@ if(isTouch){document.body.classList.add('touch');}
 var hasToken=${hasWrite};
 var platformReadonly=${platformReadonly};
 var remoteScroll=${forceRemoteScroll};
-var herdrBackend=${herdrBackend};
+var localTerminalBackend=${localTerminalBackend};
 if(!hasToken){
   if(platformReadonly){var _lb=document.getElementById('login-banner');_lb.classList.add('show');}
   else{var _rb=document.getElementById('readonly-banner');_rb.classList.add('show');_rb.addEventListener('click',function(){_rb.classList.remove('show')});}
@@ -8549,19 +8557,20 @@ window.addEventListener('resize',onViewportResize);
 // cap the whole continuous burst — not each browser event — then require an idle
 // gap (or direction reversal) before loading the next history chunk.
 //
-// The burst ceiling exists ONLY to throttle Herdr's EXPENSIVE forwarding path:
-// on a Herdr backend each forwarded wheel triggers a pane send-text + snapshot
-// re-render, so a fast spin must not fire hundreds of them. That cost is a
-// property of the BACKEND, not of the adapter's declared altScreen — a Herdr
-// session running an altScreen:false CLI (Claude/Codex) that enters the
-// alternate buffer at runtime (vim/less, the CLI's own alt-screen) still hits
-// this path and must stay capped. A local PTY/tmux CLI repaints its own
-// alt-screen cheaply, so capping it at 6 ticks is what froze a continuous wheel
-// spin after ~2 notches — the "not smooth / stuck" symptom. Gate the cap on
-// herdrBackend (NOT remoteScroll, which also encodes altScreen): unlimited ticks
-// for every local backend, capped only for Herdr.
+// The burst ceiling throttles backends where a forwarded wheel is EXPENSIVE or
+// has no local terminal to drive: Herdr (each tick → pane send-text + snapshot
+// re-render) and Riff (no drivable terminal — writes become remote task/follow-up
+// creations, so an uncapped spin would flood remote task creation). That cost is
+// a BACKEND property, not the adapter's declared altScreen — an altScreen:false
+// CLI (Claude/Codex) that enters the alternate buffer at runtime (vim/less, the
+// CLI's own alt-screen) still hits this path and inherits its backend's cap. A
+// local PTY/tmux/zellij backend repaints its own alt-screen cheaply, so capping
+// it at 6 ticks is what froze a continuous wheel spin after ~2 notches — the
+// "not smooth / stuck" symptom. Gate the release on a POSITIVE allowlist of
+// cheap local terminal backends (localTerminalBackend); every other backend —
+// Herdr, Riff, and any future one — stays safely capped by default.
 var _scrollAccum=0,_scrollBurstTicks=0,_scrollBurstDir=0,_scrollBurstT=0;
-var _SCROLL_STEP=33;var _SCROLL_BURST_MAX=herdrBackend?6:Infinity;var _SCROLL_BURST_IDLE_MS=250;
+var _SCROLL_STEP=33;var _SCROLL_BURST_MAX=localTerminalBackend?Infinity:6;var _SCROLL_BURST_IDLE_MS=250;
 function _endScrollBurst(){
   clearTimeout(_scrollBurstT);_scrollBurstT=0;
   _scrollAccum=0;_scrollBurstTicks=0;_scrollBurstDir=0;
