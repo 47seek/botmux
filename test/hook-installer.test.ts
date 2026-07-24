@@ -345,3 +345,81 @@ describe('installHook — opencode-plugin', () => {
     expect(afterSecond).toBe(afterFirst);
   });
 });
+
+// ─── trae-hooks 格式 ─────────────────────────────────────────────────────────
+
+describe('installHook — trae-hooks', () => {
+  let tmpDir: string;
+  let configPath: string;
+  const hookCommand = '/usr/bin/node /path/to/cli.js hook traex';
+
+  beforeEach(() => {
+    tmpDir = makeTmpDir();
+    configPath = join(tmpDir, '.trae', 'hooks.json');
+  });
+
+  it('(a) 写入 PreToolUse ^request_user_input$ hook 指向给定 hookCommand，并带 version', () => {
+    installHook('traex', { configPath, format: 'trae-hooks' }, hookCommand);
+
+    const settings = JSON.parse(readFileSync(configPath, 'utf-8'));
+    expect(typeof settings.version).toBe('number');
+    const groups: any[] = settings.hooks?.PreToolUse ?? [];
+    const found = groups.find((g: any) => g.hooks?.some((e: any) => e.command === hookCommand));
+    expect(found).toBeDefined();
+    expect(found.matcher).toBe('^request_user_input$');
+    const entry = found.hooks.find((e: any) => e.command === hookCommand);
+    expect(entry.type).toBe('command');
+    expect(entry.timeout).toBeGreaterThan(0);
+  });
+
+  it('(b) 幂等——二次调用后文件内容与第一次完全相同', () => {
+    installHook('traex', { configPath, format: 'trae-hooks' }, hookCommand);
+    const afterFirst = readFileSync(configPath, 'utf-8');
+    installHook('traex', { configPath, format: 'trae-hooks' }, hookCommand);
+    const afterSecond = readFileSync(configPath, 'utf-8');
+    expect(afterSecond).toBe(afterFirst);
+  });
+
+  it('(c) 保留既有 version 与无关 hook（如 ERA tracing 的 UserPromptSubmit/PostToolUse/Stop）', () => {
+    const existing = {
+      version: 1,
+      hooks: {
+        UserPromptSubmit: [{ hooks: [{ type: 'command', command: 'era-cli ... UserPromptSubmit' }] }],
+        PostToolUse: [{ matcher: '*', hooks: [{ type: 'command', command: 'era-cli ... PostToolUse' }] }],
+        Stop: [{ hooks: [{ type: 'command', command: 'era-cli ... Stop' }] }],
+      },
+    };
+    mkdirSync(join(tmpDir, '.trae'), { recursive: true });
+    writeFileSync(configPath, JSON.stringify(existing, null, 2) + '\n', 'utf-8');
+
+    installHook('traex', { configPath, format: 'trae-hooks' }, hookCommand);
+
+    const settings = JSON.parse(readFileSync(configPath, 'utf-8'));
+    // version 保留
+    expect(settings.version).toBe(1);
+    // ERA tracing 的三个事件原样保留
+    expect(settings.hooks.UserPromptSubmit[0].hooks[0].command).toContain('UserPromptSubmit');
+    expect(settings.hooks.PostToolUse[0].hooks[0].command).toContain('PostToolUse');
+    expect(settings.hooks.Stop[0].hooks[0].command).toContain('Stop');
+    // 新增 botmux ask hook
+    const found = (settings.hooks.PreToolUse ?? []).find((g: any) =>
+      g.hooks?.some((e: any) => e.command === hookCommand),
+    );
+    expect(found).toBeDefined();
+    expect(found.matcher).toBe('^request_user_input$');
+  });
+
+  it('(d) 结构化幂等：dev checkout 与 npm global 的 cli.js 路径不同也只保留一条 botmux hook', () => {
+    const devCmd = '/repo/dist/cli.js hook traex';
+    const globalCmd = '/usr/local/lib/node_modules/botmux/dist/cli.js hook traex';
+    installHook('traex', { configPath, format: 'trae-hooks' }, devCmd);
+    installHook('traex', { configPath, format: 'trae-hooks' }, globalCmd);
+
+    const settings = JSON.parse(readFileSync(configPath, 'utf-8'));
+    const botmuxGroups = (settings.hooks.PreToolUse ?? []).filter((g: any) =>
+      g.hooks?.some((e: any) => typeof e.command === 'string' && e.command.includes('cli.js') && e.command.endsWith('hook traex')),
+    );
+    expect(botmuxGroups).toHaveLength(1);
+    expect(botmuxGroups[0].hooks[0].command).toBe(globalCmd);
+  });
+});

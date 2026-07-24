@@ -15,7 +15,7 @@ import { hookCommandParts } from './hook-command.js';
 
 export interface HookInstallConfig {
   readonly configPath: string;
-  readonly format: 'claude-settings' | 'opencode-plugin' | 'grok-hooks';
+  readonly format: 'claude-settings' | 'opencode-plugin' | 'grok-hooks' | 'trae-hooks';
   /** Claude read-isolation: merge the shared settings `env` map into a
    *  per-bot settings file before installing hooks. Shared values win so
    *  rotated auth/provider/proxy settings refresh on every cold spawn; global
@@ -261,6 +261,52 @@ function installClaudeSettings(
   }
 }
 
+// ─── TRAE hooks.json 格式 ────────────────────────────────────────────────────
+
+/** traex request_user_input 工具的 matcher（PreToolUse 用正则精确匹配工具名）。 */
+const TRAE_ASK_MATCHER = '^request_user_input$';
+
+/**
+ * 向 TRAE CLI 的 `~/.trae/hooks.json` 合并 botmux ask hook。
+ *
+ * traex 是 Codex 血统的内部版，但本版本（0.200.x）有结构化的 `request_user_input`
+ * 工具，且用 Claude 兼容的 PreToolUse hook 在工具执行前触发。hooks.json 结构与
+ * Claude settings 的 `hooks` 子树同构（`{ version, hooks: { <Event>: [{matcher,
+ * hooks:[{type,command,timeout}]}] } }`），因此复用同一套幂等合并/识别逻辑：
+ *   - 保留顶层 `version` 与既有的其它 hook（如 ERA tracing 的 UserPromptSubmit /
+ *     PostToolUse / Stop），只增改 botmux 这一组。
+ *   - matcher 用 `^request_user_input$`（traex matcher 按正则匹配工具名）。
+ *   - 幂等：结构化识别旧 botmux 组（命令引用 cli.js 且尾部 `hook traex`）后替换，
+ *     dev checkout 与 npm global 路径不同也不会残留两条。
+ *
+ * 全局 `~/.trae/hooks.json` 是所有 traex 会话共享的 hook 源；写这里即对所有 traex
+ * bot 生效（与 Claude 写 settings.json 同策略），无需按 workspace 分别写。
+ */
+function installTraeHooks(configPath: string, hookCommand: string): void {
+  const settings: ClaudeSettings = readJsonFile<ClaudeSettings>(configPath) ?? {};
+  // traex hooks.json 顶层带 `version`；文件不存在时补上，已存在则原样保留。
+  if (typeof settings.version !== 'number') settings.version = 1;
+
+  const existingHooks = settings.hooks ?? {};
+
+  const newEntry: ClaudeHookEntry = { type: 'command', command: hookCommand, timeout: 86400 };
+  const newGroup: ClaudeHookGroup = { matcher: TRAE_ASK_MATCHER, hooks: [newEntry] };
+
+  // 幂等：清掉旧 botmux ask 组（PreToolUse 与迁移期的 PermissionRequest），再追加。
+  removeBotmuxAskHookGroups(existingHooks, 'PermissionRequest', hookCommand);
+  removeBotmuxAskHookGroups(existingHooks, 'PreToolUse', hookCommand);
+  existingHooks['PreToolUse'] = [...(existingHooks['PreToolUse'] ?? []), newGroup];
+
+  settings.hooks = existingHooks;
+  const content = JSON.stringify(settings, null, 2) + '\n';
+  const changed = writeIfChanged(configPath, content);
+  if (changed) {
+    logger.info(`[hook] 已写入 TRAE hook → ${configPath}`);
+  } else {
+    logger.info(`[hook] TRAE hook 已是最新，跳过写入 → ${configPath}`);
+  }
+}
+
 // ─── OpenCode plugin 格式 ─────────────────────────────────────────────────────
 
 /**
@@ -503,6 +549,10 @@ export function installHook(
       case 'grok-hooks':
         // Grok has no ask-hook surface yet; only SessionStart ready-gate.
         installGrokHooks(configPath, hookInstall.sessionStartCommand);
+        break;
+      case 'trae-hooks':
+        // TRAE CLI (traex)：把 ask hook 写进 ~/.trae/hooks.json 的 PreToolUse。
+        installTraeHooks(configPath, hookCommand);
         break;
       default: {
         // TypeScript exhaustiveness（编译时保障，运行时防御）

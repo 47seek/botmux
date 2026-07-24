@@ -1,0 +1,23 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "request_user_input",
+  "session_id": "abc123",
+  "tool_input": {
+    "itemId": "item_0",
+    "threadId": "019f-thread",
+    "turnId": "turn_0",
+    "isBlocking": true,
+    "questions": [
+      {
+        "id": "q_env",
+        "header": "环境",
+        "question": "继续部署还是回滚？",
+        "multiSelect": false,
+        "options": [
+          { "label": "继续部署", "description": "推进到线上" },
+          { "label": "回滚", "description": "回到上一个稳定版本" }
+        ]
+      }
+    ]
+  }
+}

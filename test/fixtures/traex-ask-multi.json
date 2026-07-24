@@ -1,0 +1,34 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "request_user_input",
+  "session_id": "abc123",
+  "tool_input": {
+    "itemId": "item_0",
+    "threadId": "019f-thread",
+    "turnId": "turn_0",
+    "isBlocking": true,
+    "questions": [
+      {
+        "id": "q_test_env",
+        "header": "测试环境",
+        "question": "选择测试环境？",
+        "multiSelect": true,
+        "options": [
+          { "label": "staging", "description": "预发" },
+          { "label": "canary", "description": "灰度" },
+          { "label": "production", "description": "线上" }
+        ]
+      },
+      {
+        "id": "q_notify",
+        "header": "通知",
+        "question": "通知方式？",
+        "multiSelect": false,
+        "options": [
+          { "label": "飞书", "description": "群消息" },
+          { "label": "邮件", "description": "邮件通知" }
+        ]
+      }
+    ]
+  }
+}

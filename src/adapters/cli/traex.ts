@@ -3,7 +3,7 @@ import { createRequire } from 'node:module';
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import type { CliAdapter, PtyHandle } from './types.js';
-import { traeStateDbPath, traeSessionsRoot } from '../../services/traex-paths.js';
+import { traeStateDbPath, traeSessionsRoot, traeHooksPath } from '../../services/traex-paths.js';
 import { traexRolloutHasUserInputSince } from '../../services/traex-transcript.js';
 import { discoverRolloutSessions } from '../../services/resumable-session-discovery.js';
 import { delay } from '../../utils/timing.js';
@@ -328,6 +328,15 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
       'DeepSeek-V4-Pro',
       'kimi-k2.6',
     ],
+    // traex 0.200.x 有结构化 request_user_input 工具，通过 Claude 兼容的 PreToolUse
+    // hook 在工具执行前触发。声明式写 ~/.trae/hooks.json（trae-hooks 格式），把它转发
+    // 到 `botmux hook traex`（core/ask-hook/traex.ts 解析 + 回填 directive），复用飞书
+    // 问答链路。asksViaHook=true 让 ensureAskSkill 不再装 botmux-ask skill 兜底。
+    asksViaHook: true,
+    hookInstall: {
+      configPath: traeHooksPath(),
+      format: 'trae-hooks',
+    },
   };
 }
 

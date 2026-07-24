@@ -21,6 +21,13 @@ export function traeStateDbPath(): string {
   return join(traeHome(), 'cli', 'state_5.sqlite');
 }
 
+/** Global hooks config (`<TRAE_HOME>/hooks.json`, default `~/.trae/hooks.json`).
+ *  Shared by all traex sessions; botmux merges its ask hook here so
+ *  `request_user_input` forwards to `botmux hook traex`. */
+export function traeHooksPath(): string {
+  return join(traeHome(), 'hooks.json');
+}
+
 /** Per-session rollout JSONL files live under dates here, e.g.
  *  sessions/2026/06/04/rollout-<timestamp>-<uuid>.jsonl. The threads table
  *  stores the absolute path per session. */
