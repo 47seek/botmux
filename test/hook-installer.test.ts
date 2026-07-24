@@ -358,7 +358,7 @@ describe('installHook — trae-hooks', () => {
     configPath = join(tmpDir, '.trae', 'hooks.json');
   });
 
-  it('(a) 写入 PreToolUse ^request_user_input$ hook 指向给定 hookCommand，并带 version', () => {
+  it('(a) 写入 PreToolUse AskUserQuestion hook 指向给定 hookCommand，并带 version', () => {
     installHook('traex', { configPath, format: 'trae-hooks' }, hookCommand);
 
     const settings = JSON.parse(readFileSync(configPath, 'utf-8'));
@@ -366,7 +366,10 @@ describe('installHook — trae-hooks', () => {
     const groups: any[] = settings.hooks?.PreToolUse ?? [];
     const found = groups.find((g: any) => g.hooks?.some((e: any) => e.command === hookCommand));
     expect(found).toBeDefined();
-    expect(found.matcher).toBe('^request_user_input$');
+    // matcher 必须匹配运行时真实 tool_name AskUserQuestion（也兼容 request_user_input）
+    expect(found.matcher).toBe('^(AskUserQuestion|request_user_input)$');
+    expect(new RegExp(found.matcher).test('AskUserQuestion')).toBe(true);
+    expect(new RegExp(found.matcher).test('request_user_input')).toBe(true);
     const entry = found.hooks.find((e: any) => e.command === hookCommand);
     expect(entry.type).toBe('command');
     expect(entry.timeout).toBeGreaterThan(0);
@@ -406,7 +409,7 @@ describe('installHook — trae-hooks', () => {
       g.hooks?.some((e: any) => e.command === hookCommand),
     );
     expect(found).toBeDefined();
-    expect(found.matcher).toBe('^request_user_input$');
+    expect(found.matcher).toBe('^(AskUserQuestion|request_user_input)$');
   });
 
   it('(d) 结构化幂等：dev checkout 与 npm global 的 cli.js 路径不同也只保留一条 botmux hook', () => {

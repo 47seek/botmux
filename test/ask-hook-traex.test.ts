@@ -59,14 +59,25 @@ describe('TRAE (traex) hook adapter', () => {
       }
     });
 
-    it('非 request_user_input → null（含 codex 的 AskUserQuestion 不误接）', () => {
+    it('未知 tool_name → null', () => {
       expect(traex.parseQuestions({ hook_event_name: 'PreToolUse', tool_name: 'Bash' })).toBeNull();
-      // 提示词里叫 AskUserQuestion，但实际工具名是 request_user_input；工具名不符不接管
-      expect(traex.parseQuestions({
+    });
+
+    it('tool_name=AskUserQuestion（运行时真实名）→ 接管解析', () => {
+      // 实测 traex rollout 的 function_call.name / hook tool_name 是 AskUserQuestion，
+      // 不是 request_user_input——必须接管，否则 hook 不触发、问题卡在 TUI（本轮真机 bug）。
+      const parsed = traex.parseQuestions({
         hook_event_name: 'PreToolUse',
         tool_name: 'AskUserQuestion',
-        tool_input: { questions: [{ question: '?', options: [] }] },
-      })).toBeNull();
+        tool_input: { questions: [{ id: 'q1', question: '选哪个？', multiSelect: false, options: [{ label: 'A' }, { label: 'B' }] }] },
+      });
+      expect(parsed).not.toBeNull();
+      expect(parsed!.questions[0].prompt).toBe('选哪个？');
+    });
+
+    it('tool_name=request_user_input（兼容名）→ 也接管', () => {
+      const parsed = traex.parseQuestions(loadFixture('traex-ask-single.json'));
+      expect(parsed).not.toBeNull();
     });
 
     it('非 PreToolUse/PermissionRequest → null', () => {

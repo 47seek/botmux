@@ -11,7 +11,8 @@
  * ToolRequestUserInputParams，见 `traex app-server generate-json-schema`）：
  *   {
  *     hook_event_name: 'PreToolUse',
- *     tool_name: 'request_user_input',
+ *     tool_name: 'AskUserQuestion',   // ← 运行时 hook 层的 tool_name 是显示名，
+ *                                     //   不是 request_user_input（实测 rollout function_call.name=AskUserQuestion）
  *     tool_input: {
  *       questions: [
  *         {
@@ -54,8 +55,11 @@
 import type { AskQuestion } from '../ask-types.js';
 import type { HookAskAdapter, ParsedAsk } from './types.js';
 
-/** request_user_input 的工具名（提示词层叫 AskUserQuestion，实际工具名是这个）。 */
-const TOOL_NAME = 'request_user_input';
+/** traex 交互工具在 hook 层的 tool_name。**运行时 PreToolUse 传的是显示名
+ *  `AskUserQuestion`**（二进制 schema 叫 ToolRequestUserInput*、提示词也提
+ *  request_user_input，但 hook 的 tool_name 是 AskUserQuestion）。两个名字都接，
+ *  防不同版本差异。 */
+const TOOL_NAMES = new Set(['AskUserQuestion', 'request_user_input']);
 
 /** 从 payload 中提取原始 questions 数组（用于写回 updatedInput.questions）。 */
 function extractRawQuestions(payload: unknown): Array<Record<string, unknown>> {
@@ -79,9 +83,10 @@ const traexAdapter: HookAskAdapter = {
     if (!payload || typeof payload !== 'object') return null;
     const p = payload as Record<string, unknown>;
 
-    // 仅处理 PreToolUse + request_user_input。PermissionRequest 保留为兼容入口。
+    // 仅处理 PreToolUse + AskUserQuestion（运行时 tool_name，见 TOOL_NAMES）。
+    // PermissionRequest 保留为兼容入口。
     if (p.hook_event_name !== 'PreToolUse' && p.hook_event_name !== 'PermissionRequest') return null;
-    if (p.tool_name !== TOOL_NAME) return null;
+    if (typeof p.tool_name !== 'string' || !TOOL_NAMES.has(p.tool_name)) return null;
 
     const rawQuestions = extractRawQuestions(payload);
     if (rawQuestions.length === 0) return null;

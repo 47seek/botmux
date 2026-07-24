@@ -263,8 +263,11 @@ function installClaudeSettings(
 
 // ─── TRAE hooks.json 格式 ────────────────────────────────────────────────────
 
-/** traex request_user_input 工具的 matcher（PreToolUse 用正则精确匹配工具名）。 */
-const TRAE_ASK_MATCHER = '^request_user_input$';
+/** traex 交互工具的 matcher（PreToolUse 按正则匹配 tool_name）。**运行时 traex 的
+ *  tool_name 是显示名 `AskUserQuestion`**（不是 request_user_input——后者是二进制
+ *  schema / 提示词里的叫法；实测 rollout 的 function_call.name=AskUserQuestion）。
+ *  两个名字都匹配，防不同版本差异。 */
+const TRAE_ASK_MATCHER = '^(AskUserQuestion|request_user_input)$';
 
 /**
  * 向 TRAE CLI 的 `~/.trae/hooks.json` 合并 botmux ask hook。
