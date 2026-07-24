@@ -88,10 +88,49 @@ describe('TRAE (traex) hook adapter', () => {
       expect(traex.parseQuestions(undefined)).toBeNull();
     });
 
-    it('raw 保存原始 payload', () => {
+    it('raw 保存原始 payload（在 raw.payload 下）', () => {
       const payload = loadFixture('traex-ask-single.json');
       const parsed = traex.parseQuestions(payload)!;
-      expect(parsed.raw).toBe(payload);
+      expect((parsed.raw as any).payload).toBe(payload);
+    });
+
+    it('自由文本问题（options 为 null/<2）被丢弃；全自由文本 → null（passthrough）', () => {
+      // 单个自由文本问题（options 缺失）→ 无可答问题 → null
+      const allFreeText = {
+        hook_event_name: 'PreToolUse',
+        tool_name: 'request_user_input',
+        tool_input: { questions: [{ id: 'q_free', header: '备注', question: '补充说明？' }] },
+      };
+      expect(traex.parseQuestions(allFreeText)).toBeNull();
+    });
+
+    it('混合 ask：保留 ≥2 选项的问题，丢弃自由文本问题', () => {
+      const mixed = {
+        hook_event_name: 'PreToolUse',
+        tool_name: 'request_user_input',
+        tool_input: {
+          questions: [
+            { id: 'q_opt', header: '环境', question: '选环境？', multiSelect: false, options: [{ label: 'A' }, { label: 'B' }] },
+            { id: 'q_free', header: '备注', question: '补充？' },
+          ],
+        },
+      };
+      const parsed = traex.parseQuestions(mixed)!;
+      expect(parsed).not.toBeNull();
+      expect(parsed.questions).toHaveLength(1);
+      expect(parsed.questions[0].prompt).toBe('选环境？');
+      // formatAnswer 仍按可答问题的 id 回填，不错位
+      const directive = JSON.parse(traex.formatAnswer([['A']], parsed)) as any;
+      expect(directive.hookSpecificOutput.updatedInput.answers).toEqual({ q_opt: { answers: ['A'] } });
+    });
+
+    it('单选项问题（options 只有 1 个）也被丢弃（botmux 要求 ≥2）', () => {
+      const oneOpt = {
+        hook_event_name: 'PreToolUse',
+        tool_name: 'request_user_input',
+        tool_input: { questions: [{ id: 'q1', question: '?', options: [{ label: '仅一个' }] }] },
+      };
+      expect(traex.parseQuestions(oneOpt)).toBeNull();
     });
   });
 

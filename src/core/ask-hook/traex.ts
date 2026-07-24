@@ -86,23 +86,45 @@ const traexAdapter: HookAskAdapter = {
     const rawQuestions = extractRawQuestions(payload);
     if (rawQuestions.length === 0) return null;
 
-    const questions: AskQuestion[] = rawQuestions.map((q) => {
-      const qText = typeof q.question === 'string' ? q.question : String(q.question ?? '');
-      const multiSelect = !!q.multiSelect;
+    // botmux ask 子系统（core/ask-api.ts parseAskBody）硬性要求**每个**问题
+    // options.length ≥ 2，任一问不满足会 400 → 整批 postAsk 失败 → passthrough。
+    // traex 的 request_user_input 允许 options 为 null（纯自由文本问题），映射后
+    // 是 options:[]，会触发上述 400。因此这里只保留「≥2 选项」的可答问题，丢弃
+    // 自由文本/单选项问题（它们无法在飞书按钮卡上表达）。保留原始 raw 问题对象随行，
+    // 让 formatAnswer 按 question.id 回填时索引不错位。
+    const answerable: Array<{ ask: AskQuestion; rawQuestion: Record<string, unknown> }> = [];
+    let droppedFreeText = 0;
+    rawQuestions.forEach((q) => {
       const rawOpts = Array.isArray(q.options) ? (q.options as Array<Record<string, unknown>>) : [];
+      if (rawOpts.length < 2) { droppedFreeText += 1; return; }
+      const qText = typeof q.question === 'string' ? q.question : String(q.question ?? '');
       const options = rawOpts.map((opt) => {
         const label = typeof opt.label === 'string' ? opt.label : String(opt.label ?? '');
         // request_user_input 的 option 没有独立 key，用 label 作为 key（与 claude 一致）。
         return { key: label, label };
       });
-      return { prompt: qText, options, multiSelect };
+      answerable.push({ ask: { prompt: qText, options, multiSelect: !!q.multiSelect }, rawQuestion: q });
     });
 
-    // 纯自由文本问题（options 为 null/空）在 ask 卡上无按钮，只能靠话题内打字作答；
-    // 至少要有一个可解析问题才接管，否则放行让 traex 走原生 TUI 提问。
-    if (questions.length === 0) return null;
+    // 没有任何可答问题（全是自由文本/单选项）→ 放行让 traex 走原生 TUI 提问。
+    // 注意：这是本 adapter 目前的覆盖边界——纯自由文本 ask 仍会回退 TUI（飞书侧看不到），
+    // 根因是 botmux ask 契约要求每问 ≥2 选项，非 traex 独有（claude adapter 同样受限）。
+    if (answerable.length === 0) {
+      if (droppedFreeText > 0) {
+        // 走 stderr（不污染 stdout directive），便于在 traex hook 日志里看到「为何没发卡」。
+        console.error(`[botmux hook traex] request_user_input 的 ${droppedFreeText} 个问题均无 ≥2 选项（自由文本），无法发飞书卡，passthrough 放行`);
+      }
+      return null;
+    }
+    if (droppedFreeText > 0) {
+      console.error(`[botmux hook traex] request_user_input 有 ${droppedFreeText} 个自由文本问题被丢弃（botmux ask 要求每问 ≥2 选项），仅就可答问题发卡`);
+    }
 
-    return { questions, raw: payload };
+    return {
+      questions: answerable.map((a) => a.ask),
+      // raw 存「过滤后的可答 raw 问题数组」，与 questions 一一对齐，供 formatAnswer 按 id 回填。
+      raw: { payload, rawQuestions: answerable.map((a) => a.rawQuestion) },
+    };
   },
 
   formatAnswer(
@@ -110,15 +132,17 @@ const traexAdapter: HookAskAdapter = {
     parsed: ParsedAsk,
     comment?: string | null,
   ): string {
-    const rawQuestions = extractRawQuestions(parsed.raw);
-    const eventName = hookEventName(parsed.raw);
+    // parsed.raw = { payload, rawQuestions }，rawQuestions 是过滤后的可答问题，
+    // 与 parsed.questions 一一对齐（见 parseQuestions）。
+    const { payload, rawQuestions } = readRaw(parsed.raw);
+    const eventName = hookEventName(payload);
     const customText = (comment ?? '').trim();
 
     // updatedInput.answers：键为 question.id，值为 { answers: [label, ...] }
     // （request_user_input 的 ToolRequestUserInputResponse 形状）。
     // 缺席（无选中且无自定义文本）的问题不写键。
     const answers: Record<string, { answers: string[] }> = {};
-    parsed.questions.forEach((q, i) => {
+    parsed.questions.forEach((_q, i) => {
       const key = questionKey(rawQuestions[i] ?? {}, i);
       const selectedKeys = answersByQuestion[i];
       if (selectedKeys && selectedKeys.length > 0) {
@@ -142,6 +166,19 @@ const traexAdapter: HookAskAdapter = {
     return '';
   },
 };
+
+/** 从 ParsedAsk.raw（{ payload, rawQuestions }）中安全取回原始 payload 与过滤后的
+ *  可答问题数组。兼容防御：结构异常时回落到空 payload / 空问题数组。 */
+function readRaw(raw: unknown): { payload: unknown; rawQuestions: Array<Record<string, unknown>> } {
+  if (raw && typeof raw === 'object' && 'rawQuestions' in raw) {
+    const r = raw as { payload?: unknown; rawQuestions?: unknown };
+    const rawQuestions = Array.isArray(r.rawQuestions)
+      ? (r.rawQuestions as Array<Record<string, unknown>>)
+      : [];
+    return { payload: r.payload, rawQuestions };
+  }
+  return { payload: raw, rawQuestions: [] };
+}
 
 function hookEventName(payload: unknown): 'PreToolUse' | 'PermissionRequest' {
   if (payload && typeof payload === 'object') {
