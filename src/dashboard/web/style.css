@@ -18921,11 +18921,15 @@ form.dashboard-toolbar > input[type="text"]:focus {
 }
 
 .update-group {
-  display: grid;
-  gap: 8px;
+  display: flex;
+  align-items: baseline;
+  gap: 14px;
 }
 
 .update-group-label {
+  flex: 0 0 auto;
+  min-width: 40px;
+  padding-top: 8px;
   color: var(--muted);
   font-size: 11px;
   font-weight: 800;
@@ -18942,6 +18946,7 @@ form.dashboard-toolbar > input[type="text"]:focus {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
+  justify-content: flex-start;
   gap: 10px;
   padding: 0;
   border: 0;
