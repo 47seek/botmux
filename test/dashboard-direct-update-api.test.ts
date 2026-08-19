@@ -52,6 +52,8 @@ function makeDeps(overrides: Partial<DirectUpdateApiDeps> = {}) {
       upstream: 'origin/develop',
       head: 'old',
       clean: true,
+      needsStash: false,
+      pullTarget: null,
       blockedReason: null,
     })),
     runSourceUpdate,

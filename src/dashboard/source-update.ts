@@ -19,6 +19,13 @@ export interface SourceUpdateInspection {
   upstream: string | null;
   head: string | null;
   clean: boolean;
+  /** Working tree has local changes that will be stashed before the update and restored after. */
+  needsStash: boolean;
+  /**
+   * Resolved pull target. `null` for a branch with a configured upstream (plain `git pull --ff-only`).
+   * For a branch without an upstream, this is `origin/<branch>` when that remote-tracking ref exists.
+   */
+  pullTarget: string | null;
   blockedReason: SourceUpdateBlockedReason | null;
 }
 
@@ -28,6 +35,11 @@ export interface SourceUpdateResult {
   changed: boolean;
   branch: string;
   upstream: string;
+  /** Set when local changes were stashed but could not be restored cleanly after the update. */
+  stashConflict?: {
+    ref: string;
+    detail: string;
+  };
 }
 
 export interface SourceUpdateCommand {
@@ -69,6 +81,7 @@ export interface SourceUpdateOptions {
 
 const defaultFs: SourceUpdateFs = { access, realpath, rename, rm, stat };
 const PREFLIGHT_TIMEOUT_MS = 10_000;
+const STASH_TIMEOUT_MS = 30_000;
 const PULL_TIMEOUT_MS = 120_000;
 const INSTALL_TIMEOUT_MS = 300_000;
 const BUILD_TIMEOUT_MS = 300_000;
@@ -237,6 +250,8 @@ function emptyInspection(root: string, blockedReason: SourceUpdateBlockedReason)
     upstream: null,
     head: null,
     clean: false,
+    needsStash: false,
+    pullTarget: null,
     blockedReason,
   };
 }
@@ -375,6 +390,7 @@ async function inspectWithDependencies(
     return { ...emptyInspection(root, 'preflight_failed'), head, clean };
   }
   let upstream: string | null = null;
+  let pullTarget: string | null = null;
   let diverged = false;
   if (branch) {
     const upstreamResult = await execute(
@@ -404,18 +420,44 @@ async function inspectWithDependencies(
         return { ...emptyInspection(root, 'preflight_failed'), branch, upstream, head, clean };
       }
       diverged = ahead > 0 && behind > 0;
+    } else {
+      // No configured upstream: fall back to origin/<branch> when that remote-tracking ref exists,
+      // so a freshly created/checked-out branch can still be fast-forwarded from origin.
+      const originRef = `origin/${branch}`;
+      const originResult = await execute(
+        deps,
+        gitCommand(deps, root, ['rev-parse', '--verify', '--quiet', `${originRef}^{commit}`]),
+      );
+      if (originResult.error || originResult.timedOut) {
+        return { ...emptyInspection(root, 'preflight_failed'), branch, head, clean };
+      }
+      if (succeeded(originResult) && originResult.stdout.trim()) {
+        pullTarget = originRef;
+      } else if (originResult.code !== 1) {
+        // `--verify --quiet` exits 1 when the ref is simply absent; any other code is unexpected.
+        return { ...emptyInspection(root, 'preflight_failed'), branch, head, clean };
+      }
     }
   }
-  const blockedReason: SourceUpdateBlockedReason | null = !clean
-    ? 'dirty_worktree'
-    : !branch
-      ? 'detached_head'
-      : !upstream
-        ? 'no_upstream'
-        : diverged
-          ? 'diverged'
-          : null;
-  return { supported: blockedReason === null, root, branch, upstream, head, clean, blockedReason };
+  const needsStash = !clean;
+  const blockedReason: SourceUpdateBlockedReason | null = !branch
+    ? 'detached_head'
+    : !upstream && !pullTarget
+      ? 'no_upstream'
+      : diverged
+        ? 'diverged'
+        : null;
+  return {
+    supported: blockedReason === null,
+    root,
+    branch,
+    upstream,
+    head,
+    clean,
+    needsStash,
+    pullTarget,
+    blockedReason,
+  };
 }
 
 export async function inspectSourceUpdate(
@@ -510,42 +552,101 @@ export async function runSourceUpdate(
 ): Promise<SourceUpdateResult> {
   const deps = dependencies(options);
   const inspection = await inspectWithDependencies(root, deps);
-  if (!inspection.supported || !inspection.head || !inspection.branch || !inspection.upstream) {
+  if (!inspection.supported || !inspection.head || !inspection.branch) {
     throw new SourceUpdateError(
       'preflight',
       `Source update is blocked: ${inspection.blockedReason ?? 'preflight_failed'}`,
     );
   }
   const updateRoot = inspection.root;
-  await runRequiredCommand(
-    'pull',
-    deps,
-    gitCommand(deps, updateRoot, ['pull', '--ff-only'], PULL_TIMEOUT_MS),
-  );
-  await runRequiredCommand(
-    'install',
-    deps,
-    pnpmCommand(deps, updateRoot, ['install', '--frozen-lockfile'], INSTALL_TIMEOUT_MS),
-  );
-  const newHead = await withDistRollback(deps, updateRoot, async () => {
+  // Pull command: use the configured upstream when present (plain `git pull --ff-only`),
+  // otherwise fall back to the resolved origin/<branch> target.
+  const pullArgs: readonly string[] = inspection.pullTarget
+    ? ['pull', '--ff-only', 'origin', inspection.branch]
+    : ['pull', '--ff-only'];
+
+  // Stash local changes before touching the tree, and always attempt to restore them afterward.
+  const stashRef = inspection.needsStash
+    ? `botmux-source-update-${process.pid}-${deps.now()}`
+    : null;
+  if (stashRef) {
     await runRequiredCommand(
-      'build',
+      'pull',
       deps,
-      pnpmCommand(deps, updateRoot, ['build'], BUILD_TIMEOUT_MS),
+      gitCommand(deps, updateRoot, ['stash', 'push', '-u', '-m', stashRef], STASH_TIMEOUT_MS),
     );
-    await verifyBuiltCli(deps, updateRoot);
-    const headCommand = gitCommand(deps, updateRoot, ['rev-parse', 'HEAD']);
-    const headResult = await execute(deps, headCommand);
-    if (!succeeded(headResult) || !headResult.stdout.trim()) {
-      throw new SourceUpdateError('verify', commandFailure(headCommand, headResult));
+  }
+
+  let stashConflict: SourceUpdateResult['stashConflict'];
+  let newHead: string;
+  try {
+    await runRequiredCommand(
+      'pull',
+      deps,
+      gitCommand(deps, updateRoot, pullArgs, PULL_TIMEOUT_MS),
+    );
+    await runRequiredCommand(
+      'install',
+      deps,
+      pnpmCommand(deps, updateRoot, ['install', '--frozen-lockfile'], INSTALL_TIMEOUT_MS),
+    );
+    newHead = await withDistRollback(deps, updateRoot, async () => {
+      await runRequiredCommand(
+        'build',
+        deps,
+        pnpmCommand(deps, updateRoot, ['build'], BUILD_TIMEOUT_MS),
+      );
+      await verifyBuiltCli(deps, updateRoot);
+      const headCommand = gitCommand(deps, updateRoot, ['rev-parse', 'HEAD']);
+      const headResult = await execute(deps, headCommand);
+      if (!succeeded(headResult) || !headResult.stdout.trim()) {
+        throw new SourceUpdateError('verify', commandFailure(headCommand, headResult));
+      }
+      return headResult.stdout.trim();
+    });
+  } catch (error) {
+    // The update failed (dist already rolled back by withDistRollback). Restore the user's
+    // stashed changes before surfacing the failure so we never leave their work stranded.
+    if (stashRef) {
+      const popResult = await execute(
+        deps,
+        gitCommand(deps, updateRoot, ['stash', 'pop'], STASH_TIMEOUT_MS),
+      );
+      if (!succeeded(popResult) && error instanceof SourceUpdateError) {
+        throw new SourceUpdateError(
+          error.stage,
+          `${error.detail}\nLocal changes could not be restored from the stash (${stashRef}); ` +
+            `resolve it manually with \`git stash list\` / \`git stash pop\`.`,
+        );
+      }
     }
-    return headResult.stdout.trim();
-  });
+    throw error;
+  }
+
+  // Update succeeded; restore the stashed changes. A pop conflict must not undo the completed
+  // upgrade — report it so the user can resolve the still-present stash by hand.
+  if (stashRef) {
+    const popResult = await execute(
+      deps,
+      gitCommand(deps, updateRoot, ['stash', 'pop'], STASH_TIMEOUT_MS),
+    );
+    if (!succeeded(popResult)) {
+      stashConflict = {
+        ref: stashRef,
+        detail: boundedTail(
+          commandFailure(gitCommand(deps, updateRoot, ['stash', 'pop']), popResult),
+          DETAIL_LIMIT,
+        ),
+      };
+    }
+  }
+
   return {
     oldHead: inspection.head,
     newHead,
     changed: inspection.head !== newHead,
     branch: inspection.branch,
-    upstream: inspection.upstream,
+    upstream: inspection.upstream ?? inspection.pullTarget ?? inspection.branch,
+    ...(stashConflict ? { stashConflict } : {}),
   };
 }

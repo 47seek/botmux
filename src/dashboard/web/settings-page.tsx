@@ -103,6 +103,8 @@ interface SourceUpdateStatus {
   upstream: string | null;
   head: string | null;
   clean: boolean;
+  needsStash: boolean;
+  pullTarget: string | null;
   blockedReason: string | null;
 }
 interface PublishedSwitchStatus {
@@ -628,7 +630,14 @@ function SettingsPage() {
         });
         return;
       }
-      setUpMsg({ text: tr(kind === 'source' ? 'update.sourceQueued' : 'update.publishedQueued') });
+      if (kind === 'source' && body?.stashConflict?.ref) {
+        setUpMsg({
+          text: tr('update.sourceStashConflict', { ref: String(body.stashConflict.ref) }),
+          cls: 'hint-warn-inline',
+        });
+      } else {
+        setUpMsg({ text: tr(kind === 'source' ? 'update.sourceQueued' : 'update.publishedQueued') });
+      }
       pollReconnect();
     } catch (e) {
       if (!mountedRef.current) return;
@@ -1638,6 +1647,7 @@ export function UpdateCard(props: {
       : tr('update.nodeWarn', { version: s.node.version, required: s.node.required });
     const sourceHelp = [
       tr('update.sourceHelp', { root: sourceRoot, branch: sourceRef }),
+      source?.needsStash ? tr('update.sourceStashNotice') : null,
       nodeBlocked ? tr('update.actionBlocked', { reason: nodeBlocked }) : null,
       source?.supported === true ? null : tr('update.actionBlocked', { reason: sourceBlockedReason(source?.blockedReason, tr) }),
     ].filter(Boolean).join('\n');
