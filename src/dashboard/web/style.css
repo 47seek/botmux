@@ -18914,6 +18914,93 @@ form.dashboard-toolbar > input[type="text"]:focus {
   display: none;
 }
 
+.update-groups {
+  display: grid;
+  gap: 12px;
+  margin-top: 4px;
+}
+
+.update-group {
+  display: grid;
+  gap: 8px;
+}
+
+.update-group-label {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.update-group-divider {
+  height: 1px;
+  background: color-mix(in srgb, var(--border-soft) 72%, transparent);
+}
+
+.update-group .update-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  padding: 0;
+  border: 0;
+}
+
+.update-action-cell {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.update-action-badge {
+  padding: 2px 7px;
+  border-radius: var(--radius-full);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  color: var(--accent-strong);
+  font-size: 10px;
+  font-weight: 800;
+}
+
+.update-action-reason {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.update-action-tip {
+  color: var(--muted);
+}
+
+.update-outline-action {
+  border: 1px solid color-mix(in srgb, var(--accent) 48%, var(--border-soft));
+  background: transparent;
+  color: var(--accent-strong);
+}
+
+.update-outline-action:hover:not(:disabled) {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 9%, var(--surface));
+}
+
+.update-group-other .update-actions > button {
+  min-height: 28px;
+  padding: 0 10px;
+  border: 1px solid var(--border-soft);
+  background: transparent;
+  color: var(--muted);
+  box-shadow: none;
+  font-size: 11.5px;
+}
+
+.update-group-other .update-actions > button:hover:not(:disabled) {
+  border-color: color-mix(in srgb, var(--accent) 40%, var(--border-soft));
+  color: var(--accent-strong);
+}
+
+.update-group-other .update-actions > button:disabled {
+  opacity: 0.45;
+}
+
 .update-actions .page-primary-action {
   border-color: color-mix(in srgb, var(--accent) 58%, var(--border-soft));
   background: transparent;

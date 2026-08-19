@@ -1,6 +1,6 @@
 import type React from 'react';
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
-import { DropdownMenu, FieldTitle, LoadingState, dropdownLabel } from './dashboard-components.js';
+import { DropdownMenu, FieldTitle, InfoTip, LoadingState, dropdownLabel } from './dashboard-components.js';
 import { VcConsumerProfilesGate } from './vc-consumer-profiles-section.js';
 import { useT } from './react-hooks.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
@@ -94,8 +94,26 @@ const COMMON_TIMEZONES = [
 ];
 
 type InstallKind = 'npm-global' | 'pnpm-global' | 'yarn-global' | 'bun-global' | 'source-checkout' | 'unknown';
-interface InstallEntry { binPath: string; root: string; kind: InstallKind }
+interface InstallEntry { binPath: string; root: string; kind: InstallKind; active?: boolean }
 interface NodeCheck { version: string; major: number; required: number; ok: boolean }
+interface SourceUpdateStatus {
+  supported: boolean;
+  root: string;
+  branch: string | null;
+  upstream: string | null;
+  head: string | null;
+  clean: boolean;
+  blockedReason: string | null;
+}
+interface PublishedSwitchStatus {
+  supported: boolean;
+  manager: 'npm' | 'pnpm' | 'bun' | 'unknown';
+  targetRoot: string | null;
+  command: string | null;
+  blockedReason: string | null;
+  availableBytes?: number | null;
+  requiredBytes?: number;
+}
 interface CliRuntimeUpdateStatus {
   cliId: 'codex';
   runtimeId: string;
@@ -122,6 +140,8 @@ interface UpdateStatus {
   updateCommand: string | null;
   node: NodeCheck;
   installs: { entries: InstallEntry[]; multiple: boolean };
+  sourceUpdate?: SourceUpdateStatus | null;
+  publishedSwitch?: PublishedSwitchStatus | null;
 }
 interface ReleaseNote { version: string; name: string; body: string; url: string; publishedAt: string | null }
 
@@ -237,6 +257,45 @@ function installKindLabel(kind: string, tr: ReturnType<typeof useT>): string {
   return tr('update.kindUnknown');
 }
 
+function sourceRevisionLabel(source: SourceUpdateStatus | null | undefined, tr: ReturnType<typeof useT>): string {
+  return source?.branch || source?.head?.slice(0, 7) || tr('update.sourceUnknownRevision');
+}
+
+function sourceBlockedReason(reason: string | null | undefined, tr: ReturnType<typeof useT>): string {
+  if (reason === 'not_source_checkout') return tr('update.sourceBlockedNotCheckout');
+  if (reason === 'git_unavailable') return tr('update.sourceBlockedGitUnavailable');
+  if (reason === 'dirty_worktree') return tr('update.sourceBlockedDirty');
+  if (reason === 'detached_head') return tr('update.sourceBlockedDetached');
+  if (reason === 'no_upstream') return tr('update.sourceBlockedNoUpstream');
+  if (reason === 'diverged') return tr('update.sourceBlockedDiverged');
+  return reason
+    ? tr('update.sourceBlockedUnknownCode', { code: reason })
+    : tr('update.sourceBlockedUnknown');
+}
+
+function formatStorage(bytes: number | null | undefined): string {
+  if (typeof bytes !== 'number' || !Number.isFinite(bytes) || bytes < 0) return '?';
+  return `${(bytes / (1024 ** 3)).toFixed(1)} GiB`;
+}
+
+function publishedBlockedReason(
+  published: Pick<PublishedSwitchStatus, 'blockedReason' | 'availableBytes' | 'requiredBytes'> | null | undefined,
+  tr: ReturnType<typeof useT>,
+): string {
+  if (published?.blockedReason === 'no_published_install') return tr('update.publishedBlockedMissing');
+  if (published?.blockedReason === 'multiple_published_installs') return tr('update.publishedBlockedMultiple');
+  if (published?.blockedReason === 'insufficient_disk_space') {
+    return tr('update.publishedBlockedSpace', {
+      available: formatStorage(published.availableBytes),
+      required: formatStorage(published.requiredBytes),
+    });
+  }
+  if (published?.blockedReason === 'storage_check_failed') return tr('update.publishedBlockedStorageCheck');
+  return published?.blockedReason
+    ? tr('update.publishedBlockedUnknownCode', { code: published.blockedReason })
+    : tr('update.publishedBlockedUnknown');
+}
+
 function SettingsPage() {
   const tr = useT();
   const mountedRef = useRef(false);
@@ -259,6 +318,7 @@ function SettingsPage() {
   const [upReleasesUrl, setUpReleasesUrl] = useState('');
   const [upBusy, setUpBusy] = useState(false);
   const [upMsg, setUpMsg] = useState<StatusMessage>(null);
+  const directUpdateBusyRef = useRef(false);
 
   const clearTimers = useCallback(() => {
     for (const id of timersRef.current) window.clearTimeout(id);
@@ -329,6 +389,7 @@ function SettingsPage() {
   useEffect(() => {
     if (!settingsLoaded) return;
     setUpBusy(false);
+    directUpdateBusyRef.current = false;
     setUpMsg(null);
     setUpChangelogOpen(false);
     if (canWrite) void fetchStatus();
@@ -425,6 +486,7 @@ function SettingsPage() {
     const tick = async (): Promise<void> => {
       if (!mountedRef.current) return;
       if (Date.now() - start > 90_000) {
+        directUpdateBusyRef.current = false;
         setUpBusy(false);
         setUpMsg({ text: tr('update.restartSlow'), cls: 'hint-warn-inline' });
         return;
@@ -516,6 +578,72 @@ function SettingsPage() {
     }
   }
 
+  async function doSourceModeUpdate(kind: 'source' | 'published'): Promise<void> {
+    const s = upStatus;
+    if (!s?.localDevInstall || upBusy || directUpdateBusyRef.current) return;
+    if (!s.node.ok) {
+      window.alert(tr('update.nodeTooOldAlert', { version: s.node.version, required: s.node.required }));
+      return;
+    }
+    const source = s.sourceUpdate;
+    const published = s.publishedSwitch;
+    if (kind === 'source' ? !source?.supported : !published?.supported) return;
+    const confirmMessage = kind === 'source'
+      ? tr('update.sourceConfirm', {
+          root: source!.root,
+          branch: sourceRevisionLabel(source, tr),
+        })
+      : tr('update.publishedConfirm', {
+          root: published!.targetRoot ?? tr('update.publishedUnknownTarget'),
+          manager: published!.manager,
+          command: published!.command ?? tr('update.publishedUnknownCommand'),
+        });
+    if (!window.confirm(confirmMessage)) return;
+    directUpdateBusyRef.current = true;
+    setUpBusy(true);
+    setUpMsg({ text: tr(kind === 'source' ? 'update.sourceRunning' : 'update.publishedRunning') });
+    try {
+      const response = await fetch(kind === 'source' ? '/api/update/source-run' : '/api/update/published-switch', {
+        method: 'POST',
+      });
+      const body = await response.json().catch(() => ({}));
+      if (!mountedRef.current) return;
+      if (!response.ok || body.ok === false) {
+        const stage = typeof body?.stage === 'string' && body.stage ? body.stage : tr('update.actionStageRequest');
+        const reason = typeof body?.reason === 'string' && body.reason
+          ? (kind === 'source'
+              ? sourceBlockedReason(body.reason, tr)
+              : publishedBlockedReason({
+                  blockedReason: body.reason,
+                  availableBytes: body.availableBytes,
+                  requiredBytes: body.requiredBytes,
+                }, tr))
+          : null;
+        const detail = reason ?? body?.detail ?? body?.error ?? `HTTP ${response.status}`;
+        directUpdateBusyRef.current = false;
+        setUpBusy(false);
+        setUpMsg({
+          text: tr(kind === 'source' ? 'update.sourceFailed' : 'update.publishedFailed', { stage, detail }),
+          cls: 'hint-warn-inline',
+        });
+        return;
+      }
+      setUpMsg({ text: tr(kind === 'source' ? 'update.sourceQueued' : 'update.publishedQueued') });
+      pollReconnect();
+    } catch (e) {
+      if (!mountedRef.current) return;
+      directUpdateBusyRef.current = false;
+      setUpBusy(false);
+      setUpMsg({
+        text: tr(kind === 'source' ? 'update.sourceFailed' : 'update.publishedFailed', {
+          stage: tr('update.actionStageRequest'),
+          detail: e instanceof Error ? e.message : String(e),
+        }),
+        cls: 'hint-warn-inline',
+      });
+    }
+  }
+
   const updateBlock = (
     <UpdateCard
       canWrite={canWrite}
@@ -542,6 +670,8 @@ function SettingsPage() {
         if (next && upChangelog === null) void loadChangelog();
       }}
       onUpdate={() => void doUpdate()}
+      onSourceUpdate={() => void doSourceModeUpdate('source')}
+      onPublishedSwitch={() => void doSourceModeUpdate('published')}
       onRestart={() => { if (window.confirm(tr('update.confirmPlainRestart'))) void doRestart(null); }}
     />
   );
@@ -1463,7 +1593,7 @@ function TraexPluginEditor(props: {
   );
 }
 
-function UpdateCard(props: {
+export function UpdateCard(props: {
   canWrite: boolean;
   status: UpdateStatus | null;
   statusError: string | null;
@@ -1477,6 +1607,8 @@ function UpdateCard(props: {
   onCheck(): void;
   onToggleChangelog(): void;
   onUpdate(): void;
+  onSourceUpdate(): void;
+  onPublishedSwitch(): void;
   onRestart(): void;
 }) {
   const tr = useT();
@@ -1494,7 +1626,32 @@ function UpdateCard(props: {
     inner = <LoadingState label={tr('update.loading')} compact />;
   } else {
     const s = props.status;
+    const source = s.sourceUpdate;
+    const published = s.publishedSwitch;
+    const sourceRef = sourceRevisionLabel(source, tr);
+    const sourceRoot = source?.root || tr('update.sourceUnknownRoot');
+    const publishedRoot = published?.targetRoot || tr('update.publishedUnknownTarget');
+    const publishedManager = published?.manager ?? 'unknown';
+    const publishedCommand = published?.command || tr('update.publishedUnknownCommand');
+    const nodeBlocked = s.node.ok
+      ? null
+      : tr('update.nodeWarn', { version: s.node.version, required: s.node.required });
+    const sourceHelp = [
+      tr('update.sourceHelp', { root: sourceRoot, branch: sourceRef }),
+      nodeBlocked ? tr('update.actionBlocked', { reason: nodeBlocked }) : null,
+      source?.supported === true ? null : tr('update.actionBlocked', { reason: sourceBlockedReason(source?.blockedReason, tr) }),
+    ].filter(Boolean).join('\n');
+    const publishedHelp = [
+      tr('update.publishedHelp', {
+        root: publishedRoot,
+        manager: publishedManager,
+        command: publishedCommand,
+      }),
+      nodeBlocked ? tr('update.actionBlocked', { reason: nodeBlocked }) : null,
+      published?.supported === true ? null : tr('update.actionBlocked', { reason: publishedBlockedReason(published, tr) }),
+    ].filter(Boolean).join('\n');
     const updateDisabled = s.localDevInstall || !s.updateSupported || props.busy;
+    const messageIsAlert = props.message?.cls?.includes('warn') === true;
     inner = (
       <>
         <p className="update-version">
@@ -1504,13 +1661,60 @@ function UpdateCard(props: {
         {!s.node.ok ? <p className="hint-warn">{tr('update.nodeWarn', { version: s.node.version, required: s.node.required })}</p> : null}
         {!s.localDevInstall && !s.updateSupported ? <p className="hint-warn">{tr('update.unsupportedInstall')}</p> : null}
         {s.installs.multiple ? <MultiInstallWarning entries={s.installs.entries} /> : null}
-        <div className="update-actions">
-          <button type="button" data-up="check" disabled={props.busy} onClick={props.onCheck}>{tr('update.btnCheck')}</button>
-          <button type="button" data-up="changelog" disabled={props.busy} onClick={props.onToggleChangelog}>
-            {props.changelogOpen ? tr('update.btnChangelogHide') : tr('update.btnChangelog')}
-          </button>
-          <button type="button" className="page-primary-action" data-up="update" disabled={updateDisabled} onClick={props.onUpdate}>{tr('update.btnUpdate')}</button>
-          <button type="button" data-up="restart" disabled={props.busy} onClick={props.onRestart}>{tr('update.btnRestart')}</button>
+        <div className="update-groups" aria-busy={props.busy || undefined}>
+          <div className="update-group update-group-primary">
+            <span className="update-group-label">{tr('update.groupUpdate')}</span>
+            <div className="update-actions">
+              {s.localDevInstall ? (
+                <>
+                  <span className="update-action-cell">
+                    <button
+                      type="button"
+                      className="page-primary-action"
+                      data-up="source"
+                      aria-busy={props.busy || undefined}
+                      disabled={props.busy || !s.node.ok || source?.supported !== true}
+                      onClick={props.onSourceUpdate}
+                    >
+                      {tr('update.btnSourceSync')}
+                    </button>
+                    <span className="update-action-badge">{tr('update.recommended')}</span>
+                    <InfoTip className="update-action-tip" label={tr('update.sourceInfoLabel')} preventClick={false}>{sourceHelp}</InfoTip>
+                  </span>
+                  <span className="update-action-cell">
+                    <button
+                      type="button"
+                      className="update-outline-action"
+                      data-up="published"
+                      aria-busy={props.busy || undefined}
+                      disabled={props.busy || !s.node.ok || published?.supported !== true}
+                      onClick={props.onPublishedSwitch}
+                    >
+                      {tr('update.btnPublishedSwitch')}
+                    </button>
+                    <InfoTip className="update-action-tip" label={tr('update.publishedInfoLabel')} preventClick={false}>{publishedHelp}</InfoTip>
+                  </span>
+                  <span className="update-action-cell">
+                    <button type="button" className="page-primary-action" data-up="update" disabled={updateDisabled} onClick={props.onUpdate}>{tr('update.btnUpdate')}</button>
+                    <span className="update-action-reason">{tr('update.updateSourceUnavailable')}</span>
+                  </span>
+                </>
+              ) : (
+                <button type="button" className="page-primary-action" data-up="update" disabled={updateDisabled} onClick={props.onUpdate}>{tr('update.btnUpdate')}</button>
+              )}
+            </div>
+          </div>
+          <div className="update-group-divider" aria-hidden="true" />
+          <div className="update-group update-group-other">
+            <span className="update-group-label">{tr('update.groupOther')}</span>
+            <div className="update-actions">
+              <button type="button" data-up="check" disabled={props.busy} onClick={props.onCheck}>{tr('update.btnCheck')}</button>
+              <button type="button" data-up="changelog" disabled={props.busy} onClick={props.onToggleChangelog}>
+                {props.changelogOpen ? tr('update.btnChangelogHide') : tr('update.btnChangelog')}
+              </button>
+              <button type="button" data-up="restart" disabled={props.busy} onClick={props.onRestart}>{tr('update.btnRestart')}</button>
+            </div>
+          </div>
         </div>
         {s.cliUpdates?.length ? <CliRuntimeUpdates entries={s.cliUpdates} /> : null}
         {props.changelogOpen ? (
@@ -1521,7 +1725,16 @@ function UpdateCard(props: {
             releasesUrl={props.releasesUrl}
           />
         ) : null}
-        {props.message ? <p className={`oncall-status ${props.message.cls ?? ''}`}>{props.message.text}</p> : null}
+        {props.message ? (
+          <p
+            className={`oncall-status ${props.message.cls ?? ''}`}
+            role={messageIsAlert ? 'alert' : 'status'}
+            aria-live={messageIsAlert ? 'assertive' : 'polite'}
+            aria-atomic="true"
+          >
+            {props.message.text}
+          </p>
+        ) : null}
       </>
     );
   }

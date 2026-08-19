@@ -17,6 +17,9 @@ export interface GlobalInstallPlan {
   manager: GlobalInstallManager;
   command: GlobalInstallManager;
   args: string[];
+  /** Launcher paths owned by this install. Dashboard source→published switches
+   *  snapshot these alongside the package root for transactional rollback. */
+  binPaths?: string[];
   /** Package-manager-specific environment needed to keep the update in the
    *  install location that owns the running botmux process. */
   env?: Record<string, string>;

@@ -122,6 +122,19 @@ import {
 import { withFileLock } from './utils/file-lock.js';
 import { spawn } from 'node:child_process';
 import {
+  inspectSourceUpdate,
+  runSourceUpdate,
+} from './dashboard/source-update.js';
+import {
+  markActiveInstallEntries,
+  resolvePublishedSwitch,
+} from './dashboard/published-switch.js';
+import {
+  inspectPublishedInstallStorage,
+  runPublishedInstallTransaction,
+} from './dashboard/published-install.js';
+import { createDirectUpdateApi } from './dashboard/direct-update-api.js';
+import {
   applySettingsWrite,
   defaultSettingsWriteApplierDeps,
   hasResolvedCodexNotifierRecipient,
@@ -1390,6 +1403,38 @@ function runGlobalInstall(plan: GlobalInstallPlan): Promise<void> {
     });
   });
 }
+
+const directUpdateApi = createDirectUpdateApi({
+  isLocalDevInstall,
+  getSourceRoot: botmuxInstallRoot,
+  inspectSourceUpdate,
+  runSourceUpdate,
+  resolvePublishedSwitch: sourceRoot => resolvePublishedSwitch(detectBotmuxInstalls(), sourceRoot),
+  inspectPublishedInstallStorage,
+  checkNode,
+  tryAcquireUpdateGate: () => {
+    if (updateInFlight) return false;
+    updateInFlight = true;
+    return true;
+  },
+  releaseUpdateGate: () => { updateInFlight = false; },
+  withUpdateLock: operation => withFileLock(
+    globalInstallUpdateLockTarget(),
+    operation,
+    { maxWaitMs: 2_000 },
+  ),
+  hasActiveRestartLease,
+  claimRestartLease,
+  clearRestartLease,
+  clearRestartIntent,
+  writeManualIntentIfAbsent,
+  writeRestartIntent,
+  currentInstalledVersion,
+  versionAt: botmuxVersionAt,
+  runPublishedInstall: plan => runPublishedInstallTransaction(plan, runGlobalInstall),
+  spawnRestart: spawnDetachedRestart,
+  logRestartFailure: message => logger.error(message),
+});
 
 /**
  * Attach to one daemon: hydrate its sessions/schedules into the aggregator,
@@ -3062,8 +3107,29 @@ const server = createServer(async (req, res) => {
     if (req.method === 'GET' && url.pathname === '/api/update/status') {
       const current = currentInstalledVersion();
       const packageRoot = lastSuccessfulUpdatePlan?.activePackageRoot ?? botmuxInstallRoot();
+      const localDevInstall = isLocalDevInstall();
       const installManager = detectGlobalInstallManager(packageRoot);
       const installPlan = tryResolveGlobalInstallPlan(packageRoot);
+      const installDiagnostics = detectBotmuxInstalls();
+      const sourceUpdate = localDevInstall ? await inspectSourceUpdate(packageRoot) : null;
+      let publishedSwitch = null;
+      if (localDevInstall) {
+        const resolution = resolvePublishedSwitch(installDiagnostics, packageRoot);
+        if (resolution.plan) {
+          const storage = await inspectPublishedInstallStorage(resolution.plan);
+          publishedSwitch = storage.supported
+            ? resolution.status
+            : {
+                ...resolution.status,
+                supported: false,
+                blockedReason: storage.blockedReason,
+                availableBytes: storage.availableBytes,
+                requiredBytes: storage.requiredBytes,
+              };
+        } else {
+          publishedSwitch = resolution.status;
+        }
+      }
       // Compare against the npm `latest` dist-tag (always stable; the update
       // button installs `@latest`). isNewerVersion uses semver precedence, so a
       // canary running AHEAD of the latest stable (e.g. 2.87.0-canary.0 vs
@@ -3104,12 +3170,17 @@ const server = createServer(async (req, res) => {
         behind: !!latest && isNewerVersion(latest, current),
         cliBehind: cliUpdates.some((entry) => entry.updateAvailable),
         cliUpdates,
-        localDevInstall: isLocalDevInstall(),
+        localDevInstall,
         updateSupported: installPlan !== null,
         updateManager: installPlan?.manager ?? installManager,
         updateCommand: installPlan ? formatGlobalInstallCommand(installPlan) : null,
+        sourceUpdate,
+        publishedSwitch,
         node: checkNode(),
-        installs: detectBotmuxInstalls(),
+        installs: {
+          ...installDiagnostics,
+          entries: markActiveInstallEntries(installDiagnostics, packageRoot),
+        },
       });
     }
 
@@ -3129,6 +3200,14 @@ const server = createServer(async (req, res) => {
         releases: result.releases,
         releasesUrl: `https://github.com/${GITHUB_REPO}/releases`,
       });
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/update/source-run') {
+      return directUpdateApi.runSource(res, authed);
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/update/published-switch') {
+      return directUpdateApi.runPublished(res, authed);
     }
 
     if (req.method === 'POST' && url.pathname === '/api/update/run') {
