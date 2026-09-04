@@ -69,10 +69,10 @@ vi.mock('../src/bot-registry.js', () => ({
   // per case. Default 'footer' keeps the positive usage-render tests below green.
   resolveUsageDisplay: vi.fn(() => 'footer'),
   normalizeUsageDisplay: vi.fn(() => 'footer'),
-  // Per-bot replyDelivery. Default 'send' = today's behaviour; the transcript
-  // tests below flip it per case. (clearAllMocks resets it to undefined, which
-  // effectiveReplyDelivery also treats as 'send'.)
-  resolveReplyDelivery: vi.fn(() => 'send'),
+  // Per-bot replyDelivery 的显式配置值。缺省给显式 'send'（绝大多数用例的前提）；
+  // transcript 用例逐个翻转。undefined = 未配置，交由 effectiveReplyDelivery 按缺省
+  // 解析（见 completedIdleTurnId 用例）。
+  resolveReplyDelivery: vi.fn((): 'send' | 'transcript' | undefined => 'send'),
 }));
 
 vi.mock('../src/config.js', () => ({
@@ -757,7 +757,19 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       expect(ds.completedIdleTurnId).toBeUndefined();
     });
 
-    it("send mode (default replyDelivery) never sets completedIdleTurnId", async () => {
+    it('unconfigured replyDelivery on claude-code = transcript by default → marks the turn too', async () => {
+      vi.mocked(resolveReplyDelivery).mockReturnValue(undefined);
+      const sessionReply = vi.fn(async () => 'om_reply');
+      initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+      const ds = makeDs();
+      const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+      __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
+      await vi.advanceTimersByTimeAsync(10);
+      expect(sessionReply).toHaveBeenCalledTimes(1);
+      expect(ds.completedIdleTurnId).toBe('turn-1');
+    });
+
+    it('explicit send mode never sets completedIdleTurnId', async () => {
       vi.mocked(resolveReplyDelivery).mockReturnValue('send');
       const sessionReply = vi.fn(async () => 'om_reply');
       initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
