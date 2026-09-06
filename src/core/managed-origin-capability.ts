@@ -349,6 +349,29 @@ export function managedOriginLegacyIsolationProbeAccess(
   }
 }
 
+/**
+ * True when this process runs inside a botmux sandbox / read-isolated pane and
+ * therefore cannot act as a session store host (it may only SEND commands to
+ * the owning daemon). Positive signals only: the sandbox outbox marker, the
+ * host-stamped read-isolation env, the host-stamped origin channel (stamped
+ * for every isolation flavour — full sandbox, credential-only bwrap /
+ * Seatbelt, read isolation — and never for a plain host session), or a
+ * kernel denial (EACCES/EPERM) on a probe inode. `missing_or_unsafe` — an
+ * absent `~/.botmux`, a secret never created because no daemon ran here, a
+ * foreign HOME — is NEVER isolation: a genuine host shell must keep its
+ * offline close / abandon / prune.
+ */
+export function isIsolatedCliProcess(
+  env: NodeJS.ProcessEnv,
+  osUserHomeDir: string,
+): boolean {
+  if (env.BOTMUX_SEND_RELAY) return true;
+  if (env.BOTMUX_READ_ISOLATED === '1') return true;
+  if (env.BOTMUX_ORIGIN_CHANNEL_ID?.trim()) return true;
+  return managedOriginLegacyIsolationProbeAccess(osUserHomeDir) === 'sandbox_denied'
+    || managedOriginIsolationSentinelAccess(osUserHomeDir) === 'sandbox_denied';
+}
+
 /** Strict bounded reader for host-owned authority metadata. It never follows a
  * leaf symlink and opens FIFOs/devices nonblocking before rejecting them by
  * inode type, ownership, link count, mode, and size. */

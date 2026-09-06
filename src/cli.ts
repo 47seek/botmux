@@ -109,7 +109,6 @@ import type { CodexAppDispatchLedgerEntry } from './types.js';
 import {
   validateCodexAppManagedSendOrigin,
 } from './utils/codex-app-dispatch-ledger.js';
-import { hasProtectedSessionMutationOwnership } from './core/session-mutation-guard.js';
 import type { BackendType, PersistentBackendTarget, SessionProbe } from './adapters/backend/types.js';
 import { logger } from './utils/logger.js';
 import { reapLegacyPm2, liveGodAt } from './core/legacy-pm2-reaper.js';
@@ -217,6 +216,7 @@ import { DISPATCH_REPORT_REGISTER_ROUTE } from './core/dispatch-report-binding.j
 import { isRetryableAskHttpStatus } from './core/ask-types.js';
 import {
   hasManagedOriginIsolationMarker,
+  isIsolatedCliProcess,
   managedOriginDataRootProbeAccess,
   managedOriginIsolationSentinelAccess,
   managedOriginLegacyIsolationProbeAccess,
@@ -286,7 +286,8 @@ import {
   writeRestartAttemptIntentTo,
 } from './services/restart-intent-store.js';
 import { loadAllSessionsSnapshot } from './services/session-store.js';
-import { isOccupancyHeld, mutateSessionRowWhenUnowned } from './services/session-offline-write.js';
+import { applySessionCommandAsHost, isOccupancyHeld, readSessionRowAsHost, type UnownedRowApply } from './services/session-command-host.js';
+import type { HostSessionCommand } from './services/session-commands.js';
 import {
   evaluateVcMeetingManagedSend,
   isTrustedVcMeetingHostRelayParent,
@@ -3614,21 +3615,55 @@ function loadSessions(): Map<string, SessionData> {
   }) as unknown as Map<string, SessionData>;
 }
 
-/** Offline-only narrow session mutation. Callers must prefer the owning daemon
- * while it is available; the shared helper rereads the exact row under the
- * store's write exclusion (so a stale CLI snapshot can never be written back)
- * and re-evaluates occupancy inside that exclusion. */
-function mutateSessionOffline(
-  session: SessionData,
-  mutate: (current: SessionData) => boolean,
-): SessionData | undefined {
+/** Host-side offline session commands. Callers must prefer the owning daemon
+ * while it is available; the shared host module rereads the exact row under
+ * the store's write exclusion (so a stale CLI snapshot can never be written
+ * back), re-evaluates occupancy inside that exclusion, and runs the ONE
+ * command apply the daemon also uses (services/session-commands.ts). */
+function hostTarget(session: SessionData): { sessionId: string; larkAppId?: string } {
   const larkAppId = session.larkAppId;
-  return mutateSessionRowWhenUnowned(
-    { sessionId: session.sessionId, ...(larkAppId ? { larkAppId } : {}) },
-    current => mutate(current as unknown as SessionData),
-    { dataDir: resolveDataDir() },
-  ) as unknown as SessionData | undefined;
+  return { sessionId: session.sessionId, ...(larkAppId ? { larkAppId } : {}) };
 }
+
+type OfflineRowRead =
+  | { ok: true; current: SessionData }
+  | { ok: false; error: string };
+
+function offlineBlockedError(outcome: 'owned' | 'missing' | 'contended'): string {
+  switch (outcome) {
+    case 'owned': return 'owning_daemon_became_available';
+    case 'missing': return 'session_row_missing';
+    case 'contended': return 'session_store_busy';
+  }
+}
+
+/** Exclusion-ordered fresh read that yields while a daemon holds the store. */
+function readSessionOffline(session: SessionData): OfflineRowRead {
+  const read = readSessionRowAsHost(hostTarget(session), { dataDir: resolveDataDir() });
+  if (read.outcome === 'ok') return { ok: true, current: read.row as unknown as SessionData };
+  return { ok: false, error: offlineBlockedError(read.outcome) };
+}
+
+function applySessionOffline(
+  session: SessionData,
+  command: HostSessionCommand,
+  options: { expectAdopted?: boolean } = {},
+): UnownedRowApply {
+  return applySessionCommandAsHost(hostTarget(session), command, { dataDir: resolveDataDir(), ...options });
+}
+
+/** True inside a sandboxed / read-isolated pane: such a process can only send
+ * commands to the owning daemon and never becomes a store host (design §1).
+ * Classified by positive signals (sandbox outbox env, host-stamped isolation
+ * env, kernel denial on a probe inode) — never by a missing secret file, so a
+ * host shell on a machine whose daemon never ran keeps its offline commands. */
+function isolatedCliProcess(): boolean {
+  let osUserHomeDir: string | undefined;
+  try { osUserHomeDir = userInfo().homedir; } catch { osUserHomeDir = undefined; }
+  if (!osUserHomeDir) return isIsolatedCliProcess(process.env, '');
+  return isIsolatedCliProcess(process.env, osUserHomeDir);
+}
+const ISOLATED_CLI_OFFLINE_ERROR = '隔离会话内不能离线修改会话（daemon 不可达）';
 
 /** Is this bot's store held by a live host (occupancy lease, or a fresh
  *  heartbeat while no live lease exists)? Same data dir as the store access
@@ -3645,14 +3680,15 @@ type OfflineAbandonResult =
  * the newest durable row under the shared session-file lock. Provider-specific
  * backing cleanup remains owned by the dedicated backend lifecycle changes. */
 async function abandonSessionOffline(session: SessionData): Promise<OfflineAbandonResult> {
-  let current = mutateSessionOffline(session, () => false);
-  if (!current) return { ok: false, error: 'owning_daemon_became_available' };
+  const first = readSessionOffline(session);
+  if (!first.ok) return first;
+  let current = first.current;
 
   const originalPid = adoptedCliPid(current);
   const ownedWorkerPid = current.pid && current.pid !== originalPid ? current.pid : undefined;
   if (ownedWorkerPid) {
     // Narrow the unavoidable occupancy race: do not signal a worker after an
-    // owning daemon has claimed the row. The locked write below repeats this.
+    // owning daemon has claimed the row. The locked command below repeats this.
     if (current.larkAppId && occupancyHeld(current.larkAppId)) {
       return { ok: false, error: 'owning_daemon_became_available' };
     }
@@ -3666,24 +3702,21 @@ async function abandonSessionOffline(session: SessionData): Promise<OfflineAband
 
     // Persist worker-less state without touching FIFO authority. If a new
     // daemon/generation changed the row while SIGTERM settled, fail closed.
-    let workerCleared = false;
-    const afterStop = mutateSessionOffline(current, latest => {
-      if (latest.pid !== ownedWorkerPid
-        || isAdoptedSession(latest) !== isAdoptedSession(current!)) return false;
-      delete latest.pid;
-      workerCleared = true;
-      return true;
-    });
-    if (!afterStop || !workerCleared) {
+    const afterStop = applySessionOffline(
+      current,
+      { type: 'worker-exited', pid: ownedWorkerPid },
+      { expectAdopted: isAdoptedSession(current) },
+    );
+    if (afterStop.outcome !== 'applied') {
       return { ok: false, error: 'session_changed_while_stopping_worker' };
     }
-    current = afterStop;
+    current = afterStop.row as unknown as SessionData;
   } else {
     // Even without a Botmux worker pid, re-read after the first authority check
     // so the cleanup inputs are the newest locked backend/task lineage.
-    const refreshed = mutateSessionOffline(current, () => false);
-    if (!refreshed) return { ok: false, error: 'owning_daemon_became_available' };
-    current = refreshed;
+    const refreshed = readSessionOffline(current);
+    if (!refreshed.ok) return refreshed;
+    current = refreshed.current;
   }
 
   // Provider-specific backing teardown (no daemon to run killWorker()). Adopted
@@ -3726,64 +3759,50 @@ async function abandonSessionOffline(session: SessionData): Promise<OfflineAband
     }
   }
 
-  let applied = false;
-  const published = mutateSessionOffline(current, latest => {
-    if (isAdoptedSession(latest) !== isAdoptedSession(current)) return false;
-    if (latest.status === 'closed') {
-      applied = true;
-      return false;
-    }
-    latest.status = 'closed';
-    latest.closedAt = new Date().toISOString();
-    delete latest.codexAppDispatchLedger;
-    delete latest.codexAppGenerationCommits;
-    delete latest.queuedActivationPending;
-    delete latest.queuedActivationTail;
-    delete latest.pendingRepoSetup;
-    delete latest.previewTarget;
-    applied = true;
-    return true;
-  });
-  if (!published || !applied) {
+  // The same close the daemon applies (one field list, one module); an
+  // already-closed fresh row is a success that keeps its original closedAt.
+  const published = applySessionOffline(
+    current,
+    { type: 'close' },
+    { expectAdopted: isAdoptedSession(current) },
+  );
+  if (published.outcome !== 'applied' && published.outcome !== 'noop') {
     return { ok: false, error: 'session_changed_during_offline_cleanup' };
   }
 
-  return { ok: true, current: published, ...(cleanedBacking ? { cleanedBacking } : {}) };
+  return {
+    ok: true,
+    current: published.row as unknown as SessionData,
+    ...(cleanedBacking ? { cleanedBacking } : {}),
+  };
 }
 
 function pruneSessionOfflineIfLedgerEmpty(session: SessionData): boolean {
-  let pruned = false;
-  mutateSessionOffline(session, current => {
-    if (hasProtectedSessionMutationOwnership(current)) return false;
-    current.status = 'closed';
-    current.closedAt = new Date().toISOString();
-    delete current.codexAppDispatchLedger;
-    delete current.codexAppGenerationCommits;
-    delete current.previewTarget;
-    pruned = true;
-    return true;
-  });
-  return pruned;
+  const result = applySessionOffline(session, { type: 'prune' });
+  return result.outcome === 'applied' || result.outcome === 'noop';
 }
 
 function patchSessionWhiteboardOffline(session: SessionData, whiteboardId: string): boolean {
-  return !!mutateSessionOffline(session, current => {
-    current.whiteboardId = whiteboardId;
-    return true;
-  });
+  const result = applySessionOffline(session, { type: 'whiteboard', whiteboardId });
+  return result.outcome === 'applied' || result.outcome === 'noop';
 }
 
+/** `unavailable`: no daemon answered, and this host may take the offline
+ *  path. `forbidden_isolated`: no daemon answered, and this process is a
+ *  sandboxed / read-isolated CLI that may only send — never write. */
 async function postOwningDaemonSessionMutation(
   session: SessionData,
   suffix: 'close' | 'prune' | 'whiteboard',
   body?: Record<string, unknown>,
-): Promise<'applied' | 'refused' | 'unavailable'> {
-  if (!session.larkAppId) return 'unavailable';
+): Promise<'applied' | 'refused' | 'unavailable' | 'forbidden_isolated'> {
+  const unavailable = (): 'unavailable' | 'forbidden_isolated' =>
+    (isolatedCliProcess() ? 'forbidden_isolated' : 'unavailable');
+  if (!session.larkAppId) return unavailable();
   let daemon: ReturnType<typeof findDaemon>;
-  try { daemon = findDaemon(session.larkAppId); } catch { return 'unavailable'; }
-  if (!daemon) return 'unavailable';
+  try { daemon = findDaemon(session.larkAppId); } catch { return unavailable(); }
+  if (!daemon) return unavailable();
   let secret: string;
-  try { secret = loadDaemonIpcSecret(); } catch { return 'unavailable'; }
+  try { secret = loadDaemonIpcSecret(); } catch { return unavailable(); }
   let res: Awaited<ReturnType<typeof fetchDaemonIpc>>;
   try {
     res = await fetchDaemonIpc(
@@ -3807,7 +3826,7 @@ async function postOwningDaemonSessionMutation(
     if (occupancyHeld(session.larkAppId)) {
       throw new Error(`连接 daemon 失败: ${err instanceof Error ? err.message : String(err)}`);
     }
-    return 'unavailable';
+    return unavailable();
   }
   if (suffix === 'prune' && res.status === 409) return 'refused';
   // A daemon that ANSWERED is alive and authoritative whatever the lease says:
@@ -3875,6 +3894,10 @@ async function abandonSessionAuthoritatively(
       }
     }
   }
+  // A sandboxed / read-isolated CLI has no store host capability (design §1):
+  // with no daemon to send the command to it fails here, explicitly, instead
+  // of degrading into a write behind the sandbox's read-only grant.
+  if (isolatedCliProcess()) return { ok: false, error: ISOLATED_CLI_OFFLINE_ERROR };
   const offline = await abandonSessionOffline(session);
   return offline.ok
     ? {
@@ -3889,7 +3912,7 @@ async function abandonSessionAuthoritatively(
 async function pruneSessionAuthoritatively(session: SessionData): Promise<boolean> {
   const result = await postOwningDaemonSessionMutation(session, 'prune');
   if (result === 'applied') return true;
-  if (result === 'refused') return false;
+  if (result === 'refused' || result === 'forbidden_isolated') return false;
   return pruneSessionOfflineIfLedgerEmpty(session);
 }
 
@@ -3899,7 +3922,7 @@ async function patchSessionWhiteboardAuthoritatively(
 ): Promise<boolean> {
   const result = await postOwningDaemonSessionMutation(session, 'whiteboard', { whiteboardId });
   if (result === 'applied') return true;
-  if (result === 'refused') return false;
+  if (result === 'refused' || result === 'forbidden_isolated') return false;
   return patchSessionWhiteboardOffline(session, whiteboardId);
 }
 
