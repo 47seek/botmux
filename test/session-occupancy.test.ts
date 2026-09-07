@@ -11,7 +11,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { DatabaseSync } from 'node:sqlite';
 
@@ -43,6 +43,7 @@ import {
   OCCUPANCY_SCOPE_BOT,
 } from '../src/services/session-store.js';
 import { applySessionCommandAsHost, isOccupancyHeld } from '../src/services/session-command-host.js';
+import { materializeDashboardImages } from '../src/core/dashboard-images.js';
 import {
   seedPersistedSessionRows,
   seedOccupancyLease,
@@ -371,5 +372,23 @@ describe('JSON upgrade-window path still uses abortIf', () => {
     expect(published).toMatchObject({ outcome: 'applied', row: { status: 'closed' } });
     expect(JSON.parse(readFileSync(join(tempDir, 'sessions-appA.json'), 'utf-8')).s1.status).toBe('closed');
     expect(existsSync(sessionStorePath(tempDir, 'appA'))).toBe(false);
+  });
+});
+
+describe('host close post-commit cleanup', () => {
+  it('deletes the materialized dashboard image directory after an offline close', () => {
+    const png = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl2ZVQAAAAASUVORK5CYII=';
+    const attachments = materializeDashboardImages('appA', [{
+      name: 'shot.png', mimeType: 'image/png', dataBase64: png,
+    }]);
+    const directory = dirname(attachments[0]!.path);
+    expect(existsSync(attachments[0]!.path)).toBe(true);
+
+    seedPersistedSessionRows(tempDir, 'appA', {
+      s1: row('s1', { larkAppId: 'appA', dashboardAttachments: attachments }),
+    });
+    expect(closeS1Offline()).toMatchObject({ outcome: 'applied', row: { status: 'closed' } });
+    expect(existsSync(directory)).toBe(false);
+    expect(readPersistedSessionRows(tempDir, 'appA').s1).not.toHaveProperty('dashboardAttachments');
   });
 });

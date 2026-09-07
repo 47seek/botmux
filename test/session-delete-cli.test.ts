@@ -435,6 +435,29 @@ describe('botmux delete — daemon-first close', () => {
     expect(stored).not.toHaveProperty('tokenUsage');
   });
 
+  it('fails closed when only BOTMUX_ORIGIN_CHANNEL_ID is set and no daemon is reachable', async () => {
+    // The worker stamps this on every isolated child (full sandbox, read
+    // isolation, credential-only). Those children are not a store host. A
+    // host shell never receives the variable from device enrollment — this
+    // case is the child, not `botmux delete` typed in a normal terminal.
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-delete-data-'));
+    tempDirs.push(dataDir);
+    const session = makeSession('sess-delete-origin-channel');
+    writeSessions(dataDir, [session]);
+
+    const result = await runDelete(dataDir, [session.sessionId], {
+      BOTMUX_SESSION_ID: undefined,
+      BOTMUX_LARK_APP_ID: undefined,
+      BOTMUX_SEND_RELAY: undefined,
+      BOTMUX_ORIGIN_CHANNEL_ID: ORIGIN_CHANNEL,
+      BOTMUX_DAEMON_IPC_PORT: undefined,
+    });
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('隔离会话内不能离线修改会话');
+    expect(readSessions(dataDir)[session.sessionId].status).toBe('active');
+  });
+
   it('fails closed inside a sandboxed CLI when no daemon is reachable — no offline write', async () => {
     // A sandboxed / read-isolated CLI can only SEND commands (design §1). With
     // no daemon it must fail explicitly, not degrade into a write behind the

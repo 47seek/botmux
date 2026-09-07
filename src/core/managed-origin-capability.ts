@@ -353,13 +353,20 @@ export function managedOriginLegacyIsolationProbeAccess(
  * True when this process runs inside a botmux sandbox / read-isolated pane and
  * therefore cannot act as a session store host (it may only SEND commands to
  * the owning daemon). Positive signals only: the sandbox outbox marker, the
- * host-stamped read-isolation env, the host-stamped origin channel (stamped
- * for every isolation flavour — full sandbox, credential-only bwrap /
- * Seatbelt, read isolation — and never for a plain host session), or a
+ * host-stamped read-isolation env, the host-stamped origin channel, or a
  * kernel denial (EACCES/EPERM) on a probe inode. `missing_or_unsafe` — an
  * absent `~/.botmux`, a secret never created because no daemon ran here, a
  * foreign HOME — is NEVER isolation: a genuine host shell must keep its
  * offline close / abandon / prune.
+ *
+ * `BOTMUX_ORIGIN_CHANNEL_ID` is stamped by the worker onto the session CLI
+ * child for every isolation flavour (full sandbox, credential-only
+ * Seatbelt/bwrap, read isolation). Device enrollment does NOT put this in
+ * the host shell — a user's `botmux delete` in a normal terminal stays a
+ * host even on a registered machine. The child that does carry the stamp
+ * also cannot write `~/.botmux` (credential-only denies that tree), so
+ * fail-closed here is the same product rule as sandbox, not a host-shell
+ * regression.
  */
 export function isIsolatedCliProcess(
   env: NodeJS.ProcessEnv,

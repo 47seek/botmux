@@ -54,6 +54,26 @@ describe('close', () => {
     expect(r.closedAt).toBe('2026-08-13T00:00:00.000Z');
   });
 
+  it('re-close of a legacy closed row still drops leftover attachments without refreshing closedAt', () => {
+    // Older offline close left queuedAttachments / dashboardAttachments on the
+    // closed row. Re-close must release the images and clear the queue, but
+    // must not rewrite closedAt.
+    const images = [{ type: 'image' as const, path: '/d/attachments/app/dashboard-1/a.png', name: 'a.png' }];
+    const r = row({
+      status: 'closed',
+      closedAt: '2026-08-13T00:00:00.000Z',
+      dashboardAttachments: images,
+      queuedAttachments: [{ type: 'image', path: '/d/q.png', name: 'q.png' }],
+    });
+    expect(applySessionRowCommand(r, { type: 'close' }, { now: NOW })).toEqual({
+      outcome: 'applied',
+      released: { dashboardAttachments: images },
+    });
+    expect(r.closedAt).toBe('2026-08-13T00:00:00.000Z');
+    expect(r.dashboardAttachments).toBeUndefined();
+    expect(r.queuedAttachments).toBeUndefined();
+  });
+
   it('still parks / wipes daemon-only fields on an already-closed row without refreshing closedAt', () => {
     const r = row({
       status: 'closed',

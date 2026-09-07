@@ -3652,11 +3652,13 @@ function applySessionOffline(
   return applySessionCommandAsHost(hostTarget(session), command, { dataDir: resolveDataDir(), ...options });
 }
 
-/** True inside a sandboxed / read-isolated pane: such a process can only send
- * commands to the owning daemon and never becomes a store host (design §1).
- * Classified by positive signals (sandbox outbox env, host-stamped isolation
- * env, kernel denial on a probe inode) — never by a missing secret file, so a
- * host shell on a machine whose daemon never ran keeps its offline commands. */
+/** True inside a sandboxed / read-isolated / credential-only pane: such a
+ * process can only send commands to the owning daemon and never becomes a
+ * store host (design §1). Classified by positive signals (sandbox outbox env,
+ * host-stamped isolation env, host-stamped origin channel, kernel denial on a
+ * probe inode) — never by a missing secret file, so a host shell on a machine
+ * whose daemon never ran keeps its offline commands. Device enrollment does
+ * not stamp the host shell; see `isIsolatedCliProcess`. */
 function isolatedCliProcess(): boolean {
   let osUserHomeDir: string | undefined;
   try { osUserHomeDir = userInfo().homedir; } catch { osUserHomeDir = undefined; }
@@ -3924,6 +3926,23 @@ async function patchSessionWhiteboardAuthoritatively(
   if (result === 'applied') return true;
   if (result === 'refused' || result === 'forbidden_isolated') return false;
   return patchSessionWhiteboardOffline(session, whiteboardId);
+}
+
+/** Persist the binding, then mirror it on the in-memory row. A failed
+ *  authoritative patch must not pretend the session is bound. */
+async function bindSessionWhiteboard(
+  session: SessionData,
+  whiteboardId: string,
+): Promise<boolean> {
+  const bound = await patchSessionWhiteboardAuthoritatively(session, whiteboardId);
+  if (bound) {
+    session.whiteboardId = whiteboardId;
+    return true;
+  }
+  console.error(
+    `白板已创建，但未能绑定到会话 ${session.sessionId}（daemon 不可达或当前进程不能离线写）`,
+  );
+  return false;
 }
 
 function isProcessAlive(pid: number): boolean {
@@ -6557,8 +6576,7 @@ Context flags: --session-id, --lark-app-id, --chat-id, --working-dir/--repo`);
     if (!meta && argFlag(rest, '--create')) {
       meta = ensureDefaultWhiteboard({ larkAppId: ctx.larkAppId, chatId: ctx.chatId, workingDir: ctx.workingDir, sessionId: ctx.sessionId });
       if (ctx.session) {
-        await patchSessionWhiteboardAuthoritatively(ctx.session, meta.id);
-        ctx.session.whiteboardId = meta.id;
+        await bindSessionWhiteboard(ctx.session, meta.id);
       }
     }
     if (!meta) {
@@ -6574,8 +6592,7 @@ Context flags: --session-id, --lark-app-id, --chat-id, --working-dir/--repo`);
     const ctx = currentWhiteboardContext(rest);
     const meta = createWhiteboard({ id: argValue(rest, '--id'), title: argValue(rest, '--title'), larkAppId: ctx.larkAppId, chatId: ctx.chatId, workingDir: ctx.workingDir, sessionId: ctx.sessionId });
     if (ctx.session && !ctx.session.whiteboardId) {
-      await patchSessionWhiteboardAuthoritatively(ctx.session, meta.id);
-      ctx.session.whiteboardId = meta.id;
+      await bindSessionWhiteboard(ctx.session, meta.id);
     }
     console.log(JSON.stringify({ board: meta, path: whiteboardPath(meta.id) }, null, 2));
     return;
@@ -6598,8 +6615,7 @@ Context flags: --session-id, --lark-app-id, --chat-id, --working-dir/--repo`);
     const meta = ensureDefaultWhiteboard({ larkAppId: ctx.larkAppId, chatId: ctx.chatId, workingDir: ctx.workingDir, sessionId: ctx.sessionId });
     id = meta.id;
     if (ctx.session) {
-      await patchSessionWhiteboardAuthoritatively(ctx.session, id);
-      ctx.session.whiteboardId = id;
+      await bindSessionWhiteboard(ctx.session, id);
     }
   }
   if (!id) { console.error('No whiteboard id. Pass --id or run `botmux whiteboard current --create`.'); process.exit(1); }
