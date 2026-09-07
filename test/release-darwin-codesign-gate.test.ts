@@ -184,6 +184,113 @@ describe('build-bun-binary.mjs — re-signs darwin output, because the bun pin i
   });
 });
 
+describe('ci.yml — darwin is gated on PRs, not only at release', () => {
+  /**
+   * Until this job existed, `darwin`/`macos` appeared ZERO times in ci.yml, so the
+   * signature failure path was reachable only in a release run — which is how both
+   * incidents escaped: 3.18.14 shipped an unrunnable darwin-arm64 binary, and
+   * v3.19.0 burned a tag on the cross-built darwin-x64 with no Release behind it.
+   *
+   * Following the MECHANISM vs MEANS note in ci-musl-gate.test.ts: what must hold
+   * is that CI compiles the darwin artifacts on macOS and verifies their signatures
+   * with the same strictness the release does — not that any particular job name or
+   * runner label is used.
+   */
+  const job = (() => {
+    const start = CI.indexOf('bun-binary-darwin:');
+    return start < 0 ? '' : CI.slice(start);
+  })();
+
+  it('defines a darwin binary job', () => {
+    expect(CI).toMatch(/^ {2}bun-binary-darwin:/m);
+  });
+
+  it('MECHANISM: runs on macOS (codesign exists nowhere else)', () => {
+    // A linux runner cannot invoke codesign at all, so a darwin job scheduled
+    // there could only ever compile — never verify.
+    expect(job).toMatch(/runs-on:\s*macos-/);
+  });
+
+  it('compiles BOTH darwin arches, since the defect lives in the cross-built one', () => {
+    // The v3.19.0 failure was darwin-x64 on an arm64 runner while the native
+    // arm64 output was valid on the same run. Building only the host arch would
+    // reproduce exactly the blind spot that let it ship.
+    expect(job).toContain('bun-darwin-x64');
+    expect(job).toContain('bun-darwin-arm64');
+  });
+
+  it('THE LOAD-BEARING GATE: codesign --verify --strict, iterating every darwin output', () => {
+    // Anchored to line start for the same reason as the release.yml assertion
+    // above: an `echo` of the command is not a comment and survives comment
+    // stripping, so an unanchored match can be satisfied while the executed
+    // command has dropped --strict.
+    expect(job).toMatch(/^\s*codesign --verify --strict/m);
+    expect(job).toMatch(/for f in dist-bin\/botmux-darwin-\*/);
+  });
+
+  it('fails closed when no darwin binary is present (found=0 → exit 1)', () => {
+    expect(job).toMatch(/found=0/);
+    expect(job).toMatch(/\[ "\$found" = 0 \][\s\S]*exit 1/);
+  });
+
+  it('skips .map/.sha256 siblings (codesign rejects a non-Mach-O file)', () => {
+    expect(job).toMatch(/\*\.map/);
+  });
+
+  it('proves each output is really the arch it is named after', () => {
+    // Without this the signature verdict can be VACUOUS: if --target were ignored
+    // or the native fell back to the host prebuild, both outputs would be native
+    // arm64, codesign would pass them both (native signing was never broken), and
+    // the job would be green while darwin-x64 users got an unexecutable binary.
+    expect(job).toMatch(/lipo -archs/);
+    expect(job).toMatch(/x86_64/);
+    // Must fail closed, not merely print the mismatch.
+    expect(job).toMatch(/REFUSING[\s\S]{0,200}exit 1/);
+  });
+
+  it('EXECUTES the host-arch binary through the shared smoke script', () => {
+    // Running it is what proves the embedded darwin native LOADS: node-pty dlopens
+    // pty.node at module scope and needs its macOS spawn-helper sidecar, which no
+    // linux leg can exercise.
+    expect(job).toMatch(/node scripts\/smoke-bun-binary\.mjs/);
+  });
+
+  it('stamps a version BEFORE compiling (or the smoke version check cannot pass)', () => {
+    // Same ordering constraint as the musl leg: `npm version` must come after
+    // install (--frozen-lockfile must see the committed manifest) and before the
+    // compile that bakes the value in, else the binary reports the `unknown`
+    // sentinel the smoke script rejects.
+    const install = job.indexOf('bun install --frozen-lockfile');
+    const version = job.indexOf('npm version');
+    const compile = job.indexOf('bun scripts/build-bun-binary.mjs');
+    expect(install).toBeGreaterThan(-1);
+    expect(version).toBeGreaterThan(install);
+    expect(compile).toBeGreaterThan(version);
+  });
+
+  it('PARITY: the PR gate uses the same builder and smoke script as the release', () => {
+    // Parity is the actual invariant — it is what stops the PR gate from being
+    // left behind on a weaker path when the release moves on, or vice versa.
+    for (const src of [CI, RELEASE]) {
+      expect(src).toContain('scripts/build-bun-binary.mjs');
+      expect(src).toContain('scripts/smoke-bun-binary.mjs');
+    }
+  });
+
+  it('tracks the release runner ARCH, so the cross-compiled cell stays covered', () => {
+    // Not cosmetic: the defect only exists when darwin-x64 is CROSS-built, which
+    // requires an arm64 (Apple silicon) runner — macos-13 is x64 and would make
+    // x64 the native output and arm64 the cross-built one. The verify loop covers
+    // both, so the gate stays correct either way, but drifting away from the
+    // release's runner means CI stops exercising the cell that actually ships.
+    const releaseDarwin = RELEASE.split(/-\s+os:/).filter((e) => e.includes('bun-darwin'));
+    expect(releaseDarwin).toHaveLength(1);
+    const releaseRunner = releaseDarwin[0].match(/^\s*(macos-[\w.]+)/)?.[1];
+    expect(releaseRunner, 'could not read the release darwin runner — re-anchor this test').toBeDefined();
+    expect(job).toMatch(new RegExp(`runs-on:\\s*${releaseRunner!.replace(/\./g, '\\.')}`));
+  });
+});
+
 describe('Bun pin — carries the darwin codesign fix and is consistent everywhere', () => {
   const pinned = PKG.packageManager?.match(/^bun@(\d+\.\d+\.\d+)$/)?.[1];
 
