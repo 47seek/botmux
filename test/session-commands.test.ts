@@ -48,12 +48,37 @@ describe('close', () => {
     expect(r.workerGeneration).toBe(3);
   });
 
-  it('is a noop on an already-closed row and keeps its closedAt', () => {
-    const r = row({ status: 'closed', closedAt: '2026-08-13T00:00:00.000Z', previewTarget: { host: '127.0.0.1', port: 1, registeredAt: 'x', owner: 'agent', workerGeneration: 1 } as Session['previewTarget'] });
-    expect(applySessionRowCommand(r, { type: 'close', parkMojoLineage: 'm1' }, { now: NOW })).toEqual({ outcome: 'noop' });
+  it('is a noop on a clean already-closed row and keeps its closedAt', () => {
+    const r = row({ status: 'closed', closedAt: '2026-08-13T00:00:00.000Z' });
+    expect(applySessionRowCommand(r, { type: 'close' }, { now: NOW })).toEqual({ outcome: 'noop' });
     expect(r.closedAt).toBe('2026-08-13T00:00:00.000Z');
-    expect(r.mojoQuarantinedLineage).toBeUndefined();
-    expect(r.previewTarget).toBeDefined();
+  });
+
+  it('still parks / wipes daemon-only fields on an already-closed row without refreshing closedAt', () => {
+    const r = row({
+      status: 'closed',
+      closedAt: '2026-08-13T00:00:00.000Z',
+      previewTarget: { host: '127.0.0.1', port: 1, registeredAt: 'x', owner: 'agent', workerGeneration: 1 } as Session['previewTarget'],
+      mojoCloseJournal: { phase: 'prepared' } as Session['mojoCloseJournal'],
+      riffParentTaskId: 'riff-stale',
+    });
+    expect(applySessionRowCommand(r, {
+      type: 'close',
+      parkMojoLineage: 'm1',
+      parkLocalResidual: 'local_subtree_boundary_unproven',
+      clearMojoCloseJournal: true,
+      clearRiffParentTaskId: true,
+    }, { now: NOW })).toEqual({ outcome: 'applied', released: {} });
+    expect(r.closedAt).toBe('2026-08-13T00:00:00.000Z');
+    expect(r.mojoQuarantinedLineage).toBe('m1');
+    expect(r.mojoQuarantineNoticePending).toBe(true);
+    expect(r.mojoLocalResidual).toBe('local_subtree_boundary_unproven');
+    expect(r.mojoCloseJournal).toBeUndefined();
+    expect(r.riffParentTaskId).toBeUndefined();
+    expect(r.previewTarget).toBeUndefined();
+    // Same park again is a noop — the first close already merged the handle.
+    expect(applySessionRowCommand(r, { type: 'close', parkMojoLineage: 'm1' }, { now: NOW })).toEqual({ outcome: 'noop' });
+    expect(r.mojoQuarantinedLineage).toBe('m1');
   });
 
   it('writes a sampled token snapshot, and null only when the row has none yet', () => {

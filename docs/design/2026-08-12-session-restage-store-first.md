@@ -142,7 +142,7 @@ Mailbox 在本仓库里要解决的问题：飞书、dashboard、CLI、worker �
 2. 拥有 store 的 daemon 在首次 `load()` 的 `BEGIN IMMEDIATE` 事务里领取占位（`init(..., { occupancy })`）。领取是有条件的：别的 boot 的租约只有在过期、或其 `owner_pid` 已不存在时才会被接管；仍然存活的前任保留所有权，后任记 warn 并在心跳里重试。领取失败（如只读库）只记 error，不阻止快照加载。descriptor 文件仍写，只作 IPC 发现。
 3. 非当前 host 的 SQLite 写入：`BEGIN IMMEDIATE` → 读租约 → 有效则中止；没有有效租约时再看心跳（`abortIf`）；两者都不在场才允许宿主在同一事务内 apply（不写租约行，见 §1）。
 4. 领取与续期是同一条语句（`claimOccupancyLease`），随 descriptor 心跳每 30s 执行，首次 load 之后立即执行一次（reconcile 可能已经提前触发过 load）。TTL 与心跳 staleness 共用 `DAEMON_HEARTBEAT_STALE_MS`（90s）。优雅关停期间租约一直持有到 `process.exit` 前才按 `boot_id` 释放——teardown 中 worker 仍在写回缓存；`exit` handler 兜底。
-5. 所有权调用点：`mutateSessionRowWhenUnowned`、CLI close / abandon / prune、whiteboard 离线解绑。`findOnlineDaemon` 用于 IPC 地址、dashboard 展示，以及无有效租约时的心跳回落。已经**应答**的 daemon（任何 HTTP 状态）始终权威：它的拒绝是终态，不因租约状态回落到离线写；只有连接失败时才用 `isOccupancyHeld` 区分「daemon 在但不可达」与「descriptor 是残留」。
+5. 所有权调用点：`applySessionCommandUnowned` / `applySessionCommandAsHost`、CLI close / abandon / prune、whiteboard 离线解绑。`findOnlineDaemon` 用于 IPC 地址、dashboard 展示，以及无有效租约时的心跳回落。已经**应答**的 daemon（任何 HTTP 状态）始终权威：它的拒绝是终态，不因租约状态回落到离线写；只有连接失败时才用 `isOccupancyHeld` 区分「daemon 在但不可达」与「descriptor 是残留」。
 
 **心跳回落（不是长期双协议）**：没有有效租约时，仍用心跳判断「未写 occupancy 的 daemon 是否在线」——包括未升级的 #1051 daemon，也包括新构建崩溃留下过期行后回滚运行的旧构建。有效租约存在时心跳不再能放行（心跳陈旧也中止）。删除该回落的条件与 Stage 0 JSON 读路径相同（fleet 自动重启落地，或 2026-11-26 复核）。
 
@@ -154,7 +154,7 @@ Mailbox 在本仓库里要解决的问题：飞书、dashboard、CLI、worker �
 
 已落地：
 
-1. `services/session-commands.ts#applySessionRowCommand(row, command, { now })`：`close` / `prune` / `whiteboard` / `worker-exited` 四条命令对行的唯一变换。纯函数、不做任何 I/O（它在宿主路径上跑在 `BEGIN IMMEDIATE` / 文件锁之内）；close 时的 token 快照由调用方在锁外采样后作为命令字段传入。幂等：对已关闭行再 close 是 `noop`，不再刷新 `closedAt`。
+1. `services/session-commands.ts#applySessionRowCommand(row, command, { now })`：`close` / `prune` / `whiteboard` / `worker-exited` 四条命令对行的唯一变换。纯函数、不做任何 I/O（它在宿主路径上跑在 `BEGIN IMMEDIATE` / 文件锁之内）；close 时的 token 快照由调用方在锁外采样后作为命令字段传入。幂等：对已关闭行再 close **不刷新 `closedAt`**；宿主 close（无 daemon 专属字段、无残留 runtime 字段）是 `noop`。daemon 专属的 park / journal wipe 在已关闭行上仍可落地——并发二次 close 输掉 status 竞态时不能把 residual 丢掉。
 2. daemon 侧 `session-store.closeSession` 与 `/api/sessions/:id/whiteboard` 路由改为调用它；daemon 独有的 close 输入（`tokenUsage`、`parkMojoLineage`、`parkLocalResidual`、`clearRiffParentTaskId`、`clearMojoCloseJournal`）在 `HostSessionCommand` 上被类型化为 `never`——宿主构造不出能抹掉 mojo 对账栅栏或钉死 token 快照的命令，边界由 tsc 检查。
 3. `session-store.mutateSessionRowOffline(target, 闭包)` 删除，替换为 `applySessionCommandUnowned(target, HostSessionCommand)` 与 `readSessionRowUnowned(target)`（同一事务、同一权威判定、不写）。结果是判别联合：`applied` / `noop` / `refused(reason)` / `owned` / `missing` / `contended`——不再用 `undefined` 混同「被占用」「行不存在」「锁竞争」。
 4. `services/session-offline-write.ts` 改名为 `services/session-command-host.ts`：`applySessionCommandAsHost` / `readSessionRowAsHost` / `isOccupancyHeld`，补心跳回落探针、并在 commit 后做 close 释放的 dashboard 图片目录清理（与 daemon 的 close 后清理同一函数）。CLI 的 delete / prune / whiteboard 与 dashboard 删板解绑都走它；CLI 私有的三份字段清单删除。

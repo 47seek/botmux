@@ -2068,37 +2068,45 @@ export function closeSession(
     // The close-time token snapshot is sampled here, outside any store lock
     // (the transcript scan can be large), and handed to the shared apply as an
     // input. `null` = sampled, nothing found; the apply then writes `null`
-    // only when the row carries no snapshot yet.
-    let tokenUsage: NonNullable<Session['tokenUsage']> | null = null;
-    try {
-      tokenUsage = getSessionTokenUsage({
-        cliId: session.cliId ?? 'unknown',
-        sessionId: session.sessionId,
-        cliSessionId: session.cliSessionId,
-        cwd: session.workingDir,
-        larkAppId: session.larkAppId,
-        fresh: true,
-      });
-    } catch (err: any) {
-      logger.warn(`Failed to snapshot token usage for session ${sessionId}: ${err?.message ?? err}`);
+    // only when the row carries no snapshot yet. An already-closed row does
+    // not take a new snapshot — re-close must not pin a later `null` over a
+    // live dashboard read, and must not spend the scan when apply will ignore it.
+    let tokenUsage: NonNullable<Session['tokenUsage']> | null | undefined;
+    if (session.status !== 'closed') {
+      tokenUsage = null;
+      try {
+        tokenUsage = getSessionTokenUsage({
+          cliId: session.cliId ?? 'unknown',
+          sessionId: session.sessionId,
+          cliSessionId: session.cliSessionId,
+          cwd: session.workingDir,
+          larkAppId: session.larkAppId,
+          fresh: true,
+        });
+      } catch (err: any) {
+        logger.warn(`Failed to snapshot token usage for session ${sessionId}: ${err?.message ?? err}`);
+      }
     }
     // Durable first: build the closed row, commit it, and only then merge it
     // into the live object. A failed write leaves the session exactly as it
     // was, including any prior tokenUsage snapshot. The transition itself is
     // the ONE shared apply (session-commands.ts); this is the daemon's own
     // store close, reached after its explicit prepare, so it alone names the
-    // journal wipe.
+    // journal wipe. Persist only on `applied` — a no-op re-close must not
+    // rewrite the row.
     const next: Session = { ...session };
     const applied = applySessionRowCommand(next, {
       type: 'close',
-      tokenUsage,
+      ...(tokenUsage !== undefined ? { tokenUsage } : {}),
       clearMojoCloseJournal: true,
       ...(opts.parkMojoLineage ? { parkMojoLineage: opts.parkMojoLineage } : {}),
       ...(opts.parkLocalResidual ? { parkLocalResidual: opts.parkLocalResidual } : {}),
       ...(opts.clearRiffParentTaskId ? { clearRiffParentTaskId: true } : {}),
     }, { now: new Date() });
-    persistRow(next);
-    Object.assign(session, next);
+    if (applied.outcome === 'applied') {
+      persistRow(next);
+      Object.assign(session, next);
+    }
     const released = applied.outcome === 'applied' ? applied.released.dashboardAttachments : undefined;
     if (session.larkAppId && released?.length) {
       try {

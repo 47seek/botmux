@@ -114,8 +114,10 @@ export type SessionRowCommandResult =
 /**
  * Apply `command` to `row` IN PLACE. Returns whether anything changed; the
  * caller persists the row (and merges it back into any live alias) only on
- * `applied`. Idempotent: a re-applied command reports `noop` and touches
- * nothing — in particular a closed row keeps its original `closedAt`.
+ * `applied`. A re-applied close never refreshes `closedAt`. A host close of an
+ * already-closed row with no leftover runtime fields is `noop`; daemon-only
+ * parks / journal wipe still apply when they change the row (a concurrent
+ * second close that lost the status race must not drop a residual).
  */
 export function applySessionRowCommand(
   row: Session,
@@ -149,20 +151,38 @@ export function applySessionRowCommand(
 }
 
 function applyClose(row: Session, command: SessionCloseCommand, now: Date): SessionRowCommandResult {
-  if (row.status === 'closed') return { outcome: 'noop' };
+  const alreadyClosed = row.status === 'closed';
+  let changed = false;
   // The materialised images are cleaned up AFTER the row commits, so the list
   // is handed back before it is dropped from the row.
-  const released: SessionRowReleased = row.dashboardAttachments?.length
-    ? { dashboardAttachments: row.dashboardAttachments }
-    : {};
-  row.status = 'closed';
-  row.closedAt = now.toISOString();
-  if (command.tokenUsage !== undefined) {
-    if (command.tokenUsage !== null) row.tokenUsage = command.tokenUsage;
-    else if (row.tokenUsage === undefined) row.tokenUsage = null;
+  const released: SessionRowReleased = {};
+
+  if (!alreadyClosed) {
+    if (row.dashboardAttachments?.length) {
+      released.dashboardAttachments = row.dashboardAttachments;
+    }
+    row.status = 'closed';
+    row.closedAt = now.toISOString();
+    if (command.tokenUsage !== undefined) {
+      if (command.tokenUsage !== null) row.tokenUsage = command.tokenUsage;
+      else if (row.tokenUsage === undefined) row.tokenUsage = null;
+    }
+    row.dashboardAttachments = undefined;
+    row.queuedAttachments = undefined;
+    changed = true;
+  } else if (row.dashboardAttachments?.length) {
+    // A row closed by an older build can still carry leftover images; re-close
+    // must not refresh closedAt, but the caller still needs the list to delete
+    // the directory.
+    released.dashboardAttachments = row.dashboardAttachments;
+    row.dashboardAttachments = undefined;
+    changed = true;
   }
-  row.dashboardAttachments = undefined;
-  row.queuedAttachments = undefined;
+  if (alreadyClosed && row.queuedAttachments !== undefined) {
+    row.queuedAttachments = undefined;
+    changed = true;
+  }
+
   // `previewTarget` is a live loopback (host, port) the session's agent
   // registered with `botmux preview <port>` for its CURRENT worker generation —
   // routing state, not a durable property of the conversation. A closed
@@ -170,23 +190,42 @@ function applyClose(row: Session, command: SessionCloseCommand, now: Date): Sess
   // an unrelated local server; the preview proxy dials a target by host/port
   // alone, so a retained value would let a later reader (resume, an offline
   // row copy, a dashboard snapshot) proxy the user into someone else's
-  // service. Drop it in the same atomic save as status='closed'.
-  row.previewTarget = undefined;
-  if (command.clearMojoCloseJournal) row.mojoCloseJournal = undefined;
+  // service. Drop it on every close, including re-close of a legacy closed row.
+  if (row.previewTarget !== undefined) {
+    row.previewTarget = undefined;
+    changed = true;
+  }
+
+  if (command.clearMojoCloseJournal && row.mojoCloseJournal !== undefined) {
+    row.mojoCloseJournal = undefined;
+    changed = true;
+  }
   // Survives close on purpose — the containment handle is still in the durable
   // store, so the row must keep reporting the residual until the handle clears.
-  if (command.parkLocalResidual) row.mojoLocalResidual = command.parkLocalResidual;
+  if (command.parkLocalResidual && row.mojoLocalResidual !== command.parkLocalResidual) {
+    row.mojoLocalResidual = command.parkLocalResidual;
+    changed = true;
+  }
   if (command.parkMojoLineage) {
     // Keep both ids when a different one was already parked: each is the only
     // handle left for manual cleanup of its remote session.
     const already = row.mojoQuarantinedLineage;
-    row.mojoQuarantinedLineage = already && already !== command.parkMojoLineage
+    const next = already && already !== command.parkMojoLineage
       ? `${already},${command.parkMojoLineage}`
       : command.parkMojoLineage;
-    row.mojoQuarantineNoticePending = true;
+    if (next !== already) {
+      row.mojoQuarantinedLineage = next;
+      row.mojoQuarantineNoticePending = true;
+      changed = true;
+    }
   }
   // Riff cancellation has already completed before this durable transition.
   // Clear its retry handle in the same atomic save as status='closed'.
-  if (command.clearRiffParentTaskId) row.riffParentTaskId = undefined;
+  if (command.clearRiffParentTaskId && row.riffParentTaskId !== undefined) {
+    row.riffParentTaskId = undefined;
+    changed = true;
+  }
+
+  if (!changed) return { outcome: 'noop' };
   return { outcome: 'applied', released };
 }

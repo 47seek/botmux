@@ -980,9 +980,28 @@ describe('closeSession()', () => {
     closeSession(session.sessionId);
     const secondClosedAt = getSession(session.sessionId)!.closedAt;
 
-    // closedAt gets updated on second close
-    expect(secondClosedAt).toBeDefined();
+    // Re-close is a noop: original closedAt is kept.
+    expect(secondClosedAt).toBe(firstClosedAt);
     expect(getSession(session.sessionId)!.status).toBe('closed');
+  });
+
+  it('parks a residual on an already-closed row without refreshing closedAt', () => {
+    const session = createSession('chat1', 'root1', 'Reclose Park Residual');
+    closeSession(session.sessionId);
+    const firstClosedAt = getSession(session.sessionId)!.closedAt;
+
+    closeSession(session.sessionId, {
+      parkLocalResidual: 'local_subtree_boundary_unproven',
+      parkMojoLineage: 'mojo-late',
+    });
+
+    expect(getSession(session.sessionId)).toMatchObject({
+      status: 'closed',
+      closedAt: firstClosedAt,
+      mojoLocalResidual: 'local_subtree_boundary_unproven',
+      mojoQuarantinedLineage: 'mojo-late',
+      mojoQuarantineNoticePending: true,
+    });
   });
 });
 
