@@ -14576,13 +14576,26 @@ switch (command) {
     break;
   }
   case 'autostart': {
+    const args = process.argv.slice(3);
+    if (args.some(arg => arg === '--help' || arg === '-h')) {
+      console.log('用法: botmux autostart <enable|disable|status>');
+      break;
+    }
+    const sub = args[0] ?? 'status';
+    const extra = args.slice(1);
+    const knownSubcommands = new Set(['enable', 'install', 'disable', 'uninstall', 'status']);
+    if (!knownSubcommands.has(sub) || extra.length > 0) {
+      const unknown = [...(!knownSubcommands.has(sub) ? [sub] : []), ...extra];
+      console.error(`未知参数: ${unknown.join(' ')}`);
+      console.error('  `botmux autostart` 只接受一个子命令: enable、disable、status（兼容别名: install、uninstall）。');
+      process.exitCode = 2;
+      break;
+    }
     ensureConfigDir();
-    const sub = process.argv[3] ?? 'status';
     const opts = { pkgRoot: PKG_ROOT, configDir: CONFIG_DIR, logDir: LOG_DIR };
     if (sub === 'enable' || sub === 'install') enableAutostart(opts);
     else if (sub === 'disable' || sub === 'uninstall') disableAutostart(opts);
-    else if (sub === 'status') autostartStatus(opts);
-    else { console.error(`用法: botmux autostart <enable|disable|status>`); process.exit(1); }
+    else autostartStatus(opts);
     break;
   }
   default:
