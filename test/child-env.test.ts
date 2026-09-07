@@ -666,8 +666,9 @@ describe('session CLI home scrub call sites', () => {
     // TERM is re-pinned (not left absent) inside the shared scrub so pm2
     // CLIENT output on a real TTY keeps supports-color detection.
     expect(fnBody).toContain("env.TERM = 'xterm-256color'");
-    const pluginPm2 = read('core/plugins/pm2.ts');
-    expect(pluginPm2).toContain('scrubPm2CallerEnv(');
+    const pluginSupervisor = read('core/plugins/supervisor-client.ts');
+    expect(pluginSupervisor).toContain('scrubExternalMemberEnv(');
+    expect(read('index-plugin-supervisor.ts')).toContain('scrubExternalMemberEnv(process.env)');
     expect(read('index-daemon.ts')).toContain('scrubInvokerTerminalEnv(process.env)');
     expect(read('index-daemon.ts')).toContain('scrubSessionTurnMarkerEnv(process.env)');
     // Daemon boot must re-pin too: the boot scrub runs AFTER pm2Env() baked

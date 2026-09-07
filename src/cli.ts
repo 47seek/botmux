@@ -42,7 +42,6 @@ import {
 } from './core/session-marker.js';
 import { resolveBotmuxDataDir } from './core/data-dir.js';
 import { ENTRY_SUBCOMMANDS, entryForSubcommand, resolveEntrySpawn } from './core/self-spawn.js';
-import { PM2_EXISTING_CLIENT_SUBCOMMAND, PM2_READONLY_CLIENT_SUBCOMMAND } from './cli/pm2-helper-spawn.js';
 import { dashboardSecretPath } from './core/dashboard-secret.js';
 import { acceptedDispatchBotAppIds, activeConversationBotOpenIds, buildDispatchCompletionBrief, parseDispatchBotSpec, buildDispatchMessages, buildRepoPrimeText, buildReportContent, eligibleAutoMentionAliases, foldableChatSessionAppIds, offTopicSubBotTopic, resolveReportPlacement, resolveReportRecipient, resolveSendTarget, threadRootForReachability } from './core/dispatch.js';
 import {
@@ -13435,6 +13434,7 @@ if (__entrySubcommand) {
   else if (__entrySubcommand === 'worker') await import('./worker.js');
   else if (__entrySubcommand === 'supervisor') await import('./index-supervisor.js');
   else if (__entrySubcommand === 'dashboard') await import('./index-dashboard.js');
+  else if (__entrySubcommand === 'plugin-supervisor') await import('./index-plugin-supervisor.js');
   // CLI-adapter runners. Same mechanism, different role: these ARE the CLI session
   // process an adapter launches, not a fleet member. Without these branches the
   // compiled binary re-execed itself with a `/$bunfs/…-runner.js` argv[0] that
@@ -13448,18 +13448,6 @@ if (__entrySubcommand) {
   // loop alive for the daemon; the worker's IPC listener does the same; a
   // core-only bind failure exits from within). Park here so the normal dispatch
   // below never runs. This awaits forever; the imported module owns exit().
-  await new Promise<never>(() => {});
-}
-
-if (command === PM2_READONLY_CLIENT_SUBCOMMAND) {
-  process.argv.splice(2, 1);
-  await import('./cli/pm2-readonly-client.js');
-  await new Promise<never>(() => {});
-}
-
-if (command === PM2_EXISTING_CLIENT_SUBCOMMAND) {
-  process.argv.splice(2, 1);
-  await import('./cli/pm2-existing-client.js');
   await new Promise<never>(() => {});
 }
 
@@ -14062,11 +14050,11 @@ function printPluginServiceDeleteError(err: unknown): boolean {
   if (!err || typeof err !== 'object' || (err as any).code !== 'plugin_service_delete_failed') return false;
   const failures = Array.isArray((err as any).failures) ? (err as any).failures : [];
   const details = failures
-    .map((failure: any) => `${String(failure.pluginId ?? 'unknown')}: ${String(failure.warning ?? 'PM2 删除失败')}`)
+    .map((failure: any) => `${String(failure.pluginId ?? 'unknown')}: ${String(failure.warning ?? 'supervisor 删除失败')}`)
     .join('; ');
-  console.error('❌ 插件服务的 PM2 记录删除失败，插件未卸载。');
+  console.error('❌ 插件服务的 supervisor 记录删除失败，插件未卸载。');
   if (details) console.error(`   ${details}`);
-  console.error('   请确认 PM2 可用后重新执行卸载；Botmux 未清理插件文件、配置或绑定。');
+  console.error('   请确认插件 supervisor 可用后重新执行卸载；Botmux 未清理插件文件、配置或绑定。');
   return true;
 }
 
