@@ -287,6 +287,7 @@ import {
 } from './services/restart-intent-store.js';
 import { loadAllSessionsSnapshot } from './services/session-store.js';
 import { applySessionCommandAsHost, isOccupancyHeld, readSessionRowAsHost, type UnownedRowApply } from './services/session-command-host.js';
+import { bindSessionWhiteboard as persistThenRememberWhiteboard, whiteboardBindFailedMessage } from './services/session-whiteboard-bind.js';
 import type { HostSessionCommand } from './services/session-commands.js';
 import {
   evaluateVcMeetingManagedSend,
@@ -3934,15 +3935,13 @@ async function bindSessionWhiteboard(
   session: SessionData,
   whiteboardId: string,
 ): Promise<boolean> {
-  const bound = await patchSessionWhiteboardAuthoritatively(session, whiteboardId);
-  if (bound) {
-    session.whiteboardId = whiteboardId;
-    return true;
-  }
-  console.error(
-    `白板已创建，但未能绑定到会话 ${session.sessionId}（daemon 不可达或当前进程不能离线写）`,
+  const bound = await persistThenRememberWhiteboard(
+    session,
+    whiteboardId,
+    patchSessionWhiteboardAuthoritatively,
   );
-  return false;
+  if (!bound) console.error(whiteboardBindFailedMessage(session.sessionId));
+  return bound;
 }
 
 function isProcessAlive(pid: number): boolean {
