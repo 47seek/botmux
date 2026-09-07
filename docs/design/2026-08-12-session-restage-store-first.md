@@ -60,7 +60,8 @@ Host 进程可以更换，apply 实现不能分叉：
 
 - **daemon 运行中**：由该 bot 的长驻 daemon（或 supervisor 下的 bot 进程）持有激活。进程拓扑与现状相同。
 - **daemon 未运行**：宿主 CLI（或 supervisor）在本进程执行**同一模块**的 close / abandon / prune / 白板绑定（`services/session-commands.ts#applySessionRowCommand`）。临时 host 的激活 = 一次排他的 store 事务（SQLite `BEGIN IMMEDIATE`，或升级窗口内 JSON 的文件锁）：事务内读 `occupancy` 行判权威、读新鲜行、apply、发布。**不写租约行**——同一事务内的 claim + release 对其它连接不可观测；而跨多步 abandon 持有租约只会让期间启动的 daemon 按接管规则被判 `displaced`，直到下一个心跳 tick 才重试。多步命令的每一步在各自事务内重验权威。`mutateSessionRowOffline` 这种「任意闭包改行」的入口已删除；非 owner 进程只能对行施加 `HostSessionCommand`。今天走这条路径的只有宿主 CLI 与 dashboard 进程（删板解绑）——supervisor 不写会话行。
-- **沙盒内的 CLI 不能成为 host。** `botmux send` 一类跑在 bwrap / Seatbelt 里的进程对会话库只有 readOnly 授权，也读不到 daemon IPC secret（改用本轮的 origin capability 证明身份）。它只能发命令；daemon 不在时它明确失败，不能退化成自己写盘。判定用正向信号（`core/managed-origin-capability.ts#isIsolatedCliProcess`：沙盒 outbox env、宿主打的 read-isolation env、宿主给每种隔离形态都打的 origin channel env、探针 inode 上的内核拒绝），**不用「读不到 secret」**——从未跑过 daemon 的机器上宿主 shell 也读不到 secret，它必须保留离线 close。
+- **沙盒内的 CLI 不能成为 host。** `botmux send` 一类跑在 bwrap / Seatbelt 里的进程读不到 daemon IPC secret（改用本轮的 origin capability 证明身份）。它只能发命令；daemon 不在时它明确失败，不能退化成自己写盘。判定用正向信号（`core/managed-origin-capability.ts#isIsolatedCliProcess`：沙盒 outbox env、宿主打的 read-isolation env、宿主给每种隔离形态都打的 origin channel env、探针 inode 上的内核拒绝），**不用「读不到 secret」**——从未跑过 daemon 的机器上宿主 shell 也读不到 secret，它必须保留离线 close。
+  ⚠️ 这道闸的依据是 **confused-deputy**，不是「它反正写不了盘」：只有 full sandbox 对会话库是 readOnly；credential-only 的 bwrap / Seatbelt 只掩掉 `device-auth` 与根级凭据文件，`BOTMUX_HOME`（含 `session-stores/`）对子进程**仍然可写**（见 `worker.ts` 挂载处 “leaving BOTMUX_HOME itself live and writable” 的注释，以及 `isIsolatedCliProcess` 的 docstring）。挡的是被 prompt 注入的 agent 借官方原语离线改会话行——**不要按「反正写不了」把 origin-channel 那条判定删掉**。
 
 持久化：
 
