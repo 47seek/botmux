@@ -437,9 +437,10 @@ describe('botmux delete — daemon-first close', () => {
 
   it('fails closed when only BOTMUX_ORIGIN_CHANNEL_ID is set and no daemon is reachable', async () => {
     // The worker stamps this on every isolated child (full sandbox, read
-    // isolation, credential-only). Those children are not a store host. A
-    // host shell never receives the variable from device enrollment — this
-    // case is the child, not `botmux delete` typed in a normal terminal.
+    // isolation, credential-only). Those children must not become a store
+    // host: credential-only still leaves ~/.botmux writable, so this is a
+    // confused-deputy gate, not "the write would fail anyway". A host shell
+    // never receives the variable from device enrollment.
     const dataDir = mkdtempSync(join(tmpdir(), 'botmux-delete-data-'));
     tempDirs.push(dataDir);
     const session = makeSession('sess-delete-origin-channel');

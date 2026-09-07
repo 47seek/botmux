@@ -363,10 +363,15 @@ export function managedOriginLegacyIsolationProbeAccess(
  * child for every isolation flavour (full sandbox, credential-only
  * Seatbelt/bwrap, read isolation). Device enrollment does NOT put this in
  * the host shell — a user's `botmux delete` in a normal terminal stays a
- * host even on a registered machine. The child that does carry the stamp
- * also cannot write `~/.botmux` (credential-only denies that tree), so
- * fail-closed here is the same product rule as sandbox, not a host-shell
- * regression.
+ * host even on a registered machine.
+ *
+ * Fail-closed is a confused-deputy gate, not a filesystem consolation.
+ * Credential-only bwrap masks `device-auth` and leaves `BOTMUX_HOME` itself
+ * live and writable (`worker.ts` prepares that shape). A prompt-injected
+ * agent in that child can still write the session store; this predicate
+ * is what stops `botmux delete` from becoming an offline store host when
+ * the daemon is down. Do not delete the origin-channel arm on the reading
+ * "it couldn't write anyway".
  */
 export function isIsolatedCliProcess(
   env: NodeJS.ProcessEnv,

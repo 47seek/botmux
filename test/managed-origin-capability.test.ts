@@ -304,7 +304,8 @@ describe('isIsolatedCliProcess', () => {
       expect(isIsolatedCliProcess({ BOTMUX_SEND_RELAY: '/tmp/relay' }, home)).toBe(true);
       expect(isIsolatedCliProcess({ BOTMUX_READ_ISOLATED: '1' }, home)).toBe(true);
       // Worker-stamped origin channel (sandbox / read-isolation / credential-only
-      // children). A host shell is never given this variable by device enrollment.
+      // children). Credential-only can still write ~/.botmux; this arm is the
+      // confused-deputy gate. A host shell is never given this variable.
       expect(isIsolatedCliProcess({ BOTMUX_ORIGIN_CHANNEL_ID: 'ab'.repeat(32) }, home)).toBe(true);
     } finally {
       rmSync(home, { recursive: true, force: true });
