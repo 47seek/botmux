@@ -123,13 +123,16 @@ import {
   updateTaskWithOptionalPrecondition,
   type SchedulePreconditionMutation,
 } from './schedule-precondition-config.js';
-import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners, forkWorker, suspendWorker, killWorker, latestPerBotEnvForRestart, latestModelForRespawn, getDaemonReplyCardUsageSnapshot, sessionSupportsWebTerminal, sendWorkerSessionInput, isSessionTransferring, mojoCloseResidualForRow, getDaemonBootId } from './worker-pool.js';
+import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners, forkWorker, suspendWorker, killWorker, latestPerBotEnvForRestart, latestModelForRespawn, getDaemonReplyCardUsageSnapshot, sessionSupportsWebTerminal, sendWorkerSessionInput, isSessionTransferring, mojoCloseResidualForRow, getDaemonBootId, CARD_POSTING_SENTINEL } from './worker-pool.js';
 import { listOnlineDaemons } from '../utils/daemon-discovery.js';
 import { isSessionStopped } from './session-liveness.js';
 import { isRemoteBackendType, isRemoteCliId, isSuspendableBackendType } from './persistent-backend.js';
-import { getChatMode, replyMessage, sendMessage, resolveUnionIdFromOpenId, listThreadMessages, listChatMessages, listChatMessagesUntil, listChatBotMembers, getUserProfile, getUserProfileStrict, resolveAllowedUsersWithMap, type ChatBotMember } from '../im/lark/client.js';
+import { getChatMode, replyMessage, sendMessage, resolveUnionIdFromOpenId, listThreadMessages, listChatMessages, listChatMessagesUntil, listChatBotMembers, getUserProfile, getUserProfileStrict, resolveAllowedUsersWithMap, getMessageThreadId, type ChatBotMember } from '../im/lark/client.js';
+import { fillNativeTopicId, isNativeTopicId } from './native-topic-id.js';
+import { publishNativeTopicLinkPatchForSession } from './session-activity.js';
 import { parseApiMessage, cardContentHasUpgradeFallback, resolveMergedCardContent, messageMentionsBot } from '../im/lark/message-parser.js';
 import { resumeSession, spawnDashboardSession, activateQueuedSession, closeCliMismatchedSessionsForBot } from './session-manager.js';
+import { reconcileResumedStreamingCard } from './resume-streaming-card.js';
 
 import { parseSpawnRequest } from './session-create.js';
 import { cleanupMaterializedDashboardImages, materializeDashboardImages } from './dashboard-images.js';
@@ -139,6 +142,7 @@ import { locateLimiter } from './dashboard-locate.js';
 import { DEFAULT_SESSION_OWNER_REMINDER } from './session-owner-reminder.js';
 import { updateSessionOwnerReminderConfig } from '../services/session-owner-reminder-config-store.js';
 import { sendSessionOwnerThreadNotification } from '../services/session-owner-notification.js';
+import { matchesExpectedSessionLocateScope, type SessionLocateExpectedScope } from './session-locate-guard.js';
 import { buildTerminalUrl } from './terminal-url.js';
 import { dashboardEventBus } from './dashboard-events.js';
 import { validateWorkingDir } from './working-dir.js';
@@ -1190,6 +1194,46 @@ ipcRoute('GET', '/api/sessions/:sessionId', (_req, res, params) => {
     });
   }
   jsonRes(res, 404, { error: 'not_found' });
+});
+
+const topicIdResolveInFlight = new Map<string, Promise<{ ok: boolean; status: string }>>();
+const topicIdResolveCooldownUntil = new Map<string, number>();
+const TOPIC_ID_RESOLVE_COOLDOWN_MS = 5 * 60_000;
+
+ipcRoute('POST', '/api/sessions/:sessionId/resolve-thread-id', async (_req, res, params) => {
+  const sessionId = params.sessionId;
+  const existing = topicIdResolveInFlight.get(sessionId);
+  if (existing) return jsonRes(res, 200, await existing);
+  const task = (async () => {
+    const session = findOwnedSessionRecord(sessionId);
+    if (!session) return { ok: false, status: 'not_found' };
+    if (session.scope !== 'thread' || !/^om_[A-Za-z0-9_-]+$/.test(session.rootMessageId)) {
+      return { ok: true, status: 'ineligible' };
+    }
+    if (isNativeTopicId(session.larkThreadId)) return { ok: true, status: 'already_present' };
+    if ((topicIdResolveCooldownUntil.get(sessionId) ?? 0) > Date.now()) return { ok: true, status: 'unresolved' };
+    let nativeId: string | null;
+    try {
+      nativeId = await getMessageThreadId(session.larkAppId || cachedLarkAppId, session.rootMessageId);
+    } catch {
+      topicIdResolveCooldownUntil.set(sessionId, Date.now() + TOPIC_ID_RESOLVE_COOLDOWN_MS);
+      return { ok: false, status: 'unresolved' };
+    }
+    // Re-read after the remote call: a normal inbound event may have filled it.
+    const current = findOwnedSessionRecord(sessionId);
+    if (!current) return { ok: false, status: 'not_found' };
+    if (isNativeTopicId(current.larkThreadId)) return { ok: true, status: 'already_present' };
+    if (!fillNativeTopicId(current, 'thread', nativeId)) {
+      topicIdResolveCooldownUntil.set(sessionId, Date.now() + TOPIC_ID_RESOLVE_COOLDOWN_MS);
+      return { ok: true, status: 'unresolved' };
+    }
+    sessionStore.updateSession(current);
+    publishNativeTopicLinkPatchForSession(current);
+    topicIdResolveCooldownUntil.delete(sessionId);
+    return { ok: true, status: 'resolved' };
+  })();
+  topicIdResolveInFlight.set(sessionId, task);
+  try { return jsonRes(res, 200, await task); } finally { topicIdResolveInFlight.delete(sessionId); }
 });
 
 /** Low-frequency card-display read used by `botmux send`. Keeping the
@@ -2863,6 +2907,15 @@ function workingDirForSession(sessionId: string): string | undefined {
  * the original Lark thread so users see why the session is alive again.
  */
 ipcRoute('POST', '/api/sessions/:sessionId/resume', async (req, res, params) => {
+  const parsedBody = await readJsonBody<unknown>(req, 4_096).catch(() => ({}));
+  // JSON accepts null, arrays, and scalars. Treat all non-record input as an
+  // empty option bag before resuming, so a malformed optional body can never
+  // turn a successful state transition into a 500 below.
+  const body: { reconcileStreamingCard?: unknown } = parsedBody !== null
+    && typeof parsedBody === 'object'
+    && !Array.isArray(parsedBody)
+    ? parsedBody as { reconcileStreamingCard?: unknown }
+    : {};
   const sessionId = params.sessionId;
   const sourceSession = findSessionRecord(sessionId);
   if (!sourceSession) return jsonRes(res, 404, { ok: false, error: 'not_found' });
@@ -2907,17 +2960,47 @@ ipcRoute('POST', '/api/sessions/:sessionId/resume', async (req, res, params) => 
   const cliName = sessionConfiguredRuntimeDisplayName(ds.session, botCfg?.cliRuntime)
     ?? getCliDisplayName(cliId ?? botCfg?.cliId ?? 'claude-code');
   const notice = JSON.stringify({ text: `🔄 会话已通过命令行恢复，发条消息继续与 ${cliName} 对话。` });
-  if (ds.larkAppId && !sessionTransportDisabled(ds)) {
-    if (ds.scope === 'chat' && ds.chatId) {
-      getChatMode(ds.larkAppId, ds.chatId, { forceRefresh: true })
-        .then((mode) => mode === 'topic' && ds.session.rootMessageId
-          ? replyMessage(ds.larkAppId, ds.session.rootMessageId, notice, 'text', true)
-          : sendMessage(ds.larkAppId, ds.chatId, notice, 'text'))
-        .catch(err => logger.debug(`[resume] failed to post chat-scope resume notice: ${err}`));
-    } else if (ds.session.rootMessageId) {
-      replyMessage(ds.larkAppId, ds.session.rootMessageId, notice, 'text', true)
-        .catch(err => logger.debug(`[resume] failed to post thread-scope resume notice: ${err}`));
+  const postResumeNotice = async (): Promise<void> => {
+    if (!ds.larkAppId) return;
+    if (!sessionTransportDisabled(ds)) {
+      if (ds.scope === 'chat' && ds.chatId) {
+        await getChatMode(ds.larkAppId, ds.chatId, { forceRefresh: true })
+          .then((mode) => mode === 'topic' && ds.session.rootMessageId
+            ? replyMessage(ds.larkAppId, ds.session.rootMessageId, notice, 'text', true)
+            : sendMessage(ds.larkAppId, ds.chatId, notice, 'text'))
+          .catch(err => logger.debug(`[resume] failed to post chat-scope resume notice: ${err}`));
+      } else if (ds.session.rootMessageId) {
+        await replyMessage(ds.larkAppId, ds.session.rootMessageId, notice, 'text', true)
+          .catch(err => logger.debug(`[resume] failed to post thread-scope resume notice: ${err}`));
+      }
     }
+  };
+
+  // `/sessions` resumes from a card outside the original topic, so there is no
+  // clicked in-topic card callback to replace the stale "session closed" card.
+  // Opt in explicitly from that caller: publish the fresh waiting card first,
+  // then withdraw its predecessor. Keep CLI/dashboard resume behavior stable.
+  const staleCardId = ds.streamCardId;
+  const shouldReconcileStreamingCard = body.reconcileStreamingCard === true
+    && ds.scope === 'thread'
+    && !!ds.session.rootMessageId
+    && !!staleCardId
+    && staleCardId !== CARD_POSTING_SENTINEL
+    && botCfg?.privateCard !== true;
+  if (shouldReconcileStreamingCard) {
+    const rootMessageId = ds.session.rootMessageId!;
+    void reconcileResumedStreamingCard(
+      ds,
+      staleCardId,
+      cardJson => replyMessage(ds.larkAppId, rootMessageId, cardJson, 'interactive', true),
+    ).then(async (result) => {
+      if (result.status === 'committed') await postResumeNotice();
+    }).catch(async (err) => {
+      logger.warn(`[resume] failed to reconcile original streaming card: ${err instanceof Error ? err.message : String(err)}`);
+      await postResumeNotice();
+    });
+  } else {
+    void postResumeNotice();
   }
 
   // Report the EFFECTIVE action, not the raw request flag: only fork when wake
@@ -3062,8 +3145,21 @@ ipcRoute('POST', '/api/sessions/migrate-to-chat', async (req, res) => {
   jsonRes(res, 200, { ok: true, sessionId: ds.session.sessionId });
 });
 
-ipcRoute('POST', '/api/sessions/:sessionId/locate', async (_req, res, params) => {
+ipcRoute('POST', '/api/sessions/:sessionId/locate', async (req, res, params) => {
   const sid = params.sessionId;
+  let body: unknown;
+  try {
+    body = await readJsonBody(req, 8 * 1024);
+  } catch (err) {
+    return jsonRes(res, err instanceof JsonBodyTooLargeError ? 413 : 400, {
+      ok: false,
+      error: err instanceof JsonBodyTooLargeError ? 'body_too_large' : 'invalid_json',
+    });
+  }
+  if (body === null || typeof body !== 'object' || Array.isArray(body)) {
+    return jsonRes(res, 400, { ok: false, error: 'body_must_be_object' });
+  }
+  const expected = body as SessionLocateExpectedScope;
   const acq = locateLimiter.tryAcquire(sid);
   if (!acq.ok) {
     res.writeHead(429, {
@@ -3082,18 +3178,31 @@ ipcRoute('POST', '/api/sessions/:sessionId/locate', async (_req, res, params) =>
   const ctx = ds
     ? {
         larkAppId: ds.larkAppId,
+        chatId: ds.chatId,
+        scope: ds.session.scope,
+        status: ds.session.status,
         rootMessageId: ds.session.rootMessageId,
         ownerOpenId: ds.session.ownerOpenId,
       }
     : closed
       ? {
           larkAppId: closed.larkAppId ?? '',
+          chatId: closed.chatId,
+          scope: closed.scope,
+          status: closed.status,
           rootMessageId: closed.rootMessageId,
           ownerOpenId: closed.ownerOpenId,
         }
       : null;
   if (!ctx || !ctx.larkAppId) {
     return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
+  }
+  // Optional compare-before-locate guard used by the public `/sessions` card.
+  // Existing dashboard callers send `{}` and keep their historical behavior.
+  // When present, every field is checked against the daemon's latest row so a
+  // transfer/close racing the card handler's fresh GET fails closed here.
+  if (!matchesExpectedSessionLocateScope(ctx, expected)) {
+    return jsonRes(res, 409, { ok: false, error: 'session_scope_changed' });
   }
   if (!ctx.ownerOpenId) {
     return jsonRes(res, 422, { ok: false, error: 'no_owner' });
