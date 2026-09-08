@@ -16,7 +16,7 @@ import { forkWorker, sendWorkerInput, promoteQueuedActivationTail, forkAdoptWork
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import type { CliAdapter } from '../adapters/cli/types.js';
 import { botHomePath } from '../adapters/cli/read-isolation.js';
-import { buildBotmuxShellHints } from '../adapters/cli/shared-hints.js';
+import { buildBotmuxShellHints, buildCredentialBoundaryBlock } from '../adapters/cli/shared-hints.js';
 import {
   resolveSkillInjectionModeForApp,
   builtinSkillEntries,
@@ -626,7 +626,7 @@ export function getProjectScanDirs(ds?: DaemonSession): string[] {
 
 // ─── Attachment download ─────────────────────────────────────────────────────
 
-export async function downloadResources(larkAppId: string, messageId: string, resources: MessageResource[]): Promise<{ attachments: LarkAttachment[]; needLogin: boolean }> {
+export async function downloadResources(larkAppId: string, messageId: string, resources: MessageResource[], senderOpenId?: string): Promise<{ attachments: LarkAttachment[]; needLogin: boolean }> {
   if (resources.length === 0) return { attachments: [], needLogin: false };
 
   const attachments: LarkAttachment[] = [];
@@ -648,7 +648,10 @@ export async function downloadResources(larkAppId: string, messageId: string, re
     const savePath = join(dir, res.name);
     try {
       const resMessageId = res.messageId ?? messageId;
-      await downloadMessageResource(larkAppId, resMessageId, res.key, res.type, savePath);
+      // Whose token backs the user-token fallback: the person who sent the
+      // attachment. They can see what they just posted, and the download is
+      // attributed to them rather than to whoever happens to be logged in.
+      await downloadMessageResource(larkAppId, resMessageId, res.key, res.type, savePath, senderOpenId);
       attachments.push({ type: res.type, path: savePath, name: res.name });
     } catch (err: any) {
       // Per-failure log stays at info to aid retries.
@@ -1092,6 +1095,15 @@ function sessionIsNoTransport(larkAppId?: string, chatId?: string): boolean {
   return !larkTransportEnabled({ chatId, apiOnly });
 }
 
+/** Whether this bot enabled trigger-user CLI auth, for the inline-prompt path.
+ *  Absent bot / unreadable config → false: an uncertain answer must not add a
+ *  block claiming a boundary that is not configured. */
+function triggerUserAuthEnabledForPrompt(larkAppId?: string): boolean {
+  if (!larkAppId) return false;
+  try { return getBot(larkAppId).config.triggerUserAuth?.enabled === true; }
+  catch { return false; }
+}
+
 /** opening 构建选项。在原有 larkAppId/chatId/whiteboardId 等之外，新增 hook 模式
  *  （#794 后续）所需的 turnId 与 sessionBackendType：turnId 是 opening 轮的权威
  *  turnId（= 发给 worker 的 turnId，最终成为 managedTurnOrigin.turnId），用于
@@ -1106,7 +1118,7 @@ type NewTopicOpts = {
   sessionBackendType?: BackendType;
 };
 
-type NewTopicBlockKey = 'routing' | 'skill' | 'identity' | 'sessionId' | 'role'
+type NewTopicBlockKey = 'routing' | 'skill' | 'identity' | 'credentials' | 'sessionId' | 'role'
   | 'summaryMemory' | 'whiteboard' | 'chatContextPolicy' | 'chatContext'
   | 'userMessage' | 'sender' | 'substitute' | 'senderNote' | 'attachments'
   | 'mentions' | 'availableBots';
@@ -1227,6 +1239,25 @@ function buildNewTopicBlocks(
     if (routingBlock) blocks.push({ key: 'routing', text: routingBlock });
     if (skillBlock) blocks.push({ key: 'skill', text: skillBlock });
     if (identityBlock) blocks.push({ key: 'identity', text: identityBlock });
+    // Trigger-user auth: the same credential boundary the claude-family adapters
+    // get via --append-system-prompt. Without it the inline-prompt CLIs
+    // (codex/gemini/…) would run with NO constraint at all — and since that is
+    // this release's only protection, a missing block there is a silent hole.
+    //
+    // Deliberately NOT added to ENVELOPE_KEYS. Today that choice is inert:
+    // hook mode requires `supportsInvisiblePromptHook`, which only claude-code
+    // has, and claude-code has `injectsSessionContext` — so this whole branch is
+    // skipped for it and a `credentials` block is never produced in hook mode
+    // (verified: claude-code's opening prompt carries no <botmux_credentials>;
+    // it gets the block via --append-system-prompt instead).
+    //
+    // Kept out of the envelope anyway, because the day another CLI becomes
+    // hook-capable this is the difference between the agent seeing the boundary
+    // and not. An envelope the CLI cannot read drops the block silently —
+    // nothing errors when a constraint is merely absent.
+    if (triggerUserAuthEnabledForPrompt(opts?.larkAppId)) {
+      blocks.push({ key: 'credentials', text: buildCredentialBoundaryBlock(locale) });
+    }
     blocks.push({ key: 'sessionId', text: `<session_id>${xmlEscape(sessionId)}</session_id>` });
   }
   if (roleBlock) blocks.push({ key: 'role', text: roleBlock });

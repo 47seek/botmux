@@ -326,6 +326,7 @@ import {
   resumeSession,
   closeCliMismatchedSessionsForBot,
 } from './core/session-manager.js';
+import { publishTurnCliIdentity } from './core/turn-cli-identity.js';
 import { triggerSessionTurn, reconcileIdempotencyLeasesOnBoot, convergeIdempotentAsyncTurnOnWorkerExit, externalEventOpensOwnTopic } from './core/trigger-session.js';
 import {
   runIdempotencyFailClose,
@@ -341,7 +342,7 @@ import { claimInitialUserTurn, isInitialUserTurnPending, releaseInitialUserTurn 
 import { applyQueuedCodexAppLegacyFallback, mergeQueuedCodexAppTurn } from './core/session-create.js';
 import { fillNativeTopicId } from './core/native-topic-id.js';
 import { findOnlineDaemon, listOnlineDaemons } from './utils/daemon-discovery.js';
-import { beginReplyTargetTurn, buildTurnParticipantsFrom, chatSessionAnsweredRootAtTopLevel, fallbackTurnId, isSubstituteTurn, resolveInboundReplyTarget, resolveSessionReplyTarget, syncReplyTargetState } from './core/reply-target.js';
+import { beginReplyTargetTurn, buildTurnParticipantsFrom, chatSessionAnsweredRootAtTopLevel, fallbackTurnId, isSubstituteTurn, pickTurnReplyTarget, resolveInboundReplyTarget, resolveSessionReplyTarget, syncReplyTargetState } from './core/reply-target.js';
 import { readDeferredTopicBinding } from './core/deferred-topic-binding.js';
 import {
   buildBotmuxLarkNativeSessionTitle,
@@ -3510,6 +3511,21 @@ export async function noteTurnReceived(
   _turnId?: string,
   receivedReactionEmoji?: string,
 ): Promise<void> {
+  // Trigger-user CLI auth: publish (or withhold) the acting identity for THIS
+  // turn. This is the per-message acceptance point — every inbound turn passes
+  // through here before reaching the worker — so it is the one place that can
+  // guarantee no turn runs with the previous sender's credentials still on disk.
+  // It precedes the reaction bookkeeping and its early returns: a card-on session
+  // returns below, but its turns need the identity refreshed just the same.
+  //
+  // The enablement check is SYNCHRONOUS on purpose. An unconditional `await`
+  // here would yield a microtask before the bookkeeping below on every turn of
+  // every bot, reordering concurrent turns that the single-flight paths depend
+  // on. A feature that is off must not perturb timing at all, so the await only
+  // happens once a bot has actually opted in.
+  if (triggerUserAuthEnabledFor(ds)) {
+    await refreshTurnCliIdentity(ds, _turnId ?? triggerMessageId);
+  }
   // Replaces the old 「处理中」 placeholder card. That card existed only to be
   // PATCHed with the final answer, and `im.v1.message.patch` is silent (no Feishu
   // notification / unread) — so card-off answers could land unseen. The
@@ -3554,6 +3570,65 @@ export async function noteTurnReceived(
     return;
   }
   (ds.pendingAckReactions ??= []).push({ messageId: triggerMessageId, reactionId });
+}
+
+/**
+ * Publish the acting CLI identity for one turn, and tell the sender when they
+ * need to authorize.
+ *
+ * The sender comes from the daemon's own per-turn record (`replyTargets`, via
+ * {@link pickTurnReplyTarget}), falling back to the session's last caller. Both
+ * are daemon-owned: a worker contributes only a turn id and can never choose
+ * which human that id denotes.
+ *
+ * The "please authorize" notice is sent at most once per session per tool. A
+ * repeat on every turn would be noise, and the sender already has the link.
+ */
+/** Whether this session's bot opted into trigger-user CLI auth. Synchronous so a
+ *  bot that has not opted in adds no await boundary to the turn path at all. */
+function triggerUserAuthEnabledFor(ds: DaemonSession): boolean {
+  try { return getBot(ds.larkAppId).config.triggerUserAuth?.enabled === true; }
+  catch { return false; }
+}
+
+async function refreshTurnCliIdentity(ds: DaemonSession, turnId: string): Promise<void> {
+  let botConfig;
+  try { botConfig = getBot(ds.larkAppId).config; } catch { return; }
+  if (!botConfig.triggerUserAuth?.enabled) return;
+
+  // Strictly this turn's sender. NOT `lastCallerOpenId`: that is the last human
+  // who happened to talk to the session, and a turn with no sender of its own
+  // (scheduled run, hook, meeting event, bot-to-bot handoff) is exactly the case
+  // where borrowing them would run someone else's automation under their name,
+  // silently and with their permissions.
+  const senderOpenId = pickTurnReplyTarget(ds.session, turnId)?.senderOpenId;
+
+  await publishTurnCliIdentity({
+    botConfig,
+    sessionDataDir: config.session.dataDir,
+    sessionId: ds.session.sessionId,
+    senderOpenId,
+    locale: localeForBot(ds.larkAppId),
+    // Stamped so the wrapper can tell these credentials apart from a later
+    // message's: acceptance here is not the same instant as the CLI starting
+    // this turn, and B's message can be accepted while A's turn still runs.
+    turnId,
+  });
+
+  // NO chat notice here.
+  //
+  // This ran at message-acceptance, before the agent had decided which tool it
+  // would use, so it announced every governed tool that lacked credentials.
+  // Ask for lark-cli and you were told to authorize bytedcli as well — advice
+  // for something you were not doing. It was also once-per-session, so the one
+  // time it WOULD have been useful (you finally do call bytedcli and it is
+  // refused) it stayed silent.
+  //
+  // The refusal already carries this. The wrapper prints, on stderr, which tool
+  // was refused and which command authorizes it — at the moment of the refusal,
+  // for that tool only, every time it happens. That is strictly better
+  // information than a guess made a second earlier, so the guess is gone rather
+  // than being made narrower.
 }
 
 async function sessionReply(
@@ -18000,6 +18075,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
       data.message?.content ?? '',
       parsed.content,
       (text) => replyMessage(larkAppId, replyAnchorId, text, 'text'),
+      parsed.senderId,
     );
     if (audioOutcome.kind === 'transcribed') {
       parsed.content = audioOutcome.text;
@@ -18450,7 +18526,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   }
 
   // Download attachments
-  const { attachments, needLogin } = await downloadResources(larkAppId, messageId, resources);
+  const { attachments, needLogin } = await downloadResources(larkAppId, messageId, resources, senderOpenId);
   if (attachments.length > 0) {
     parsed.attachments = attachments;
   }
@@ -19469,6 +19545,7 @@ async function handleThreadReplyAdmitted(
       data.message?.content ?? '',
       parsed.content,
       (text) => replyMessage(larkAppId, anchor, text, 'text'),
+      parsed.senderId,
     );
     if (audioOutcome.kind === 'transcribed') {
       parsed.content = audioOutcome.text;
@@ -20060,11 +20137,14 @@ async function handleThreadReplyAdmitted(
 
   // Download attachments
   const effectiveAppId = ds?.larkAppId ?? larkAppId;
+  // Same value the turn record below is built from; read here because the
+  // user-token fallback for a download should use the SENDER's own credentials.
+  const inboundSenderOpenId = parsed.senderId || data?.sender?.sender_id?.open_id;
   let attachments: LarkAttachment[];
   if (prepared) {
     attachments = prepared.attachments;
   } else {
-    const downloaded = await downloadResources(effectiveAppId, parsed.messageId, resources);
+    const downloaded = await downloadResources(effectiveAppId, parsed.messageId, resources, inboundSenderOpenId);
     attachments = downloaded.attachments;
     if (attachments.length > 0) {
       parsed.attachments = attachments;
@@ -20077,7 +20157,7 @@ async function handleThreadReplyAdmitted(
   // Update last message time + last caller (used by `botmux send` to address
   // reply cards to whoever triggered this turn — matters in oncall groups
   // where the caller is often not the session owner).
-  const callerOpenId = parsed.senderId || data?.sender?.sender_id?.open_id;
+  const callerOpenId = inboundSenderOpenId;
   if (ds) {
     markSessionActivity(ds, Date.now(), { human: parsed.senderType === 'user' && !isForeignBot });
     // quoteTargetId changes every inbound message (always a new message_id), so
