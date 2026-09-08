@@ -6252,6 +6252,8 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
        --proactive                    标记为 AI 主动改名（应用 10 分钟防抖）
   send [content]                       发消息到当前话题（支持 stdin / --content-file）
        --images <path>                 内联图片（可重复）
+       --image-mode <mode>             独立单图：fit_horizontal（默认）|medium|small|tiny
+                                      medium/small/tiny 等比占宽 1/2、1/3、1/4，完整显示不裁剪
        --files <path>                  附件（可重复）
        --videos <path>                 视频预览 MP4（可重复，需配套 --video-covers）
        --video-covers <path>           视频封面图片（可重复，按顺序对应 --videos）
@@ -8474,6 +8476,12 @@ async function cmdSend(rest: string[]): Promise<void> {
     console.error('botmux send: --card-json 与 --card-file 不能同时使用');
     process.exit(2);
   }
+  const imageMode = argValue(rest, '--image-mode') ?? 'fit_horizontal';
+  if (flagPresentButValueMissing(rest, '--image-mode')
+    || !['fit_horizontal', 'medium', 'small', 'tiny'].includes(imageMode)) {
+    console.error('botmux send: --image-mode 仅支持 fit_horizontal|medium|small|tiny');
+    process.exit(2);
+  }
   const images = argValues(rest, '--image', '--images');
   const files = argValues(rest, '--file', '--files');
   const videos = argValues(rest, '--video', '--videos');
@@ -10068,7 +10076,7 @@ async function cmdSend(rest: string[]): Promise<void> {
           ? 'lexical'
           : 'filesystem';
       const elements = (md || imageKeys.length > 0)
-        ? buildImageCardElements(md, imageKeys, process.cwd(), localHomeLinkMode)
+        ? buildImageCardElements(md, imageKeys, process.cwd(), localHomeLinkMode, imageMode)
         : [];
 
       // Footer: de-emphasized markdown (v2 dropped the `note` tag). Use small
