@@ -996,12 +996,12 @@ describe('dsh-tui buildArgs (PTY TUI model)', () => {
     expect(adapter.readyPattern?.test('❯ ')).toBe(true);
   });
 
-  it('defers the first prompt until the TUI composer is ready', () => {
+  it('defers the first prompt until the TUI composer is ready (three-stage boot)', () => {
     expect(adapter.deferFirstPromptTimeoutUntilReady).toBe(true);
   });
 
-  it('does not type ahead', () => {
-    expect(adapter.supportsTypeAhead).not.toBe(true);
+  it('supports type-ahead so queued messages are written while the TUI is busy', () => {
+    expect(adapter.supportsTypeAhead).toBe(true);
   });
 
   it('exposes and pre-creates configured DSH_HOME plus ~/.dsh-tui as auth paths', () => {
