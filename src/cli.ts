@@ -62,6 +62,7 @@ import {
 } from './autostart.js';
 import { tmuxEnv } from './setup/ensure-tmux.js';
 import { writeBotsJsonAtomic as writeBotsAtomic } from './setup/bots-store.js';
+import { findQuotaFallbackCycles } from './services/quota-fallback.js';
 import {
   applyBotConfigEdits,
   assertUniqueBotProcessNames,
@@ -404,6 +405,21 @@ function loadBotsJson(): any[] {
     }
   }
   return [];
+}
+
+function preflightQuotaFallbackTopology(
+  bots: any[],
+  action: 'start' | 'restart',
+  report = true,
+): Set<string> {
+  const cycles = findQuotaFallbackCycles(bots);
+  const blocked = new Set(cycles.flat());
+  if (cycles.length === 0 || !report) return blocked;
+  console.warn(`\n⚠️  daemon ${action} 前自检发现额度耗尽交接配置存在循环。`);
+  for (const cycle of cycles) console.warn(`   环路: ${cycle.join(' → ')}`);
+  console.warn(`   已跳过 ${blocked.size} 个环路 Bot；Dashboard 和其它 Bot 将继续启动。`);
+  console.warn('   修复入口: Dashboard → Bot 配置 → 高级 → 额度耗尽交接');
+  return blocked;
 }
 
 function ensureBotWorkingDirsExist(bot: Record<string, any>, context = 'workingDir'): boolean {
@@ -2474,10 +2490,12 @@ async function cmdStart(): Promise<void> {
 /** Validate before systemd handoff so a predictable failure cannot stop the old fleet. */
 async function preflightConfiguredBotCredentials() {
   const botsForCheck = loadBotsJson();
+  const blockedBotIds = preflightQuotaFallbackTopology(botsForCheck, 'start');
   if (botsForCheck.length > 0) {
     const { validateCredentials } = await import('./setup/verify-permissions.js');
     const invalid: Array<{ appId: string; reason: string }> = [];
     for (const b of botsForCheck) {
+      if (blockedBotIds.has(b.larkAppId)) continue;
       if (!b.larkAppId || !b.larkAppSecret) {
         invalid.push({ appId: b.larkAppId || '(空 appId)', reason: 'larkAppId/larkAppSecret 缺失' });
         continue;
@@ -2542,8 +2560,12 @@ async function startConfiguredFleet(
     autoOnly: true,
   });
   const bots = loadBotsJson();
-  const count = bots.length || 1;
-  console.log(`\n✅ daemon 已启动${count > 1 ? ` (${count} 个机器人, 每个独立进程)` : ''}`);
+  const blockedCount = new Set(findQuotaFallbackCycles(bots).flat()).size;
+  const count = Math.max(0, bots.length - blockedCount);
+  console.log(count === 0
+    ? '\n✅ Dashboard 已启动 (0 个 Bot daemon)'
+    : `\n✅ daemon 已启动${count > 1 ? ` (${count} 个机器人, 每个独立进程)` : ''}`);
+  if (blockedCount > 0) console.log(`   已跳过 ${blockedCount} 个额度交接环路 Bot，请在 Dashboard 修复后重启`);
   console.log(`   日志: botmux logs`);
   console.log(`   状态: botmux status`);
   // If the user previously enabled autostart, sync the unit file in case the
@@ -2665,6 +2687,9 @@ async function cmdRestart(): Promise<void> {
   }
   ensureConfigDir();
   await withFileLock(PM2_FLEET_MUTATION_LOCK_TARGET, async () => {
+    // Report recovery guidance before any live-fleet mutation. The locked
+    // check below repeats against the exact generation used for restart.
+    preflightQuotaFallbackTopology(loadBotsJson(), 'restart');
     const includePluginServices = process.argv.includes('--with-plugin');
 
     const restartIntentDir = resolveDataDir();
@@ -2681,6 +2706,9 @@ async function cmdRestart(): Promise<void> {
 
     await withFileLock(BOTS_JSON_FILE, async () => {
       const restartBots = loadBotsJson();
+      // Recompute the skip set source against the locked config generation;
+      // resolveFleetMembers applies the same projection in the new supervisor.
+      preflightQuotaFallbackTopology(restartBots, 'restart', false);
       const restartAttemptId = randomBytes(16).toString('hex');
       let restartIntentPrepared = false;
       try {

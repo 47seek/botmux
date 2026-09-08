@@ -4974,6 +4974,7 @@ function beginNewTurn(ds: DaemonSession, title: string, turnId: string): void {
   // while the previous turn is still running) and must not relabel this card.
   ds.currentTurnId = turnId;
   ds.usageLimit = undefined;
+  ds.quotaFallbackAttemptToken = undefined;
   ds.streamCardPending = true;
   ds.streamCardPendingTurnId = turnId;
   ds.streamCardTurnGeneration = (ds.streamCardTurnGeneration ?? 0) + 1;
@@ -20862,6 +20863,7 @@ async function handleThreadReplyAdmitted(
       ds.usageLimitRetryTimer = undefined;
     }
     ds.usageLimit = undefined;
+    ds.quotaFallbackAttemptToken = undefined;
     ds.currentTurnTitle = parsed.content.substring(0, 50);
     // The cosmetic freeze step (above) is gated on a live worker. With no
     // worker we just park the current card in frozenCards — the upcoming
@@ -21517,6 +21519,7 @@ async function handleDocCommentAdmitted(ctx: DocCommentContext): Promise<boolean
       logger.info(`[${tag(ds)}] Worker not running for doc-comment, re-forking...`);
       if (ds.usageLimitRetryTimer) { clearTimeout(ds.usageLimitRetryTimer); ds.usageLimitRetryTimer = undefined; }
       ds.usageLimit = undefined;
+      ds.quotaFallbackAttemptToken = undefined;
       ds.currentTurnTitle = text.substring(0, 50);
       parkStreamCard(ds);
       ds.streamCardId = undefined;

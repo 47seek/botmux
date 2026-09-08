@@ -30,7 +30,7 @@ import { persistStreamCardState, rememberLastCliInput } from './session-manager.
 import { spawnWorker, isStandaloneBinary, WORKER_ENTRY_SUBCOMMAND } from './self-spawn.js';
 import { resolveSessionLaunchModel } from './session-model.js';
 import { fallbackTurnId, frozenReplyContextForTurn, isSubstituteTurn, pickTurnReplyTarget, rehomeReplyTargetState, replyTargetKey } from './reply-target.js';
-import { updateMessage, deleteMessage, pinMessage, unpinMessage, listChatPins, sendEphemeralCard, sendUserMessage, addReaction, removeReaction, getMessageChatId, MessageWithdrawnError, type LarkPinRecord } from '../im/lark/client.js';
+import { updateMessage, deleteMessage, pinMessage, unpinMessage, listChatPins, sendEphemeralCard, sendUserMessage, addReaction, removeReaction, getMessageChatId, resolveCurrentChatBotOpenIdsByLarkAppIds, MessageWithdrawnError, type LarkPinRecord } from '../im/lark/client.js';
 import { buildStreamingCard, buildPrivateSnapshotCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, buildTuiPromptFailedCard, buildRelayedFrozenCard, buildTurnFailedCard, getCliDisplayName } from '../im/lark/card-builder.js';
 import { codexServiceTierBadge } from '../services/codex-service-tier.js';
 import { isFableModelId, normalizeClaudeModelId } from '../services/claude-transcript.js';
@@ -488,6 +488,10 @@ import { isStructuredBridgeAdoptCli } from '../services/structured-bridge-clis.j
 import { resolveEffectivePluginIds } from './plugins/effective.js';
 import { ensureGatewayEntry } from './plugins/mcp/gateway-installer.js';
 import { readPeerCrossRef } from '../services/peer-cross-ref-store.js';
+import {
+  claimQuotaFallbackEvent,
+  resolveQuotaFallbackTarget,
+} from '../services/quota-fallback.js';
 import type {
   CliTurnPayload,
   CodexAppDeliverySink,
@@ -1989,6 +1993,40 @@ function failureNoticeFallbackMentionOpenId(ds: DaemonSession): string | undefin
   return admin;
 }
 
+function isConfiguredLarkBot(appId: string): boolean {
+  try {
+    return loadBotConfigs().some(bot => bot.larkAppId === appId && bot.apiOnly !== true);
+  } catch {
+    return getAllBots().some(bot => bot.config.larkAppId === appId && bot.config.apiOnly !== true);
+  }
+}
+
+/** Resolve the configured stable target App ID into one live mention handle.
+ * The strict local-peer path proves app identity + current membership. Remote
+ * peers fail closed until an equivalent identity proof exists. */
+async function resolveQuotaFallbackForSession(
+  ds: DaemonSession,
+  targetAppId: string,
+) {
+  return resolveQuotaFallbackTarget(ds.larkAppId, ds.chatId, targetAppId, {
+    isLocalConfigured: isConfiguredLarkBot,
+    resolveLocal: async (receiverAppId, chatId, subjectAppId) => {
+      const resolved = await resolveCurrentChatBotOpenIdsByLarkAppIds(
+        receiverAppId,
+        chatId,
+        [subjectAppId],
+      );
+      if (!resolved.ok) {
+        return { ok: false as const, detail: `${resolved.error}: ${resolved.message}` };
+      }
+      const mapping = resolved.mappings.find(row => row.larkAppId === subjectAppId);
+      return mapping
+        ? { ok: true as const, openId: mapping.subjectOpenId }
+        : { ok: false as const, detail: 'strict resolver returned no target mapping' };
+    },
+  });
+}
+
 export function clearUsageLimitState(ds: DaemonSession): void {
   if (ds.usageLimitRetryTimer) {
     clearTimeout(ds.usageLimitRetryTimer);
@@ -1998,6 +2036,9 @@ export function clearUsageLimitState(ds: DaemonSession): void {
   // Re-arm the proactive rate-limit notification latch: the next limit episode
   // (even one with the same usageLimitStateKey) must notify the owner again.
   ds.rateLimitNotifiedKey = undefined;
+  // Only the async ownership token is session-local. Cross-session duplicate
+  // handoffs are suppressed by the source-bot five-minute event window.
+  ds.quotaFallbackAttemptToken = undefined;
   persistStreamCardState(ds);
 }
 
@@ -12389,6 +12430,83 @@ function setupWorkerHandlers(
           scopedReply(notifyText, 'text', msg.turnId).catch((err: any) => {
             logger.debug(`[${t}] Failed to deliver rate-limit notification: ${err?.message ?? err}`);
           });
+        }
+
+        // Optional daemon-side backup-Bot handoff. This deliberately sits next
+        // to (but does not share) the owner-notification latch: the daemon sends
+        // one fixed message with one real <at>, without asking the exhausted CLI
+        // to generate or replay anything. Claim the source-bot/kind five-minute
+        // window BEFORE asynchronous identity resolution/send, so repeated
+        // screen ticks and concurrent limited sessions cannot produce a storm.
+        const quotaFallback = botCfg.quotaFallbackBot;
+        if (
+          ds.lastScreenStatus === 'limited'
+          && prevStatus !== 'limited'
+          && ds.usageLimit
+          && !ds.suppressRecoveryCard
+          && quotaFallback?.enabled === true
+          && quotaFallback.kinds.includes(ds.usageLimit.kind)
+        ) {
+          const limitKey = usageLimitStateKey(ds.usageLimit);
+          const fallbackTurn = fallbackTurnId(ds, msg.turnId);
+          if (!claimQuotaFallbackEvent(ds.larkAppId, ds.usageLimit.kind)) {
+            logger.info(
+              `[${t}] Quota fallback deduplicated within five minutes `
+              + `(kind=${ds.usageLimit.kind}, target=${quotaFallback.targetAppId})`,
+            );
+          } else {
+            const attemptToken = randomUUID();
+            ds.quotaFallbackAttemptToken = attemptToken;
+            const ownsFallbackAttempt = (): boolean =>
+              ownsLifecycleMutation()
+              && ds.quotaFallbackAttemptToken === attemptToken
+              && ds.lastScreenStatus === 'limited'
+              && !!ds.usageLimit
+              && usageLimitStateKey(ds.usageLimit) === limitKey;
+            void resolveQuotaFallbackForSession(ds, quotaFallback.targetAppId)
+              .then(async resolved => {
+                // Identity resolution is asynchronous. Never let a lookup from
+                // a cleared/replaced worker episode post into a later turn —
+                // even when that later episode happens to have the same limit
+                // key (the token distinguishes the two claims).
+                if (!ownsFallbackAttempt()) {
+                  logger.info(
+                    `[${t}] Dropped stale quota fallback resolution for ${quotaFallback.targetAppId}`,
+                  );
+                  return;
+                }
+                if (!resolved.ok) {
+                  logger.warn(
+                    `[${t}] Quota fallback target rejected: target=${quotaFallback.targetAppId} `
+                    + `reason=${resolved.reason}${resolved.detail ? ` detail=${resolved.detail}` : ''}`,
+                  );
+                  return;
+                }
+                const handoff = `<at id=${resolved.openId}></at> ${quotaFallback.message}`;
+                try {
+                  if (!ownsFallbackAttempt()) return;
+                  await scopedReply(handoff, 'text', fallbackTurn);
+                  logger.info(
+                    `[${t}] Quota fallback handed off to ${quotaFallback.targetAppId} `
+                    + `(${resolved.source}) for episode=${limitKey}`,
+                  );
+                } catch (err: any) {
+                  // Keep the daemon-wide five-minute claim. A later frame/session
+                  // must not retry and spam the same peer; owner notice and manual
+                  // retry controls remain available.
+                  logger.warn(
+                    `[${t}] Failed to deliver quota fallback to ${quotaFallback.targetAppId}: `
+                    + `${err?.message ?? err}`,
+                  );
+                }
+              })
+              .catch((err: any) => {
+                logger.warn(
+                  `[${t}] Quota fallback resolution failed for ${quotaFallback.targetAppId}: `
+                  + `${err?.message ?? err}`,
+                );
+              });
+          }
         }
 
         // Bot opted out of the streaming card — dashboard SSE above already got

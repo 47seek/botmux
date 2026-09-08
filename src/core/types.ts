@@ -434,6 +434,10 @@ export interface DaemonSession {
    *  clearUsageLimitState (limit self-heal / turn end) so the next episode can
    *  notify again. In-memory only. */
   rateLimitNotifiedKey?: string;
+  /** Unique claim for the current handoff attempt. Guards an asynchronous
+   * target lookup from posting after this episode cleared and a same-key later
+   * episode started. Cross-session duplicate events use a daemon-wide TTL. */
+  quotaFallbackAttemptToken?: string;
   /** Interval that re-PATCHes the live streaming card with fresh Context/Token
    *  usage while a turn is executing (streaming display mode). Armed on the
    *  working edge, cleared on idle/turn-end/card removal. */

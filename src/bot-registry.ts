@@ -53,6 +53,11 @@ import {
   normalizeSessionOwnerReminderConfig,
   type SessionOwnerReminderConfig,
 } from './core/session-owner-reminder.js';
+import {
+  findQuotaFallbackCycles,
+  normalizeQuotaFallbackBotConfig,
+  type QuotaFallbackBotConfig,
+} from './services/quota-fallback.js';
 import { normalizeCardActionAckTimeoutMs } from './core/card-action-ack.js';
 import type {
   VcMeetingConsumerAgentConfig,
@@ -1621,6 +1626,13 @@ export interface BotConfig {
    * runtime states remain unchanged. Missing means disabled. */
   sessionOwnerReminder?: SessionOwnerReminderConfig;
   /**
+   * Optional daemon-side handoff when this bot's CLI enters a trusted usage or
+   * rate-limit state. The stable target App ID is resolved to a live,
+   * receiver-scoped mention handle at send time; no open_id is persisted here.
+   * Missing/invalid/disabled means no automatic handoff.
+   */
+  quotaFallbackBot?: QuotaFallbackBotConfig;
+  /**
    * When true, THIS bot's daemon watches host load/memory and DMs the bot owner
    * when the machine crosses into (and back out of) an overloaded state — a
    * heads-up that botmux session cold-starts may time out and false-die. Host
@@ -2892,10 +2904,30 @@ function resolveBotConfigPath(): string {
   );
 }
 
+/** Warn once per relevant cycle and identify only the Bot rows whose handoff must be disabled. */
+function warnAndCollectCyclicQuotaFallbackIds(
+  entries: any[],
+  selectedAppId?: string,
+): Set<string> {
+  const cycles = findQuotaFallbackCycles(entries);
+  const affected = new Set<string>();
+  for (const cycle of cycles) {
+    for (const appId of cycle) affected.add(appId);
+    // Indexed daemon loading should not make every unrelated daemon repeat the
+    // same warning. The all-bot parser has no selectedAppId and logs each cycle.
+    if (selectedAppId && !cycle.includes(selectedAppId)) continue;
+    logger.warn(
+      `[bot-registry] quotaFallbackBot cycle disabled for affected bots: ${cycle.join(' -> ')}; `
+      + 'unrelated bots remain available',
+    );
+  }
+  return affected;
+}
+
 /**
  * Resolve one daemon's exact raw bots.json slot without compacting earlier
- * activation-pending entries. PM2 assigns BOTMUX_BOT_INDEX from the durable
- * array index; filtering the array first would make a later ready bot load a
+ * activation-pending entries. The supervisor assigns BOTMUX_BOT_INDEX from the
+ * durable array index; filtering first would make a later ready bot load a
  * different App whenever concurrent onboarding left an earlier slot pending.
  */
 export function loadBotConfigAtIndex(index: number): BotConfig {
@@ -2916,6 +2948,8 @@ export function loadBotConfigAtIndex(index: number): BotConfig {
   if (!entry || typeof entry !== 'object') {
     throw new Error(`Bot config [${index}] does not exist (file: ${filePath})`);
   }
+  const selectedAppId = String((entry as Record<string, unknown>).larkAppId ?? '');
+  const cyclicQuotaFallbackIds = warnAndCollectCyclicQuotaFallbackIds(parsed, selectedAppId);
   if ((entry as Record<string, unknown>).activationPending === true) {
     throw new Error(`Bot config [${index}] activation pending (file: ${filePath})`);
   }
@@ -2951,6 +2985,9 @@ export function loadBotConfigAtIndex(index: number): BotConfig {
     }
   }
   const entryForDaemon = { ...(entry as Record<string, unknown>) };
+  if (cyclicQuotaFallbackIds.has(String(entryForDaemon.larkAppId))) {
+    delete entryForDaemon.quotaFallbackBot;
+  }
   delete entryForDaemon.activationStarting;
   delete entryForDaemon.activationCommitted;
   const exact = parseBotConfigsFromText(JSON.stringify([entryForDaemon]));
@@ -3047,6 +3084,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
   if (!Array.isArray(parsed)) {
     throw new Error(`Bot config file must contain a JSON array`);
   }
+  const cyclicQuotaFallbackIds = warnAndCollectCyclicQuotaFallbackIds(parsed);
 
   const configs: BotConfig[] = [];
   for (let i = 0; i < parsed.length; i++) {
@@ -3377,6 +3415,14 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     const messageListeners = normalizeMessageListeners(entry.messageListeners, i);
     const commandTriggers = normalizeCommandTriggers(entry.commandTriggers);
     const vcMeetingAgent = normalizeVcMeetingAgentConfig(entry.vcMeetingAgent);
+    const normalizedQuotaFallback = cyclicQuotaFallbackIds.has(entry.larkAppId)
+      ? {}
+      : normalizeQuotaFallbackBotConfig(entry.quotaFallbackBot, entry.larkAppId);
+    if (normalizedQuotaFallback.error) {
+      logger.warn(
+        `[bot-registry:${entry.larkAppId}] quotaFallbackBot ignored: ${normalizedQuotaFallback.error}`,
+      );
+    }
     const normalizedNativeSubagentRuntime = normalizeNativeSubagentRuntimePolicy(
       entry.nativeSubagentRuntime,
     );
@@ -3508,6 +3554,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         ? entry.maxLiveWorkers
         : undefined,
       sessionOwnerReminder: normalizeSessionOwnerReminderConfig(entry.sessionOwnerReminder),
+      quotaFallbackBot: normalizedQuotaFallback.config,
       // Only explicit true persisted (undefined = off), same as restrictGrantCommands.
       overloadAlert: entry.overloadAlert === true || undefined,
       vcMeetingAgent,
