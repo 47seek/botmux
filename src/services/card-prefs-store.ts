@@ -10,6 +10,7 @@
  *                                  body, 'footer' = ordinary reply-card footer,
  *                                  'off' = nowhere
  *   • disableStreamingCard      — suppress the live streaming session card
+ *   • hiddenStreamingCardButtons — omit selected controls from live cards
  *   • silentTurnReactions       — in card-off sessions, also drop the ✋→✅
  *                                  lightweight status reactions on the trigger
  *                                  message (only meaningful while the card is off)
@@ -44,6 +45,10 @@ import {
   notifyPinStreamingCardChanged,
   serializePinStreamingCardConfigChange,
 } from './pin-streaming-card-change.js';
+import {
+  normalizeHiddenStreamingCardButtons,
+  type StreamingCardButtonId,
+} from '../im/lark/streaming-card-buttons.js';
 
 export interface BotCardPrefs {
   /** Where to show native Context / Token usage:
@@ -51,6 +56,7 @@ export interface BotCardPrefs {
    *  reply-card footer, 'off' = nowhere. */
   usageDisplay: UsageDisplayMode;
   disableStreamingCard: boolean;
+  hiddenStreamingCardButtons: StreamingCardButtonId[];
   pinStreamingCard: boolean;
   silentTurnReactions: boolean;
   /** Experimental Codex App presentation mode. Default false preserves the
@@ -107,6 +113,7 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
     return {
       usageDisplay: normalizeUsageDisplay(c),
       disableStreamingCard: c.disableStreamingCard === true,
+      hiddenStreamingCardButtons: normalizeHiddenStreamingCardButtons(c.hiddenStreamingCardButtons) ?? [],
       pinStreamingCard: c.pinStreamingCard === true,
       silentTurnReactions: c.silentTurnReactions === true,
       codexAppCleanInput: c.codexAppCleanInput === true,
@@ -132,6 +139,7 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
     return {
       usageDisplay: DEFAULT_USAGE_DISPLAY,
       disableStreamingCard: false,
+      hiddenStreamingCardButtons: [],
       pinStreamingCard: false,
       silentTurnReactions: false,
       codexAppCleanInput: false,
@@ -227,10 +235,17 @@ async function updateBotCardPrefsInternal(
     if (val === 'footer' || val === 'off') entry[key] = val;
     else delete entry[key];
   };
+  const applyHiddenButtons = (entry: any, val: StreamingCardButtonId[] | undefined) => {
+    if (val === undefined) return;
+    const normalized = normalizeHiddenStreamingCardButtons(val);
+    if (normalized) entry.hiddenStreamingCardButtons = normalized;
+    else delete entry.hiddenStreamingCardButtons;
+  };
 
   const r = await rmwBotEntry<BotCardPrefs>(larkAppId, (entry) => {
     applyUsageDisplay(entry, 'usageDisplay', patch.usageDisplay);
     apply(entry, 'disableStreamingCard', patch.disableStreamingCard);
+    applyHiddenButtons(entry, patch.hiddenStreamingCardButtons);
     apply(entry, 'pinStreamingCard', patch.pinStreamingCard);
     apply(entry, 'silentTurnReactions', patch.silentTurnReactions);
     apply(entry, 'codexAppCleanInput', patch.codexAppCleanInput);
@@ -255,6 +270,7 @@ async function updateBotCardPrefsInternal(
       result: {
         usageDisplay: normalizeUsageDisplay(entry),
         disableStreamingCard: entry.disableStreamingCard === true,
+        hiddenStreamingCardButtons: normalizeHiddenStreamingCardButtons(entry.hiddenStreamingCardButtons) ?? [],
         pinStreamingCard: entry.pinStreamingCard === true,
         silentTurnReactions: entry.silentTurnReactions === true,
         codexAppCleanInput: entry.codexAppCleanInput === true,
@@ -292,6 +308,9 @@ async function updateBotCardPrefsInternal(
   }
   if (patch.disableStreamingCard !== undefined) {
     bot.config.disableStreamingCard = patch.disableStreamingCard || undefined;
+  }
+  if (patch.hiddenStreamingCardButtons !== undefined) {
+    bot.config.hiddenStreamingCardButtons = normalizeHiddenStreamingCardButtons(patch.hiddenStreamingCardButtons);
   }
   if (patch.pinStreamingCard !== undefined) {
     bot.config.pinStreamingCard = patch.pinStreamingCard || undefined;
@@ -365,6 +384,7 @@ async function updateBotCardPrefsInternal(
   logger.info(
     `[card-prefs:${larkAppId}] usageDisplay=${r.result.usageDisplay} ` +
     `disableStreamingCard=${r.result.disableStreamingCard} ` +
+    `hiddenStreamingCardButtons=${r.result.hiddenStreamingCardButtons.join(',') || '-'} ` +
     `pinStreamingCard=${r.result.pinStreamingCard} ` +
     `silentTurnReactions=${r.result.silentTurnReactions} ` +
     `codexAppCleanInput=${r.result.codexAppCleanInput} ` +

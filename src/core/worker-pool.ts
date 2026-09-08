@@ -102,6 +102,7 @@ import { withBotTurnMutation } from './bot-turn-mutation-gate.js';
 import { recordQuarantinedLauncherEnvKeys } from './mojo-launcher-env-quarantine.js';
 import { freezeMojoIdentityForSession } from './mojo-session-identity.js';
 import { getBot, getAllBots, getOwnerOpenId, loadBotConfigs, resolveBrandLabel, getLoadedConfigPath, getLoadedConfigProvenance, resolveUsageDisplay } from '../bot-registry.js';
+import { resolveHiddenStreamingCardButtons } from '../im/lark/streaming-card-buttons.js';
 import { resolvePricingConfig, type ResolvedModelPricing } from '../services/model-pricing.js';
 import { RestartCoordinator, type RestartObserver } from './restart-coordinator.js';
 import { runtimeBuildIdentity } from '../utils/runtime-build-id.js';
@@ -977,6 +978,7 @@ function scheduleLocalCliOpenReadinessPatch(ds: DaemonSession): void {
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
     silentIdleCardFlag(ds),
     dshRuntimeForSession(ds),
+    resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
   );
   scheduleCardPatch(ds, cardJson);
 }
@@ -1032,6 +1034,7 @@ function scheduleActiveRuntimePatch(ds: DaemonSession): void {
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
     silentIdleCardFlag(ds),
     dshRuntimeForSession(ds),
+    resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
   );
   scheduleCardPatch(ds, cardJson);
 }
@@ -1147,6 +1150,7 @@ function scheduleCodexServiceTierPatch(ds: DaemonSession): void {
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
     silentIdleCardFlag(ds),
     dshRuntimeForSession(ds),
+    resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
   );
   scheduleCardPatch(ds, cardJson);
 }
@@ -1227,6 +1231,7 @@ export function refreshStreamingCardUsage(ds: DaemonSession): void {
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
     silentIdleCardFlag(ds),
     dshRuntimeForSession(ds),
+    resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
   );
   scheduleCardPatch(ds, cardJson);
 }
@@ -1311,6 +1316,7 @@ export function scheduleRiffAccessUrlPatch(ds: DaemonSession): void {
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
     silentIdleCardFlag(ds),
     dshRuntimeForSession(ds),
+    resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
   );
   scheduleCardPatch(ds, cardJson);
 }
@@ -2076,6 +2082,7 @@ function scheduleUsageLimitCardPatch(ds: DaemonSession): void {
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
     silentIdleCardFlag(ds),
     dshRuntimeForSession(ds),
+    resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
   );
   scheduleCardPatch(ds, cardJson);
 }
@@ -3160,6 +3167,7 @@ function reconcilePostedStartingCard(ds: DaemonSession, turnId: string | undefin
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
     silentIdleCardFlag(ds),
     dshRuntimeForSession(ds),
+    resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
   );
   scheduleCardPatch(ds, cardJson, turnId);
 }
@@ -3226,6 +3234,7 @@ export async function postTurnStartingCard(
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
     silentIdleCardFlag(ds),
     dshRuntimeForSession(ds),
+    resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
   );
 
   ds.streamCardNonce = nonce;
@@ -3366,6 +3375,7 @@ export async function postFreshStreamingCard(
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
     silentIdleCardFlag(ds),
     dshRuntimeForSession(ds),
+    resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
   );
   ds.streamCardId = CARD_POSTING_SENTINEL;
   const ownsPost = (): boolean =>
@@ -6520,6 +6530,7 @@ export function buildStreamingCardJson(ds: DaemonSession, status?: StreamStatus)
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
     silentIdleCardFlag(ds),
     dshRuntimeForSession(ds),
+    resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
   );
 }
 
@@ -11843,6 +11854,7 @@ function setupWorkerHandlers(
               codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
               silentIdleCardFlag(ds),
               dshRuntimeForSession(ds),
+              resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
             );
             await updateMessage(ds.larkAppId, restoredCardId, streamCardJson);
             if (!ownsLifecycleMutation()) break;
@@ -11952,6 +11964,7 @@ function setupWorkerHandlers(
             codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
             silentIdleCardFlag(ds),
             dshRuntimeForSession(ds),
+            resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
           );
           const postedCardId = await scopedReply(
             streamCardJson, 'interactive', cardReplyTarget.turnId,
@@ -12558,6 +12571,7 @@ function setupWorkerHandlers(
             codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
             silentIdleCardFlag(ds),
             dshRuntimeForSession(ds),
+            resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
           );
           // Mark POST in-flight so subsequent screen_updates are dropped,
           // not POSTed as duplicate cards.
@@ -12672,6 +12686,7 @@ function setupWorkerHandlers(
             codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
             silentIdleCardFlag(ds),
             dshRuntimeForSession(ds),
+            resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
           );
           scheduleCardPatch(ds, cardJson, msg.turnId);
           // Keep the live usage climbing during a long working phase; stop once
@@ -12748,6 +12763,7 @@ function setupWorkerHandlers(
           codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
           silentIdleCardFlag(ds),
           dshRuntimeForSession(ds),
+          resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
         );
         scheduleCardPatch(ds, cardJson);
         break;
@@ -13177,6 +13193,7 @@ function setupWorkerHandlers(
               codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
               silentIdleCardFlag(ds),
               dshRuntimeForSession(ds),
+              resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
             );
             scheduleCardPatch(ds, frozenCard);
           }
@@ -13251,6 +13268,7 @@ function setupWorkerHandlers(
               codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
               silentIdleCardFlag(ds),
               dshRuntimeForSession(ds),
+              resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
             );
             scheduleCardPatch(ds, frozenCard);
           }
