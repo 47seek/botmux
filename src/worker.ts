@@ -122,6 +122,7 @@ import {
   evaluateVcMeetingManagedSend,
 } from './services/vc-meeting-send-policy.js';
 import { TurnTerminalDeduper } from './services/turn-terminal-deduper.js';
+import { TurnExecutionClock } from './services/turn-execution-clock.js';
 import {
   appendBridgeTurnJournalEntry,
   BridgeRestoreGate,
@@ -2786,6 +2787,9 @@ async function deliverRawInput(msg: Extract<DaemonToWorker, { type: 'raw_input' 
         currentBotmuxDispatchAttempt = undefined;
         currentGatewayTrustedCaller = undefined;
         currentVcMeetingImTurnOrigin = undefined;
+        // A passthrough is a real CLI turn and can settle with a terminal, so it
+        // gets the same write-anchored execution window as a queued message.
+        markTurnExecutionStart(msg.turnId, undefined);
         stampMojoTurnMark(msg.turnId, undefined); // a passthrough IS a mojo turn
         writeCliPidMarker();
         publishSandboxRelayCapability();
@@ -8294,6 +8298,10 @@ async function writeAdoptMessage(
   const prepareAdoptWrite = (): void => {
     if (adoptWritePrepared) return;
     adoptWritePrepared = true;
+    // Same anchor rule as flushPending: the execution window opens at the
+    // literal adopt write, inside the submission transaction, so a refused
+    // write never leaves a start armed for work that never began.
+    markTurnExecutionStart(turnId, dispatchAttempt);
     beginCliWriteCycle();
     if (bridgeJsonlPath) {
       try { bridgeIngest(); } catch { /* best effort */ }
@@ -9867,6 +9875,10 @@ async function handleTrustedCodexAppMarker(
     if (codexAppDispatchId) {
       if (!control || codexAppDispatchHandle === undefined) return false;
       const requestId = randomBytes(16).toString('hex');
+      // Read (do NOT consume) this turn's execution window: the daemon persists a
+      // synthesized terminal from this settlement before our own emitTurnTerminal
+      // below runs, so both must report the same numbers.
+      const settlementTiming = turnExecutionClock.peek(turnId, dispatchAttempt, completedAtMs);
       // A superseded member is durably settled but NEVER delivered: force empty
       // content + suppressDelivery so the daemon persists the FIFO advance without
       // deliverFinalOutput, and tag the disposition so the sink is explicit.
@@ -9885,6 +9897,8 @@ async function handleTrustedCodexAppMarker(
           generation: control.generation,
           seq: control.seq,
           dispatchId: codexAppDispatchId!,
+          ...(settlementTiming ? { completedAtMs: settlementTiming.completedAtMs } : {}),
+          ...(settlementTiming?.durationMs !== undefined ? { durationMs: settlementTiming.durationMs } : {}),
         },
       }));
       if (!persisted || !codexAppTurnDispatchQueue.commitExactHead(codexAppDispatchHandle)) {
@@ -9963,7 +9977,10 @@ async function handleTrustedCodexAppMarker(
         codexAppCompletionAwaitingFinal = false;
       }
     }
-    emitTurnTerminal(turnId, 'completed', undefined, dispatchAttempt);
+    // The app-server runner timestamps its own completion; prefer that instant
+    // over "whenever this worker got around to handling the marker". The clock
+    // clamps it to now, so a skewed runner cannot mint a future completion.
+    emitTurnTerminal(turnId, 'completed', undefined, dispatchAttempt, undefined, undefined, completedAtMs);
     return true;
   }
   rejectCodexAppControlMarker(`unsupported signed ${kind}`);
@@ -11677,6 +11694,14 @@ async function flushPending(): Promise<void> {
           log('Refused durable Claude submit: transcript terminal bridge is unavailable');
           throw new Error('terminal bridge unavailable before submission');
         }
+        // All pre-write guards have passed and the fenced write (the next
+        // operation) is about to hand this turn's input to the CLI. Arm the
+        // execution window HERE, not at the top of the hook: the guard above can
+        // refuse the submission before a single byte is written, and a turn that
+        // never executed must not report a (near-zero) duration — it still gets a
+        // real completedAtMs (the failure instant), just no durationMs. Arming
+        // here also keeps queueing time out of the span.
+        markTurnExecutionStart(item.turnId, item.dispatchAttempt);
         if (lastInitConfig?.cliId === 'codex-app') {
           log(
             `Writing Codex App input to PTY (flush): `
@@ -19139,6 +19164,16 @@ if(isTouch&&hasToken){(function(){
 
 type TurnTerminalStatus = Extract<WorkerToDaemon, { type: 'turn_terminal' }>['status'];
 const emittedTurnTerminals = new TurnTerminalDeduper();
+/** Opens at each turn's literal CLI write, closes at its terminal. See
+ *  turn-execution-clock.ts for why queueing time is deliberately excluded. */
+const turnExecutionClock = new TurnExecutionClock();
+
+/** Arm the execution window for the turn whose input is being written right
+ *  now. Called from every literal-write site (flush, adopt, passthrough, init)
+ *  so `durationMs` measures the CLI, not the daemon's backlog. */
+function markTurnExecutionStart(turnId: string | undefined, dispatchAttempt?: number): void {
+  turnExecutionClock.start(turnId, dispatchAttempt);
+}
 
 /** Report CLI processing completion independently from user-visible output.
  *  Keep a bounded worker-local dedup set because transcript watchers and app
@@ -19150,6 +19185,9 @@ function emitTurnTerminal(
   dispatchAttempt?: number,
   outputDisposition?: 'nothing_to_send',
   retryable?: boolean,
+  /** Backend-supplied completion instant (codex-app's runner timestamps its own
+   *  finals). Clamped to now by the clock; absent means "use this instant". */
+  completedAtMs?: number,
 ): void {
   if (!sessionId || !turnId) return;
   cancelSubmitFailureChainForTerminal(
@@ -19157,7 +19195,14 @@ function emitTurnTerminal(
     { turnId, dispatchAttempt },
     cliSpawnGeneration,
   );
-  if (!emittedTurnTerminals.claim(sessionId, turnId, dispatchAttempt)) return;
+  if (!emittedTurnTerminals.claim(sessionId, turnId, dispatchAttempt)) {
+    // A duplicate terminal must not leave the start armed: the first emission
+    // already published this turn's timing and consumed the entry, but a
+    // *replay* whose first emission never ran through this path could.
+    turnExecutionClock.forget(turnId, dispatchAttempt);
+    return;
+  }
+  const timing = turnExecutionClock.settle(turnId, dispatchAttempt, completedAtMs);
   if (status !== 'completed') {
     const dropped = codexBridgeQueue.dropPendingTurn(turnId, dispatchAttempt, true);
     if (dropped) {
@@ -19176,6 +19221,8 @@ function emitTurnTerminal(
     ...(errorCode ? { errorCode } : {}),
     ...(outputDisposition ? { outputDisposition } : {}),
     ...(retryable !== undefined ? { retryable } : {}),
+    ...(timing ? { completedAtMs: timing.completedAtMs } : {}),
+    ...(timing?.durationMs !== undefined ? { durationMs: timing.durationMs } : {}),
   });
   if (terminalReleasesDurableTurn(
     { turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt },
@@ -19482,6 +19529,11 @@ process.on('message', async (raw: unknown) => {
           currentBotmuxDispatchAttempt = msg.dispatchAttempt;
           currentGatewayTrustedCaller = msg.trustedCaller;
           currentVcMeetingImTurnOrigin = msg.vcMeetingImTurnOrigin;
+          // Opening/argv turns start with the session (their prompt rides the
+          // spawn). Arm the window at init; a later literal write re-arms with
+          // the true write instant, so argv-only turns measure spawn→terminal
+          // and written turns measure write→terminal.
+          markTurnExecutionStart(msg.turnId, msg.dispatchAttempt);
           writeCliPidMarker();
           publishSandboxRelayCapability();
         }
