@@ -14745,6 +14745,11 @@ switch (command) {
   case 'restart': await cmdRestart(); break;
   case 'logs':    await cmdLogs(); break;
   case 'status':  await cmdStatus(); break;
+  case 'codex-instances': {
+    const { runCodexInstancesCommand } = await import('./cli/codex-instances.js');
+    await runCodexInstancesCommand(process.argv.slice(3));
+    break;
+  }
   case 'upgrade':
   case 'update':  await cmdUpgrade(); break;
   case 'dashboard': await cmdDashboard(process.argv.slice(3)); break;

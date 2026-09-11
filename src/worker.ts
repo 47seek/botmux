@@ -295,6 +295,8 @@ import { strictInputHandle } from './adapters/cli/strict-input-handle.js';
 import { PtyBackend } from './adapters/backend/pty-backend.js';
 import { HerdrBackend, type HerdrWebTerminalCursor } from './adapters/backend/herdr-backend.js';
 import { TmuxBackend } from './adapters/backend/tmux-backend.js';
+import { applyCodexInstanceEnv, codexInstanceIdentity } from './services/codex-instance-pool.js';
+import { withFileLockSync } from './utils/file-lock.js';
 import { TmuxPipeBackend } from './adapters/backend/tmux-pipe-backend.js';
 import { ZellijBackend, ZELLIJ_CONFIG_KDL } from './adapters/backend/zellij-backend.js';
 import { ZellijObserveBackend } from './adapters/backend/zellij-observe-backend.js';
@@ -1216,6 +1218,9 @@ async function bridgeTraexUserInput(
  *  spawns; it renders as history and later turns stream live. "thread ready" is
  *  thus a distinct step from "first turn sent". */
 async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): Promise<EngageOutcome> {
+  if (cfg.cliInstanceBinding && cfg.cliInstanceBinding.source !== 'legacy' && cfg.backendType === 'tmux') {
+    TmuxBackend.assertInstanceIdentity(TmuxBackend.sessionName(cfg.sessionId), codexInstanceIdentity(cfg.cliInstanceBinding, cfg.cliRuntime));
+  }
   if (!codexRpcEligible(cfg, { sandboxForced: sandboxEnabled() })) return 'not-engaged';
   const wantResume = cfg.resume === true && !!cfg.cliSessionId;
   stopCodexRpcEngine();
@@ -1264,6 +1269,7 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
     // injects into the TUI — else a 3rd-party-provider bot's app-server silently
     // falls back to the default provider. Re-sanitized (crossed IPC).
     Object.assign(engineEnv, sanitizePerBotEnv(cfg.env));
+    applyCodexInstanceEnv(engineEnv, cfg.cliInstanceBinding);
     // Session identity is host-owned. Pin it after the config-controlled merge,
     // matching every other backend and preventing stale owner resurrection.
     applySessionOwnerEnv(engineEnv, cfg.ownerOpenId);
@@ -1666,6 +1672,22 @@ async function prepareCliPluginGenerationAndGateway(
   cfg: Extract<DaemonToWorker, { type: 'init' }>,
   adapter: CliAdapter,
 ): Promise<SessionMcpRuntimeManifest | null> {
+  if (cfg.cliInstanceBinding && cfg.cliInstanceBinding.source !== 'legacy') {
+    // RPC calls this before spawnCli. Fence the surviving pane before changing
+    // its gateway/catalog, and install the config before either CLI process
+    // (app-server or TUI) has a chance to read it.
+    if ((cfg.backendType ?? config.daemon.backendType) === 'tmux') {
+      TmuxBackend.assertInstanceIdentity(TmuxBackend.sessionName(cfg.sessionId), codexInstanceIdentity(cfg.cliInstanceBinding, cfg.cliRuntime));
+    }
+    if (adapter.mcpGateway) {
+      const gateway = adapter.mcpGateway;
+      const instanceConfig = join(cfg.cliInstanceBinding.codexHome, 'config.toml');
+      const report = withFileLockSync(instanceConfig, () => ensureGatewayEntry({
+        id: adapter.id, mcpGateway: { ...gateway, configPath: instanceConfig },
+      }));
+      if (report.warning) throw new Error('Codex instance MCP configuration could not be initialized safely');
+    }
+  }
   refreshCliPluginGeneration(cfg, adapter);
   const manifest = readSessionMcpRuntimeManifest(cfg.sessionId, config.session.dataDir);
   stopSessionMcpGatewayHost();
@@ -12796,6 +12818,9 @@ async function spawnCli(
   opts: { pluginGenerationPrepared?: boolean } = {},
 ): Promise<void> {
   const spawnGeneration = ++cliSpawnGeneration;
+  if (cfg.cliInstanceBinding && cfg.cliInstanceBinding.source !== 'legacy' && cfg.backendType === 'tmux') {
+    TmuxBackend.assertInstanceIdentity(TmuxBackend.sessionName(cfg.sessionId), codexInstanceIdentity(cfg.cliInstanceBinding, cfg.cliRuntime));
+  }
   // Deferred submit-failure chains are generation-keyed; a fresh generation
   // invalidates every live chain before any old timer can touch new state.
   submitFailureChains.clear();
@@ -13378,6 +13403,9 @@ async function spawnCli(
   }
   const sandboxRequested = !riffRemoteBackend
     && (cfg.sandbox === true || cfg.readIsolation === true || sandboxEnabled());
+  if (cfg.cliInstanceBinding?.source !== 'legacy' && cfg.cliInstanceBinding && sandboxRequested) {
+    throw new Error('Codex instance routing does not support sandbox/readIsolation');
+  }
   const backendIsolationGate = backendSandboxCompatibilityError({
     backendType: effectiveBackendType,
     fileSandboxRequested: sandboxRequested,
@@ -13541,8 +13569,9 @@ async function spawnCli(
   // sandbox itself still applies). Decided EARLY so every JSONL/bridge/resume
   // path below already targets the right dir. wrapperCli strips spawn args, so
   // the redirect (and its env) can't be guaranteed there → not redirected.
-  const isolatedCodexHomeRequested = cfg.cliId === 'codex' && cfg.codexAuthSync === 'isolated';
-  const willRedirectCliData = shouldRedirectCliData({
+  const legacyHomePolicy = !cfg.cliInstanceBinding || cfg.cliInstanceBinding.source === 'legacy';
+  const isolatedCodexHomeRequested = legacyHomePolicy && cfg.cliId === 'codex' && cfg.codexAuthSync === 'isolated';
+  const willRedirectCliData = legacyHomePolicy && shouldRedirectCliData({
     sandboxRequested,
     forcePerBotHome: isolatedCodexHomeRequested,
     supportsReadIsolation: cliAdapter.supportsReadIsolation === true,
@@ -14192,6 +14221,9 @@ async function spawnCli(
   }
   const fallBackToFresh =
     effectiveResume && !willReattachPersistent && (tier1ProbeFalse || tier2ForceFresh || missingExactResumeId);
+  if (fallBackToFresh && cfg.cliInstanceBinding && cfg.cliInstanceBinding.source !== 'legacy') {
+    throw new Error(`Codex instance ${cfg.cliInstanceBinding.instanceId}: exact resume target unavailable; refusing fresh-session fallback`);
+  }
   if (fallBackToFresh) {
     const reason = tier2ForceFresh
       ? `consecutive restart x${consecutiveInWorkerRestarts} — 2nd failed resume attempt`
@@ -14828,6 +14860,8 @@ async function spawnCli(
     if (claudeDataDir) childEnv.CLAUDE_CONFIG_DIR = canonicalizeForSandbox(claudeDataDir); // = <BOT_HOME>/claude
     else childEnv.CODEX_HOME = canonicalizeForSandbox(isolatedCodexHome!);
   }
+  applyCodexInstanceEnv(childEnv, cfg.cliInstanceBinding);
+  if (cfg.cliInstanceBinding && cfg.cliInstanceBinding.source !== 'legacy') childEnv.BOTMUX_CODEX_INSTANCE_BINDING = codexInstanceIdentity(cfg.cliInstanceBinding, cfg.cliRuntime);
   // Sandboxed Codex cannot discover a trust store inside Seatbelt (see
   // utils/darwin-ca-bundle for why, and for why realpath matters). `codex-app`
   // needs this too: its outer child is a Node runner that spawns the same Codex
@@ -19359,6 +19393,10 @@ process.on('message', async (raw: unknown) => {
         }
       }
       lastInitConfig = msg;
+      if (msg.cliInstanceBinding && (msg.cliId !== 'codex' || msg.adoptMode || msg.existingAppServerEndpoint)) {
+        throw new Error('Codex instance binding is incompatible with this worker init');
+      }
+      applyCodexInstanceEnv(process.env, msg.cliInstanceBinding);
       initialInputOwnershipPending = !!msg.prompt;
       activeRestartAttemptId = msg.restartAttemptId;
       sessionId = msg.sessionId;
