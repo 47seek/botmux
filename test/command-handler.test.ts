@@ -434,6 +434,7 @@ vi.mock('../src/im/lark/doc-comment.js', () => {
 });
 
 vi.mock('../src/services/doc-subs-store.js', () => ({
+  docWatchAnchor: (fileToken: string) => `doc:${fileToken}:watch`,
   putDocSubscription: vi.fn(() => ({})),
   removeDocSubscription: vi.fn(),
   listDocSubscriptionsForSession: vi.fn(() => []),
@@ -2070,10 +2071,10 @@ describe('handleCommand', () => {
         LARK_APP_ID,
         expect.objectContaining({
           fileToken: 'doc_token_12345678901234567890',
-          sessionAnchor: 'doc:doc_token_12345678901234567890',
+          sessionAnchor: 'doc:doc_token_12345678901234567890:watch',
           sessionId: undefined,
           scope: 'chat',
-          chatId: 'doc:doc_token_12345678901234567890',
+          chatId: 'doc:doc_token_12345678901234567890:watch',
           workingDir: '/work/repo',
           managedBy: 'watch-comment',
         }),
