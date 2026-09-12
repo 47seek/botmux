@@ -1,4 +1,5 @@
 import * as Lark from '@larksuiteoapi/node-sdk';
+import { normalizeCodexInstancePool, registerCodexInstanceBot, clearCodexInstanceBots, validateCodexInstanceRoster } from './services/codex-instance-pool.js';
 import { readFileSync, existsSync, statSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { underReadIsolation } from './adapters/cli/read-isolation.js';
@@ -16,6 +17,7 @@ import type { VoiceConfig } from './services/voice/types.js';
 import type { PricingOverrides } from './services/model-pricing.js';
 import type { BudgetConfig } from './services/budget-tracker.js';
 import { normalizePricingOverrides } from './services/model-pricing.js';
+import { parseTriggerUserAuthConfig } from './services/trigger-user-auth.js';
 import { parseBudgetConfig } from './services/budget-tracker.js';
 import { type Brand, sdkDomain, normalizeBrand } from './im/lark/lark-hosts.js';
 import type { BotSkillPolicy, SkillSelector } from './core/skills/types.js';
@@ -52,6 +54,11 @@ import {
   normalizeSessionOwnerReminderConfig,
   type SessionOwnerReminderConfig,
 } from './core/session-owner-reminder.js';
+import {
+  findQuotaFallbackCycles,
+  normalizeQuotaFallbackBotConfig,
+  type QuotaFallbackBotConfig,
+} from './services/quota-fallback.js';
 import { normalizeCardActionAckTimeoutMs } from './core/card-action-ack.js';
 import type {
   VcMeetingConsumerAgentConfig,
@@ -60,6 +67,10 @@ import type {
   VcMeetingConsumerProfileConfig,
 } from './types.js';
 import type { VcMeetingActivityType } from './vc-agent/types.js';
+import {
+  normalizeHiddenStreamingCardButtons,
+  type StreamingCardButtonId,
+} from './im/lark/streaming-card-buttons.js';
 
 /**
  * Thrown when any Feishu client is requested for a core-only (`apiOnly`) bot.
@@ -1541,6 +1552,15 @@ export interface BotConfig {
    * CODEX_HOME and never reads or copies global auth, with or without sandbox.
    */
   codexAuthSync?: import('./services/codex-auth-sync.js').CodexAuthSyncMode;
+  codexInstancePool?: import('./services/codex-instance-pool.js').CodexInstancePool;
+  /**
+   * Trigger-user CLI authentication. Missing → off; this bot's CLI calls keep
+   * using whatever identity is logged in on the machine. Enabled → `lark-cli` /
+   * `bytedcli` run as the person who sent the current message, and a sender who
+   * has not authorized gets the bot's own tenant identity (or a failure, per
+   * `fallback`) — never another person's login. See services/trigger-user-auth.ts.
+   */
+  triggerUserAuth?: import('./services/trigger-user-auth.js').TriggerUserAuthConfig;
   /**
    * Run this bot's CLI inside a per-session file sandbox (unified three-tier
    * whitelist, deny-by-default; Linux bwrap + macOS Seatbelt with identical
@@ -1612,6 +1632,13 @@ export interface BotConfig {
    * runtime states remain unchanged. Missing means disabled. */
   sessionOwnerReminder?: SessionOwnerReminderConfig;
   /**
+   * Optional daemon-side handoff when this bot's CLI enters a trusted usage or
+   * rate-limit state. The stable target App ID is resolved to a live,
+   * receiver-scoped mention handle at send time; no open_id is persisted here.
+   * Missing/invalid/disabled means no automatic handoff.
+   */
+  quotaFallbackBot?: QuotaFallbackBotConfig;
+  /**
    * When true, THIS bot's daemon watches host load/memory and DMs the bot owner
    * when the machine crosses into (and back out of) an overloaded state — a
    * heads-up that botmux session cold-starts may time out and false-die. Host
@@ -1635,7 +1662,9 @@ export interface BotConfig {
    *   1. a fail-safe DM recipient for allowedUsers-resolve failure notices, so
    *      the owner is reachable even when the resolve that would have produced
    *      their open_id is the very thing that failed (cold-start race);
-   *   2. an always-available owner anchor for runtime permission checks.
+   *   2. an explicit owner priority, but only while that identity is still
+   *      present in the resolved allowlist. Runtime permissions remain
+   *      fail-closed when the allowlist removes or cannot resolve this entry.
    * Optional: bots created before this field, or via paths without a scanner
    * identity, simply have none and fall back to the resolved allowlist.
    */
@@ -1851,6 +1880,8 @@ export interface BotConfig {
    * (undefined) keeps the streaming card. For users who find the live card noisy.
    */
   disableStreamingCard?: boolean;
+  /** Main controls omitted from live streaming cards. Missing means show all. */
+  hiddenStreamingCardButtons?: StreamingCardButtonId[];
   /**
    * Pin the current public streaming card. Default false; best-effort only.
    */
@@ -1869,6 +1900,11 @@ export interface BotConfig {
    * {@link noCotChats} (`/cot off`).
    */
   thinkingCard?: boolean;
+  /** 思考气泡是否附带工具输出（TOOL_CALL_RESULT 代码块）。默认 ON（缺省 =
+   *  开；只有显式 false 持久化）。off 时气泡只保留思考段落与工具节点标题
+   *  （工具名 · 命令/路径），与 Claude Code 自身界面一致。子开关：
+   *  {@link thinkingCard} 关闭时无意义。 */
+  thinkingCardToolResult?: boolean;
   /** chat_id list: chats where the CoT (thinking process) message is suppressed
    *  even when {@link thinkingCard} is on. Written by `/cot off|on`. */
   noCotChats?: string[];
@@ -2138,10 +2174,12 @@ const bots = new Map<string, BotState>();
 let parsedNativeSubagentRuntimeStatus = new WeakMap<BotConfig, NativeSubagentRuntimeConfigState['status']>();
 
 export function __testOnly_resetBotRegistry(): void {
+  clearCodexInstanceBots();
   bots.clear();
   parsedNativeSubagentRuntimeStatus = new WeakMap();
   loadedConfigPath = undefined;
   loadedConfigProvenance = undefined;
+  registeredOncallConfigMtimeMs = null;
   oncallChatCache = null;
   brandLabelCache = null;
   cachedLarkUploadHttpInstance = undefined;
@@ -2299,6 +2337,7 @@ export function vcMeetingAgentConfigActive(
 }
 
 export function registerBot(cfg: BotConfig): BotState {
+  registerCodexInstanceBot(cfg);
   const parsedStatus = parsedNativeSubagentRuntimeStatus.get(cfg);
   const normalizedRuntime = cfg.cliId === 'traex'
     ? normalizeNativeSubagentRuntimePolicy(cfg.nativeSubagentRuntime)
@@ -2433,14 +2472,42 @@ export function getBotUploadClient(larkAppId: string): Lark.Client {
   return bot.uploadClient;
 }
 
-/** Owner = bot 首个已授权 open_id，与「缺权限警告私信对象」同口径（见 admin 解析）。 */
-export function getOwnerOpenId(larkAppId: string): string | undefined {
-  return bots.get(larkAppId)?.resolvedAllowedUsers.find(u => u.startsWith('ou_'));
+/**
+ * Return the raw setup-time owner identity for DM fallback paths only.
+ *
+ * This value is deliberately not an authorization result: it can outlive an
+ * allowlist edit or a transient contact-resolution failure. Callers that gate
+ * runtime actions must use getOwnerOpenId() or the resolved allowlist instead.
+ */
+export function getConfiguredOwnerOpenId(larkAppId: string): string | undefined {
+  const bot = bots.get(larkAppId);
+  if (!bot) return undefined;
+  if (bot.config.ownerOpenId && typeof bot.config.ownerOpenId === 'string' && bot.config.ownerOpenId.startsWith('ou_')) {
+    return bot.config.ownerOpenId;
+  }
+  return undefined;
 }
 
-/** Admins = all resolved allowedUsers, matching `/botconfig`'s permission model. */
+/**
+ * Current permission owner: explicit ownerOpenId keeps priority only while it
+ * is still in the resolved allowlist. Once removed or unresolved, ownership
+ * follows the first resolved ou_ entry, matching legacy allowlist semantics.
+ */
+export function getOwnerOpenId(larkAppId: string): string | undefined {
+  const bot = bots.get(larkAppId);
+  if (!bot) return undefined;
+  const configuredOwner = getConfiguredOwnerOpenId(larkAppId);
+  if (configuredOwner && bot.resolvedAllowedUsers.includes(configuredOwner)) {
+    return configuredOwner;
+  }
+  return bot.resolvedAllowedUsers.find(u => u.startsWith('ou_'));
+}
+
+/** Admins = only resolved allowedUsers, matching `/botconfig`'s fail-closed permission model. */
 export function getDashboardAdminOpenIds(larkAppId: string): string[] {
-  return [...(bots.get(larkAppId)?.resolvedAllowedUsers ?? [])];
+  const bot = bots.get(larkAppId);
+  if (!bot) return [];
+  return [...(bot.resolvedAllowedUsers ?? [])].filter(u => typeof u === 'string' && u.startsWith('ou_'));
 }
 
 /**
@@ -2499,8 +2566,57 @@ export function effectiveBotDisplayName(state: BotState): string {
   return state.config.displayName || state.botName || state.config.larkAppId;
 }
 
+// Exact-bot oncall bindings can be written by another process. The main case is
+// `botmux create-group --working-dir`: the one-shot creator process persists a
+// binding for every invited bot, then immediately sends the kickoff message.
+// Each target bot daemon must observe that write before it resolves the new
+// session's working directory. Keep the registered configs fresh with one
+// stat() per lookup and only re-read bots.json when its mtime changes.
+let registeredOncallConfigMtimeMs: number | null = null;
+let oncallChatCache: { mtimeMs: number; chats: Map<string, OncallChat> } | null = null;
+
+function refreshRegisteredOncallChatsFromDisk(): void {
+  if (underReadIsolation()) return;
+  const path = loadedConfigProvenance === 'loaded' ? loadedConfigPath : undefined;
+  if (!path) return;
+  try {
+    const mtimeMs = statSync(path).mtimeMs;
+    if (registeredOncallConfigMtimeMs === mtimeMs) return;
+
+    const raw = JSON.parse(readFileSync(path, 'utf-8'));
+    if (!Array.isArray(raw)) return;
+
+    const byAppId = new Map<string, OncallChat[]>();
+    const chats = new Map<string, OncallChat>();
+    for (const entry of raw) {
+      if (!entry || typeof entry.larkAppId !== 'string') continue;
+      const botChats: OncallChat[] = [];
+      if (Array.isArray(entry.oncallChats)) {
+        for (const chat of entry.oncallChats) {
+          if (chat && typeof chat.chatId === 'string' && typeof chat.workingDir === 'string') {
+            const normalized = { chatId: chat.chatId, workingDir: chat.workingDir };
+            botChats.push(normalized);
+            chats.set(normalized.chatId, normalized);
+          }
+        }
+      }
+      byAppId.set(entry.larkAppId, botChats);
+    }
+
+    for (const [larkAppId, bot] of bots) {
+      const chats = byAppId.get(larkAppId);
+      if (chats) bot.config.oncallChats = chats;
+    }
+    oncallChatCache = { mtimeMs, chats };
+    registeredOncallConfigMtimeMs = mtimeMs;
+  } catch {
+    // Keep the last known-good in-memory snapshot during transient read errors.
+  }
+}
+
 /** Lookup the oncall binding for a given bot+chat, if any. */
 export function findOncallChat(larkAppId: string, chatId: string): OncallChat | undefined {
+  refreshRegisteredOncallChatsFromDisk();
   const bot = bots.get(larkAppId);
   return bot?.config.oncallChats?.find(c => c.chatId === chatId);
 }
@@ -2541,39 +2657,15 @@ export function effectiveDefaultWorkingDir(cfg: BotConfig): string | undefined {
 // map only sees this daemon's own bot — sibling bots' bindings live only on
 // disk in the shared bots.json. Re-read that file lazily, keyed by mtime,
 // so the hot path is a single stat() once the cache is warm.
-let oncallChatCache: { mtimeMs: number; chats: Map<string, OncallChat> } | null = null;
-
 export function findOncallChatForAnyBot(chatId: string): OncallChat | undefined {
+  refreshRegisteredOncallChatsFromDisk();
   // Fast path: this daemon's own bot(s). Covers single-daemon setups and any
   // case where the receiving bot itself is bound.
   for (const bot of bots.values()) {
     const entry = bot.config.oncallChats?.find(c => c.chatId === chatId);
     if (entry) return entry;
   }
-  // Slow path: scan the shared bots.json for sibling bots' bindings.
-  const path = loadedConfigPath;
-  if (!path) return undefined;
-  try {
-    const stat = statSync(path);
-    if (!oncallChatCache || oncallChatCache.mtimeMs !== stat.mtimeMs) {
-      const raw = JSON.parse(readFileSync(path, 'utf-8'));
-      const chats = new Map<string, OncallChat>();
-      if (Array.isArray(raw)) {
-        for (const entry of raw) {
-          if (!Array.isArray(entry?.oncallChats)) continue;
-          for (const c of entry.oncallChats) {
-            if (c && typeof c.chatId === 'string' && typeof c.workingDir === 'string') {
-              chats.set(c.chatId, { chatId: c.chatId, workingDir: c.workingDir });
-            }
-          }
-        }
-      }
-      oncallChatCache = { mtimeMs: stat.mtimeMs, chats };
-    }
-    return oncallChatCache.chats.get(chatId);
-  } catch {
-    return undefined;
-  }
+  return oncallChatCache?.chats.get(chatId);
 }
 
 export function isChatOncallBoundForAnyBot(chatId: string): boolean {
@@ -2852,10 +2944,30 @@ function resolveBotConfigPath(): string {
   );
 }
 
+/** Warn once per relevant cycle and identify only the Bot rows whose handoff must be disabled. */
+function warnAndCollectCyclicQuotaFallbackIds(
+  entries: any[],
+  selectedAppId?: string,
+): Set<string> {
+  const cycles = findQuotaFallbackCycles(entries);
+  const affected = new Set<string>();
+  for (const cycle of cycles) {
+    for (const appId of cycle) affected.add(appId);
+    // Indexed daemon loading should not make every unrelated daemon repeat the
+    // same warning. The all-bot parser has no selectedAppId and logs each cycle.
+    if (selectedAppId && !cycle.includes(selectedAppId)) continue;
+    logger.warn(
+      `[bot-registry] quotaFallbackBot cycle disabled for affected bots: ${cycle.join(' -> ')}; `
+      + 'unrelated bots remain available',
+    );
+  }
+  return affected;
+}
+
 /**
  * Resolve one daemon's exact raw bots.json slot without compacting earlier
- * activation-pending entries. PM2 assigns BOTMUX_BOT_INDEX from the durable
- * array index; filtering the array first would make a later ready bot load a
+ * activation-pending entries. The supervisor assigns BOTMUX_BOT_INDEX from the
+ * durable array index; filtering first would make a later ready bot load a
  * different App whenever concurrent onboarding left an earlier slot pending.
  */
 export function loadBotConfigAtIndex(index: number): BotConfig {
@@ -2876,6 +2988,8 @@ export function loadBotConfigAtIndex(index: number): BotConfig {
   if (!entry || typeof entry !== 'object') {
     throw new Error(`Bot config [${index}] does not exist (file: ${filePath})`);
   }
+  const selectedAppId = String((entry as Record<string, unknown>).larkAppId ?? '');
+  const cyclicQuotaFallbackIds = warnAndCollectCyclicQuotaFallbackIds(parsed, selectedAppId);
   if ((entry as Record<string, unknown>).activationPending === true) {
     throw new Error(`Bot config [${index}] activation pending (file: ${filePath})`);
   }
@@ -2911,6 +3025,9 @@ export function loadBotConfigAtIndex(index: number): BotConfig {
     }
   }
   const entryForDaemon = { ...(entry as Record<string, unknown>) };
+  if (cyclicQuotaFallbackIds.has(String(entryForDaemon.larkAppId))) {
+    delete entryForDaemon.quotaFallbackBot;
+  }
   delete entryForDaemon.activationStarting;
   delete entryForDaemon.activationCommitted;
   const exact = parseBotConfigsFromText(JSON.stringify([entryForDaemon]));
@@ -3007,10 +3124,12 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
   if (!Array.isArray(parsed)) {
     throw new Error(`Bot config file must contain a JSON array`);
   }
+  const cyclicQuotaFallbackIds = warnAndCollectCyclicQuotaFallbackIds(parsed);
 
   const configs: BotConfig[] = [];
   for (let i = 0; i < parsed.length; i++) {
     const entry = parsed[i];
+    const codexInstancePool = normalizeCodexInstancePool(entry.codexInstancePool, entry);
     if (!entry.larkAppId || typeof entry.larkAppId !== 'string') {
       throw new Error(`Bot config [${i}]: larkAppId is required and must be a string`);
     }
@@ -3078,6 +3197,15 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       entry.existingAppServer,
       `Bot config [${i}].existingAppServer`,
     );
+    // Malformed input throws instead of degrading to off: an operator who typo'd
+    // a tool name would otherwise believe a credential boundary is enforced
+    // when it is not — worse than not having the feature.
+    let triggerUserAuth;
+    try {
+      triggerUserAuth = parseTriggerUserAuthConfig(entry.triggerUserAuth) ?? undefined;
+    } catch (e) {
+      throw new Error(`Bot config [${i}]: ${(e as Error).message}`);
+    }
     const codexBrowser = normalizeCodexBrowserConfig(
       entry.codexBrowser,
       `Bot config [${i}].codexBrowser`,
@@ -3328,6 +3456,14 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     const messageListeners = normalizeMessageListeners(entry.messageListeners, i);
     const commandTriggers = normalizeCommandTriggers(entry.commandTriggers);
     const vcMeetingAgent = normalizeVcMeetingAgentConfig(entry.vcMeetingAgent);
+    const normalizedQuotaFallback = cyclicQuotaFallbackIds.has(entry.larkAppId)
+      ? {}
+      : normalizeQuotaFallbackBotConfig(entry.quotaFallbackBot, entry.larkAppId);
+    if (normalizedQuotaFallback.error) {
+      logger.warn(
+        `[bot-registry:${entry.larkAppId}] quotaFallbackBot ignored: ${normalizedQuotaFallback.error}`,
+      );
+    }
     const normalizedNativeSubagentRuntime = normalizeNativeSubagentRuntimePolicy(
       entry.nativeSubagentRuntime,
     );
@@ -3436,6 +3572,8 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       existingAppServer,
       // Missing keeps the historical every-cold-spawn global auth refresh.
       codexAuthSync: entry.codexAuthSync === 'isolated' ? 'isolated' : 'shared',
+      codexInstancePool,
+      ...(triggerUserAuth ? { triggerUserAuth } : {}),
       sandbox: entry.sandbox === true,
       sandboxPaths: entry.sandboxPaths && typeof entry.sandboxPaths === 'object' && !Array.isArray(entry.sandboxPaths)
         ? {
@@ -3458,6 +3596,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         ? entry.maxLiveWorkers
         : undefined,
       sessionOwnerReminder: normalizeSessionOwnerReminderConfig(entry.sessionOwnerReminder),
+      quotaFallbackBot: normalizedQuotaFallback.config,
       // Only explicit true persisted (undefined = off), same as restrictGrantCommands.
       overloadAlert: entry.overloadAlert === true || undefined,
       vcMeetingAgent,
@@ -3516,9 +3655,12 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         ? undefined
         : normalizeUsageDisplay(entry),
       disableStreamingCard: entry.disableStreamingCard === true || undefined,
+      hiddenStreamingCardButtons: normalizeHiddenStreamingCardButtons(entry.hiddenStreamingCardButtons),
       pinStreamingCard: entry.pinStreamingCard === true || undefined,
       // Default ON: only an explicit false is meaningful/persisted (undefined = on).
       thinkingCard: entry.thinkingCard === false ? false : undefined,
+      // 同 thinkingCard 约定：缺省 = 开，只有显式 false 有意义。
+      thinkingCardToolResult: entry.thinkingCardToolResult === false ? false : undefined,
       // Default ON, same convention as thinkingCard: an absent key means the
       // <sender> tag is injected, so existing prompts are unchanged.
       senderTag: entry.senderTag === false ? false : undefined,
@@ -3620,7 +3762,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     parsedNativeSubagentRuntimeStatus.set(config, nativeSubagentRuntimeStatus);
     configs.push(config);
   }
-
+  validateCodexInstanceRoster(configs);
   return configs;
 }
 

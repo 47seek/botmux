@@ -87,6 +87,7 @@ vi.mock('../src/core/cost-calculator.js', () => ({
 }));
 
 vi.mock('../src/services/session-store.js', () => ({
+  getSession: vi.fn(() => undefined),
   registerSessionBridgeSendMarkerCleanupFence: vi.fn(),
   cleanupSessionBridgeSendMarkers: vi.fn(),
   cleanupSessionBridgeSendMarkersNow: vi.fn(),
@@ -504,15 +505,23 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(String(sessionReply.mock.calls[0][1])).not.toContain('botmux_feedback');
   });
 
-  it('keeps feedback disabled by default and does not open the store', async () => {
+  it('keeps feedback disabled by default but still records the turn-completion delivery', async () => {
     const sessionReply = vi.fn(async () => 'om_plain_answer');
     initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
     const ds = makeDs();
     const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
     __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
     await vi.advanceTimersByTimeAsync(10);
+    // No feedback control on the card itself.
     expect(String(sessionReply.mock.calls[0][1])).not.toContain('botmux_feedback');
-    expect(existsSync(join('/tmp/test-sessions', 'botmux-feedback.sqlite'))).toBe(false);
+    // But the delivery is still recorded so a later turn_terminal correlates to
+    // a turn.completed event — feedback is independent of completion bookkeeping.
+    const { getSkillFeedbackStore } = await import('../src/services/skill-feedback-store.js');
+    const delivery = (await getSkillFeedbackStore('/tmp/test-sessions'))
+      .findDeliveryByPlatformMessage('lark', ds.larkAppId, 'om_plain_answer');
+    expect(delivery).toMatchObject({ cardMode: 'card' });
+    expect(delivery?.policy).toBeUndefined();
+    expect(delivery?.baseCard).toBeUndefined();
   });
 
   it('keeps feedback controls on ordinary local-turn output', async () => {
@@ -2722,6 +2731,43 @@ describe('Worker turn_terminal routing', () => {
     } satisfies Extract<WorkerToDaemon, { type: 'user_notify' }>);
     await Promise.resolve();
     expect(sessionReply).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['running', 'completed'] as const)('restores a %s silent recovery before handling trailing output', async (status) => {
+    const ds = makeDs();
+    ds.adoptedFrom = undefined;
+    const logicalTurnId = 'schedule:abcdef12:11111111-2222-3333-4444-555555555555';
+    const turnId = 'schedule:abcdef12:22222222-2222-3333-4444-555555555555';
+    ds.session.ordinaryTurnRecovery = {
+      logicalTurnId, currentTurnId: turnId, continuationsStarted: 1,
+      status, silentLogicalTurnIds: [logicalTurnId],
+    };
+    vi.mocked(getBot).mockReturnValue({
+      config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code' },
+      resolvedAllowedUsers: [], botOpenId: 'ou_bot', botName: 'TestBot',
+    } as any);
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    expect(ds.silentScheduledTurns).toBeUndefined();
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    // A terminal can be persisted before the trailing bridge output arrives.
+    (ds.worker as any).emit('message', {
+      type: 'final_output', sessionId: ds.session.sessionId, turnId,
+      content: 'late silent answer', lastUuid: `silent-restored-${status}`,
+    } satisfies Extract<WorkerToDaemon, { type: 'final_output' }>);
+    (ds.worker as any).emit('message', {
+      type: 'user_notify', message: 'late silent notice', turnId,
+    } satisfies Extract<WorkerToDaemon, { type: 'user_notify' }>);
+    await Promise.resolve();
+    expect(sessionReply).not.toHaveBeenCalled();
+
+    (ds.worker as any).emit('message', {
+      type: 'user_notify', message: 'ordinary notice', turnId: 'om_normal_after_restart',
+    } satisfies Extract<WorkerToDaemon, { type: 'user_notify' }>);
+    await Promise.resolve();
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(sessionReply.mock.calls[0][1]).toBe('ordinary notice');
   });
 
   it('drops only the final_output of a suppressed trigger turn while other turns and its aux UI stay loud', async () => {

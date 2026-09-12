@@ -25,6 +25,7 @@ vi.mock('node:child_process', () => ({
 }));
 
 import { createCliAdapterSync } from '../src/adapters/cli/registry.js';
+import { busyProbeRegion } from '../src/utils/busy-probe.js';
 import { TERMINAL_CANCEL_COOLDOWN_MS } from '../src/adapters/backend/critical-control-key.js';
 import { createClaudeCodeAdapter } from '../src/adapters/cli/claude-code.js';
 import { createAidenAdapter } from '../src/adapters/cli/aiden.js';
@@ -456,6 +457,40 @@ describe('codex buildArgs', () => {
     expect(args[idx + 1]).toBe('shell_environment_policy.set.BOTMUX_SESSION_ID="sess-4"');
   });
 
+  // Codex does NOT hand its own environment to the shell commands it runs, so
+  // the trigger-user wrapper vars have to be declared explicitly or `lark-cli`
+  // resolves the machine's login instead of the acting person's. Shipped broken
+  // exactly this way: worker set them, tmux forwarded them, codex stripped them.
+  it('forwards the trigger-user identity vars to shell subprocesses', () => {
+    const args = adapter.buildArgs({
+      sessionId: 'sess-tua',
+      resume: false,
+      shellSubprocessEnv: {
+        BOTMUX_IDENTITY_BIN: '/data/cli-identity/sess-tua.bin',
+        ZDOTDIR: '/data/cli-identity/sess-tua.bin/shell',
+      },
+    });
+    expect(args).toContain('shell_environment_policy.set.BOTMUX_IDENTITY_BIN="/data/cli-identity/sess-tua.bin"');
+    expect(args).toContain('shell_environment_policy.set.ZDOTDIR="/data/cli-identity/sess-tua.bin/shell"');
+  });
+
+  // `.set` per key, never `inherit="all"`: that would hand every shell command
+  // the entire worker environment for a need that is exactly three variables.
+  it('does not widen the policy to inherit everything', () => {
+    const args = adapter.buildArgs({
+      sessionId: 'sess-tua', resume: false,
+      shellSubprocessEnv: { BOTMUX_IDENTITY_BIN: '/data/x.bin' },
+    });
+    expect(args).not.toContain('shell_environment_policy.inherit="all"');
+  });
+
+  it('adds nothing when trigger-user auth is off', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-plain', resume: false });
+    expect(args.filter(a => a.startsWith('shell_environment_policy.set.'))).toEqual([
+      'shell_environment_policy.set.BOTMUX_SESSION_ID="sess-plain"',
+    ]);
+  });
+
   it('RPC mode: attaches to the app-server thread AND disables the startup update check', () => {
     const args = adapter.buildArgs({
       sessionId: 'sess-rpc', resume: true,
@@ -467,7 +502,9 @@ describe('codex buildArgs', () => {
     // pure --remote viewer: no paste-mode bypass flag, no stale resume path
     expect(args).toEqual([
       '--remote', 'ws://127.0.0.1:9931', 'resume', '--no-alt-screen',
-      '-c', 'check_for_update_on_startup=false', 'thread-abc',
+      '-c', 'check_for_update_on_startup=false',
+      '-c', 'notice.hide_rate_limit_model_nudge=true',
+      'thread-abc',
     ]);
     // the -c disable must land BEFORE the thread id (a resume-subcommand config)
     const cIdx = args.indexOf('-c');
@@ -533,6 +570,8 @@ describe('codex buildArgs', () => {
       'shell_environment_policy.set.BOTMUX_SESSION_ID="sess-4"',
       '-c',
       'check_for_update_on_startup=false',
+      '-c',
+      'notice.hide_rate_limit_model_nudge=true',
       '-C',
       '/repo/root',
     ]);
@@ -546,6 +585,8 @@ describe('codex buildArgs', () => {
       'shell_environment_policy.set.BOTMUX_SESSION_ID="sess-4"',
       '-c',
       'check_for_update_on_startup=false',
+      '-c',
+      'notice.hide_rate_limit_model_nudge=true',
       '-C',
       '/repo/root',
     ]);
@@ -558,6 +599,40 @@ describe('codex buildArgs', () => {
     const idx = args.indexOf('check_for_update_on_startup=false');
     expect(idx).toBeGreaterThan(0);
     expect(args[idx - 1]).toBe('-c');
+  });
+
+  it('suppresses the low-usage luna model nudge for plain TUI launches', () => {
+    // Codex 0.151+ shows a "Switch to <luna> for lower credit usage?" popup at
+    // >=90% primary usage; its default item switches models, and the paste
+    // path's submit Enter would confirm it (#1281). Process-level -c only.
+    const fresh = adapter.buildArgs({ sessionId: 'sess-4', resume: false });
+    const idx = fresh.indexOf('notice.hide_rate_limit_model_nudge=true');
+    expect(idx).toBeGreaterThan(0);
+    expect(fresh[idx - 1]).toBe('-c');
+
+    // Must survive resume as well, placed before the resumed session id.
+    const resumed = adapter.buildArgs({
+      sessionId: 'sess-4',
+      resume: true,
+      resumeSessionId: 'codex-session-id',
+    });
+    const resumeIdx = resumed.indexOf('notice.hide_rate_limit_model_nudge=true');
+    expect(resumeIdx).toBeGreaterThan(0);
+    expect(resumeIdx).toBeLessThan(resumed.indexOf('codex-session-id'));
+  });
+
+  it('also suppresses the luna nudge popup on the pure --remote RPC viewer', () => {
+    // The viewer injects no keys (turns go through app-server JSON-RPC), but it
+    // is itself a TUI that renders the modal; keep the pane free of it like the
+    // startup update picker, before the resumed thread id.
+    const args = adapter.buildArgs({
+      sessionId: 'sess-rpc', resume: true,
+      remoteWsUrl: 'ws://127.0.0.1:9931', remoteThreadId: 'thread-abc',
+    });
+    const idx = args.indexOf('notice.hide_rate_limit_model_nudge=true');
+    expect(idx).toBeGreaterThan(0);
+    expect(args[idx - 1]).toBe('-c');
+    expect(idx).toBeLessThan(args.indexOf('thread-abc'));
   });
 
   it('keeps the startup update override on resume before the Codex session id', () => {
@@ -962,12 +1037,12 @@ describe('dsh-tui buildArgs (PTY TUI model)', () => {
     expect(adapter.readyPattern?.test('❯ ')).toBe(true);
   });
 
-  it('defers the first prompt until the TUI composer is ready', () => {
+  it('defers the first prompt until the TUI composer is ready (three-stage boot)', () => {
     expect(adapter.deferFirstPromptTimeoutUntilReady).toBe(true);
   });
 
-  it('does not type ahead', () => {
-    expect(adapter.supportsTypeAhead).not.toBe(true);
+  it('supports type-ahead so queued messages are written while the TUI is busy', () => {
+    expect(adapter.supportsTypeAhead).toBe(true);
   });
 
   it('exposes and pre-creates configured DSH_HOME plus ~/.dsh-tui as auth paths', () => {
@@ -1484,6 +1559,14 @@ describe('opencode buildArgs', () => {
 
   it('passesInitialPromptViaArgs is true', () => {
     expect(adapter.passesInitialPromptViaArgs).toBe(true);
+  });
+
+  it('declares maxInitialPromptArgBytes to guard tmux command-too-long', () => {
+    // OpenCode bakes the full first-round prompt into `--prompt <content>`.
+    // tmux new-session rejects long command strings well below OS ARG_MAX,
+    // so the adapter must declare a byte budget: short prompts keep --prompt,
+    // over-limit prompts defer to the post-start input queue.
+    expect(adapter.maxInitialPromptArgBytes).toBe(8192);
   });
 
   it('exposes paste-line raw command delivery capability', () => {
@@ -2254,6 +2337,109 @@ describe('busyPattern', () => {
     expect(busy!.test('› Ask anything                                      97% left')).toBe(false);
     expect(busy!.test('Working through the implementation')).toBe(false);
     expect(busy!.test('press esc to interrupt')).toBe(false);
+  });
+
+  it('claude-code matches the working footer structure and self-heals a false idle, but not prose or the idle composer', () => {
+    // Regression: claude-code only had a readyPattern (❯ is resident while
+    // Claude works), so a single ≥2s PTY stall flipped a busy session to idle
+    // with no path back. The working footer carries an extra
+    // 「· esc to interrupt ·」 segment the idle composer lacks.
+    const claude = createCliAdapterSync('claude-code');
+    const busy = claude.busyPattern;
+    expect(busy).toBeDefined();
+    expect(claude.idleToBusyPattern).toBeDefined();
+    expect(claude.idleToBusyPattern!.source).toBe(busy!.source);
+    // Real footer lines (5 permission modes — mode names are runtime-assembled,
+    // do NOT enumerate them in the anchor — plus the ctrl+t variant and the
+    // retry footer), extracted from live panes.
+    expect(busy!.test('⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt · ← for agents')).toBe(true);
+    expect(busy!.test('⏸  manual mode on · esc to interrupt · ← for agents')).toBe(true);
+    expect(busy!.test('⏵⏵ accept edits on (shift+tab to cycle) · esc to interrupt · ← for agents')).toBe(true);
+    expect(busy!.test('⏸  plan mode on (shift+tab to cycle) · esc to interrupt · ← for agents')).toBe(true);
+    expect(busy!.test('⏵⏵ auto mode on (shift+tab to cycle) · esc to interrupt · ← for agents')).toBe(true);
+    expect(busy!.test('⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt · ctrl+t to hide tasks · ← for agents')).toBe(true);
+    expect(busy!.test(' · next try in 3s · attempt 2 · esc to interrupt')).toBe(true);
+    // Idle composer: no interrupt segment.
+    expect(busy!.test('⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents')).toBe(false);
+    expect(busy!.test('❯')).toBe(false);
+    // Prose quoting the hint must not flip an idle card back to busy. The
+    // transcript shares the screen with the footer and busyProbeRegion scans
+    // the bottom third, so the BARE phrase in prose (prompt echo, assistant
+    // reply, mid-dot decoration, "on" + hint shape, prompt-then-help form)
+    // must all stay inert — a loose /esc to interrupt/ anchor pinned idle
+    // sessions busy forever (probe retries have no deadline).
+    expect(busy!.test('press esc to interrupt')).toBe(false);
+    expect(busy!.test('❯ Reply with exactly this one line and nothing else: docs say esc to interrupt works')).toBe(false);
+    expect(busy!.test('● docs say esc to interrupt works')).toBe(false);
+    expect(busy!.test('· esc to interrupt ·')).toBe(false);
+    expect(busy!.test('the mode is on · esc to interrupt is documented in the docs')).toBe(false);
+    expect(busy!.test('next try: please esc to interrupt yourself')).toBe(false);
+    // Multi-line probe region: prose above must not rescue a busy verdict,
+    // and a busy footer must be found mid-region.
+    const region = [
+      '❯ docs say esc to interrupt works',
+      '● docs say esc to interrupt works',
+      '✻ Cogitated for 19s · done 10:36 PM',
+      '────────────────────────────────',
+      '❯',
+      '────────────────────────────────',
+      '  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents',
+    ].join('\n');
+    expect(busy!.test(region)).toBe(false);
+    const busyRegion = region.replace(
+      '· ← for agents',
+      '· esc to interrupt · ← for agents',
+    );
+    expect(busy!.test(busyRegion)).toBe(true);
+    // Shared def: seed/relay render the same Claude Code footer.
+    expect(createCliAdapterSync('seed').busyPattern!.source).toBe(busy!.source);
+    expect(createCliAdapterSync('relay').busyPattern!.source).toBe(busy!.source);
+  });
+
+  it('claude-code busy footer matches through the SGR color codes tmux capture-pane -e emits at line starts', () => {
+    // Regression: the worker's viewport busy probe reads captureViewport() =
+    // `tmux capture-pane -e -p`, whose rows carry SGR/control codes. A live
+    // busy footer is literally (verbatim bytes from a busy pane):
+    //   \x1b[39m  \x1b[38;5;211m⏵⏵ bypass permissions on\x1b[38;5;246m (shift+tab to cycle) · esc to interrupt · ← for agents\x1b[39m
+    // The pattern anchors on `^\s*[⏵⏸]`, but the line STARTS with an ESC
+    // sequence, so the anchor never binds and the pre-idle veto never fires —
+    // the card flips green while Claude works. Assertions go through the REAL
+    // worker entry (busyProbeRegion, which strips ANSI before region/slice),
+    // so reverting the worker fix makes these fail.
+    const busy = createCliAdapterSync('claude-code').busyPattern!;
+    const ansiBusyFooter =
+      '\x1b[39m  \x1b[38;5;211m⏵⏵ bypass permissions on\x1b[38;5;246m (shift+tab to cycle) · esc to interrupt · ← for agents\x1b[39m';
+    const ansiIdleFooter =
+      '\x1b[39m  \x1b[38;5;211m⏵⏵ bypass permissions on\x1b[38;5;246m (shift+tab to cycle) · ← for agents\x1b[39m';
+    // Raw ANSI rows do NOT match the bare pattern — that is the production
+    // bug; busyProbeRegion must repair them.
+    expect(busy.test(ansiBusyFooter)).toBe(false);
+    expect(busy.test(ansiIdleFooter)).toBe(false);
+    // Through the real viewport entry: busy resolves busy, idle stays idle.
+    expect(busy.test(busyProbeRegion(ansiBusyFooter))).toBe(true);
+    expect(busy.test(busyProbeRegion(ansiIdleFooter))).toBe(false);
+    // Multi-line region (tail slice + strip): colored prose above + colored
+    // busy footer at the bottom resolves busy; the same with the interrupt
+    // segment removed stays idle.
+    const region = (footer: string) => [
+      '\x1b[36m● docs say esc to interrupt works\x1b[39m',
+      '\x1b[2m────────────────────────────────\x1b[22m',
+      '\x1b[1m❯\x1b[22m',
+      '\x1b[2m────────────────────────────────\x1b[22m',
+      footer,
+    ].join('\n');
+    expect(busy.test(busyProbeRegion(region(ansiBusyFooter)))).toBe(true);
+    expect(busy.test(busyProbeRegion(region(ansiIdleFooter)))).toBe(false);
+    // Control sequences tmux capture-pane can emit that a narrower stripper
+    // misses (Codex review): CSI with ':' subparameter, ST-terminated OSC 8
+    // hyperlink, and bare SO/SI charset-shift bytes at the line start. Each
+    // must be removed so the `^` anchor still binds; all must resolve busy.
+    const plainBusy = '⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt · ← for agents';
+    expect(busy.test(busyProbeRegion('\x1b[4:3m' + plainBusy))).toBe(true);
+    expect(busy.test(busyProbeRegion('\x1b]8;;http://x\x1b\\' + plainBusy + '\x1b]8;;\x1b\\'))).toBe(true);
+    expect(busy.test(busyProbeRegion('\x0f' + plainBusy))).toBe(true);
+    // Cursor-forward (ESC[nC) renders as real gaps and is preserved as spaces.
+    expect(busy.test(busyProbeRegion('\x1b[5C' + plainBusy))).toBe(true);
   });
 
   it('traex matches spinner-anchored working labels and standalone queue strings but not prose or idle composer', () => {

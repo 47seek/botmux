@@ -280,6 +280,23 @@ export interface Session {
   /** This chat-scoped automation deliberately has no topic seed. Prevents the
    *  chat-mode conversion guard from treating chatId as a replyable message id. */
   externalTriggerTopicless?: boolean;
+  /** Session created by `botmux headless`: no Lark chat is bound until an
+   *  explicit publish/bind command provides one. The synthetic chat/root ids
+   *  keep the existing session store and worker lifecycle reusable while every
+   *  Lark-facing path can fail closed through larkTransportEnabled(). */
+  headless?: {
+    id: string;
+    createdAt: string;
+    source: 'cli';
+    latestTriggerId?: string;
+    lastRunAt?: string;
+    lastPublishedAt?: string;
+    lastPublishedMessageId?: string;
+    boundAt?: string;
+    boundChatId?: string;
+    boundRootMessageId?: string;
+    boundScope?: 'thread' | 'chat';
+  };
   /** A silent `executionPosition='new-topic'` schedule starts without a Lark
    *  root message. `routingAnchor` is the durable daemon-internal identity for
    *  that one run; the first successful `botmux send` materializes a real root
@@ -602,6 +619,10 @@ export interface Session {
   currentImageKey?: string;
   currentTurnTitle?: string;
   usageLimit?: CliUsageLimitState;
+  /** Model fallback in effect. Persisted alongside usageLimit because the
+   *  worker's baseline cursors to EOF after a restart — the switch record is
+   *  already history by then and would never be drained again. */
+  modelFallback?: ModelFallbackState;
   lastUserPrompt?: string;
   lastCliInput?: string;
   /** Structured companion for lastCliInput so retry_last_task can preserve a
@@ -670,6 +691,9 @@ export interface Session {
   cliId?: import('./adapters/cli/types.js').CliId;
   /** Bot-owned /cli selection, authoritative when present. */
   cliLaunchSnapshot?: SessionCliLaunchSnapshotV1;
+  /** Durable account-directory routing, independent of the live bot defaults. */
+  cliInstanceBinding?: import('./services/codex-instance-pool.js').SessionCliInstanceBindingV1;
+  creationSource?: import('./services/codex-instance-pool.js').SessionCreationSource;
   /** Concrete CLI distribution frozen with cliId. New sessions carry this
    * structured snapshot while cliPathOverride remains shadow-written for
    * downgrade compatibility with older botmux builds. */
@@ -938,6 +962,10 @@ export type ScheduleExecutionPosition = 'top-level' | 'topic' | 'new-topic';
 
 export interface ScheduledTask {
   id: string;
+  /** Opaque pointer to a daemon-owned Bash precondition sidecar. The script is
+   *  never stored in this sandbox-writable task row. Absence does not prove
+   *  that no condition exists: runtime always checks the sidecar by task id. */
+  preconditionRef?: string;
   name: string;
   /** Raw user input (e.g. "每日17:50" or "30m" or "0 9 * * *") */
   schedule: string;
@@ -945,7 +973,12 @@ export interface ScheduledTask {
   parsed: ParsedSchedule;
   prompt: string;
   workingDir: string;
+  /** Primary execution chat retained for backward compatibility. For a
+   *  multi-chat task this is always the first entry of `chatIds`. */
   chatId: string;
+  /** All execution chats in deterministic dispatch order. Persisted only
+   *  when more than one chat is configured; absent means `[chatId]`. */
+  chatIds?: string[];
   /** Root message id of the topic where the task was created. When set,
    *  execution replies into this thread instead of creating a new one. */
   rootMessageId?: string;
@@ -994,7 +1027,7 @@ export interface ScheduledTask {
   createdAt: string;
   lastRunAt?: string;
   nextRunAt?: string;
-  lastStatus?: 'ok' | 'error';
+  lastStatus?: 'ok' | 'error' | 'skipped';
   lastError?: string;
   lastDeliveryError?: string;
   /** Repeat counter — times=null means forever; times>0 auto-removes after N runs */
@@ -1028,6 +1061,35 @@ export interface ScheduledTask {
    *  becomes the landing point. Only meaningful with executionPosition
    *  'topic'. */
   followActive?: boolean;
+  /** Per-task CLI model, overriding the bot's configured one for this task's
+   *  own runs (e.g. a cheap model for a 30m sentinel next to a strong one for
+   *  the nightly review, on ONE bot).
+   *
+   *  Same fresh-spawn-only semantics as the trigger API's `options.model`, and
+   *  for the same physical reason: the model is a CLI **process launch**
+   *  argument, so only a fire that spawns a worker can apply it. A fire that
+   *  injects into the task's existing session keeps whatever that process
+   *  started with. In practice: `new-topic` tasks apply it on every run;
+   *  `topic` / `top-level` tasks apply it on the run that creates their
+   *  session and then keep it. Creation surfaces say so out loud rather than
+   *  letting the difference be discovered at fire time.
+   *
+   *  Gated at fire time on the bot's CLI actually supporting the override
+   *  (isConfigurableReasoningCliId) — an unsupported pairing is dropped with a
+   *  warning, never a skipped run.
+   *
+   *  It rides on the in-memory DaemonSession (spawnModelOverride), never on the
+   *  session record, so a daemon restart drops it: a `topic` / `top-level` task
+   *  whose session survives the restart re-forks on the bot's model. Persisting
+   *  it is not the fix — a stored session model outranks the bot's configured one
+   *  forever, which is the bug `resolveSessionLaunchModel` exists to undo. Same
+   *  behavior as the trigger API's per-turn model. */
+  model?: string;
+  /** Per-task reasoning effort, same override + fresh-spawn-only semantics as
+   *  `model`. Dropped at fire time when the resolved model does not offer the
+   *  level (`cliModelSupportsReasoningEffort`), mirroring what sessionAgentConfig
+   *  already does to a session-level effort. */
+  reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
   // DEPRECATED — kept only for backward-compat migration
   type?: 'cron' | 'interval' | 'once';
 }
@@ -1186,6 +1248,11 @@ export interface PendingRepoSetup {
   rawInput?: string;
   turnId?: string;
   baseDir?: string;
+  force?: boolean;
+  worktreePath?: string;
+  branch?: string;
+  reuseExisting?: boolean;
+  targetSubdir?: string;
   repoCardMessageId?: string;
   codexAppText?: string;
   codexAppApplicationContext?: string;
@@ -1198,7 +1265,7 @@ export interface PendingRepoSetup {
 
 /** Messages sent from Daemon to Worker */
 type DaemonToWorkerBase =
-  | { type: 'init'; sessionId: string; chatId: string; chatType?: 'group' | 'p2p'; rootMessageId: string; workingDir: string; cliId: string; cliRuntime?: import('./adapters/cli/runtime.js').CliRuntimeSnapshot; cliPathOverride?: string; wrapperCli?: string; launchShell?: string; model?: string; modelBackendVariant?: 'standard' | 'max'; turnTimeoutMs?: number; dshProfile?: string; dshRuntime?: 'official' | 'tui'; reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'; disableCliBypass?: boolean; codexBrowser?: import('./core/codex-browser-config.js').CodexBrowserConfig; codexRpcInput?: boolean; codexAuthSync?: import('./services/codex-auth-sync.js').CodexAuthSyncMode; existingAppServerEndpoint?: string; startupCommands?: string[]; env?: Record<string, string>; replyStyle?: import('./im/lark/reply-card-style.js').ReplyStyleConfig; sandbox?: boolean; sandboxPaths?: { readWrite?: string[]; readOnly?: string[]; deny?: string[] }; sandboxHidePaths?: string[]; sandboxReadonlyPaths?: string[]; sandboxNetwork?: boolean; readIsolation?: boolean; readDenyExtraPaths?: string[]; daemonBootId?: string; backendType: BackendType; persistentBackendTarget?: PersistentBackendTarget; backendConfig?: RiffBackendConfig | MojoConfig; riffParentTaskId?: string; riffRepoDirs?: string[]; deferredScheduleRun?: Session['deferredScheduleRun']; nativeSessionTitle?: string; nativeSessionTitlePrompt?: string; prompt: string; promptCodexAppInput?: CodexAppTurnInput; queuedActivationToken?: string; resume?: boolean; forkSession?: boolean; cliSessionId?: string; originalSessionId?: string; ownerOpenId?: string; webPort?: number; larkAppId: string; larkAppSecret: string; apiOnly?: boolean; loadedBotsConfigPath?: string; loadedBotsConfigProvenance?: import('./core/config-dir.js').BotsConfigProvenance; brand?: 'feishu' | 'lark'; botName?: string; botOpenId?: string; locale?: 'zh' | 'en'; turnId?: string; replyTurnId?: string; dispatchAttempt?: number; atMostOnce?: boolean; codexAppDispatchId?: string; codexAppSteerable?: true; codexAppRecoveredDispatches?: CodexAppDispatchLedgerEntry[]; codexAppGenerationCommits?: CodexAppGenerationCommit[]; vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin; trustedCaller?: TrustedCaller; pluginBindings?: string[]; skillPolicy?: BotSkillPolicy; skillPluginDir?: string; skillReadonlyRoots?: string[]; adoptMode?: boolean; adoptSource?: 'tmux' | 'herdr' | 'zellij'; adoptTmuxTarget?: string; adoptZellijSession?: string; adoptZellijPaneId?: string; adoptHerdrSessionName?: string; adoptHerdrTarget?: string; adoptHerdrPaneId?: string; adoptPaneCols?: number; adoptPaneRows?: number; bridgeJsonlPath?: string; adoptCliPid?: number; adoptCwd?: string; adoptRestoredFromMetadata?: boolean; runnerBuildId?: string; persistedRunnerBuildId?: string; restartAttemptId?: string }
+  | { type: 'init'; sessionId: string; chatId: string; chatType?: 'group' | 'p2p'; rootMessageId: string; workingDir: string; cliId: string; cliRuntime?: import('./adapters/cli/runtime.js').CliRuntimeSnapshot; cliPathOverride?: string; wrapperCli?: string; launchShell?: string; model?: string; modelBackendVariant?: 'standard' | 'max'; turnTimeoutMs?: number; dshProfile?: string; dshRuntime?: 'official' | 'tui'; reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'; disableCliBypass?: boolean; codexBrowser?: import('./core/codex-browser-config.js').CodexBrowserConfig; codexRpcInput?: boolean; codexAuthSync?: import('./services/codex-auth-sync.js').CodexAuthSyncMode; triggerUserAuth?: import('./services/trigger-user-auth.js').TriggerUserAuthConfig; existingAppServerEndpoint?: string; startupCommands?: string[]; env?: Record<string, string>; replyStyle?: import('./im/lark/reply-card-style.js').ReplyStyleConfig; sandbox?: boolean; sandboxPaths?: { readWrite?: string[]; readOnly?: string[]; deny?: string[] }; sandboxHidePaths?: string[]; sandboxReadonlyPaths?: string[]; sandboxNetwork?: boolean; readIsolation?: boolean; readDenyExtraPaths?: string[]; daemonBootId?: string; backendType: BackendType; persistentBackendTarget?: PersistentBackendTarget; backendConfig?: RiffBackendConfig | MojoConfig; riffParentTaskId?: string; riffRepoDirs?: string[]; deferredScheduleRun?: Session['deferredScheduleRun']; nativeSessionTitle?: string; nativeSessionTitlePrompt?: string; prompt: string; promptCodexAppInput?: CodexAppTurnInput; queuedActivationToken?: string; resume?: boolean; forkSession?: boolean; cliSessionId?: string; originalSessionId?: string; ownerOpenId?: string; webPort?: number; larkAppId: string; larkAppSecret: string; apiOnly?: boolean; loadedBotsConfigPath?: string; loadedBotsConfigProvenance?: import('./core/config-dir.js').BotsConfigProvenance; brand?: 'feishu' | 'lark'; botName?: string; botOpenId?: string; locale?: 'zh' | 'en'; turnId?: string; replyTurnId?: string; dispatchAttempt?: number; atMostOnce?: boolean; codexAppDispatchId?: string; codexAppSteerable?: true; codexAppRecoveredDispatches?: CodexAppDispatchLedgerEntry[]; codexAppGenerationCommits?: CodexAppGenerationCommit[]; vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin; trustedCaller?: TrustedCaller; pluginBindings?: string[]; skillPolicy?: BotSkillPolicy; skillPluginDir?: string; skillReadonlyRoots?: string[]; adoptMode?: boolean; adoptSource?: 'tmux' | 'herdr' | 'zellij'; adoptTmuxTarget?: string; adoptZellijSession?: string; adoptZellijPaneId?: string; adoptHerdrSessionName?: string; adoptHerdrTarget?: string; adoptHerdrPaneId?: string; adoptPaneCols?: number; adoptPaneRows?: number; bridgeJsonlPath?: string; adoptCliPid?: number; adoptCwd?: string; adoptRestoredFromMetadata?: boolean; runnerBuildId?: string; persistedRunnerBuildId?: string; restartAttemptId?: string }
   /** `model` rides along on every turn for the SAME reason the restart IPC carries
    *  it: the crash-loop park recovery respawns the CLI from inside the worker on
    *  the next message, with no restart IPC to refresh the snapshot. Same
@@ -1292,7 +1359,7 @@ type DaemonToWorkerBase =
 
 export type DaemonToWorker = DaemonToWorkerBase extends infer Message
   ? Message extends { type: 'init' }
-    ? Message & { feedback?: import('./services/feedback-policy.js').FeedbackPolicy }
+    ? Message & { feedback?: import('./services/feedback-policy.js').FeedbackPolicy; cliInstanceBinding?: import('./services/codex-instance-pool.js').SessionCliInstanceBindingV1 }
     : Message
   : never;
 
@@ -1302,8 +1369,46 @@ export type DaemonToWorker = DaemonToWorkerBase extends infer Message
  *  worker truncates args/results before shipping. */
 export type CotEntry =
   | { kind: 'thinking'; text: string }
-  | { kind: 'tool_call'; id: string; name: string; args: string }
+  | {
+    kind: 'tool_call'; id: string; name: string; args: string;
+    /** 转写层从**未截断**的完整 input 提取的单行主题（command / file_path /
+     *  …），气泡工具节点标题的首选载体：args 会被截到 600 字符，长命令 /
+     *  大 content 的 Write 一截就解析不出主题。缺省时（旧世代 worker）渲染层
+     *  回退解析 args。已折叠为单行、≤1000 字符（超长带 `…`）。 */
+    subject?: string;
+  }
   | { kind: 'tool_result'; id: string; result: string };
+
+/** A Claude model switch that is still in effect: Claude Code fell back off the
+ *  configured model and every later reply is served by `fallbackModel` until the
+ *  user runs `/model` to switch back. Observed by the worker from the session
+ *  transcript, persisted on the Session, and rendered as one notice line on the
+ *  live card. */
+export interface ModelFallbackState {
+  /** uuid of the transcript record that caused the switch — the stable key for
+   *  dedupe and for "is this still the same switch". */
+  uuid: string;
+  /** 'refusal' = safety guardrails, 'unavailable' = model not usable,
+   *  'consent' = quota/billing confirmation. */
+  kind: 'refusal' | 'unavailable' | 'consent';
+  /** Configured model, as written in the transcript (e.g. `claude-fable-5-1[1m]`). */
+  originalModel: string;
+  /** Model now serving the session (e.g. `claude-opus-4-8[1m]`). */
+  fallbackModel: string;
+  /** Raw reason for a non-refusal switch: `overloaded`, `model_not_found`, … */
+  trigger?: string;
+  /** Refusal category (`cyber`, `bio`, …). */
+  apiRefusalCategory?: string;
+  observedAt?: string;
+  /** Claude session (transcript jsonl basename) this switch happened in. The
+   *  notice is per Claude conversation, not per botmux session: `/repo`,
+   *  `/adopt` and a resume onto another native session all replace it, and a
+   *  record carried across that boundary is either a warning about a
+   *  conversation the user is no longer having or one nothing can ever clear.
+   *  Absent on state persisted by builds that predate the binding; the next
+   *  worker's mandatory seed re-establishes it. */
+  claudeSessionId?: string;
+}
 
 /** Messages sent from Worker to Daemon */
 export type WorkerToDaemon =
@@ -1360,6 +1465,25 @@ export type WorkerToDaemon =
       type: 'active_runtime';
       model: string | null;
       reasoningEffort: string | null;
+    }
+  /** OBSERVED FACTS about Claude Code's automatic model switching — never a
+   * decision. `claudeSessionId` (always present) says WHICH Claude conversation
+   * they are about; `fallback` is a `scope:"session"` switch record this worker
+   * had not reported yet, or `null` when the newest such record is positive
+   * evidence that no notice applies (a non-Fable original, or one a fork
+   * neutralised); `servingModel` is the model serving the MAIN thread, sent
+   * whenever it changed since the worker's last report — it also drives the
+   * card's usage line, because Claude never emits `active_runtime`. The daemon
+   * holds the state and merges: a message from a different Claude session drops
+   * what it held first, a new record replaces, `fallback: null` clears, and a
+   * serving model different from the held `fallbackModel` clears. An ABSENT
+   * field means "nothing new observed" — a worker restart or a too-short
+   * transcript window must never read as "cleared". */
+  | {
+      type: 'model_fallback';
+      claudeSessionId: string;
+      fallback?: ModelFallbackState | null;
+      servingModel?: string;
     }
   | { type: 'native_session_title_generated'; title: string }
   | {
@@ -1480,6 +1604,15 @@ export type WorkerToDaemon =
         generation: string;
         seq: number;
         dispatchId: string;
+        /** Real completion instant / native execution span for the terminal the
+         *  daemon synthesizes from this settlement. The daemon persists that
+         *  terminal BEFORE the worker's own ordered `turn_terminal` arrives, and
+         *  the store's INSERT OR IGNORE keeps whichever lands first — so without
+         *  these the durable path would durably win with a timing-less row and
+         *  permanently mask the worker's real numbers. Same optional-means-
+         *  unknown contract as `turn_terminal`. */
+        completedAtMs?: number;
+        durationMs?: number;
       };
       /** The model already delivered through botmux send; settle without fallback output. */
       suppressDelivery?: boolean;
@@ -1525,6 +1658,18 @@ export type WorkerToDaemon =
        *  emits `completed` with no final_output after fs-lag and must NOT be
        *  read as silence (that would mask a real, still-arriving answer). */
       outputDisposition?: 'nothing_to_send';
+      /** Wall-clock epoch ms at which the CLI turn actually reached its native
+       *  terminal. Absent when the emitter cannot vouch for a real instant, in
+       *  which case the recorder falls back to its own write time (which is NOT
+       *  the completion time — that fallback is exactly why this field exists). */
+      completedAtMs?: number;
+      /** True native execution time: from the moment this turn's input was
+       *  literally written to the CLI, to `completedAtMs`. Deliberately excludes
+       *  daemon/worker queueing before the write, so it measures the CLI, not the
+       *  backlog. Omitted (never guessed, never zero-filled) whenever the start
+       *  instant is unknown — an absent duration is honest, a fabricated one is
+       *  not. Always a non-negative integer when present. */
+      durationMs?: number;
     }
   | { type: 'adopt_preamble'; userText: string; assistantText: string; turnId?: string }
   | { type: 'deferred_topic_materialized'; sessionId: string; turnId: string; rootMessageId: string }
