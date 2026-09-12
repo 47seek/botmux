@@ -6,7 +6,7 @@ import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { readPeerCrossRef } from './services/peer-cross-ref-store.js';
 import { parseBotSteerDirective } from './core/bot-steer-directive.js';
 import { readAllowedUsersResolveCache, writeAllowedUsersResolveCache } from './utils/allowed-users-cache.js';
-import { join, dirname } from 'node:path';
+import { join, dirname, basename, isAbsolute, relative } from 'node:path';
 import { homedir, loadavg, cpus, totalmem, freemem } from 'node:os';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { fileURLToPath } from 'node:url';
@@ -3604,6 +3604,10 @@ function triggerUserAuthEnabledFor(ds: DaemonSession): boolean {
   catch { return false; }
 }
 
+function prepareTurnCliIdentity(ds: DaemonSession, turnId: string): Promise<void> | undefined {
+  return triggerUserAuthEnabledFor(ds) ? refreshTurnCliIdentity(ds, turnId) : undefined;
+}
+
 async function refreshTurnCliIdentity(ds: DaemonSession, turnId: string): Promise<void> {
   let botConfig;
   try { botConfig = getBot(ds.larkAppId).config; } catch { return; }
@@ -4122,6 +4126,59 @@ async function replyGrantRestrictionIfNeeded(
   if (!text) return false;
   await sessionReply(anchor, text, 'text', larkAppId);
   return true;
+}
+
+async function forceTopicWorktreeTarget(baseDir: string, anchor: string): Promise<{
+  worktreePath: string;
+  branch: string;
+  targetSubdir?: string;
+}> {
+  const { mainWorktreeFor, worktreeRootFor } = await import('./services/git-worktree.js');
+  const containingRoot = await worktreeRootFor(baseDir);
+  const repoRoot = await mainWorktreeFor(baseDir);
+  const subdir = containingRoot ? relative(containingRoot, baseDir) : '';
+  const short = createHash('sha1').update(anchor).digest('hex').slice(0, 12);
+  const branch = `wt/botmux-${short}`;
+  return {
+    branch,
+    worktreePath: join(dirname(repoRoot), `${basename(repoRoot)}-wt-botmux-${short}`),
+    ...((subdir && !subdir.startsWith('..') && !isAbsolute(subdir)) ? { targetSubdir: subdir } : {}),
+  };
+}
+
+function validateExplicitForceTopicWorkingDir(dir: string | undefined, loc: ReturnType<typeof localeForBot>): string | undefined {
+  if (!dir) return undefined;
+  const validation = validateWorkingDir(dir, loc);
+  if (!validation.ok) return undefined;
+  return validation.resolvedPath;
+}
+
+function resolveForceTopicCurrentWorkingDir(ctx: {
+  scope: 'thread' | 'chat';
+  anchor: string;
+  chatId: string;
+  larkAppId: string;
+  currentSession?: DaemonSession;
+}): string | undefined {
+  const loc = localeForBot(ctx.larkAppId);
+  const current = validateExplicitForceTopicWorkingDir(ctx.currentSession?.workingDir, loc);
+  if (current) return current;
+
+  const oncall = validateExplicitForceTopicWorkingDir(findOncallChat(ctx.larkAppId, ctx.chatId)?.workingDir, loc);
+  if (oncall) return oncall;
+
+  const peers = ctx.scope === 'chat'
+    ? sessionStore.findActiveChatScopeSessionsByChat(ctx.chatId)
+    : [
+        ...sessionStore.findActiveSessionsByRoot(ctx.anchor),
+        ...sessionStore.findActiveChatScopeSessionsByChat(ctx.chatId),
+      ];
+  for (const peer of peers) {
+    if (!peer.workingDir) continue;
+    const resolved = validateExplicitForceTopicWorkingDir(peer.workingDir, loc);
+    if (resolved) return resolved;
+  }
+  return undefined;
 }
 
 // ─── PID file ────────────────────────────────────────────────────────────────
@@ -5085,6 +5142,7 @@ const commandDeps: CommandHandlerDeps = {
   sessionReply,
   getActiveCount,
   lastRepoScan,
+  prepareTurn: (ds, turnId) => prepareTurnCliIdentity(ds, turnId),
   prewarmDocCommentSession,
 };
 
@@ -17092,11 +17150,14 @@ function willAutoWorktree(larkAppId: string, pinnedWorkingDir: string | undefine
  * (build fails / user /closes) — an early ✋ would be orphaned. The pending dashboard
  * row is announced inside runAutoWorktreeCommit (one place for all callers). */
 function startAutoWorktreePending(ds: DaemonSession, args: {
-  anchor: string; baseDir: string; title?: string; prompt: string; operatorOpenId?: string;
+  anchor: string; baseDir: string; title?: string; prompt: string; operatorOpenId?: string; force?: boolean;
+  worktreePath?: string; branch?: string; reuseExisting?: boolean; targetSubdir?: string;
 }): void {
   void runAutoWorktreeCommit({
     ds, anchor: args.anchor, larkAppId: ds.larkAppId, baseDir: args.baseDir,
-    title: args.title, prompt: args.prompt, operatorOpenId: args.operatorOpenId,
+    title: args.title, prompt: args.prompt, operatorOpenId: args.operatorOpenId, force: args.force,
+    worktreePath: args.worktreePath, branch: args.branch, reuseExisting: args.reuseExisting,
+    targetSubdir: args.targetSubdir,
     activeSessions,
     notify: (m) => sessionReply(args.anchor, m, 'text', ds.larkAppId),
   });
@@ -18255,11 +18316,24 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   // reasoningEffort。任一项校验失败就在**改 scope 之前**回一句用法错误并返回——
   // 于是拒绝路径不开新话题、不发选仓卡、不留会话记录（fail closed，D5）。
   const selfBotForHeader = getBot(larkAppId);
-  const headerParse = parseTopicHeader(stripBotMentions(
+  const strippedTopicHeader = stripBotMentions(
     cmdContent,
     followupMentions,
     { botOpenId: selfBotForHeader.botOpenId, larkAppId },
-  ));
+  );
+  const lifecycleAlias = /^\s*\/(th|tw)(?:\s+([\s\S]*))?$/i.exec(strippedTopicHeader);
+  const lifecycleVariant = /^\s*\/(t|topic)\s+(here|worktree)(?:\s+([\s\S]*))?$/i.exec(strippedTopicHeader);
+  const forceTopicMode: 'default' | 'here' | 'worktree' = lifecycleAlias
+    ? (lifecycleAlias[1]!.toLowerCase() === 'tw' ? 'worktree' : 'here')
+    : lifecycleVariant
+      ? (lifecycleVariant[2]!.toLowerCase() === 'worktree' ? 'worktree' : 'here')
+      : 'default';
+  const normalizedTopicHeader = lifecycleAlias
+    ? `/t ${lifecycleAlias[2] ?? ''}`.trimEnd()
+    : lifecycleVariant
+      ? `/${lifecycleVariant[1]} ${lifecycleVariant[3] ?? ''}`.trimEnd()
+      : strippedTopicHeader;
+  const headerParse = parseTopicHeader(normalizedTopicHeader);
   const forceTopic = isTopicHeader(headerParse) ? headerParse : null;
   let topicSpec: TopicSpec | undefined;
   if (headerParse !== null) {
@@ -18498,7 +18572,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
       await handleTermLinkCommand(anchor, larkAppId, chatId, senderOpenId, commandContent, invocationDeps);
       return;
     }
-    if (resolvePassthroughCommands(larkAppId).has(cmd)) {
+    if (forceTopicMode !== 'worktree' && resolvePassthroughCommands(larkAppId).has(cmd)) {
       if (isInitialSessionPassthrough(larkAppId, cmd)) {
         await startInitialPassthroughSession({
           promptResources: resources,
@@ -18654,7 +18728,8 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   // CLI input, but it creates no AI turn and therefore must not consume a
   // message-quota unit. `buildQuoteHint` distinguishes a real user quote from
   // parent_id values that merely point at the current thread root.
-  const isBareForceTopic = forceTopic?.prompt === ''
+  const isBareForceTopic = !!forceTopic
+    && forceTopic.prompt === ''
     && content === ''
     && resources.length === 0
     && buildQuoteHint(parsed, scope, anchor, localeForBot(larkAppId)) === ''
@@ -18765,25 +18840,45 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   // 裸 `/repo`（不带参数）沿用它今天的语义，一个字都不改：不弹选仓卡、不建 worktree，
   // 直接在 `getSessionWorkingDir` 解析出的默认目录里起会话 —— 就是 command-handler 里
   // `!repoArg && ds.pendingRepo` 那条分支（选仓卡「直接开始」按钮的文本孪生）。
+  const lifecycleWorkingDir = forceTopic && forceTopicMode !== 'default'
+    ? resolveForceTopicCurrentWorkingDir({
+        scope,
+        anchor,
+        chatId,
+        larkAppId,
+        currentSession: activeSessions.get(sessionKey(chatId, larkAppId))
+          ?? activeSessions.get(sessionKey(anchor, larkAppId)),
+      })
+    : undefined;
+  if (forceTopic && forceTopicMode !== 'default' && !lifecycleWorkingDir) {
+    await sessionReply(
+      anchor,
+      tr('daemon.force_topic_current_dir_missing', undefined, localeForBot(larkAppId)),
+      'text',
+      larkAppId,
+    );
+    logger.warn(`[/t:${forceTopicMode}] no current workingDir available for chat ${chatId}`);
+    return;
+  }
   const headerStartInDefaultDir = topicSpec?.repoStartInDefaultDir === true;
   const headerDefaultStartDir = headerStartInDefaultDir
     ? getSessionWorkingDir({ workingDir: configPinnedWorkingDir, larkAppId } as DaemonSession)
     : undefined;
-  const pinnedWorkingDir = topicSpec?.workingDir ?? headerDefaultStartDir ?? configPinnedWorkingDir;
-  const pinnedFromBotDefault = (topicSpec?.workingDir || headerStartInDefaultDir)
+  const pinnedWorkingDir = lifecycleWorkingDir ?? topicSpec?.workingDir ?? headerDefaultStartDir ?? configPinnedWorkingDir;
+  const pinnedFromBotDefault = (lifecycleWorkingDir || topicSpec?.workingDir || headerStartInDefaultDir)
     ? false
     : configPinnedFromBotDefault;
   // 写进会话记录（会被兄弟 bot 的 inherit 层继承）的只有「真的钉了目录」那两种来源。
   // 裸 `/repo` 兜底到的默认目录刻意不写 —— 与卡片「直接开始」的 pinWorkingDir: false
   // 同一条理由，也与今天 `/t /repo` 的落点逐字一致（那条路只在 pinned 存在时才写）。
-  const persistedWorkingDir = topicSpec?.workingDir ?? configPinnedWorkingDir;
+  const persistedWorkingDir = lifecycleWorkingDir ?? topicSpec?.workingDir ?? configPinnedWorkingDir;
   // A text-only bare `/t` is topic setup, not an empty CLI turn. Preserve the
   // repo-picker path when no cwd is pinned; a pinned cwd needs no setup owner,
   // so one visible reply can materialize the Lark thread and the first real
   // task (or `/repo`) will create its Session. Attachments, quotes, forwarded
   // context, and listener prompts remain real inputs and must not be dropped.
   let prefetchedRepoProjects: import('./services/project-scanner.js').ProjectInfo[] | undefined;
-  if (isBareForceTopic) {
+  if (isBareForceTopic && forceTopicMode !== 'worktree') {
     const setupDirs = pinnedWorkingDir
       ? [pinnedWorkingDir]
       : getProjectScanDirsForBot(larkAppId);
@@ -18831,7 +18926,9 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
 
   // Auto-worktree: register PENDING (router buffers concurrent msgs, no force-fork)
   // and build the worktree off the critical path (willAutoWorktree / runAutoWorktreeCommit).
-  const autoWt = willAutoWorktree(larkAppId, pinnedWorkingDir, pinnedFromBotDefault);
+  const autoWt = forceTopicMode === 'worktree'
+    ? !!pinnedWorkingDir
+    : willAutoWorktree(larkAppId, pinnedWorkingDir, pinnedFromBotDefault);
 
   // Create session in pending-repo state — don't spawn CLI yet.
   // For thread-scope, rootMessageId == anchor (the thread root). Critical
@@ -19007,10 +19104,15 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     }
     return;
   }
+  const sharedWorktree = autoWt && pinnedWorkingDir && forceTopicMode === 'worktree'
+    ? await forceTopicWorktreeTarget(pinnedWorkingDir, anchor)
+    : undefined;
   if (ds.pendingRepo) {
     stageClaimedPendingRepoSetup(activeSessions, ds, {
       mode: autoWt ? 'auto_worktree' : 'picker',
       ...(autoWt && pinnedWorkingDir ? { baseDir: pinnedWorkingDir } : {}),
+      ...(forceTopicMode === 'worktree' ? { force: true } : {}),
+      ...(sharedWorktree ? { ...sharedWorktree, reuseExisting: true } : {}),
       // Persisted turn identity feeds the eventual fork's turnId; it must be the
       // reply anchor so provenance (quoteTargetId === marker.turnId) holds on
       // session-group first turns that go through the repo picker / worktree.
@@ -19031,7 +19133,11 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     // 已 durable staging（auto_worktree）且通过放弃闸：detached 建库流程接管投递。
     markIngressAdmitted(ctx);
     ds.initialStartPending = false; // pendingRepo/worktree now owns buffering
-    startAutoWorktreePending(ds, { anchor, baseDir: pinnedWorkingDir, title: session.title, prompt: promptContent, operatorOpenId: senderOpenId });
+    startAutoWorktreePending(ds, {
+      anchor, baseDir: pinnedWorkingDir, title: session.title, prompt: promptContent, operatorOpenId: senderOpenId,
+      force: forceTopicMode === 'worktree',
+      ...(sharedWorktree ? { ...sharedWorktree, reuseExisting: true } : {}),
+    });
     return;
   }
 
@@ -20710,6 +20816,11 @@ async function handleThreadReplyAdmitted(
         stagePendingRepoSetup(ds, {
           mode: existingSetup?.mode ?? 'picker',
           ...(existingSetup?.baseDir ? { baseDir: existingSetup.baseDir } : {}),
+          ...(existingSetup?.force !== undefined ? { force: existingSetup.force } : {}),
+          ...(existingSetup?.worktreePath ? { worktreePath: existingSetup.worktreePath } : {}),
+          ...(existingSetup?.branch ? { branch: existingSetup.branch } : {}),
+          ...(existingSetup?.reuseExisting !== undefined ? { reuseExisting: existingSetup.reuseExisting } : {}),
+          ...(existingSetup?.targetSubdir ? { targetSubdir: existingSetup.targetSubdir } : {}),
           turnId: parsed.messageId,
         });
       } else {
@@ -22732,6 +22843,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     sessionReply,
     getSessionWorkingDir,
     getActiveCount,
+    prepareRawInputTurn: (ds, turnId) => prepareTurnCliIdentity(ds, turnId),
     closeSession(ds: DaemonSession): Promise<boolean> {
       // Route through the dashboard-aware helper so session.exited / session.update
       // events fire for withdrawn-message / crash / adopt-exit teardown paths too,
@@ -23382,7 +23494,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // Restore active sessions from previous run
   await restoreSessionsAndScheduleStartupRecovery({
     larkAppId: cfg.larkAppId,
-    restoreSessions: () => restoreActiveSessions(activeSessions, idempotencyQuarantinedSessionIds),
+    restoreSessions: () => restoreActiveSessions(activeSessions, idempotencyQuarantinedSessionIds, {
+      prepareTurn: (ds, turnId) => prepareTurnCliIdentity(ds, turnId),
+    }),
     // Restore complete → /api/asks may now safely 403 unknown sessions again; a
     // reconnecting ask hook that raced the restore got retryable 503s until here.
     markSessionsRestored: () => {

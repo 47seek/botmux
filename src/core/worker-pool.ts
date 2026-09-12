@@ -692,6 +692,8 @@ export interface WorkerPoolCallbacks {
   ) => Promise<string>;
   getSessionWorkingDir: (ds?: DaemonSession) => string;
   getActiveCount: () => number;
+  /** Prepare trigger-user CLI identity before a delayed raw-input turn. */
+  prepareRawInputTurn?: (ds: DaemonSession, turnId: string) => void | Promise<void>;
   /** Close a stale session (message withdrawn, etc.). `false` means the
    * authoritative close failed and the active owner must remain retryable.
    * `void` is retained for older embedders/tests that implement a synchronous
@@ -12181,6 +12183,8 @@ function setupWorkerHandlers(
           const followUpCodexAppInput = followUp?.codexAppInputGateFrozen
             ? followUp.codexAppInput
             : codexAppInputForSession(ds, followUp?.codexAppInput);
+          if (rawTurnId) await requireCallbacks().prepareRawInputTurn?.(ds, rawTurnId);
+          if (ds.worker !== worker || ds.workerGeneration !== workerGeneration) break;
           sendWorkerSessionInput(ds, {
             type: 'raw_input',
             content: rawInput,
