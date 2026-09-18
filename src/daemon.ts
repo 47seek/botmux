@@ -21778,7 +21778,6 @@ async function handleThreadReplyAdmitted(
   const parsedResult = prepared ?? parseEventMessage(data);
   const parsed = parsedResult.parsed;
   const resources = parsedResult.resources;
-
   // Expand merge_forward: fetch sub-messages and collect their resources
   if (!prepared && parsed.msgType === 'merge_forward') {
     const { extraResources } = await expandMergeForward(larkAppId, parsed.messageId, parsed);
@@ -21846,8 +21845,24 @@ async function handleThreadReplyAdmitted(
   const threadCommandPrompt = ctx.commandTrigger
     ? renderCommandTriggerPrompt(ctx.commandTrigger)
     : undefined;
-  const threadCommandLane = parsed.content.trim();
+  let threadCommandLane = parsed.content.trim();
   if (threadCommandPrompt) parsed.content = threadCommandPrompt;
+
+  // A listener may use chat scope and therefore arrive through an existing
+  // session's reply path after its first match. Apply its untrusted wrapper
+  // only after audio transcription and bot-steer / command-template parsing:
+  // both can rewrite parsed.content, and every later command lane must see the
+  // wrapper rather than the observed message. This deliberately mirrors the
+  // new-topic path's final listener override.
+  let listenerPrompt: string | undefined;
+  if (ctx.messageListener) {
+    refreshListenerCardTextFromResolved(ctx.messageListener, data.message);
+    listenerPrompt = renderMessageListenerPrompt(ctx.messageListener);
+  }
+  if (listenerPrompt) {
+    parsed.content = listenerPrompt;
+    threadCommandLane = listenerPrompt;
+  }
   const senderUnionIdForPrefix = parsed.senderUnionId || data?.sender?.sender_id?.union_id;
   const foreignBotName = isForeignBot ? lookupForeignBotName(senderOpenIdForPrefix!, larkAppId, senderUnionIdForPrefix) : undefined;
   const botSenderPrefix = isForeignBot
@@ -21909,11 +21924,20 @@ async function handleThreadReplyAdmitted(
     return threadSenderCached;
   };
 
-  const content = parsed.content.trim();
+  let content = parsed.content.trim();
   // Strip leading @<bot> mentions so "@bot /restart" is recognized as a command.
   // threadCommandLane 是免@ 命令模板改写**之前**的正文；没有模板时与 content
   // 逐字相同（见上方 threadCommandPrompt 处的说明）。
-  const cmdContent = stripLeadingMentions(threadCommandLane, parsed.mentions);
+  let cmdContent = stripLeadingMentions(threadCommandLane, parsed.mentions);
+  // Keep the three values consumed by the remainder of this function in lock
+  // step. In particular, workflow/slash parsing reads cmdContent while worker
+  // injection reads content/parsed.content; listener input is never trusted as
+  // a control command on either path.
+  if (listenerPrompt) {
+    content = listenerPrompt;
+    cmdContent = listenerPrompt;
+    parsed.content = listenerPrompt;
+  }
   const threadSenderOpenId = parsed.senderId || data?.sender?.sender_id?.open_id;
   // Tenant-stable union_id of the thread sender — lets canOperate recognise a
   // cross-deployment TEAM peer bot (isTeamBot) and grant it daemon-command
@@ -22079,7 +22103,9 @@ async function handleThreadReplyAdmitted(
   // acceptSlashFromBots gate (mirror of the new-topic path): a bot sender's
   // slash is only routed as a command when this bot opts in (default on); when
   // off it falls through to ordinary message handling. Human senders unaffected.
-  const invocation = ((isBotSenderType || isForeignBot) && !botAcceptsSlashFromBots(larkAppId))
+  const invocation = ctx.messageListener
+    ? null
+    : ((isBotSenderType || isForeignBot) && !botAcceptsSlashFromBots(larkAppId))
     ? null
     : parseSlashCommandInvocation(cmdContent);
   if (invocation) {

@@ -210,7 +210,7 @@ import {
   protectedSessionMutationReasons,
 } from './session-mutation-guard.js';
 import { listPendingAsks, submitAskFromDesktop } from './ask-broker.js';
-import { getMessageListenerConfig, messageListenerConfigFromUpdate, sanitizeMessageListenerUpdate, updateMessageListenerConfig, validateMessageListenerUpdate } from '../services/message-listener-store.js';
+import { getGlobalMessageListenerConfig, getGroupMessageListenerMode, getMessageListenerConfig, messageListenerConfigFromUpdate, sanitizeMessageListenerUpdate, updateGlobalMessageListenerConfig, updateGroupMessageListenerMode, updateMessageListenerConfig, validateMessageListenerUpdate } from '../services/message-listener-store.js';
 import { getCommandTriggerConfig, setCommandTriggerChatEnabled, updateCommandTriggerConfig } from '../services/command-trigger-store.js';
 import { reservedCommandKind } from '../services/command-trigger.js';
 import { resolvePassthroughCommands } from './command-handler.js';
@@ -222,6 +222,7 @@ import {
   buildListenerBotAppIdToOpenId,
   collectListenerBotAppIds,
   renderMessageListenerInstruction,
+  resolveEffectiveMessageListener,
   type MessageListenerPreviewMatch,
 } from '../services/message-listener.js';
 import {
@@ -4827,12 +4828,15 @@ ipcRoute('GET', '/api/groups', async (_req, res) => {
     let groupDefaultModels: Record<string, import('./group-default-models.js').GroupDefaultModels> = {};
     let pinStreamingCardMasterEnabled = false;
     let noPinStreamingCardChats = new Set<string>();
+    let effectiveMessageListenerForChat: ((chatId: string) => boolean) | undefined;
     try {
-      const botConfig = getBot(cachedLarkAppId).config;
+      const botState = getBot(cachedLarkAppId);
+      const botConfig = botState.config;
       agentDefaults = { agentCliId: botConfig.cliId, agentModel: botConfig.model, agentReasoningEffort: botConfig.reasoningEffort };
       groupDefaultModels = botConfig.groupDefaultModels ?? {};
       pinStreamingCardMasterEnabled = botConfig.pinStreamingCard === true;
       noPinStreamingCardChats = new Set(botConfig.noPinStreamingCardChats ?? []);
+      effectiveMessageListenerForChat = (chatId) => resolveEffectiveMessageListener(botState, chatId)?.enabled === true;
     } catch {
       // Fail open for the groups board when config lookup is unavailable:
       // rows still render with safe defaults instead of dropping the whole list.
@@ -4846,7 +4850,7 @@ ipcRoute('GET', '/api/groups', async (_req, res) => {
     const enriched = chats.map(c => {
       const oncall = oncallStore.getOncallStatus(cachedLarkAppId, c.chatId);
       const hasRole = resolveRoleFile(cachedLarkAppId, c.chatId) !== null;
-      const hasMessageListener = getMessageListenerConfig(cachedLarkAppId, c.chatId)?.enabled === true;
+      const hasMessageListener = effectiveMessageListenerForChat?.(c.chatId) ?? false;
       // /introduce 记录的外部 botmux 机器人（按名字）——dashboard 团队看板用
       // 它识别「介绍过同团队机器人的协作群」。
       const observedBotNames = observedBotsStore
@@ -5217,9 +5221,10 @@ async function collectMessageListenerPreviewMatches(
     ...bot,
     config: {
       ...bot.config,
-      messageListeners: {
-        ...(bot.config.messageListeners ?? {}),
-        [chatId]: previewListener,
+      globalMessageListener: previewListener,
+      groupMessageListenerOverrides: {
+        ...(bot.config.groupMessageListenerOverrides ?? {}),
+        [chatId]: { mode: 'custom' as const, listener: previewListener },
       },
     },
   };
@@ -5400,6 +5405,64 @@ ipcRoute('DELETE', '/api/message-listeners/:chatId', async (_req, res, p) => {
   const result = await updateMessageListenerConfig(cachedLarkAppId, p.chatId, { enabled: false, prompt: '' });
   if (!result.ok) return jsonRes(res, 500, { ok: false, error: result.reason });
   jsonRes(res, 200, { ok: true });
+});
+
+// Bot-scoped listener APIs for the dedicated Dashboard page. The supervisor
+// proxy selects a bot's IPC server; this process therefore uses cachedLarkAppId
+// as the authoritative bot identity rather than accepting an app id from body.
+ipcRoute('GET', '/api/global-message-listener', async (_req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  jsonRes(res, 200, { listener: getGlobalMessageListenerConfig(cachedLarkAppId), maxPromptBytes: MAX_MESSAGE_LISTENER_PROMPT_BYTES });
+});
+
+ipcRoute('PUT', '/api/global-message-listener', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  let body: unknown;
+  try { body = await readJsonBody(req); } catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  const update = sanitizeMessageListenerUpdate(body);
+  if (!update) return jsonRes(res, 400, { ok: false, error: 'invalid_listener' });
+  const validation = validateMessageListenerUpdate(update);
+  if (!validation.ok) return jsonRes(res, 400, { ok: false, error: validation.reason });
+  if (update.prompt && Buffer.byteLength(update.prompt, 'utf-8') > MAX_MESSAGE_LISTENER_PROMPT_BYTES) return jsonRes(res, 400, { ok: false, error: 'prompt_too_large' });
+  const result = await updateGlobalMessageListenerConfig(cachedLarkAppId, update);
+  if (!result.ok) return jsonRes(res, 500, { ok: false, error: result.reason });
+  jsonRes(res, 200, { ok: true, listener: result.listener });
+});
+
+ipcRoute('GET', '/api/group-message-listeners', async (_req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  try {
+    const chats = await groupsStore.listChats(cachedLarkAppId);
+    jsonRes(res, 200, { groups: chats.map(chat => ({ chatId: chat.chatId, name: chat.name, mode: getGroupMessageListenerMode(cachedLarkAppId!, chat.chatId), listener: getMessageListenerConfig(cachedLarkAppId!, chat.chatId) })) });
+  } catch (err) { jsonRes(res, 502, { ok: false, error: err instanceof Error ? err.message : String(err) }); }
+});
+
+ipcRoute('GET', '/api/group-message-listeners/:chatId', async (_req, res, p) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  if (!isValidRoleChatId(p.chatId)) return jsonRes(res, 400, { ok: false, error: 'invalid_chat_id' });
+  jsonRes(res, 200, { chatId: p.chatId, mode: getGroupMessageListenerMode(cachedLarkAppId, p.chatId), listener: getMessageListenerConfig(cachedLarkAppId, p.chatId) });
+});
+
+ipcRoute('PUT', '/api/group-message-listeners/:chatId', async (req, res, p) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  if (!isValidRoleChatId(p.chatId)) return jsonRes(res, 400, { ok: false, error: 'invalid_chat_id' });
+  let body: any;
+  try { body = await readJsonBody(req); } catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  if (body?.mode === 'inherit' || body?.mode === 'disabled') {
+    const result = await updateGroupMessageListenerMode(cachedLarkAppId, p.chatId, body.mode);
+    return jsonRes(res, result.ok ? 200 : 500, result.ok ? { ok: true, mode: result.mode } : { ok: false, error: result.reason });
+  }
+  if (body?.mode !== 'custom') return jsonRes(res, 400, { ok: false, error: 'invalid_listener_mode' });
+  const update = sanitizeMessageListenerUpdate(body.listener);
+  if (!update) return jsonRes(res, 400, { ok: false, error: 'invalid_listener' });
+  const validation = validateMessageListenerUpdate(update);
+  if (!validation.ok) return jsonRes(res, 400, { ok: false, error: validation.reason });
+  if (update.prompt && Buffer.byteLength(update.prompt, 'utf-8') > MAX_MESSAGE_LISTENER_PROMPT_BYTES) {
+    return jsonRes(res, 400, { ok: false, error: 'prompt_too_large' });
+  }
+  const result = await updateMessageListenerConfig(cachedLarkAppId, p.chatId, update);
+  jsonRes(res, result.ok ? 200 : ['prompt_required', 'sender_required'].includes(result.reason) ? 400 : 500,
+    result.ok ? { ok: true, mode: 'custom', listener: result.listener } : { ok: false, error: result.reason });
 });
 
 // ─── 免@ 斜杠命令（commandTriggers） ──────────────────────────────────────
