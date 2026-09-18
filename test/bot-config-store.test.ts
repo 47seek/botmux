@@ -817,7 +817,7 @@ describe('bot-config store', () => {
     expect(registry.getBot('app_default').config.reasoningEffort).toBe('xhigh');
   });
 
-  it('replyDelivery: claude-code defaults to transcript; explicit send persists; unset clears back to the CLI default', async () => {
+  it('replyDelivery: defaults to send on every CLI; both values persist; unset clears back to that default', async () => {
     const { registry, store } = await loaded({ cliId: 'claude-code' });
     const spec = store.findConfigField('replyDelivery')!;
     expect(spec.kind).toBe('enum');
@@ -827,32 +827,32 @@ describe('bot-config store', () => {
     expect(store.coerceConfigValue(spec, 'send')).toEqual({ ok: true, value: 'send' });
     expect(store.coerceConfigValue(spec, 'auto')).toEqual({ ok: false, reason: 'invalid_enum' });
 
-    // 缺省展示随 CLI（而非 ∅）：claude-code 未配置时 /config get 读到的生效值是 transcript。
+    // 缺省展示是 send（而非 ∅），claude-code 也不例外——transcript 不随 CLI 自动翻转。
     const before = store.getConfigSnapshot('app_default');
-    expect(before.ok && before.rows.find(r => r.key === 'replyDelivery')?.value).toBe('transcript');
+    expect(before.ok && before.rows.find(r => r.key === 'replyDelivery')?.value).toBe('send');
     expect('replyDelivery' in readConfig()).toBe(false);
     expect(registry.resolveReplyDelivery('app_default')).toBeUndefined();
 
-    // set send：显式落盘 'send'——claude-code 退回旧行为（模型自己 botmux send）的唯一方式。
-    const r1 = await store.applyConfigField('app_default', spec, 'send');
+    // set transcript：opt-in，显式落盘。
+    const r1 = await store.applyConfigField('app_default', spec, 'transcript');
     expect(r1.ok).toBe(true);
-    if (r1.ok) expect(r1).toMatchObject({ oldText: 'transcript', newText: 'send', effect: 'next-session' });
-    expect(readConfig().replyDelivery).toBe('send');
-    expect(registry.getBot('app_default').config.replyDelivery).toBe('send');
-    expect(registry.resolveReplyDelivery('app_default')).toBe('send');
-
-    // set transcript：显式落盘 'transcript'。
-    const r2 = await store.applyConfigField('app_default', spec, 'transcript');
-    expect(r2.ok).toBe(true);
-    if (r2.ok) expect(r2).toMatchObject({ oldText: 'send', newText: 'transcript' });
+    if (r1.ok) expect(r1).toMatchObject({ oldText: 'send', newText: 'transcript', effect: 'next-session' });
     expect(readConfig().replyDelivery).toBe('transcript');
     expect(registry.getBot('app_default').config.replyDelivery).toBe('transcript');
     expect(registry.resolveReplyDelivery('app_default')).toBe('transcript');
 
-    // unset：删 key，回 CLI 缺省（claude-code 展示仍是 transcript），内存同步为 undefined。
+    // set send：显式退回也落盘（与缺省同值，但意图是「钉住」，不靠缺省兜）。
+    const r2 = await store.applyConfigField('app_default', spec, 'send');
+    expect(r2.ok).toBe(true);
+    if (r2.ok) expect(r2).toMatchObject({ oldText: 'transcript', newText: 'send' });
+    expect(readConfig().replyDelivery).toBe('send');
+    expect(registry.getBot('app_default').config.replyDelivery).toBe('send');
+    expect(registry.resolveReplyDelivery('app_default')).toBe('send');
+
+    // unset：删 key，回缺省 send，内存同步为 undefined。
     const r3 = await store.applyConfigField('app_default', spec, null);
     expect(r3.ok).toBe(true);
-    if (r3.ok) expect(r3).toMatchObject({ oldText: 'transcript', newText: 'transcript' });
+    if (r3.ok) expect(r3).toMatchObject({ oldText: 'send', newText: 'send' });
     expect('replyDelivery' in readConfig()).toBe(false);
     expect(registry.getBot('app_default').config.replyDelivery).toBeUndefined();
     expect(registry.resolveReplyDelivery('app_default')).toBeUndefined();

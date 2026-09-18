@@ -635,20 +635,20 @@ describe('buildReforkPrompt', () => {
     expect(out).toContain(`<session_id>${SESSION_ID}</session_id>`);
   });
 
-  it('omits <session_id> for claude-code (injectsSessionContext=true); reminder only under explicit send', () => {
+  it('omits <session_id> for claude-code (injectsSessionContext=true); reminder stays unless transcript is opted in', () => {
     const ds = makeDs();
-    // claude-code 缺省 transcript：无 reminder（最终回复由 daemon 从转写转发）。
+    // 缺省 send：保留 reminder（模型仍要自己 botmux send）。
     const out = buildReforkPrompt(ds, 'hello', { cliId: 'claude-code' });
     expect(out).not.toContain('<session_id>');
     expect(out).toContain('<user_message>');
-    expect(out).not.toContain('<botmux_reminder>');
-    // 显式 send 退回旧行为：保留 reminder。
-    mockBotConfig.replyDelivery = 'send';
+    expect(out).toContain('<botmux_reminder>');
+    // 显式 transcript 才切换：最终回复由 daemon 从转写转发，不再注入 reminder。
+    mockBotConfig.replyDelivery = 'transcript';
     try {
-      const sendOut = buildReforkPrompt(ds, 'hello', { cliId: 'claude-code' });
-      expect(sendOut).not.toContain('<session_id>');
-      expect(sendOut).toContain('<user_message>');
-      expect(sendOut).toContain('<botmux_reminder>');
+      const transcriptOut = buildReforkPrompt(ds, 'hello', { cliId: 'claude-code' });
+      expect(transcriptOut).not.toContain('<session_id>');
+      expect(transcriptOut).toContain('<user_message>');
+      expect(transcriptOut).not.toContain('<botmux_reminder>');
     } finally {
       delete mockBotConfig.replyDelivery;
     }
@@ -1029,15 +1029,15 @@ describe('replyDelivery=transcript envelope', () => {
     delete mockBotConfig.apiOnly;
   });
 
-  it('缺省按 CLI：claude-code 缺省 = 显式 transcript，codex 缺省 = 显式 send（字节相同）', () => {
+  it('缺省一律 send：claude-code 与 codex 缺省都等于显式 send（字节相同）', () => {
     const followDefault = buildFollowUpContent('继续', 'sess-rd', { ...base, cliId: 'claude-code', attachments, mentions });
     const topicDefault = buildNewTopicPrompt(
       '帮我看下', 'sess-rd', 'codex', undefined, attachments, mentions, undefined, undefined,
       { name: 'Bot', openId: 'ou_bot' }, 'zh', sender, { larkAppId: 'app_test', chatId: 'oc_1' },
     );
-    // claude-code 缺省 transcript：无 reminder，等于显式 transcript。
-    expect(followDefault).not.toContain('<botmux_reminder>');
-    mockBotConfig.replyDelivery = 'transcript';
+    // claude-code 缺省 send：带 reminder，等于显式 send。
+    expect(followDefault).toContain('<botmux_reminder>');
+    mockBotConfig.replyDelivery = 'send';
     expect(buildFollowUpContent('继续', 'sess-rd', { ...base, cliId: 'claude-code', attachments, mentions })).toBe(followDefault);
     // codex 缺省 send：首轮 routing 仍是 send 版，等于显式 send。
     expect(topicDefault).toContain('唯一方式');
@@ -1047,10 +1047,12 @@ describe('replyDelivery=transcript envelope', () => {
       { name: 'Bot', openId: 'ou_bot' }, 'zh', sender, { larkAppId: 'app_test', chatId: 'oc_1' },
     );
     expect(topicSend).toBe(topicDefault);
-    // 显式 send 的 claude-code 续轮退回旧行为：带 reminder；且 send 模式下 solo 标志是 no-op。
-    const followSend = buildFollowUpContent('继续', 'sess-rd', { ...base, cliId: 'claude-code', attachments, mentions });
-    expect(followSend).toContain('<botmux_reminder>');
-    expect(buildFollowUpContent('继续', 'sess-rd', { ...base, cliId: 'claude-code', attachments, mentions, solo: true, selfMention })).toBe(followSend);
+    // send 模式下 solo 标志是 no-op（去壳只在 transcript 下发生）。
+    expect(buildFollowUpContent('继续', 'sess-rd', { ...base, cliId: 'claude-code', attachments, mentions, solo: true, selfMention })).toBe(followDefault);
+    // 只有显式 transcript 才切换：续轮不再注入 reminder。
+    mockBotConfig.replyDelivery = 'transcript';
+    expect(buildFollowUpContent('继续', 'sess-rd', { ...base, cliId: 'claude-code', attachments, mentions }))
+      .not.toContain('<botmux_reminder>');
   });
 
   it('transcript + claude-code 续轮：不注入 <botmux_reminder>，非 solo 保留壳与 sender', () => {

@@ -757,7 +757,8 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       expect(ds.completedIdleTurnId).toBeUndefined();
     });
 
-    it('unconfigured replyDelivery on claude-code = transcript by default → marks the turn too', async () => {
+    it('unconfigured replyDelivery on claude-code = send by default → does NOT mark the turn', async () => {
+      // 缺省不随 CLI 翻转：没显式配 transcript 就是 send，走不到 completedIdleTurnId。
       vi.mocked(resolveReplyDelivery).mockReturnValue(undefined);
       const sessionReply = vi.fn(async () => 'om_reply');
       initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
@@ -766,7 +767,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
       await vi.advanceTimersByTimeAsync(10);
       expect(sessionReply).toHaveBeenCalledTimes(1);
-      expect(ds.completedIdleTurnId).toBe('turn-1');
+      expect(ds.completedIdleTurnId).toBeUndefined();
     });
 
     it('explicit send mode never sets completedIdleTurnId', async () => {

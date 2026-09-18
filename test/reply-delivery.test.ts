@@ -111,7 +111,8 @@ describe('supportsTranscriptReplyDelivery', () => {
 
 describe('defaultReplyDeliveryFor', () => {
   const cases: Array<[string | undefined, 'send' | 'transcript']> = [
-    ['claude-code', 'transcript'],
+    // 缺省一律 send：transcript 是 opt-in，不随 CLI 自动翻转。
+    ['claude-code', 'send'],
     ['codex', 'send'],
     ['hermes', 'send'],
     ['cursor', 'send'],
@@ -132,8 +133,8 @@ describe('effectiveReplyDelivery', () => {
     vi.mocked(resolveReplyDelivery).mockReturnValue(undefined);
   });
 
-  it('未配置 + claude-code → transcript（CLI 缺省）', () => {
-    expect(effectiveReplyDelivery('app_a', 'claude-code')).toBe('transcript');
+  it('未配置 + claude-code → send（缺省不翻转，与上游一致）', () => {
+    expect(effectiveReplyDelivery('app_a', 'claude-code')).toBe('send');
     expect(resolveReplyDelivery).toHaveBeenCalledWith('app_a');
   });
 

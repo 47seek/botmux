@@ -9,8 +9,8 @@
  *   （bridge fallback 升为主通道）；系统提示不再提及 `botmux send`、不注入每轮
  *   reminder；solo 会话去掉 `<user_message>` 壳与 `<sender/>`。
  *
- * 缺省值按 CLI 走（`defaultReplyDeliveryFor`）：claude-code 缺省 `transcript`，其余
- * 缺省 `send`；bots.json 显式写 `send` / `transcript` 才覆盖。所有判定 fail-closed：
+ * 缺省值统一是 `send`（`defaultReplyDeliveryFor`），与上游一致；bots.json 显式写
+ * `transcript` 才切换，写 `send` 亦持久化。所有判定 fail-closed：
  * 拿不准就回到 `send` / 非 solo。
  */
 import { getOwnerOpenId, resolveReplyDelivery } from '../bot-registry.js';
@@ -28,10 +28,20 @@ export function supportsTranscriptReplyDelivery(cliId: string | undefined): bool
   return isStructuredBridgeFallbackActive(cliId, false);
 }
 
-/** 未显式配置时的缺省投递方式：claude-code 的最终回复由 daemon 从转写自动转发
- *  （transcript），模型不再被教「botmux send」；其它 CLI 保持 send。 */
-export function defaultReplyDeliveryFor(cliId: string | undefined): ReplyDelivery {
-  return cliId === 'claude-code' ? 'transcript' : 'send';
+/**
+ * 未显式配置时的缺省投递方式：**一律 `send`**，与上游行为逐字节一致——模型仍被
+ * 教「botmux send」，最终回复由它自己发。
+ *
+ * `transcript` 是 opt-in：它改的不只是投递路径，还会改写系统提示、去掉逐轮
+ * `<botmux_reminder>`、并让 solo 会话的信封去壳，且 `/adopt` 不再把这类会话识别
+ * 为本 bot 自产。这些都是对既有会话可感知的变化，不该由升级顺带发生，所以交给
+ * 使用者在 bots.json 或 dashboard 上显式打开。
+ *
+ * 保留 `cliId` 形参而不直接写死常量：缺省策略的唯一出口就在这里，将来若要为某个
+ * CLI 单独换缺省，只改这一个函数即可，不必回头翻所有调用点。
+ */
+export function defaultReplyDeliveryFor(_cliId: string | undefined): ReplyDelivery {
+  return 'send';
 }
 
 const warnedUnsupported = new Set<string>();

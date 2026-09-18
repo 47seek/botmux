@@ -1981,31 +1981,32 @@ describe('PUT /api/bot-reply-delivery — 最终回复投递方式', () => {
   });
   const persisted = (configPath: string) => JSON.parse(readFileSync(configPath, 'utf-8'))[0];
 
-  it('claude-code: GET 生效值缺省 transcript（CLI 默认），PUT send / transcript 都落盘，PUT 空串 unset 回缺省', async () => {
+  it('claude-code: GET 生效值缺省 send（不随 CLI 翻转），PUT transcript / send 都落盘，PUT 空串 unset 回缺省', async () => {
     await withBot('claude-code', async (base, configPath, appId) => {
       const initial = await (await fetch(`${base}/api/bot-default-oncall`)).json();
-      expect(initial).toMatchObject({ replyDelivery: 'transcript', replyDeliveryDefault: 'transcript', replyDeliverySupported: true });
+      expect(initial).toMatchObject({ replyDelivery: 'send', replyDeliveryDefault: 'send', replyDeliverySupported: true });
       expect('replyDelivery' in persisted(configPath)).toBe(false);
 
-      // send：显式落盘（claude-code 退回旧行为的唯一方式）。
-      const off = await put(base, 'send');
-      expect(off.status).toBe(200);
-      expect(await off.json()).toMatchObject({ ok: true, replyDelivery: 'send', replyDeliveryDefault: 'transcript' });
-      expect(persisted(configPath).replyDelivery).toBe('send');
-      expect(getBot(appId).config.replyDelivery).toBe('send');
-      const afterOff = await (await fetch(`${base}/api/bot-default-oncall`)).json();
-      expect(afterOff).toMatchObject({ replyDelivery: 'send', replyDeliveryDefault: 'transcript', replyDeliverySupported: true });
-
+      // transcript：opt-in，显式落盘。
       const on = await put(base, 'transcript');
       expect(on.status).toBe(200);
-      expect(await on.json()).toMatchObject({ ok: true, replyDelivery: 'transcript' });
+      expect(await on.json()).toMatchObject({ ok: true, replyDelivery: 'transcript', replyDeliveryDefault: 'send' });
       expect(persisted(configPath).replyDelivery).toBe('transcript');
       expect(getBot(appId).config.replyDelivery).toBe('transcript');
+      const afterOn = await (await fetch(`${base}/api/bot-default-oncall`)).json();
+      expect(afterOn).toMatchObject({ replyDelivery: 'transcript', replyDeliveryDefault: 'send', replyDeliverySupported: true });
 
-      // '' / 未知值删 key，回 CLI 缺省（claude-code = transcript）。
+      // send：显式退回也落盘（与缺省同值，但意图是钉住，不靠缺省兜）。
+      const off = await put(base, 'send');
+      expect(off.status).toBe(200);
+      expect(await off.json()).toMatchObject({ ok: true, replyDelivery: 'send' });
+      expect(persisted(configPath).replyDelivery).toBe('send');
+      expect(getBot(appId).config.replyDelivery).toBe('send');
+
+      // '' / 未知值删 key，回缺省 send。
       const cleared = await put(base, '');
       expect(cleared.status).toBe(200);
-      expect(await cleared.json()).toMatchObject({ ok: true, replyDelivery: 'transcript', replyDeliveryDefault: 'transcript' });
+      expect(await cleared.json()).toMatchObject({ ok: true, replyDelivery: 'send', replyDeliveryDefault: 'send' });
       expect('replyDelivery' in persisted(configPath)).toBe(false);
       expect(getBot(appId).config.replyDelivery).toBeUndefined();
     });
