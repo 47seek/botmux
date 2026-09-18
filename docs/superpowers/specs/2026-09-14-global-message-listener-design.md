@@ -90,7 +90,7 @@ interface BotConfig {
 
 - 旧 `messageListeners[chatId]` 迁为 `groupMessageListenerOverrides[chatId] = { mode: 'custom', listener }`；
 - 新 `globalMessageListener` 初始为空或关闭；
-- 成功迁移后删除旧字段；
+- 旧 `messageListeners` 保留为降级影子与旧端点兼容读取；新运行时优先读取 `groupMessageListenerOverrides`，写入覆写变更时同步维护或清理对应影子，避免降级或滚动发布期间丢失既有群级规则；
 - 历史规则未携带 `replyPolicy` 时默认 `thread`，保证与既有行为一致。
 
 需要保证 registry 的规范化、Dashboard API 写入、配置持久化和运行时读取共同支持新旧形态；对格式异常的覆写或规则 fail-closed，跳过监听并记录可诊断日志。

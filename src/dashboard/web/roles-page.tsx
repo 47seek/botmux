@@ -1550,6 +1550,7 @@ export function MessageListenerEditor(props: {
   flash: FlashState;
   previewLimit: number;
   previewStatus: ListenerPreviewStatus;
+  previewScope?: string;
   tr: Translator;
   onPatch(patch: Partial<MessageListenerData>): void;
   onSenderPolicyPatch(patch: NonNullable<MessageListenerData['senderPolicy']>): void;
@@ -1821,7 +1822,7 @@ export function MessageListenerEditor(props: {
         </span>
         <Flash flash={props.flash} />
       </div>
-      <div className="roles-listener-preview-panel">
+      <div className="roles-listener-preview-panel" data-listener-preview-scope={props.previewScope}>
         <div className="roles-listener-preview-head">
           <div>
             <div className="roles-profile-section-title">{tr('roles.listenerPreviewTitle')}</div>

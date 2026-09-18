@@ -5589,6 +5589,8 @@ describe('managed Agent clone owner boundary', () => {
       'name',
       'displayName',
       'messageListeners',
+      'globalMessageListener',
+      'groupMessageListenerOverrides',
       'oncallChats',
       'defaultOncallAutoboundChats',
       'allowedChatGroups',
@@ -5643,6 +5645,27 @@ describe('managed Agent clone owner boundary', () => {
     setupBotState({ configAllowedUsers: target.allowedUsers, allowedUsers: [USER_OPEN_ID] });
     expect(canOperate(MY_APP_ID, 'chat-A', USER_OPEN_ID)).toBe(true);
     expect(canOperate(MY_APP_ID, 'chat-A', 'ou_source_owner')).toBe(false);
+  });
+
+  it('never copies global or per-chat listener rules into a new Bot', () => {
+    const source = {
+      larkAppId: 'cli_source',
+      cliId: 'codex',
+      globalMessageListener: { enabled: true, prompt: '监听源 Bot 所在的群' },
+      groupMessageListenerOverrides: {
+        oc_source_custom: { mode: 'custom', listener: { enabled: true, prompt: '只监听源群' } },
+        oc_source_disabled: { mode: 'disabled' },
+      },
+      messageListeners: {
+        oc_source_legacy: { enabled: true, prompt: '旧监听' },
+      },
+    };
+    const target = cloneBotConfig(source, { larkAppId: 'cli_target', larkAppSecret: 'target-secret' });
+
+    expect(target).not.toHaveProperty('globalMessageListener');
+    expect(target).not.toHaveProperty('groupMessageListenerOverrides');
+    expect(target).not.toHaveProperty('messageListeners');
+    expect(target).toMatchObject({ larkAppId: 'cli_target', cliId: 'codex' });
   });
 
   it('never carries a source-app identity into the cloned bot', () => {
