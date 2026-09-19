@@ -1321,6 +1321,13 @@ setInterval(() => {}, 1_000);
     const readyIndex = messages.findIndex(m => m.type === 'ready');
     expect(attestationIndex).toBeGreaterThanOrEqual(0);
     expect(attestationIndex).toBeLessThan(readyIndex);
+    // Attestation precedes the current turn's origin snapshot refresh: the
+    // daemon records this CLI pid before it snapshots the turn's descendants,
+    // so a managed_turn_origin for the live turn follows the attestation.
+    const originAfterAttestation = messages.findIndex(
+      (m, i) => i > attestationIndex && m.type === 'managed_turn_origin' && m.turnId === 'om_turn',
+    );
+    expect(originAfterAttestation, JSON.stringify(messages)).toBeGreaterThan(attestationIndex);
   }, 20_000);
 
   it('forces the synthetic working seed before classifying a limited settle', async () => {

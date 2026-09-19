@@ -305,6 +305,7 @@ herdr pane report-agent "$HERDR_PANE_ID" \\
     async () => {
       const root = mkdtempSync(join(tmpdir(), 'botmux-herdr-adopt-attest-'));
       tempDirs.add(root);
+      const paneMarker = `botmux-adopt-attest-${Date.now().toString(36)}`;
       const fakeAgent = join(root, 'pi');
       writeFileSync(fakeAgent, `#!/bin/bash
 export HERDR_AGENT=pi
@@ -316,19 +317,32 @@ herdr pane report-agent "$HERDR_PANE_ID" \\
       const externalSession = `adopt-attest-${Date.now().toString(36)}`;
       sessions.add(externalSession);
       const external = new HerdrBackend(externalSession);
-      external.spawn(fakeAgent, ['-lc', 'echo ADOPT_INITIAL; while :; do sleep 1; done'], {
+      external.spawn(fakeAgent, ['-lc', `echo ${paneMarker}; while :; do sleep 1; done`], {
         cwd: root,
         cols: 100,
         rows: 30,
         env: { ...process.env } as Record<string, string>,
       });
       await waitFor(
-        () => external.captureCurrentScreen().includes('ADOPT_INITIAL'),
+        () => external.captureCurrentScreen().includes(paneMarker),
         10_000,
         'external pane initial marker',
       );
-      const panePid = external.getChildPid?.() ?? process.pid;
-      expect(typeof panePid === 'number' && panePid > 1).toBe(true);
+      // The Herdr backend never records the external pane's CLI pid, so resolve
+      // the live pane process from the OS by its unique marker command instead
+      // of falling back to this test runner's pid.
+      const panePid = await waitFor(
+        () => {
+          try {
+            const out = execFileSync('pgrep', ['-f', paneMarker], { encoding: 'utf8' }).trim();
+            const pid = out.split('\n').map(Number).find(n => Number.isInteger(n) && n > 1 && n !== process.pid);
+            return pid ?? null;
+          } catch { return null; }
+        },
+        10_000,
+        'external pane process pid',
+      );
+      expect(Number.isInteger(panePid) && panePid > 1).toBe(true);
 
       const sessionId = `hratt${Date.now().toString(36)}`;
       const logs: string[] = [];
@@ -371,6 +385,13 @@ herdr pane report-agent "$HERDR_PANE_ID" \\
       const readyIndex = messages.findIndex(m => m.type === 'ready');
       expect(attestationIndex).toBeGreaterThanOrEqual(0);
       expect(attestationIndex).toBeLessThan(readyIndex);
+      // The attestation must precede the current turn's origin snapshot: the
+      // daemon records this CLI pid before it snapshots the turn's pre-existing
+      // descendants, so a managed_turn_origin for om_turn follows the attestation.
+      const originAfter = messages.findIndex(
+        (m, i) => i > attestationIndex && m.type === 'managed_turn_origin' && m.turnId === 'om_turn',
+      );
+      expect(originAfter).toBeGreaterThan(attestationIndex);
 
       void ready;
       child.send({ type: 'close' } satisfies DaemonToWorker);
