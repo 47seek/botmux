@@ -511,8 +511,10 @@ export function structuredFallbackKind(
 ): StructuredFallbackKind {
   const rateLimitHandled = hasDedicatedRateLimitChain
     && turn.terminalErrorCode === CODEX_RATE_LIMIT_ERROR_CODE;
+  // failed 判定在 #1337 之后是 mode-agnostic 的（恒开，只留 adopt / isLocal /
+  // 裸 sentinel 三道门禁，不读 markers），所以这里不传 replyDelivery。
   if (!rateLimitHandled
-    && shouldEmitFailedBridgeFallback(turn, nextBoundaryMs, markers, adoptMode, replyDelivery)) {
+    && shouldEmitFailedBridgeFallback(turn, nextBoundaryMs, markers, adoptMode)) {
     return 'failed';
   }
   if (turn.finalText && turn.finalText.trim()) return 'final';
