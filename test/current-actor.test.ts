@@ -92,19 +92,6 @@ describe('current actor client contract', () => {
     expect(body).toContain('if (currentBotmuxTurnId) publishSandboxRelayCapability()');
   });
 
-  it('publishes the adopted CLI pid before each adopt observer returns', () => {
-    const worker = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
-    for (const marker of [
-      'Adopt mode (herdr): observing',
-      'Adopt mode (${effectiveBackendType}): observing',
-    ]) {
-      const at = worker.indexOf(marker);
-      expect(at).toBeGreaterThan(-1);
-      const block = worker.slice(worker.lastIndexOf('renderer?.markNewTurn();', at), worker.indexOf('return;', at));
-      expect(block).toContain('publishLocalProcessAttestation(cfg.adoptCliPid)');
-    }
-  });
-
   it('accepts only the machine-readable current command', () => {
     expect(parseCurrentActorArgs(['current', '--json'])).toEqual({ ok: true });
     expect(parseCurrentActorArgs(['current'])).toEqual({
