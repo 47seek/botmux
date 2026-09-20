@@ -129,13 +129,39 @@ export function resolveLoopbackPeerProcesses(input: {
     : { ok: false, reason: 'peer_unresolved' };
 }
 
+export type ProofMode = 'tuple' | 'host_lineage';
+
+/** Discriminating reason for a collapsed `current_actor_unverified`. Diagnostic
+ *  only — never changes the verdict. `lineage_hit_preexisting` carries the peer,
+ *  the anchor cliPid, and the snapshotted ancestor the upward walk hit first. */
+export type AttestationDiagnostic =
+  | { reason: 'ok' }
+  | { reason: 'session_inactive' }
+  | { reason: 'transport_disabled' }
+  | { reason: 'origin_incomplete' }
+  | { reason: 'worker_missing_or_stale' }
+  | { reason: 'cli_pid_missing' }
+  | { reason: 'cli_proc_start_mismatch' }
+  | { reason: 'snapshot_missing' }
+  | { reason: 'peer_proc_start_mismatch' }
+  | { reason: 'lineage_platform_unsupported' }
+  | { reason: 'lineage_walk_read_failed'; peerPid: number }
+  | { reason: 'lineage_hit_preexisting'; peerPid: number; cliPid: number; ancestorPid: number; ancestorStart: string }
+  | { reason: 'lineage_exhausted'; peerPid: number; cliPid: number };
+
+export type AttestationDiagnosticSink = (d: AttestationDiagnostic) => void;
+
 function peerBelongsToCurrentTurn(input: {
   peer: ProcessIdentity;
   cliPid: number;
   procRoot: string;
   preexistingProcessIdentities: ReadonlySet<string>;
+  onDiagnostic?: AttestationDiagnosticSink;
 }): boolean {
-  if (input.procRoot === '/proc' && process.platform !== 'linux') return false;
+  if (input.procRoot === '/proc' && process.platform !== 'linux') {
+    input.onDiagnostic?.({ reason: 'lineage_platform_unsupported' });
+    return false;
+  }
   let pid = input.peer.pid;
   for (let depth = 0; depth < 32 && pid > 1; depth++) {
     if (pid === input.cliPid) return true;
@@ -145,12 +171,20 @@ function peerBelongsToCurrentTurn(input: {
       const parent = Number(fields[1]);
       const started = fields[19];
       if (!Number.isSafeInteger(parent) || !/^\d+$/.test(started ?? '')
-        || input.preexistingProcessIdentities.has(`${pid}:${started}`)) return false;
+        || input.preexistingProcessIdentities.has(`${pid}:${started}`)) {
+        input.onDiagnostic?.({
+          reason: 'lineage_hit_preexisting',
+          peerPid: input.peer.pid, cliPid: input.cliPid, ancestorPid: pid, ancestorStart: started ?? '',
+        });
+        return false;
+      }
       pid = parent;
     } catch {
+      input.onDiagnostic?.({ reason: 'lineage_walk_read_failed', peerPid: input.peer.pid });
       return false;
     }
   }
+  input.onDiagnostic?.({ reason: 'lineage_exhausted', peerPid: input.peer.pid, cliPid: input.cliPid });
   return false;
 }
 
@@ -176,6 +210,9 @@ export interface CurrentTurnPeerAttestationInput {
   peer: ProcessIdentity;
   findSession: (sessionId: string) => DaemonSession | undefined;
   procRoot?: string;
+  /** Diagnostic sink — receives the discriminating reason for a rejection or
+   *  `ok`. Instrumentation only; passing it never changes the verdict. */
+  onDiagnostic?: AttestationDiagnosticSink;
 }
 
 /**
@@ -200,6 +237,10 @@ export function attestCurrentTurnLoopbackPeer(
   const workerProcStart = workerPid ? readProcStart(workerPid, procRoot) : undefined;
   const callerOpenId = ds?.managedTurnOrigin?.callerOpenId;
   const capability = ds?.managedTurnOrigin?.capability;
+  const emit = input.onDiagnostic;
+  // The compound guard below is byte-for-byte the shipped verdict. When a
+  // diagnostic sink is supplied we additionally classify WHICH clause collapsed
+  // it — without altering the short-circuit result.
   if (!ds || ds.session.status !== 'active'
     || !larkTransportEnabled({ chatId: ds.chatId, apiOnly: ds.initConfig?.apiOnly })
     || !turnId || generation === undefined
@@ -209,15 +250,28 @@ export function attestCurrentTurnLoopbackPeer(
     || !processIdentities || processIdentities.length === 0
     || !callerOpenId?.startsWith('ou_') || !capability
     || readProcStart(cliPid, procRoot) !== cliProcStart) {
+    if (emit) {
+      if (!ds || ds.session.status !== 'active') emit({ reason: 'session_inactive' });
+      else if (!larkTransportEnabled({ chatId: ds.chatId, apiOnly: ds.initConfig?.apiOnly })) emit({ reason: 'transport_disabled' });
+      else if (!turnId || !callerOpenId?.startsWith('ou_') || !capability) emit({ reason: 'origin_incomplete' });
+      else if (generation === undefined || !workerPid || !workerProcStart || ds.worker?.killed === true
+        || attestation?.workerGeneration !== generation) emit({ reason: 'worker_missing_or_stale' });
+      else if (!cliPid || !cliProcStart) emit({ reason: 'cli_pid_missing' });
+      else if (!processIdentities || processIdentities.length === 0) emit({ reason: 'snapshot_missing' });
+      else emit({ reason: 'cli_proc_start_mismatch' });
+    }
     return null;
   }
-  if (!peerBelongsToCurrentTurn({
-      peer: input.peer, cliPid, procRoot,
-      preexistingProcessIdentities: new Set(processIdentities),
-    })
-    || readProcStart(input.peer.pid, procRoot) !== input.peer.procStart) {
+  const lineageOk = peerBelongsToCurrentTurn({
+    peer: input.peer, cliPid, procRoot,
+    preexistingProcessIdentities: new Set(processIdentities),
+    onDiagnostic: emit,
+  });
+  if (!lineageOk || readProcStart(input.peer.pid, procRoot) !== input.peer.procStart) {
+    if (emit && lineageOk) emit({ reason: 'peer_proc_start_mismatch' });
     return null;
   }
+  emit?.({ reason: 'ok' });
   return {
     ds, turnId, generation, callerOpenId, capability,
     cliPid, cliProcStart, workerPid, workerProcStart,
