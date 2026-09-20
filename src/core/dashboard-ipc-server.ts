@@ -82,7 +82,36 @@ import {
   attestCurrentTurnLoopbackPeer,
   resolveDaemonCurrentActor,
   resolveLoopbackPeerProcesses,
+  type AttestationDiagnostic,
+  type ProofMode,
 } from './current-actor-attestation.js';
+
+/** Emit one request-correlated attestation diagnostic. Instrumentation only —
+ *  never gates a request. Secret values (capability, token, email) are never
+ *  logged; only pids, proc-start ticks, the reason enum, and turn/session ids. */
+function logAttestationDiagnostic(fields: {
+  route: string;
+  proofMode: ProofMode;
+  sessionId: string;
+  ds?: DaemonSession;
+}, d: AttestationDiagnostic): void {
+  const origin = fields.ds?.managedTurnOrigin;
+  const parts: string[] = [
+    `route=${fields.route}`,
+    `proofMode=${fields.proofMode}`,
+    `reason=${d.reason}`,
+    `session=${fields.sessionId}`,
+    `turn=${origin?.turnId ?? '-'}`,
+    `generation=${fields.ds?.workerGeneration ?? '-'}`,
+    `senderType=${origin?.callerOpenId?.startsWith('ou_') ? 'user_candidate' : (origin?.callerOpenId ? 'non_user' : 'none')}`,
+  ];
+  if ('peerPid' in d) parts.push(`peerPid=${d.peerPid}`);
+  if ('cliPid' in d) parts.push(`cliPid=${d.cliPid}`);
+  if ('ancestorPid' in d) parts.push(`ancestorPid=${d.ancestorPid}`);
+  if ('ancestorStart' in d) parts.push(`ancestorStart=${d.ancestorStart}`);
+  if ('detail' in d) parts.push(`detail=${d.detail}`);
+  logger.debug(`[attest-diag] ${parts.join(' ')}`);
+}
 
 /** Whether read isolation can actually be ENFORCED for this bot right now — the
  *  SAME gate the worker fail-closes on (adapter support + no wrapperCli + macOS).
@@ -1112,6 +1141,10 @@ ipcRoute('POST', CURRENT_ACTOR_ROUTE, async (req, res) => {
     sessionId,
     peer: peer.peer,
     findSession: findActiveBySessionId,
+    onDiagnostic: (d) => logAttestationDiagnostic({
+      route: 'current-actor', proofMode: 'host_lineage', sessionId,
+      ds: findActiveBySessionId(sessionId),
+    }, d),
   });
   return result.ok
     ? jsonRes(res, 200, result.document)
@@ -2085,14 +2118,23 @@ for (const action of ['auth-request', 'auth-status']) {
     }
     const ds = findActiveBySessionId(params.sessionId);
     const auth = sessionCliIpcAuth(req, ds, params.sessionId, body);
-    if (!auth.ok) return jsonRes(res, 403, { ok: false, error: auth.error });
+    if (!auth.ok) {
+      logAttestationDiagnostic({ route: action, proofMode: 'tuple', sessionId: params.sessionId, ds }, { reason: 'session_cli_ipc_auth_failed', detail: auth.error });
+      return jsonRes(res, 403, { ok: false, error: auth.error });
+    }
     if (['callerOpenId', 'openId', 'larkAppId', 'chatId'].some(key => key in body)) {
       return jsonRes(res, 400, { ok: false, error: 'invalid_auth_request' });
     }
     const origin = ds?.managedTurnOrigin;
+    // proofMode: isolated pane presents the rotating tuple; managed host proves lineage.
+    const presentsOriginTuple = 'originCapability' in body || 'originTurnId' in body
+      || 'originDispatchAttempt' in body;
+    const proofMode: ProofMode = presentsOriginTuple ? 'tuple' : 'host_lineage';
+    const diag = (d: AttestationDiagnostic) => logAttestationDiagnostic({ route: action, proofMode, sessionId: params.sessionId, ds }, d);
     if (!ds || ds.session.status !== 'active' || sessionTransportDisabled(ds)
       || ds.session.vcMeetingReceiver || !ds.worker || ds.worker.killed
       || !origin?.callerOpenId || !origin.turnId || !origin.capability) {
+      diag({ reason: 'origin_incomplete' });
       return jsonRes(res, 403, { ok: false, error: 'current_actor_unverified' });
     }
     // Two proof modes for "this request belongs to the current turn":
@@ -2102,11 +2144,10 @@ for (const action of ['auth-request', 'auth-status']) {
     //    proves lineage the way `/api/current-actor` does — the daemon maps the
     //    loopback socket to the client pid and walks it to the live CLI. Never
     //    let a partial/stale tuple fall through to the host path.
-    const presentsOriginTuple = 'originCapability' in body || 'originTurnId' in body
-      || 'originDispatchAttempt' in body;
     if (presentsOriginTuple) {
       if (body.originCapability !== origin.capability || body.originTurnId !== origin.turnId
         || body.originDispatchAttempt !== origin.dispatchAttempt) {
+        diag({ reason: 'tuple_mismatch' });
         return jsonRes(res, 403, { ok: false, error: 'current_actor_unverified' });
       }
     } else {
@@ -2115,8 +2156,13 @@ for (const action of ['auth-request', 'auth-status']) {
         remotePort: req.socket.remotePort,
         localPort: req.socket.localPort,
       });
-      if (!peer.ok || !attestCurrentTurnLoopbackPeer({
+      if (!peer.ok) {
+        diag({ reason: 'peer_unresolved', detail: peer.reason });
+        return jsonRes(res, 403, { ok: false, error: 'current_actor_unverified' });
+      }
+      if (!attestCurrentTurnLoopbackPeer({
         sessionId: params.sessionId, peer: peer.peer, findSession: findActiveBySessionId,
+        onDiagnostic: (d) => { if (d.reason !== 'ok') diag(d); },
       })) {
         return jsonRes(res, 403, { ok: false, error: 'current_actor_unverified' });
       }
@@ -2170,6 +2216,7 @@ for (const action of ['auth-request', 'auth-status']) {
       ? cached
       : await resolveVerifiedUserIdentity(ds.larkAppId, callerOpenId);
     if (!identity || identity.type !== 'user' || identity.openId !== callerOpenId || !isCurrent()) {
+      diag(isCurrent() ? { reason: 'identity_unresolved_or_non_user' } : { reason: 'turn_changed_during_await' });
       return jsonRes(res, 403, { ok: false, error: 'current_actor_unverified' });
     }
     let authorization: Awaited<ReturnType<typeof requestUserAuthorization>>;
@@ -2180,7 +2227,10 @@ for (const action of ['auth-request', 'auth-status']) {
     } catch {
       return jsonRes(res, 502, { ok: false, error: 'authorization_request_failed' });
     }
-    if (!isCurrent()) return jsonRes(res, 409, { ok: false, error: 'auth_turn_changed' });
+    if (!isCurrent()) {
+      diag({ reason: 'turn_changed_during_await' });
+      return jsonRes(res, 409, { ok: false, error: 'auth_turn_changed' });
+    }
     const requestId = randomBytes(32).toString('hex');
     sessionAuthRequests.set(requestId, { sessionId: params.sessionId, isCurrent, poll: authorization.poll });
     setTimeout(() => sessionAuthRequests.delete(requestId), authorization.expiresIn * 1_000).unref();
