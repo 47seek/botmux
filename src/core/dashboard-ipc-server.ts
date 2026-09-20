@@ -57,6 +57,8 @@ import * as oncallStore from '../services/oncall-store.js';
 import * as brandStore from '../services/brand-store.js';
 import * as sandboxStore from '../services/sandbox-store.js';
 import * as backendTypeStore from '../services/backend-type-store.js';
+import { setGroupSerialInput } from '../services/group-serial-input-store.js';
+import { parseGroupSerialInput } from './group-serial-input.js';
 import { setGroupDefaultModels } from '../services/group-default-models-store.js';
 import { parseGroupDefaultModels } from './group-default-models.js';
 import { setChatStreamingCardPin } from '../services/pin-streaming-card-mode-store.js';
@@ -5021,6 +5023,16 @@ ipcRoute('PUT', '/api/chat-group-grant', async (req, res) => {
 
 // ─── Groups (Phase B) ──────────────────────────────────────────────────────
 
+ipcRoute('PUT', '/api/group-serial-input/:chatId', async (req, res, p) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'larkAppId_not_set' });
+  if (!/^oc_[a-zA-Z0-9_-]+$/.test(p.chatId)) return jsonRes(res, 400, { ok: false, error: 'invalid_chat_id' });
+  let enabled: boolean;
+  try { enabled = parseGroupSerialInput(await readJsonBody(req)); }
+  catch (e) { return jsonRes(res, 400, { ok: false, error: e instanceof Error ? e.message : 'bad_json' }); }
+  const result = await setGroupSerialInput(cachedLarkAppId, p.chatId, enabled);
+  return jsonRes(res, result.ok ? 200 : 500, result);
+});
+
 ipcRoute('PUT', '/api/group-default-models/:chatId', async (req, res, p) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'larkAppId_not_set' });
   if (!/^oc_[a-zA-Z0-9_-]+$/.test(p.chatId)) return jsonRes(res, 400, { ok: false, error: 'invalid_chat_id' });
@@ -5037,6 +5049,7 @@ ipcRoute('GET', '/api/groups', async (_req, res) => {
     const chats = await groupsStore.listChats(cachedLarkAppId);
     let agentDefaults: { agentCliId?: string; agentModel?: string; agentReasoningEffort?: string } = {};
     let groupDefaultModels: Record<string, import('./group-default-models.js').GroupDefaultModels> = {};
+    let groupSerialInput: Record<string, boolean> = {};
     let pinStreamingCardMasterEnabled = false;
     let noPinStreamingCardChats = new Set<string>();
     let effectiveMessageListenerForChat: ((chatId: string) => boolean) | undefined;
@@ -5045,6 +5058,7 @@ ipcRoute('GET', '/api/groups', async (_req, res) => {
       const botConfig = botState.config;
       agentDefaults = { agentCliId: botConfig.cliId, agentModel: botConfig.model, agentReasoningEffort: botConfig.reasoningEffort };
       groupDefaultModels = botConfig.groupDefaultModels ?? {};
+      groupSerialInput = botConfig.groupSerialInput ?? {};
       pinStreamingCardMasterEnabled = botConfig.pinStreamingCard === true;
       noPinStreamingCardChats = new Set(botConfig.noPinStreamingCardChats ?? []);
       effectiveMessageListenerForChat = (chatId) => resolveEffectiveMessageListener(botState, chatId)?.enabled === true;
@@ -5072,6 +5086,7 @@ ipcRoute('GET', '/api/groups', async (_req, res) => {
         ...c,
         oncallChat: oncall ?? null,
         ...agentDefaults,
+        serialInput: groupSerialInput[c.chatId] === true,
         ...(groupDefaultModels[c.chatId] ? { defaultModels: groupDefaultModels[c.chatId] } : {}),
         firstSeenAt: seenMap.get(c.chatId) ?? null,
         hasRole,

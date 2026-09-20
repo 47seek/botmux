@@ -3154,11 +3154,13 @@ const activeTurnAuthority = new ActiveTurnAuthority();
 
 function turnAuthorityIdentity(input: {
   turnId?: string;
+  queueAfterActiveTurn?: true;
   dispatchAttempt?: number;
   trustedCaller?: TrustedCaller;
   trustedController?: TrustedCaller;
 }): TurnAuthorityIdentity {
   return {
+    ...(input.queueAfterActiveTurn ? { queueAfterActiveTurn: true } : {}),
     ...(input.turnId ? { turnId: input.turnId } : {}),
     ...(input.dispatchAttempt !== undefined
       ? { dispatchAttempt: input.dispatchAttempt }
@@ -3191,11 +3193,13 @@ function crossPrincipalIsolationOn(): boolean {
 
 function activeTurnBlocks(input: {
   turnId?: string;
+  queueAfterActiveTurn?: true;
   dispatchAttempt?: number;
   trustedCaller?: TrustedCaller;
   trustedController?: TrustedCaller;
 }): boolean {
-  if (!crossPrincipalIsolationOn()) return false;
+  // Group FIFO is independent of the experimental cross-principal question gate.
+  if (!input.queueAfterActiveTurn && !crossPrincipalIsolationOn()) return false;
   return activeTurnAuthority.blocks(turnAuthorityIdentity(input));
 }
 
@@ -3217,6 +3221,7 @@ function activeTurnBlocks(input: {
  * failure handling rather than assuming that.
  */
 function adoptActiveTurnWhenIsolationOff(identity: TurnAuthorityIdentity): boolean {
+  if (identity.queueAfterActiveTurn) return false;
   if (crossPrincipalIsolationOn()) return false;
   const active = activeTurnAuthority.snapshot();
   activeTurnAuthority.clear();
@@ -3229,6 +3234,7 @@ function adoptActiveTurnWhenIsolationOff(identity: TurnAuthorityIdentity): boole
 }
 
 function reserveActiveTurn(input: {
+  queueAfterActiveTurn?: true;
   turnId?: string;
   dispatchAttempt?: number;
   trustedCaller?: TrustedCaller;
@@ -3248,6 +3254,7 @@ function reserveActiveTurn(input: {
 }
 
 function markActiveTurnStarted(input: {
+  queueAfterActiveTurn?: true;
   turnId?: string;
   dispatchAttempt?: number;
   trustedCaller?: TrustedCaller;
@@ -12088,6 +12095,7 @@ async function flushPending(): Promise<void> {
       return;
     }
     while (pendingMessages.length > 0 && backend && cliAdapter) {
+      if (activeTurnBlocks(pendingMessages[0]!)) break;
       const item = freshnessInputQueue.takeNormal();
       if (!item) break;
       // Apply the credential snapshot that arrived WITH this turn, immediately
@@ -12757,6 +12765,7 @@ function sendToPty(
   content: string,
   turnId?: string,
   opts: {
+    queueAfterActiveTurn?: true;
     codexAppInput?: CodexAppTurnInput;
     dispatchAttempt?: number;
     codexAppDispatchId?: string;
@@ -12782,6 +12791,7 @@ function sendToPty(
   const next: PendingCliInput = {
     content,
     turnId,
+    ...(opts.queueAfterActiveTurn ? { queueAfterActiveTurn: true } : {}),
     ...(opts.replyTurnId ? { replyTurnId: opts.replyTurnId } : {}),
     ...(opts.codexAppDispatchId ? { codexAppDispatchId: opts.codexAppDispatchId } : {}),
     ...(opts.codexAppSteerable ? { codexAppSteerable: true } : {}),
@@ -12840,7 +12850,7 @@ function sendToPty(
   // wedged blocking flag silently swallows every subsequent message — without
   // this override the user has no way to recover from Lark. Mirrors the
   // web-terminal text-input path (handleTuiTextInput).
-  if (tuiPromptBlocking) {
+  if (tuiPromptBlocking && !opts.queueAfterActiveTurn) {
     log(`User override: incoming Lark message clears tuiPromptBlocking — "${content.substring(0, 80)}"`);
     tuiPromptBlocking = false;
     // Tear down the prompt card so the user doesn't see stale options.
@@ -20596,7 +20606,7 @@ process.on('message', async (raw: unknown) => {
       // Cross-principal turns are rejected at this worker boundary. The daemon
       // normally isolates them before worker IPC; this closes races/restarts so
       // another human can never steer the active turn directly.
-      if (activeTurnBlocks({
+      if (!msg.queueAfterActiveTurn && activeTurnBlocks({
         turnId: msg.turnId,
         dispatchAttempt: msg.dispatchAttempt,
         trustedCaller: msg.trustedCaller,
@@ -20629,7 +20639,7 @@ process.on('message', async (raw: unknown) => {
       // Adopt handlers are async and serialized below, so their renderer/usage
       // turn begins inside writeAdoptMessage. Non-adopt keeps the immediate
       // baseline while the message waits for normal flush scheduling.
-      if (!lastInitConfig?.adoptMode) {
+      if (!lastInitConfig?.adoptMode && !msg.queueAfterActiveTurn) {
         renderer?.markNewTurn();
         usageLimitTracker.beginTurn(currentUsageLimitSnapshot());
       }
@@ -20723,6 +20733,7 @@ process.on('message', async (raw: unknown) => {
         // turn whose `botmux send` could sneak its sentAtMs past this
         // turn's markTimeMs and falsely suppress its fallback.
         const inputCommitted = sendToPty(content, msg.turnId, {
+          ...(msg.queueAfterActiveTurn ? { queueAfterActiveTurn: true } : {}),
           codexAppInput,
           dispatchAttempt: msg.dispatchAttempt,
           codexAppDispatchId: msg.codexAppDispatchId,

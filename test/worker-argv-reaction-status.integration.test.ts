@@ -128,7 +128,7 @@ async function waitForPromptReady(
   while (Date.now() < deadline) {
     if (messages.some(message => message.type === 'prompt_ready')) return;
     if (child.exitCode !== null || child.signalCode !== null) {
-      throw new Error(`worker exited before prompt_ready\n${logs.join('')}`);
+      throw new Error(`worker pid=${child.pid} exited before prompt_ready (code=${child.exitCode}, signal=${child.signalCode})\n${JSON.stringify(messages)}\n${logs.join('')}`);
     }
     await new Promise(resolvePromise => setTimeout(resolvePromise, 25));
   }

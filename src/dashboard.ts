@@ -246,6 +246,7 @@ import {
   renameGroup,
   setPinStreamingCardForGroup,
   setDefaultModelsForGroup,
+  setSerialInputForGroup,
   unbindOncall,
   type GroupsActionDeps,
   type HandlerResult as GroupsHandlerResult,
@@ -3056,7 +3057,7 @@ async function buildGroupsMatrix(): Promise<GroupsMatrix> {
       for (const c of j.chats ?? []) {
         const {
           oncallChat,
-          defaultModels, agentCliId, agentModel, agentReasoningEffort,
+          defaultModels, serialInput, agentCliId, agentModel, agentReasoningEffort,
           firstSeenAt,
           hasRole,
           hasMessageListener,
@@ -3082,6 +3083,7 @@ async function buildGroupsMatrix(): Promise<GroupsMatrix> {
           inChat: true,
           oncallChat: oncallChat ?? null,
           defaultModels: defaultModels ?? {},
+          serialInput: serialInput === true,
           agentCliId, agentModel, agentReasoningEffort,
           hasRole: hasRole ?? false,
           hasMessageListener: hasMessageListener ?? false,
@@ -6668,6 +6670,18 @@ const server = createServer(async (req, res) => {
         const result = await unbindOncall(chatId, appId, groupsActionDeps);
         return writeHandlerResult(res, result);
       }
+    }
+
+    let mSerialInput: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mSerialInput = url.pathname.match(/^\/api\/groups\/([^/]+)\/serial-input\/([^/]+)$/))) {
+      let body: unknown;
+      try { body = await readJsonBody(req, 4096); }
+      catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+      const result = await setSerialInputForGroup(
+        decodeURIComponent(mSerialInput[1]), decodeURIComponent(mSerialInput[2]),
+        JSON.stringify(body), groupsActionDeps,
+      );
+      return writeHandlerResult(res, result);
     }
 
     let mDefaultModels: RegExpMatchArray | null;
