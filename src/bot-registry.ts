@@ -11,6 +11,11 @@ import {
   normalizeCliRuntimeConfig,
   type CliRuntimeConfig,
 } from './adapters/cli/runtime.js';
+import {
+  normalizeCliLaunchMode,
+  validateCliLaunchModeConfig,
+  type CliLaunchMode,
+} from './core/cli-launch-mode.js';
 import { logger } from './utils/logger.js';
 import { isLocale, setBotLookup, type Locale } from './i18n/index.js';
 import type { VoiceConfig } from './services/voice/types.js';
@@ -1457,6 +1462,8 @@ export interface BotConfig {
    * `aiden x claude` 时自动剥掉 aiden 拒收的 --settings。见 src/setup/cli-selection.ts。
    */
   wrapperCli?: string;
+  /** Special launch mode layered above the adapter; currently Forge x TraeX. */
+  cliLaunchMode?: CliLaunchMode;
   /**
    * Per-bot launch-shell override for the persistent backends (tmux/zellij/zmx).
    * When set, botmux launches the CLI under this shell instead of the daemon's
@@ -1540,10 +1547,8 @@ export interface BotConfig {
    * 系统提示不再提及 `botmux send`、不再注入每轮 reminder；solo 会话（私聊 / 仅
    * owner 的 1v1 群）还会去掉 `<user_message>` 壳与 `<sender/>`。只对有转写采集
    * 的 CLI 有效（见 core/reply-delivery.ts），不支持的 CLI 运行时自动回落 send。
-   * 缺省按 CLI：claude-code 缺省 `transcript`，其它 CLI 缺省 `send`
-   * （`defaultReplyDeliveryFor`）；显式 `'send'` / `'transcript'` 都持久化，
-   * claude-code 要回旧行为只能显式写 `'send'`。系统提示部分需 /restart 生效，
-   * 逐轮信封立即生效。
+   * 缺省为 `send`（`defaultReplyDeliveryFor`）；显式 `'send'` / `'transcript'`
+   * 都持久化。系统提示部分需 /restart 生效，逐轮信封立即生效。
    */
   replyDelivery?: 'send' | 'transcript';
   /**
@@ -2585,9 +2590,8 @@ export function getOwnerOpenId(larkAppId: string): string | undefined {
 }
 
 /** Per-bot 最终回复投递方式的**显式**配置值；未配置 / 未注册的 bot 返回 undefined，
- *  由 core/reply-delivery.ts 的 effectiveReplyDelivery 按 CLI 补缺省（claude-code
- *  → transcript，其它 → send）。只读内存 registry：worker 通过 init IPC 拿冻结值，
- *  不需要磁盘 mtime 缓存。 */
+ *  由 core/reply-delivery.ts 的 effectiveReplyDelivery 补缺省 send。只读内存
+ *  registry：worker 通过 init IPC 拿冻结值，不需要磁盘 mtime 缓存。 */
 export function resolveReplyDelivery(larkAppId: string): 'send' | 'transcript' | undefined {
   const v = bots.get(larkAppId)?.config.replyDelivery;
   return v === 'transcript' || v === 'send' ? v : undefined;
@@ -3277,12 +3281,25 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     const cliRuntime = entry.cliRuntime === undefined
       ? undefined
       : normalizeCliRuntimeConfig(entry.cliRuntime, `Bot config [${i}].cliRuntime`);
+    const cliLaunchMode = normalizeCliLaunchMode(
+      entry.cliLaunchMode,
+      `Bot config [${i}].cliLaunchMode`,
+    );
     if (cliRuntime && entry.cliPathOverride === undefined) {
       throw new Error(`Bot config [${i}]: cliPathOverride is required as an exact downgrade shadow of cliRuntime.executable`);
     }
     if (cliRuntime && entry.cliPathOverride !== cliRuntime.executable) {
       throw new Error(`Bot config [${i}]: cliPathOverride must exactly match cliRuntime.executable`);
     }
+    validateCliLaunchModeConfig({
+      cliId: entryCliId,
+      cliLaunchMode,
+      wrapperCli: entry.wrapperCli,
+      cliRuntime: entry.cliRuntime,
+      cliPathOverride: entry.cliPathOverride,
+      sandbox: entry.sandbox,
+      readIsolation: entry.readIsolation,
+    }, `Bot config [${i}]`);
     const existingAppServer = normalizeExistingAppServerConfig(
       entry.existingAppServer,
       `Bot config [${i}].existingAppServer`,
@@ -3640,6 +3657,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       wrapperCli: typeof entry.wrapperCli === 'string' && entry.wrapperCli.trim()
         ? entry.wrapperCli.trim()
         : undefined,
+      cliLaunchMode,
       launchShell: typeof entry.launchShell === 'string' && entry.launchShell.trim()
         ? entry.launchShell.trim()
         : undefined,
@@ -3669,7 +3687,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         : undefined,
       disableCliBypass: entry.disableCliBypass === true,
       codexAppCleanInput: entry.codexAppCleanInput === true || undefined,
-      // 显式 send / transcript 都保留：claude-code 缺省 transcript，写 send 才是退回旧行为。
+      // 显式 send / transcript 都保留；缺省按 defaultReplyDeliveryFor 解析。
       replyDelivery: entry.replyDelivery === 'transcript' || entry.replyDelivery === 'send' ? entry.replyDelivery : undefined,
       codexBrowser,
       codexRpcInput: entry.codexRpcInput === true,

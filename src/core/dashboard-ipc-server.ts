@@ -89,7 +89,7 @@ import {
  *  The dashboard uses it to disable the toggle and to reject persisting an
  *  unenforceable flag, so flipping it on can never brick the bot's next session
  *  (the worker would otherwise refuse to start). Turning it OFF is always allowed. */
-function readIsolationEnforceableFor(cfg: { cliId?: string; cliPathOverride?: string; wrapperCli?: string }): boolean {
+function readIsolationEnforceableFor(cfg: { cliId?: string; cliPathOverride?: string; wrapperCli?: string; cliLaunchMode?: string }): boolean {
   let adapterSupports = false;
   try {
     adapterSupports = createCliAdapterSync(cfg.cliId as never, cfg.cliPathOverride).supportsReadIsolation === true;
@@ -97,7 +97,7 @@ function readIsolationEnforceableFor(cfg: { cliId?: string; cliPathOverride?: st
   return evaluateReadIsolationGate({
     configured: true,
     adapterSupports,
-    wrapperCliSet: !!cfg.wrapperCli,
+    wrapperCliSet: !!cfg.wrapperCli || !!cfg.cliLaunchMode,
     platform: process.platform,
     sessionDataDirSet: true,
   }).enabled;
@@ -5821,9 +5821,8 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
   } catch { /* default chat */ }
   let envelopeInjection: 'auto' | 'off' = 'off';
   try { if (getBot(cachedLarkAppId).config.envelopeInjection === 'auto') envelopeInjection = 'auto'; } catch { /* default off */ }
-  // 最终回复投递方式：给 dashboard 的是**生效值**（显式配置 → 否则按 CLI 缺省，
-  // claude-code 缺省 transcript）+ 该 CLI 的缺省值 + 当前 CLI 是否支持 transcript
-  // （dashboard 据此禁用开关并说明）。
+  // 最终回复投递方式：给 dashboard 的是**生效值**（显式配置 → 否则缺省 send）
+  // + 该 CLI 的缺省值 + 当前 CLI 是否支持 transcript（dashboard 据此禁用开关并说明）。
   let replyDelivery: 'send' | 'transcript' = 'send';
   let replyDeliveryDefault: 'send' | 'transcript' = 'send';
   let replyDeliverySupported = false;
@@ -5861,6 +5860,7 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
   let cliRuntime: CliRuntimeConfig | null = null;
   let cliPathOverride: string | null = null;
   let wrapperCli: string | null = null;
+  let cliLaunchMode: BotConfig['cliLaunchMode'] | null = null;
   let model: string | null = null;
   let modelBackendVariant: 'standard' | 'max' | null = null;
   let reasoningEffort: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra' | null = null;
@@ -5884,6 +5884,7 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
       ? cfg.cliPathOverride
       : null;
     wrapperCli = typeof cfg.wrapperCli === 'string' && cfg.wrapperCli.trim() ? cfg.wrapperCli : null;
+    cliLaunchMode = cfg.cliLaunchMode ?? null;
     model = typeof cfg.model === 'string' && cfg.model.trim() ? cfg.model : null;
     modelBackendVariant = isBackendVariantCliId(cfg.cliId)
       && (cfg.modelBackendVariant === 'standard' || cfg.modelBackendVariant === 'max')
@@ -5899,7 +5900,7 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
       ? cfg.turnTimeoutMs
       : null;
     dshRuntime = cfg.dshRuntime === 'tui' ? 'tui' : null;
-    agentSelectionKey = selectionKeyForBot(cliId, wrapperCli ?? undefined);
+    agentSelectionKey = selectionKeyForBot(cliId, wrapperCli ?? undefined, cliLaunchMode ?? undefined);
   } catch { /* no registered bot */ }
   let maxLiveWorkers: number | null = null;
   let sessionOwnerReminder = DEFAULT_SESSION_OWNER_REMINDER;
@@ -5975,6 +5976,7 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     cliRuntime,
     cliPathOverride,
     wrapperCli,
+    cliLaunchMode,
     model,
     modelBackendVariant,
     reasoningEffort,
@@ -6682,7 +6684,7 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     nextDshRuntime = body.dshRuntime;
   }
   const runtimeFieldPresent = Object.prototype.hasOwnProperty.call(body, 'cliRuntime');
-  const currentSelectionKey = selectionKeyForBot(currentBotConfig.cliId, currentBotConfig.wrapperCli);
+  const currentSelectionKey = selectionKeyForBot(currentBotConfig.cliId, currentBotConfig.wrapperCli, currentBotConfig.cliLaunchMode);
   const selectionChanged = key !== currentSelectionKey;
   let nextRuntime: CliRuntimeConfig | undefined;
   let nextLegacyPath: string | undefined;
@@ -6691,8 +6693,8 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
       if (selected.cliId !== 'codex') {
         return jsonRes(res, 400, { ok: false, error: 'runtime_requires_codex' });
       }
-      if (selected.wrapperCli) {
-        return jsonRes(res, 400, { ok: false, error: 'runtime_wrapper_conflict' });
+      if (selected.wrapperCli || selected.cliLaunchMode) {
+        return jsonRes(res, 400, { ok: false, error: selected.wrapperCli ? 'runtime_wrapper_conflict' : 'runtime_launch_mode_conflict' });
       }
       try {
         nextRuntime = normalizeCliRuntimeConfig(body.cliRuntime, 'cliRuntime');
@@ -6717,6 +6719,7 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     cliId: selected.cliId,
     wrapperCli: selected.wrapperCli,
     cliPathOverride: effectivePath,
+    cliLaunchMode: selected.cliLaunchMode,
   });
   // dsh-tui mode spawns the dsh-tui binary instead of the dsh runner. Check it
   // separately so a missing dsh-tui install surfaces as a save-time warning
@@ -6785,106 +6788,118 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     // is the other way a bot could end up configured-but-unenforceable.)
     let readIsolationCleared = false;
     const r = await rmwBotEntry<{
-      error?: 'reasoning_effort_not_supported_by_model';
+      error?: 'reasoning_effort_not_supported_by_model' | 'launch_mode_sandbox_conflict';
       nextReasoningEffort?: typeof reasoningEffort;
       nextModelBackendVariant?: 'standard' | 'max';
       nextNativeSubagentRuntimeState?: NativeSubagentRuntimeConfigState;
     }>(larkAppId, (entry) => {
-    const storedModelBackendVariant = entry.modelBackendVariant === 'standard' || entry.modelBackendVariant === 'max'
-      ? entry.modelBackendVariant
-      : undefined;
-    const entryUsesBackendVariantCli = isBackendVariantCliId(entry.cliId);
-    const nextModelBackendVariant = supportsModelBackendVariant
-      ? (modelBackendVariantFieldPresent
-        ? modelBackendVariant
-        : entryUsesBackendVariantCli ? storedModelBackendVariant : undefined)
-      : undefined;
-    const nextReasoningEffort = supportsReasoningEffort
-      ? (reasoningEffortFieldPresent ? reasoningEffort ?? undefined : entry.reasoningEffort)
-      : undefined;
-    if (nextReasoningEffort && !cliModelSupportsReasoningEffort(selected.cliId, model || undefined, nextReasoningEffort)) {
-      return { write: false, result: { error: 'reasoning_effort_not_supported_by_model' } };
-    }
-    entry.cliId = selected.cliId;
-    if (selected.wrapperCli) entry.wrapperCli = selected.wrapperCli;
-    else delete entry.wrapperCli;
-    if (nextRuntime) {
-      entry.cliRuntime = nextRuntime;
-      // Downgrade shadow: older BotMux versions ignore cliRuntime but retain
-      // cliPathOverride, so a rollback still launches this distribution.
-      entry.cliPathOverride = nextRuntime.executable;
-    } else if (nextLegacyPath) {
-      entry.cliPathOverride = nextLegacyPath;
-      delete entry.cliRuntime;
-    } else {
-      delete entry.cliRuntime;
-      delete entry.cliPathOverride;
-    }
-    if (model) entry.model = model;
-    else delete entry.model;
-    if (!supportsModelBackendVariant) delete entry.modelBackendVariant;
-    else if (modelBackendVariantFieldPresent) {
-      if (modelBackendVariant) entry.modelBackendVariant = modelBackendVariant;
-      else delete entry.modelBackendVariant;
-    } else if (!entryUsesBackendVariantCli) {
-      delete entry.modelBackendVariant;
-    }
-    if (!supportsReasoningEffort) delete entry.reasoningEffort;
-    else if (reasoningEffortFieldPresent) {
-      if (reasoningEffort) entry.reasoningEffort = reasoningEffort;
-      else delete entry.reasoningEffort;
-    }
-    let nextNativeSubagentRuntimeState: NativeSubagentRuntimeConfigState;
-    if (selected.cliId !== 'traex') {
-      delete entry.nativeSubagentRuntime;
-      nextNativeSubagentRuntimeState = { status: 'absent' };
-    } else if (nativeSubagentRuntimeFieldPresent) {
-      if (requestedNativeSubagentRuntime) entry.nativeSubagentRuntime = requestedNativeSubagentRuntime;
-      else delete entry.nativeSubagentRuntime;
-      nextNativeSubagentRuntimeState = requestedNativeSubagentRuntime
-        ? { status: 'valid', policy: requestedNativeSubagentRuntime }
-        : { status: 'absent' };
-    } else {
-      const normalized = normalizeNativeSubagentRuntimePolicy(entry.nativeSubagentRuntime);
-      nextNativeSubagentRuntimeState = !normalized.ok
-        ? { status: 'invalid' }
-        : normalized.value
-          ? { status: 'valid', policy: normalized.value }
+      if (selected.cliLaunchMode && (entry.sandbox === true || entry.readIsolation === true)) {
+        return { write: false, result: { error: 'launch_mode_sandbox_conflict' } };
+      }
+      const storedModelBackendVariant = entry.modelBackendVariant === 'standard' || entry.modelBackendVariant === 'max'
+        ? entry.modelBackendVariant
+        : undefined;
+      const entryUsesBackendVariantCli = isBackendVariantCliId(entry.cliId);
+      const nextModelBackendVariant = supportsModelBackendVariant
+        ? (modelBackendVariantFieldPresent
+          ? modelBackendVariant
+          : entryUsesBackendVariantCli ? storedModelBackendVariant : undefined)
+        : undefined;
+      const nextReasoningEffort = supportsReasoningEffort
+        ? (reasoningEffortFieldPresent ? reasoningEffort ?? undefined : entry.reasoningEffort)
+        : undefined;
+      if (nextReasoningEffort && !cliModelSupportsReasoningEffort(selected.cliId, model || undefined, nextReasoningEffort)) {
+        return { write: false, result: { error: 'reasoning_effort_not_supported_by_model' } };
+      }
+      entry.cliId = selected.cliId;
+      if (selected.wrapperCli) entry.wrapperCli = selected.wrapperCli;
+      else delete entry.wrapperCli;
+      if (selected.cliLaunchMode) entry.cliLaunchMode = selected.cliLaunchMode;
+      else delete entry.cliLaunchMode;
+      if (nextRuntime) {
+        entry.cliRuntime = nextRuntime;
+        // Downgrade shadow: older BotMux versions ignore cliRuntime but retain
+        // cliPathOverride, so a rollback still launches this distribution.
+        entry.cliPathOverride = nextRuntime.executable;
+      } else if (nextLegacyPath) {
+        entry.cliPathOverride = nextLegacyPath;
+        delete entry.cliRuntime;
+      } else {
+        delete entry.cliRuntime;
+        delete entry.cliPathOverride;
+      }
+      if (model) entry.model = model;
+      else delete entry.model;
+      if (!supportsModelBackendVariant) delete entry.modelBackendVariant;
+      else if (modelBackendVariantFieldPresent) {
+        if (modelBackendVariant) entry.modelBackendVariant = modelBackendVariant;
+        else delete entry.modelBackendVariant;
+      } else if (!entryUsesBackendVariantCli) {
+        delete entry.modelBackendVariant;
+      }
+      if (!supportsReasoningEffort) delete entry.reasoningEffort;
+      else if (reasoningEffortFieldPresent) {
+        if (reasoningEffort) entry.reasoningEffort = reasoningEffort;
+        else delete entry.reasoningEffort;
+      }
+      let nextNativeSubagentRuntimeState: NativeSubagentRuntimeConfigState;
+      if (selected.cliId !== 'traex') {
+        delete entry.nativeSubagentRuntime;
+        nextNativeSubagentRuntimeState = { status: 'absent' };
+      } else if (nativeSubagentRuntimeFieldPresent) {
+        if (requestedNativeSubagentRuntime) entry.nativeSubagentRuntime = requestedNativeSubagentRuntime;
+        else delete entry.nativeSubagentRuntime;
+        nextNativeSubagentRuntimeState = requestedNativeSubagentRuntime
+          ? { status: 'valid', policy: requestedNativeSubagentRuntime }
           : { status: 'absent' };
-    }
-    // dsh-only turn timeout: non-dsh always drops it; on dsh, an explicit
-    // field value writes/clears it, absence preserves the current value.
-    if (!supportsTurnTimeout) delete entry.turnTimeoutMs;
-    else if (turnTimeoutFieldPresent) {
-      if (nextTurnTimeoutMs !== undefined) entry.turnTimeoutMs = nextTurnTimeoutMs;
-      else delete entry.turnTimeoutMs;
-    }
-    // dsh-only runtime variant: same present/absent semantics as turnTimeoutMs.
-    if (!supportsDshRuntime) delete entry.dshRuntime;
-    else if (dshRuntimeFieldPresent) {
-      if (nextDshRuntime !== undefined) entry.dshRuntime = nextDshRuntime;
-      else delete entry.dshRuntime;
-    }
-    if (entry.readIsolation === true &&
-        !readIsolationEnforceableFor({ cliId: selected.cliId, cliPathOverride: effectivePath, wrapperCli: selected.wrapperCli })) {
-      delete entry.readIsolation;
-      readIsolationCleared = true;
-    }
-    // 远端 CLI（riff / mojo）→ backendType 自动设为同名后端（否则 spawn 走 pty 后端，
-    // 而它们的 resolvedBin 是空串）。mojo 加入后这里必须按「是否远端」判断，不能再
-    // 硬编码 riff。
-    if (isRemoteCliId(selected.cliId)) {
-      entry.backendType = selected.cliId as typeof entry.backendType;
-    } else if (entry.backendType && isRemoteBackendType(entry.backendType)) {
-      // 从远端 CLI 切回其它 CLI：清掉这个自动配对的 backend override，回落 daemon
-      // 默认后端——否则新 CLI 会跑在远端 Backend 上（PTY 分块输入被当成一串远端
-      // turn）。手动的 pty/tmux/herdr/zellij override 不受影响（它们不是远端后端）。
-      delete entry.backendType;
-    }
-    return { write: true, result: { nextReasoningEffort, nextModelBackendVariant, nextNativeSubagentRuntimeState } };
+      } else {
+        const normalized = normalizeNativeSubagentRuntimePolicy(entry.nativeSubagentRuntime);
+        nextNativeSubagentRuntimeState = !normalized.ok
+          ? { status: 'invalid' }
+          : normalized.value
+            ? { status: 'valid', policy: normalized.value }
+            : { status: 'absent' };
+      }
+      // dsh-only turn timeout: non-dsh always drops it; on dsh, an explicit
+      // field value writes/clears it, absence preserves the current value.
+      if (!supportsTurnTimeout) delete entry.turnTimeoutMs;
+      else if (turnTimeoutFieldPresent) {
+        if (nextTurnTimeoutMs !== undefined) entry.turnTimeoutMs = nextTurnTimeoutMs;
+        else delete entry.turnTimeoutMs;
+      }
+      // dsh-only runtime variant: same present/absent semantics as turnTimeoutMs.
+      if (!supportsDshRuntime) delete entry.dshRuntime;
+      else if (dshRuntimeFieldPresent) {
+        if (nextDshRuntime !== undefined) entry.dshRuntime = nextDshRuntime;
+        else delete entry.dshRuntime;
+      }
+      if (entry.readIsolation === true &&
+          !readIsolationEnforceableFor({ cliId: selected.cliId, cliPathOverride: effectivePath, wrapperCli: selected.wrapperCli, cliLaunchMode: selected.cliLaunchMode })) {
+        delete entry.readIsolation;
+        readIsolationCleared = true;
+      }
+      // 远端 CLI（riff / mojo）→ backendType 自动设为同名后端（否则 spawn 走 pty 后端，
+      // 而它们的 resolvedBin 是空串）。mojo 加入后这里必须按「是否远端」判断，不能再
+      // 硬编码 riff。
+      if (isRemoteCliId(selected.cliId)) {
+        entry.backendType = selected.cliId as typeof entry.backendType;
+      } else if (entry.backendType && isRemoteBackendType(entry.backendType)) {
+        // 从远端 CLI 切回其它 CLI：清掉这个自动配对的 backend override，回落 daemon
+        // 默认后端——否则新 CLI 会跑在远端 Backend 上（PTY 分块输入被当成一串远端
+        // turn）。手动的 pty/tmux/herdr/zellij override 不受影响（它们不是远端后端）。
+        delete entry.backendType;
+      }
+      return { write: true, result: { nextReasoningEffort, nextModelBackendVariant, nextNativeSubagentRuntimeState } };
     });
     if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
     if (r.result.error) {
+      if (r.result.error === 'launch_mode_sandbox_conflict') {
+        return jsonRes(res, 400, {
+          ok: false,
+          error: r.result.error,
+          message: 'Forge x TraeX 暂不支持文件沙盒，请先关闭 sandbox 后再切换。',
+        });
+      }
       return jsonRes(res, 400, {
         ok: false,
         error: r.result.error,
@@ -6898,6 +6913,7 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     bot.config.cliPathOverride = nextRuntime?.executable ?? nextLegacyPath;
     if (selected.wrapperCli) bot.config.wrapperCli = selected.wrapperCli;
     else bot.config.wrapperCli = undefined;
+    bot.config.cliLaunchMode = selected.cliLaunchMode;
     bot.config.model = model || undefined;
     bot.config.modelBackendVariant = supportsModelBackendVariant
       ? r.result.nextModelBackendVariant
@@ -6926,13 +6942,14 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     // 消息 lazy resume 复活，要等下次 daemon 重启才被 restore 守卫清理。
     const closedMismatchedSessions = await closeCliMismatchedSessionsForBot(larkAppId);
 
-    const selectionKey = selectionKeyForBot(selected.cliId, selected.wrapperCli);
+    const selectionKey = selectionKeyForBot(selected.cliId, selected.wrapperCli, selected.cliLaunchMode);
     jsonRes(res, 200, {
       ok: true,
       cliId: selected.cliId,
       cliRuntime: nextRuntime ?? null,
       cliPathOverride: nextRuntime ? null : nextLegacyPath ?? null,
       wrapperCli: selected.wrapperCli ?? null,
+      cliLaunchMode: selected.cliLaunchMode ?? null,
       model: model || null,
       modelBackendVariant: supportsModelBackendVariant ? bot.config.modelBackendVariant ?? null : null,
       reasoningEffort: supportsReasoningEffort ? bot.config.reasoningEffort ?? null : null,
@@ -7124,8 +7141,8 @@ ipcRoute('PUT', '/api/bot-envelope-injection', async (req, res) => {
 //   • 'transcript' → daemon 从 CLI 转写自动取本轮最后的 assistant 文本发最终回复卡，
 //     模型不再被要求 botmux send；仅 claude-code 与结构化转写白名单 CLI 支持，其它
 //     CLI 由 store 拒绝（400 reply_delivery_unsupported）。落盘 'transcript'
-//   • 'send' → 模型必须自己 botmux send。落盘 'send'（claude-code 退回旧行为的唯一方式）
-//   • ''/其它 → 删 key，回到该 CLI 的缺省（claude-code=transcript，其它=send）
+//   • 'send' → 模型必须自己 botmux send。落盘 'send'
+//   • ''/其它 → 删 key，回到缺省 send
 // 走 applyConfigField（与 /botconfig 同一写盘 + 热更新路径）：逐轮信封下一轮生效，
 // 系统提示部分要 /restart 才换新值。响应里的 replyDelivery 是写入后的**生效值**。
 ipcRoute('PUT', '/api/bot-reply-delivery', async (req, res) => {
@@ -7602,6 +7619,17 @@ ipcRoute('PUT', '/api/bot-sandbox', async (req, res) => {
   let body: { enabled?: unknown };
   try { body = await readJsonBody<{ enabled?: unknown }>(req); }
   catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  if (body.enabled === true) {
+    try {
+      if (getBot(cachedLarkAppId).config.cliLaunchMode === 'forge-traex') {
+        return jsonRes(res, 400, {
+          ok: false,
+          error: 'launch_mode_sandbox_conflict',
+          message: 'Forge x TraeX 暂不支持文件沙盒。',
+        });
+      }
+    } catch { /* Let the store return the canonical config error below. */ }
+  }
   // File-sandbox policy is frozen onto each Session at creation and reused on
   // restore; this toggle is intentionally next-session-only and cannot mutate
   // a live pane's profile.
