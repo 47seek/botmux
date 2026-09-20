@@ -9410,6 +9410,54 @@ async function handleTermAction(key: TermActionKey): Promise<void> {
   scheduleOneShotAfterAction();
 }
 
+/** Deliver Ctrl+C only when the daemon's requested turn is still the worker's
+ * active turn. This is deliberately separate from card `term_action`: a stale
+ * HTTP request must never interrupt a newer turn that reused this CLI process. */
+async function handleExactTurnInterrupt(requestId: string, turnId: string): Promise<void> {
+  if (turnId !== currentBotmuxTurnId) {
+    send({ type: 'turn_interrupt_result', requestId, turnId, delivered: false, reason: 'stale_turn' });
+    return;
+  }
+  // Codex App and codexRpcInput use the pane as a viewer while actual work is
+  // driven through app-server/RPC. Writing ETX here would kill that transport
+  // process, not safely interrupt the exact model turn. Match the card stop
+  // contract and fail closed until their native turn-interrupt protocol exists.
+  if (lastInitConfig?.cliId === 'codex-app'
+      || lastInitConfig?.codexRpcInput === true
+      || effectiveBackendType === 'riff'
+      || effectiveBackendType === 'mojo'
+      || !backend) {
+    send({ type: 'turn_interrupt_result', requestId, turnId, delivered: false, reason: 'unsupported' });
+    return;
+  }
+  const targetBackend = backend;
+  let delivered = false;
+  try {
+    delivered = await runAfterAmbiguousSubmissionWrites(targetBackend, async () => {
+      if (backend !== targetBackend || currentBotmuxTurnId !== turnId) return false;
+      return sendCriticalControlKey('ctrlc', () => {
+        if (backend !== targetBackend || currentBotmuxTurnId !== turnId) return true;
+        return sendTermActionOnce(targetBackend, 'ctrlc');
+      });
+    });
+  } catch (err) {
+    log(`Exact interrupt ${turnId.substring(0, 8)} failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  if (backend !== targetBackend || currentBotmuxTurnId !== turnId) {
+    send({ type: 'turn_interrupt_result', requestId, turnId, delivered: false, reason: 'stale_turn' });
+    return;
+  }
+  send({ type: 'turn_interrupt_result', requestId, turnId, delivered, ...(delivered ? {} : { reason: 'delivery_failed' as const }) });
+  if (delivered) {
+    if (tuiPromptBlocking) {
+      tuiPromptBlocking = false;
+      void flushPending();
+    }
+    log(`Exact interrupt delivered for turn ${turnId.substring(0, 8)}`);
+    scheduleOneShotAfterAction();
+  }
+}
+
 /** Key name → ANSI escape sequence (for PtyBackend) */
 const KEY_TO_ANSI: Record<string, string> = {
   Up: '\x1b[A', Down: '\x1b[B', Left: '\x1b[D', Right: '\x1b[C',
@@ -21293,6 +21341,11 @@ process.on('message', async (raw: unknown) => {
 
     case 'term_action': {
       await handleTermAction(msg.key);
+      break;
+    }
+
+    case 'interrupt_turn': {
+      await handleExactTurnInterrupt(msg.requestId, msg.turnId);
       break;
     }
 

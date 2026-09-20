@@ -146,7 +146,7 @@ import {
   updateTaskWithOptionalPrecondition,
   type SchedulePreconditionMutation,
 } from './schedule-precondition-config.js';
-import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners, forkWorker, suspendWorker, killWorker, latestPerBotEnvForRestart, latestModelForRespawn, getDaemonReplyCardUsageSnapshot, sessionSupportsWebTerminal, sendWorkerSessionInput, isSessionTransferring, mojoCloseResidualForRow, getDaemonBootId, CARD_POSTING_SENTINEL, ensureReadonlyTaskContinuationAttached } from './worker-pool.js';
+import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners, forkWorker, suspendWorker, killWorker, latestPerBotEnvForRestart, latestModelForRespawn, getDaemonReplyCardUsageSnapshot, sessionSupportsWebTerminal, sendWorkerSessionInput, interruptExactWorkerTurn, isSessionTransferring, mojoCloseResidualForRow, getDaemonBootId, CARD_POSTING_SENTINEL, ensureReadonlyTaskContinuationAttached } from './worker-pool.js';
 import {
   awaitReadonlyTaskContinuationUser,
   cancelReadonlyTaskContinuationExplicit,
@@ -785,6 +785,7 @@ function routeHasPublicAccess(method: string, pathname: string): boolean {
  *       · options.steer=true authorizes a best-effort native turn/steer into
  *         a live codex-app turn; same drive-my-own-turn trust surface, no extra
  *         route or capability.
+ *   POST /api/sessions/:id/turns/:triggerId/interrupt (stop exact turn)
  *   GET  /api/sessions/:id/trigger-result          (poll final)
  *   GET  /api/sessions/:id/insight                 (poll conversation/progress)
  * `/api/asks/answer` is deliberately EXCLUDED — it is askId-keyed with no
@@ -794,6 +795,7 @@ function routeHasPublicAccess(method: string, pathname: string): boolean {
  */
 function routeIsCoreOnlyPublic(method: string, pathname: string): boolean {
   if (method === 'POST' && pathname === '/api/trigger') return true;
+  if (method === 'POST' && /^\/api\/sessions\/[^/]+\/turns\/[^/]+\/interrupt$/.test(pathname)) return true;
   if (method === 'GET') {
     return /^\/api\/sessions\/[^/]+\/trigger-result$/.test(pathname)
       || /^\/api\/sessions\/[^/]+\/insight$/.test(pathname);
@@ -1336,6 +1338,71 @@ ipcRoute('POST', '/api/sessions/:sessionId/close', async (req, res, params) => {
     }
     const r = await closeSession(params.sessionId);
     jsonRes(res, r.ok ? 200 : 502, r);
+  });
+});
+
+/** Stop exactly one active async trigger without closing its session. The
+ * worker confirms turn identity before Ctrl+C is injected; this endpoint never
+ * falls back to a broad session interrupt. */
+ipcRoute('POST', '/api/sessions/:sessionId/turns/:triggerId/interrupt', async (_req, res, params) => {
+  const ds = findActiveBySessionId(params.sessionId);
+  if (!ds || ds.session.status === 'closed') {
+    return jsonRes(res, 404, { ok: false, errorCode: 'session_not_found', error: 'active session not found' });
+  }
+  if (isSessionTransferring(ds)) {
+    return jsonRes(res, 409, { ok: false, errorCode: 'trigger_failed', error: 'session transfer in progress' });
+  }
+  const larkAppId = ds.larkAppId;
+  return withBotTurnMutation(larkAppId, async () => {
+    // Recheck under the mutation fence: an accepted new turn must not be
+    // interrupted by a request that was admitted against an older snapshot.
+    if (findActiveBySessionId(params.sessionId) !== ds || ds.session.status === 'closed') {
+      return jsonRes(res, 404, { ok: false, errorCode: 'session_not_found', error: 'active session not found' });
+    }
+    const result = ds.asyncTriggerResults?.get(params.triggerId);
+    const durable = asyncTriggerStore.lookup(params.sessionId, params.triggerId);
+    if (!result && !durable) {
+      return jsonRes(res, 404, { ok: false, errorCode: 'bad_request', error: 'async trigger not found for this session' });
+    }
+    if (result?.status === 'interrupted' || durable?.result.status === 'interrupted') {
+      return jsonRes(res, 200, { ok: true, action: 'interrupted', sessionId: params.sessionId, triggerId: params.triggerId, idempotent: true });
+    }
+    if (result?.status === 'completed' || result?.status === 'failed'
+      || durable?.result.status === 'completed' || durable?.result.status === 'failed') {
+      return jsonRes(res, 409, { ok: false, errorCode: 'trigger_failed', error: 'async trigger is already terminal' });
+    }
+    // A durable pending row without a live in-memory turn cannot prove which
+    // CLI turn would be hit, so fail closed rather than sending a broad Ctrl+C.
+    if (!result || result.status !== 'pending') {
+      return jsonRes(res, 409, { ok: false, errorCode: 'trigger_failed', error: 'async trigger is not live in this daemon generation' });
+    }
+    const delivery = await interruptExactWorkerTurn(ds, params.triggerId);
+    if (!delivery.ok) {
+      const status = delivery.reason === 'stale_turn' ? 409 : 503;
+      return jsonRes(res, status, { ok: false, errorCode: 'trigger_failed', error: `interrupt not delivered: ${delivery.reason}` });
+    }
+    const interruptedAt = Date.now();
+    result.status = 'interrupted';
+    result.interruptedAt = interruptedAt;
+    try {
+      const outcome = asyncTriggerStore.recordInterruptedStrict(params.sessionId, params.triggerId, interruptedAt, larkAppId);
+      if (outcome === 'already_completed') {
+        ds.asyncTriggerResults?.delete(params.triggerId);
+        return jsonRes(res, 409, { ok: false, errorCode: 'trigger_failed', error: 'async trigger completed before interrupt was recorded' });
+      }
+    } catch (err) {
+      // Do not claim a durable terminal without its required restart proof.
+      // The process was interrupted, but callers must retry/poll after storage
+      // recovery rather than receiving an unsafe success acknowledgement.
+      result.status = 'pending';
+      result.interruptedAt = undefined;
+      return jsonRes(res, 503, { ok: false, errorCode: 'trigger_failed', error: `interrupt persistence failed: ${err instanceof Error ? err.message : String(err)}` });
+    }
+    // Only release worker-exit convergence after the durable interrupt proof
+    // exists. Otherwise an exit between Ctrl+C and fsync could rewrite this
+    // caller-selected terminal into dispatch_unknown.
+    ds.idempotentAsyncTurns?.delete(params.triggerId);
+    return jsonRes(res, 200, { ok: true, action: 'interrupted', sessionId: params.sessionId, triggerId: params.triggerId });
   });
 });
 
@@ -2791,6 +2858,7 @@ function buildAsyncTriggerLookupResponse(sessionId: string, triggerId?: string):
       errorCode: memResult.errorCode,
       terminalErrorCode: memResult.terminalErrorCode,
       usage: memResult.usage,
+      interruptedAt: memResult.interruptedAt,
     } : undefined,
     memTriggerId: memResult ? memTriggerId : undefined,
     persisted,

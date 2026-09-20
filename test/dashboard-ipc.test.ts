@@ -9903,7 +9903,7 @@ describe('core-only public routes + readiness barrier (behavioral)', () => {
     if (handle) { await handle.close(); handle = null; }
   });
 
-  it('allowlists ONLY trigger/trigger-result/insight (no HMAC), everything else still 401', async () => {
+  it('allowlists trigger/trigger-result/insight/exact-interrupt (no HMAC), everything else still 401', async () => {
     setIpcAuthSecret(TEST_IPC_SECRET);
     setLarkAppId('local_smoke');
     handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true, coreOnlyPublicRoutes: true });
@@ -9916,6 +9916,8 @@ describe('core-only public routes + readiness barrier (behavioral)', () => {
     expect(tr.status).not.toBe(401);
     const ins = await fetch(`${base}/api/sessions/nope/insight?detail=conversation`);
     expect(ins.status).not.toBe(401);
+    const interrupt = await fetch(`${base}/api/sessions/nope/turns/trg/interrupt`, { method: 'POST' });
+    expect(interrupt.status).not.toBe(401);
     // NOT allowlisted (no auth header) → 401.
     expect((await fetch(`${base}/api/sessions`)).status).toBe(401);
     expect((await fetch(`${base}/api/asks/pending`)).status).toBe(401);
