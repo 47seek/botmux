@@ -60,6 +60,7 @@ import {
 import { rawCommandWriteOptionsFor } from './core/raw-command-write-options.js';
 import { publishCliSessionIdToDaemon } from './core/cli-session-id-publisher.js';
 import { ActiveTurnAuthority, type TurnAuthorityIdentity } from './core/active-turn-authority.js';
+import { PendingAuthorityHold } from './core/pending-authority-hold.js';
 import { readProcessStartIdentity } from './core/session-marker.js';
 import { roleLibraryRoot, roleLibrarySubtree } from './core/role-library.js';
 // Central no-transport predicate. Aliased because a local `const larkTransportEnabled`
@@ -3152,6 +3153,16 @@ let currentBotmuxDispatchAttempt: number | undefined;
 let currentVcMeetingImTurnOrigin: VcMeetingImTurnOrigin | undefined;
 let durableTurnInFlight = false;
 const activeTurnAuthority = new ActiveTurnAuthority();
+// A steer into a busy Codex can be consumed after its 20s pre-start lease
+// expires. The screen-ready idle heuristic would then release authority before
+// the delayed rollout user record arrives, rejecting the human's auth-request
+// `origin_incomplete`. This non-authorizing record holds that release across the
+// consumption gap, bounded and invalidated on every real lifecycle boundary.
+const pendingAuthorityHold = new PendingAuthorityHold();
+/** Upper bound the authority hold outlives the pre-start lease by. A steer Codex
+ *  never consumes recycles here so a lost input can never wedge authority open. */
+const AUTHORITY_HOLD_MAX_MS = 60_000;
+let authorityHoldRecycleTimer: ReturnType<typeof setTimeout> | undefined;
 
 function turnAuthorityIdentity(input: {
   turnId?: string;
@@ -3279,6 +3290,17 @@ function releaseActiveTurnAuthority(
     ? activeTurnAuthority.releaseExact(exact)
     : activeTurnAuthority.clear();
   if (!released) return false;
+  // A real release is a lifecycle boundary for the hold: the turn it protected
+  // is gone. releaseExact only clears the hold when the exact tuple matches, so
+  // a stale terminal for a superseded steer cannot drop the newer turn's hold.
+  if (!exact
+    || pendingAuthorityHold.holds(
+      { turnId: released.turnId, dispatchAttempt: released.dispatchAttempt },
+      cliSpawnGeneration,
+      Date.now(),
+    )) {
+    clearAuthorityHold();
+  }
   completeManagedTurnOriginRevocation(
     sandboxRelayCapability,
     released.turnId,
@@ -3288,6 +3310,46 @@ function releaseActiveTurnAuthority(
   log(`Released active turn authority ${released.turnId?.slice(0, 12) ?? '-'} (${reason})`);
   queueMicrotask(() => { void flushPending(); });
   return true;
+}
+
+/** Hold the screen-ready idle release for an ordinary human steer whose Codex
+ *  consumption may lag the pre-start lease. Only ordinary IM turns (no
+ *  dispatchAttempt — durable deliveries already keep authority via
+ *  durableTurnInFlight) need this. Bounded and recycled so a never-consumed
+ *  steer cannot wedge authority open. */
+function beginAuthorityHoldForCurrentSteer(): void {
+  if (durableTurnInFlight) return;
+  const identity = activeTurnAuthority.identity();
+  if (!identity.turnId || identity.dispatchAttempt !== undefined) return;
+  const now = Date.now();
+  pendingAuthorityHold.begin(
+    { turnId: identity.turnId, generation: cliSpawnGeneration },
+    now,
+    AUTHORITY_HOLD_MAX_MS,
+  );
+  scheduleAuthorityHoldRecycle(AUTHORITY_HOLD_MAX_MS);
+}
+
+function clearAuthorityHold(): void {
+  pendingAuthorityHold.clear();
+  if (authorityHoldRecycleTimer) {
+    clearTimeout(authorityHoldRecycleTimer);
+    authorityHoldRecycleTimer = undefined;
+  }
+}
+
+/** A steer Codex never consumed must not wedge authority open. When the bounded
+ *  hold expires with the turn still uncollected, drop the hold and re-drive the
+ *  ready path so the stale authority can finally release. */
+function scheduleAuthorityHoldRecycle(delayMs: number): void {
+  if (authorityHoldRecycleTimer) clearTimeout(authorityHoldRecycleTimer);
+  authorityHoldRecycleTimer = setTimeout(() => {
+    authorityHoldRecycleTimer = undefined;
+    pendingAuthorityHold.clear();
+    log('Authority hold recycled (steer never consumed within bounded window)');
+    markPromptReady();
+  }, delayMs);
+  authorityHoldRecycleTimer.unref?.();
 }
 
 function currentGatewayTrustedTurnIdentity() {
@@ -11346,7 +11408,17 @@ function markPromptReady(): void {
   // Quiescence is the terminal boundary for PTY adapters that do not emit an
   // explicit turn_terminal. Durable receivers keep authority until their exact
   // terminal receipt so an early screen-idle heuristic cannot release it.
-  if (!durableTurnInFlight) releaseActiveTurnAuthority('prompt_ready');
+  // A human steer into a busy Codex can also outlive its pre-start lease before
+  // Codex writes its rollout user record. While that bounded hold matches the
+  // exact active tuple and spawn generation, keep authority so the delayed
+  // auth-request is not rejected origin_incomplete; consumption or any terminal
+  // clears the hold and the next idle edge releases normally.
+  const holdsSteerAuthority = pendingAuthorityHold.holds(
+    activeTurnAuthority.identity(),
+    cliSpawnGeneration,
+    Date.now(),
+  );
+  if (!durableTurnInFlight && !holdsSteerAuthority) releaseActiveTurnAuthority('prompt_ready');
   isPromptReady = true;
   settleSessionRenameOnPrompt();
   // An old backend can still report idle while its async teardown is running.
@@ -12258,6 +12330,11 @@ async function flushPending(): Promise<void> {
           if (bridgeTurnId) {
             codexBridgeQueue.beginSubmitVerification(bridgeTurnId, undefined, item.dispatchAttempt);
           }
+          // Codex may consume this steer only after its pre-start lease expires.
+          // Hold the screen-ready idle release across that gap so the delayed
+          // human auth-request is not rejected origin_incomplete. Durable turns
+          // are excluded (they keep authority via durableTurnInFlight).
+          beginAuthorityHoldForCurrentSteer();
         } else if (lastInitConfig?.cliId === 'cursor' && !writeRpcEngine) {
           // Reader is session-long; this also covers turns whose chatId the
           // spawn-time observation has not resolved yet.
@@ -17522,6 +17599,7 @@ async function spawnCli(
     currentBotmuxTurnId = undefined;
     currentBotmuxDispatchAttempt = undefined;
     activeTurnAuthority.clear();
+    clearAuthorityHold();
     if (!intentionalRestart && activeRestartAttemptId) {
       send({
         type: 'restart_result',
@@ -17794,6 +17872,7 @@ function killCli(opts: {
   currentBotmuxTurnId = undefined;
   currentBotmuxDispatchAttempt = undefined;
   activeTurnAuthority.clear();
+  clearAuthorityHold();
   currentVcMeetingImTurnOrigin = undefined;
   submittedCodexAppReplyTurnIds.clear();
   pendingCodexAppSteerAckIds.clear();
