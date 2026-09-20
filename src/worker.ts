@@ -20081,6 +20081,24 @@ function rejectOrdinaryImTurn(
 }
 
 function publishLocalProcessAttestation(cliPid?: number): void {
+  if (cliPid && lastInitConfig?.cliId === 'codex' && readComm(cliPid) === 'node') {
+    const launcherPid = cliPid;
+    const realPid = findLaunchedCliPid(launcherPid, 'codex');
+    if (realPid) {
+      cliPid = realPid;
+    } else {
+      const lifetime = cliLifetimeNonce;
+      const launcherStart = readProcessStartIdentity(launcherPid);
+      scheduleWrapperRealCliPid(launcherPid, {
+        findRealPid: pid => findLaunchedCliPid(pid, 'codex'),
+        getBackend: () => backend,
+        getChildPid: () => !!launcherStart && cliLifetimeNonce === lifetime
+          && readProcessStartIdentity(launcherPid) === launcherStart ? launcherPid : null,
+        applyRealPid: pid => publishLocalProcessAttestation(pid),
+        schedule: (fn, ms) => { setTimeout(fn, ms); },
+      });
+    }
+  }
   const cliProcStart = cliPid ? readProcessStartIdentity(cliPid) : undefined;
   send({
     type: 'local_process_attestation',

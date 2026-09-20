@@ -55,6 +55,7 @@ function activeSession(): any {
 async function callActor(): Promise<Response> {
   debugLines = [];
   vi.spyOn(logger, 'debug').mockImplementation((msg: string) => { debugLines.push(msg); });
+  vi.spyOn(logger, 'warn').mockImplementation((msg: string) => { debugLines.push(msg); });
   ipc = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
   return fetch(`http://127.0.0.1:${ipc.port}/api/current-actor`, {
     method: 'POST', headers: { 'content-type': 'application/json' },

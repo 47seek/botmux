@@ -38,11 +38,11 @@ function runChild(debug: boolean) {
 }
 
 describe.skipIf(process.platform !== 'linux')('attest-diag real handler output', () => {
-  it('emits one diagnostic with DEBUG enabled and none when unset', () => {
+  it('reports rejections with DEBUG enabled or unset', () => {
     const on = runChild(true);
     expect(on).toHaveLength(1);
     expect(on[0]).toContain('route=current-actor');
     expect(on[0]).toContain('reason=session_inactive');
-    expect(runChild(false)).toHaveLength(0);
+    expect(runChild(false)).toHaveLength(1);
   }, 45_000);
 });

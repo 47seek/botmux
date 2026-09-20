@@ -1,7 +1,7 @@
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { delimiter, join } from 'node:path';
 import {
   projectFleetStatus,
   readFleetStatus,
@@ -212,6 +212,47 @@ describe('resolveFleetDaemonEnv (migration: SESSION_DATA_DIR must survive pm2→
     vi.stubEnv('SESSION_DATA_DIR', '/custom/data/root');
     const env = resolveFleetDaemonEnv(process.env, '');
     expect(env.SESSION_DATA_DIR).toBe('/custom/data/root'); // ambient override wins
+  });
+
+  it.each([false, true])('removes inherited session wrapper paths with custom data dir = %s', customDataDir => {
+    const home = tmp();
+    const dataDir = customDataDir ? join(home, 'custom data') : join(home, '.botmux', 'data');
+    const currentBin = join(dataDir, 'cli-identity', 'current.bin');
+    const previousBin = join(dataDir, 'cli-identity', 'previous.bin');
+    const userBin = join(home, 'bin');
+    const inherited = {
+      HOME: home,
+      ...(customDataDir ? { SESSION_DATA_DIR: dataDir } : {}),
+      BOTMUX_SESSION_ID: 'current',
+      PATH: [currentBin, userBin, previousBin, '/usr/bin'].join(delimiter),
+      BOTMUX_IDENTITY_BIN: currentBin,
+      BASH_ENV: join(currentBin, 'shell', 'bash_env.sh'),
+      ZDOTDIR: join(currentBin, 'shell'),
+      WEB_HOST: '127.0.0.1',
+    };
+
+    const env = resolveFleetDaemonEnv(inherited, 'WEB_HOST=10.9.9.9');
+
+    expect(env.PATH).toBe([userBin, '/usr/bin'].join(delimiter));
+    expect(env.BOTMUX_IDENTITY_BIN).toBeUndefined();
+    expect(env.BASH_ENV).toBeUndefined();
+    expect(env.ZDOTDIR).toBeUndefined();
+    expect(env.SESSION_DATA_DIR).toBe(dataDir);
+    expect(env.WEB_HOST).toBe('10.9.9.9');
+    expect(inherited.PATH).toContain(currentBin);
+  });
+
+  it('preserves ordinary user PATH and shell configuration', () => {
+    const dataDir = join(tmp(), 'data');
+    const inherited = {
+      SESSION_DATA_DIR: dataDir,
+      PATH: [join(dataDir, 'cli-identity-tools'), '/usr/bin', '', '/bin'].join(delimiter),
+      BOTMUX_IDENTITY_BIN: '/opt/user/bin',
+      BASH_ENV: '/opt/user/bash_env.sh',
+      ZDOTDIR: '/opt/user/zsh',
+    };
+
+    expect(resolveFleetDaemonEnv(inherited, '')).toMatchObject(inherited);
   });
 
   it('reloads WEB_HOST from .env before a session-origin restart spawns the supervisor', () => {

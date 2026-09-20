@@ -5,7 +5,7 @@
  * pm2 `ecosystemConfig` computed, minus pm2 itself.
  */
 
-import { join, dirname } from 'node:path';
+import { join, dirname, delimiter, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { homedir } from 'node:os';
 import { existsSync, readFileSync, openSync, mkdirSync, statSync } from 'node:fs';
@@ -179,6 +179,15 @@ export function resolveFleetDaemonEnv(
   // and every downstream `resolve('')` would then silently mean CWD. A blank is
   // treated as unset; a real explicit value (test/dev override) is preserved.
   if (!env.SESSION_DATA_DIR?.trim()) env.SESSION_DATA_DIR = resolveBotmuxDataDir({ env });
+  const identityDir = resolve(env.SESSION_DATA_DIR, 'cli-identity') + sep;
+  const isIdentityPath = (value: string | undefined): boolean =>
+    Boolean(value && resolve(value).startsWith(identityDir));
+  if (env.PATH !== undefined) {
+    env.PATH = env.PATH.split(delimiter).filter(path => !isIdentityPath(path)).join(delimiter);
+  }
+  for (const key of ['BOTMUX_IDENTITY_BIN', 'BASH_ENV', 'ZDOTDIR']) {
+    if (isIdentityPath(env[key])) delete env[key];
+  }
   // Parity with the old ecosystem's stop_exit_codes:[90] sentinel — restores the
   // graceful-exit code for self-exit paths (e.g. dashboard self-update) that read
   // it. The supervisor's own restart suppression already covers operator stops via

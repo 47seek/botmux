@@ -147,7 +147,7 @@ function logAttestationDiagnostic(ctx: AttestationRequestContext, d: Attestation
   if ('ancestorPid' in d) parts.push(`ancestorPid=${d.ancestorPid}`);
   if ('ancestorStart' in d) parts.push(`ancestorStart=${d.ancestorStart}`);
   if ('detail' in d) parts.push(`detail=${d.detail}`);
-  logger.debug(`[attest-diag] ${parts.join(' ')}`);
+  (d.reason === 'ok' ? logger.debug : logger.warn)(`[attest-diag] ${parts.join(' ')}`);
 }
 
 /** Whether read isolation can actually be ENFORCED for this bot right now — the

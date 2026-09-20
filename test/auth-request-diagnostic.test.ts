@@ -31,6 +31,7 @@ beforeEach(async () => {
   } as any);
   debugLines = [];
   vi.spyOn(logger, 'debug').mockImplementation((msg: string) => { debugLines.push(msg); });
+  vi.spyOn(logger, 'warn').mockImplementation((msg: string) => { debugLines.push(msg); });
   ipc = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
 });
 
