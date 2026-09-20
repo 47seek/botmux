@@ -92,4 +92,71 @@ describe('auth-request handler emits attestation diagnostics', () => {
     // a granted request logs no rejection record
     expect(diags()).toHaveLength(0);
   });
+
+  it('freezes turn=A and records observedTurn=B when the live turn rotates during identity await (repro #2)', async () => {
+    // valid start on turn A; the identity lookup rotates the live session to B
+    vi.mocked(identities.getIdentity).mockReturnValue(undefined);
+    vi.mocked(identities.resolveVerifiedUserIdentity).mockImplementation(async () => {
+      session.managedTurnOrigin = { capability: 'cd'.repeat(32), turnId: 'om_turn_B', callerOpenId: 'ou_other' };
+      return undefined;
+    });
+    const res = await post();
+    expect(res.status).toBe(403);
+    const d = diags();
+    expect(d).toHaveLength(1);
+    // the record is attributed to the turn the request STARTED on, not the rotated one
+    expect(d[0]).toContain('turn=om_turn');
+    expect(d[0]).not.toContain('turn=om_turn_B');
+    // and the observed live rotation is recorded separately
+    expect(d[0]).toContain('observedTurn=om_turn_B');
+    expect(d[0]).toContain('reason=turn_changed_during_await');
+  });
+
+  it('records turn_changed_during_await on auth-status when the turn rotates after poll (repro #1)', async () => {
+    vi.mocked(identities.getIdentity).mockReturnValue({ openId: 'ou_sender', type: 'user', source: 'sender', updatedAt: 0 } as any);
+    // poll rotates the live session so isCurrent() goes false after the await
+    const poll = vi.fn().mockImplementation(async () => {
+      session.managedTurnOrigin = { capability: 'cd'.repeat(32), turnId: 'om_turn_B', callerOpenId: 'ou_other' };
+      return { status: 'pending' };
+    });
+    vi.mocked(tokens.requestUserAuthorization).mockResolvedValue({ authUrl: 'https://x', scopes: ['im:chat:read'], expiresIn: 600, poll } as any);
+    const created = await post();
+    expect(created.status).toBe(200);
+    const { requestId } = await created.json() as any;
+    debugLines.length = 0;
+    const statusRes = await fetch(`http://127.0.0.1:${ipc.port}/api/sessions/auth-session/auth-status`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ requestId, originCapability: CAP, originTurnId: 'om_turn' }),
+    });
+    expect(statusRes.status).toBe(409);
+    const d = diags();
+    expect(d).toHaveLength(1);
+    expect(d[0]).toContain('route=auth-status');
+    expect(d[0]).toContain('reason=turn_changed_during_await');
+    expect(d[0]).toContain('turn=om_turn');
+    expect(d[0]).toContain('observedTurn=om_turn_B');
+  });
+
+  it('records identity_refresh_failed on auth-status when the identity file refresh fails (repro #1)', async () => {
+    // First register a request via a valid auth-request, then poll auth-status.
+    vi.mocked(identities.getIdentity).mockReturnValue({ openId: 'ou_sender', type: 'user', source: 'sender', updatedAt: 0 } as any);
+    const poll = vi.fn().mockResolvedValue({ status: 'ready', token: 'tkn' });
+    vi.mocked(tokens.requestUserAuthorization).mockResolvedValue({ authUrl: 'https://x', scopes: ['im:chat:read'], expiresIn: 600, poll } as any);
+    const cliIdentity = await import('../src/core/cli-identity.js');
+    vi.spyOn(cliIdentity, 'refreshSessionIdentity').mockReturnValue(false);
+    const created = await post();
+    expect(created.status).toBe(200);
+    const { requestId } = await created.json() as any;
+    debugLines.length = 0;
+    const statusRes = await fetch(`http://127.0.0.1:${ipc.port}/api/sessions/auth-session/auth-status`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ requestId, originCapability: CAP, originTurnId: 'om_turn' }),
+    });
+    expect(statusRes.status).toBe(409);
+    expect(await statusRes.json()).toEqual({ ok: false, error: 'auth_turn_changed' });
+    const d = diags();
+    expect(d).toHaveLength(1);
+    expect(d[0]).toContain('route=auth-status');
+    expect(d[0]).toContain('reason=identity_refresh_failed');
+  });
 });

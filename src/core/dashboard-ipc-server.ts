@@ -88,25 +88,60 @@ import {
   type ProofMode,
 } from './current-actor-attestation.js';
 
-/** Emit one request-correlated attestation diagnostic. Instrumentation only —
- *  never gates a request. Secret values (capability, token, email) are never
- *  logged; only pids, proc-start ticks, the reason enum, and turn/session ids. */
-function logAttestationDiagnostic(fields: {
+/** Correlation identity frozen at the START of a request, so a later await that
+ *  rotates the live turn/sender cannot rewrite what the diagnostic attributes
+ *  this request to. `senderType` comes from trusted type evidence only. */
+interface AttestationRequestContext {
+  route: string;
+  proofMode: ProofMode;
+  sessionId: string;
+  turnId: string;
+  generation: string;
+  senderType: 'user' | 'bot' | 'unknown';
+}
+
+/** Freeze the correlation fields observable at request start. `senderType` is
+ *  `user`/`bot` only when a trusted identity type is supplied; otherwise unknown
+ *  (an `ou_`-prefixed openId alone is a candidate, not proof). */
+function freezeAttestationContext(input: {
   route: string;
   proofMode: ProofMode;
   sessionId: string;
   ds?: DaemonSession;
-}, d: AttestationDiagnostic): void {
-  const origin = fields.ds?.managedTurnOrigin;
+  identityType?: 'user' | 'bot';
+}): AttestationRequestContext {
+  return {
+    route: input.route,
+    proofMode: input.proofMode,
+    sessionId: input.sessionId,
+    turnId: input.ds?.managedTurnOrigin?.turnId ?? '-',
+    generation: input.ds?.workerGeneration === undefined ? '-' : String(input.ds.workerGeneration),
+    senderType: input.identityType ?? 'unknown',
+  };
+}
+
+/** Emit one request-correlated attestation diagnostic. Instrumentation only —
+ *  never gates a request. Correlation is read from the FROZEN context (captured
+ *  at request start), not from live daemon state, so an await-time turn/sender
+ *  rotation cannot rewrite the attribution; a change observed against the live
+ *  session is recorded as an extra `observed*` field. Secret values (capability,
+ *  token, email) are never logged; only pids, proc-start ticks, the reason enum,
+ *  and turn/session ids. */
+function logAttestationDiagnostic(ctx: AttestationRequestContext, d: AttestationDiagnostic, liveDs?: DaemonSession): void {
   const parts: string[] = [
-    `route=${fields.route}`,
-    `proofMode=${fields.proofMode}`,
+    `route=${ctx.route}`,
+    `proofMode=${ctx.proofMode}`,
     `reason=${d.reason}`,
-    `session=${fields.sessionId}`,
-    `turn=${origin?.turnId ?? '-'}`,
-    `generation=${fields.ds?.workerGeneration ?? '-'}`,
-    `senderType=${origin?.callerOpenId?.startsWith('ou_') ? 'user_candidate' : (origin?.callerOpenId ? 'non_user' : 'none')}`,
+    `session=${ctx.sessionId}`,
+    `turn=${ctx.turnId}`,
+    `generation=${ctx.generation}`,
+    `senderType=${ctx.senderType}`,
   ];
+  // Record an observed live-state divergence from the frozen turn/generation.
+  const liveTurn = liveDs?.managedTurnOrigin?.turnId ?? '-';
+  if (liveTurn !== ctx.turnId) parts.push(`observedTurn=${liveTurn}`);
+  const liveGen = liveDs?.workerGeneration === undefined ? '-' : String(liveDs.workerGeneration);
+  if (liveGen !== ctx.generation) parts.push(`observedGeneration=${liveGen}`);
   if ('peerPid' in d) parts.push(`peerPid=${d.peerPid}`);
   if ('cliPid' in d) parts.push(`cliPid=${d.cliPid}`);
   if ('ancestorPid' in d) parts.push(`ancestorPid=${d.ancestorPid}`);
@@ -1138,12 +1173,15 @@ ipcRoute('POST', CURRENT_ACTOR_ROUTE, async (req, res) => {
   const sessionId = typeof body.sessionId === 'string' && body.sessionId.length <= 256
     ? body.sessionId
     : '';
+  const dsAtStart = sessionId ? findActiveBySessionId(sessionId) : undefined;
+  const ctx = freezeAttestationContext({ route: 'current-actor', proofMode: 'host_lineage', sessionId, ds: dsAtStart });
   const peer = resolveLoopbackPeerProcesses({
     remoteAddress: req.socket.remoteAddress,
     remotePort: req.socket.remotePort,
     localPort: req.socket.localPort,
   });
   if (!sessionId || !peer.ok) {
+    if (sessionId && !peer.ok) logAttestationDiagnostic(ctx, { reason: 'peer_unresolved', detail: peer.reason }, dsAtStart);
     return jsonRes(res, 403, {
       schema: 'botmux.current-actor.v2',
       status: 'blocked',
@@ -1154,10 +1192,7 @@ ipcRoute('POST', CURRENT_ACTOR_ROUTE, async (req, res) => {
     sessionId,
     peer: peer.peer,
     findSession: findActiveBySessionId,
-    onDiagnostic: (d) => logAttestationDiagnostic({
-      route: 'current-actor', proofMode: 'host_lineage', sessionId,
-      ds: findActiveBySessionId(sessionId),
-    }, d),
+    onDiagnostic: (d) => logAttestationDiagnostic(ctx, d, findActiveBySessionId(sessionId)),
   });
   return result.ok
     ? jsonRes(res, 200, result.document)
@@ -2195,24 +2230,32 @@ for (const action of ['auth-request', 'auth-status']) {
       return jsonRes(res, 400, { ok: false, error: 'invalid_auth_request' });
     }
     const ds = findActiveBySessionId(params.sessionId);
+    // proofMode is decided by the request shape (tuple in body vs host lineage),
+    // independent of ds — so it is correct even when ds is missing.
+    const presentsOriginTuple = 'originCapability' in body || 'originTurnId' in body
+      || 'originDispatchAttempt' in body;
+    const proofMode: ProofMode = presentsOriginTuple ? 'tuple' : 'host_lineage';
+    // Freeze correlation at request start; an await-time turn/sender rotation
+    // cannot rewrite what this request is attributed to.
+    const ctx = freezeAttestationContext({ route: action, proofMode, sessionId: params.sessionId, ds });
+    const diag = (d: AttestationDiagnostic) => logAttestationDiagnostic(ctx, d, findActiveBySessionId(params.sessionId));
     const auth = sessionCliIpcAuth(req, ds, params.sessionId, body);
     if (!auth.ok) {
-      logAttestationDiagnostic({ route: action, proofMode: 'tuple', sessionId: params.sessionId, ds }, { reason: 'session_cli_ipc_auth_failed', detail: auth.error });
+      diag({ reason: 'session_cli_ipc_auth_failed', detail: auth.error });
       return jsonRes(res, 403, { ok: false, error: auth.error });
     }
     if (['callerOpenId', 'openId', 'larkAppId', 'chatId'].some(key => key in body)) {
       return jsonRes(res, 400, { ok: false, error: 'invalid_auth_request' });
     }
     const origin = ds?.managedTurnOrigin;
-    // proofMode: isolated pane presents the rotating tuple; managed host proves lineage.
-    const presentsOriginTuple = 'originCapability' in body || 'originTurnId' in body
-      || 'originDispatchAttempt' in body;
-    const proofMode: ProofMode = presentsOriginTuple ? 'tuple' : 'host_lineage';
-    const diag = (d: AttestationDiagnostic) => logAttestationDiagnostic({ route: action, proofMode, sessionId: params.sessionId, ds }, d);
     if (!ds || ds.session.status !== 'active' || sessionTransportDisabled(ds)
       || ds.session.vcMeetingReceiver || !ds.worker || ds.worker.killed
       || !origin?.callerOpenId || !origin.turnId || !origin.capability) {
-      diag({ reason: 'origin_incomplete' });
+      // Classify in the same order the `||` guard short-circuits.
+      if (!ds || ds.session.status !== 'active') diag({ reason: 'session_inactive' });
+      else if (sessionTransportDisabled(ds)) diag({ reason: 'transport_disabled' });
+      else if (ds.session.vcMeetingReceiver || !ds.worker || ds.worker.killed) diag({ reason: 'worker_missing_or_stale' });
+      else diag({ reason: 'origin_incomplete' });
       return jsonRes(res, 403, { ok: false, error: 'current_actor_unverified' });
     }
     // Two proof modes for "this request belongs to the current turn":
@@ -2268,6 +2311,7 @@ for (const action of ['auth-request', 'auth-status']) {
       }
       const result = await request.poll();
       if (!isCurrent() || !request.isCurrent()) {
+        diag({ reason: 'turn_changed_during_await' });
         return jsonRes(res, 409, { ok: false, error: 'auth_turn_changed' });
       }
       if (result.status === 'pending') return jsonRes(res, 200, { ok: true, status: 'pending' });
@@ -2277,6 +2321,7 @@ for (const action of ['auth-request', 'auth-status']) {
       if (!refreshSessionIdentity(config.session.dataDir, params.sessionId, {
         tool: 'lark-cli', appId: cfg.larkAppId, userAccessToken: result.token, turnId,
       })) {
+        diag({ reason: 'identity_refresh_failed' });
         return jsonRes(res, 409, { ok: false, error: 'auth_turn_changed' });
       }
       return jsonRes(res, 200, { ok: true, status: 'ready' });

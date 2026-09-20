@@ -154,6 +154,7 @@ export type AttestationDiagnostic =
   | { reason: 'lineage_exhausted'; peerPid: number; cliPid: number }
   | { reason: 'identity_unresolved_or_non_user' }
   | { reason: 'identity_email_invalid' }
+  | { reason: 'identity_refresh_failed' }
   | { reason: 'turn_changed_during_await' };
 
 export type AttestationDiagnosticSink = (d: AttestationDiagnostic) => void;
