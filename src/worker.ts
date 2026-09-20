@@ -11249,16 +11249,18 @@ function markPromptReady(): void {
   // in the card.  This avoids a false "就绪" flash on daemon restart
   // (where the initial prompt is queued before the CLI becomes idle).
   //
-  // ALSO skip when the Grok-class busy arm is pending (spawnArgvInitialPromptBusy):
-  // for these adapters the FIRST ready is a pre-execution SessionStart edge, not a
-  // turn boundary — the argv-baked first prompt is still running. isPromptReady was
-  // just set true above, so this generic snapshot would project 'idle' and reach the
-  // daemon BEFORE the busy arm below re-publishes 'working'. Combined with the
-  // first-turn working already sent by startScreenUpdates, the daemon would then see
-  // working→idle and fire finishTurnReactions() — a premature ✅ DONE mid-turn (and a
+  // ALSO skip when the Grok-class busy arm is pending (spawnArgvInitialPromptBusy)
+  // or a background sub-agent is still in flight (backgroundTaskTracker.pending()):
+  // for these the FIRST/this ready is not a turn boundary — the argv-baked first
+  // prompt is still running, or the turn is only quiet awaiting a background
+  // <task-notification>. isPromptReady was just set true above, so this generic
+  // snapshot would project 'idle' and reach the daemon BEFORE the busy arm below
+  // re-publishes 'working'. Combined with the first-turn working already sent by
+  // startScreenUpdates, the daemon would then see working→idle and fire
+  // finishTurnReactions() — a premature ✅ DONE mid-turn (and a
   // 「工作中→等待输入→工作中」 flicker on the open card). The busy arm below owns the
-  // correct 'working' publish for this path, so this idle must not escape first.
-  if (renderer && !spawnArgvInitialPromptBusy && pendingMessages.length === 0 && pendingAdoptMessages.length === 0 && pendingRawInputs.length === 0 && pendingSessionRename === null && !isFlushing) {
+  // correct 'working' publish for these paths, so this idle must not escape first.
+  if (renderer && !spawnArgvInitialPromptBusy && backgroundTaskTracker.pending() === 0 && pendingMessages.length === 0 && pendingAdoptMessages.length === 0 && pendingRawInputs.length === 0 && pendingSessionRename === null && !isFlushing) {
     const { content } = renderer.snapshot();
     send({
       type: 'screen_update',

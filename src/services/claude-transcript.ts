@@ -670,22 +670,32 @@ export function backgroundTaskDispatchAcks(ev: TranscriptEvent): Array<{ toolUse
 }
 
 /** A `<task-notification>` re-injected when a background agent stops. It is a
- *  synthetic user event whose content STARTS WITH the tag — a tool_result that
+ *  synthetic event whose payload STARTS WITH the tag — a tool_result that
  *  merely contains the literal string (e.g. grep over this source) is not one.
+ *  Two on-disk shapes carry it: the legacy `role:user` event (text in
+ *  `message.content`) and the type-ahead `attachment(queued_command)` form
+ *  (text in `attachment.prompt`, `commandMode:'task-notification'`) that
+ *  current CLI builds write — mirroring {@link extractTurnStartText}.
  *  `status` is the agent's terminal state; the same task-id may notify more
  *  than once (a resumed agent stops again), so a completed/failed notice only
  *  ever RETIRES a tracked id, it never adds one. */
 export function parseTaskNotification(ev: TranscriptEvent):
   { taskId: string; toolUseId?: string; status: string } | undefined {
   if (!ev) return undefined;
-  const role = ev.message?.role ?? ev.type;
-  if (role !== 'user') return undefined;
-  const raw = ev.message?.content;
-  const text = typeof raw === 'string'
-    ? raw
-    : Array.isArray(raw)
-      ? (raw.find((b: any) => b && b.type === 'text' && typeof b.text === 'string')?.text ?? '')
-      : '';
+  let text: string;
+  if (ev.type === 'attachment' && ev.attachment?.type === 'queued_command') {
+    const prompt = ev.attachment.prompt;
+    text = typeof prompt === 'string' ? prompt : stringifyUserContent(prompt);
+  } else {
+    const role = ev.message?.role ?? ev.type;
+    if (role !== 'user') return undefined;
+    const raw = ev.message?.content;
+    text = typeof raw === 'string'
+      ? raw
+      : Array.isArray(raw)
+        ? (raw.find((b: any) => b && b.type === 'text' && typeof b.text === 'string')?.text ?? '')
+        : '';
+  }
   if (!text.trimStart().startsWith('<task-notification>')) return undefined;
   const taskId = /<task-id>([^<]+)<\/task-id>/.exec(text)?.[1]?.trim();
   if (!taskId) return undefined;
@@ -711,12 +721,14 @@ export class BackgroundTaskTracker {
 
   observe(ev: TranscriptEvent): void {
     // A genuine user-typed prompt starts a new turn and supersedes any prior
-    // turn's background waits (a resumed agent's `<task-notification>` is a
-    // synthetic user event that isMeaningfulUserEvent excludes, so it never
-    // trips this). Resetting here bounds the tracker: even if a completion
-    // notification is somehow never parsed, the account cannot leak past the
-    // next real prompt and wedge the card in `working`.
-    if (isMeaningfulUserEvent(ev)) {
+    // turn's background waits — whether it lands as a `role:user` event or the
+    // type-ahead `attachment(queued_command)` form the CLI writes when it
+    // dequeues a submission (a resumed agent's `<task-notification>` is
+    // synthetic and both predicates exclude it, so it never trips this).
+    // Resetting here bounds the tracker: even if a completion notification is
+    // somehow never parsed, the account cannot leak past the next real prompt
+    // and wedge the card in `working`.
+    if (isMeaningfulUserEvent(ev) || isMeaningfulQueuedCommand(ev)) {
       this.reset();
       return;
     }

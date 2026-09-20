@@ -45,6 +45,31 @@ function taskNotification(uuid: string, taskId: string, toolUseId: string, statu
   } as TranscriptEvent;
 }
 
+/** The `attachment(queued_command)` shape current CLI builds write when they
+ *  re-inject a completion notice: the tag text lives in `attachment.prompt`
+ *  with `commandMode:'task-notification'`, and there is no `message`. */
+function attachmentTaskNotification(uuid: string, taskId: string, toolUseId: string, status = 'completed'): TranscriptEvent {
+  return {
+    type: 'attachment',
+    uuid,
+    attachment: {
+      type: 'queued_command',
+      commandMode: 'task-notification',
+      prompt: `<task-notification>\n<task-id>${taskId}</task-id>\n<tool-use-id>${toolUseId}</tool-use-id>\n<status>${status}</status>\n<summary>done</summary>\n</task-notification>`,
+    },
+  } as unknown as TranscriptEvent;
+}
+
+/** A real type-ahead submission the CLI dequeues: `attachment(queued_command)`
+ *  with `commandMode:'prompt'` carrying the user's text. */
+function queuedPrompt(uuid: string, text: string): TranscriptEvent {
+  return {
+    type: 'attachment',
+    uuid,
+    attachment: { type: 'queued_command', commandMode: 'prompt', prompt: text },
+  } as unknown as TranscriptEvent;
+}
+
 function assistant(uuid: string, text: string, stopReason: string): TranscriptEvent {
   return {
     type: 'assistant',
@@ -85,6 +110,14 @@ describe('background task detection primitives', () => {
       message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'z', content: 'src/x.ts:1: <task-notification>' }] },
     } as TranscriptEvent;
     expect(parseTaskNotification(grepHit)).toBeUndefined();
+  });
+
+  it('parses the attachment(queued_command) notification shape current CLI builds emit', () => {
+    const parsed = parseTaskNotification(attachmentTaskNotification('u', 'agent-88', 'tu-2', 'failed'));
+    expect(parsed).toEqual({ taskId: 'agent-88', toolUseId: 'tu-2', status: 'failed' });
+
+    // A type-ahead user prompt (commandMode:'prompt') is not a notification.
+    expect(parseTaskNotification(queuedPrompt('q', 'do the thing'))).toBeUndefined();
   });
 });
 
@@ -172,6 +205,40 @@ describe('BackgroundTaskTracker', () => {
     // agent-1 finishes; agent-2 still in flight — the notification retires only
     // agent-1, it must not clear the whole account.
     t.observe(taskNotification('u3', 'agent-1', 'tu-1'));
+    expect(t.pending()).toBe(1);
+  });
+
+  it('retires against the attachment(queued_command) notification shape', () => {
+    const t = new BackgroundTaskTracker();
+    t.observe(assistantAgent('a1', 'tu-1'));
+    t.observe(launchAck('u1', 'tu-1', 'agent-1'));
+    expect(t.pending()).toBe(1);
+    // The completion notice arrives in the attachment form (majority of real
+    // CLI builds) — it must still retire the tracked id.
+    t.observe(attachmentTaskNotification('u2', 'agent-1', 'tu-1', 'completed'));
+    expect(t.pending()).toBe(0);
+  });
+
+  it('a type-ahead prompt (attachment commandMode:prompt) bounds a leaked account', () => {
+    const t = new BackgroundTaskTracker();
+    t.observe(assistantAgent('a1', 'tu-1'));
+    t.observe(launchAck('u1', 'tu-1', 'agent-1'));
+    expect(t.pending()).toBe(1);
+    // Completion notice never parsed (hypothetical leak). A type-ahead prompt
+    // the CLI dequeues starts a fresh turn → account must clear, just like a
+    // role:user prompt.
+    t.observe(queuedPrompt('q', 'please do the next thing'));
+    expect(t.pending()).toBe(0);
+  });
+
+  it('an attachment notification still does NOT reset the whole account', () => {
+    const t = new BackgroundTaskTracker();
+    t.observe(assistantAgent('a1', 'tu-1'));
+    t.observe(launchAck('u1', 'tu-1', 'agent-1'));
+    t.observe(assistantAgent('a2', 'tu-2'));
+    t.observe(launchAck('u2', 'tu-2', 'agent-2'));
+    expect(t.pending()).toBe(2);
+    t.observe(attachmentTaskNotification('u3', 'agent-1', 'tu-1'));
     expect(t.pending()).toBe(1);
   });
 });
