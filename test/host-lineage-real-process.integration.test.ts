@@ -1,6 +1,5 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { createServer, type Server, type Socket } from 'node:net';
-import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -9,6 +8,7 @@ import {
   attestCurrentTurnLoopbackPeer,
   resolveLoopbackPeerProcesses,
   snapshotProcessIdentities,
+  type AttestationDiagnostic,
 } from '../src/core/current-actor-attestation.js';
 
 /**
@@ -16,21 +16,23 @@ import {
  *
  * current-actor-attestation.test.ts proves the gates against memfs /proc
  * fixtures. This drives REAL processes against the real kernel: a resident child
- * stands in for the codex host runner that is already alive at turn start; the
- * daemon takes a real `snapshotProcessIdentities` of the CLI anchor; then AFTER
- * the snapshot a fresh loopback client (the "current-turn command") is spawned.
+ * stands in for the codex host runner already alive at turn start; the daemon
+ * takes a real `snapshotProcessIdentities` of the CLI anchor; then AFTER the
+ * snapshot a fresh loopback client (the "current-turn command") is spawned and
+ * HELD OPEN until explicit release, so the peer is resolvable throughout:
  *
  *   REJECT  : client nested under the snapshotted host runner
- *             -> attest fails (walk hits the runner in the snapshot before the anchor)
+ *             -> attest fails, diagnostic reason=lineage_hit_preexisting with the
+ *                offending ancestor == the snapshotted hostChild PID
  *   SUCCESS : client spawned directly under the anchor (control)
- *             -> attest passes (walk reaches cliPid before any snapshot member)
+ *             -> attest passes; frozen turn matches
  *
- * Reads the real peer PID:start, the snapshot, and the verdict on both sides.
+ * Experiment children run in their own process group and are reaped in afterEach
+ * (no `pkill -f` on an env marker).
  */
 
 const linux = process.platform === 'linux';
 const NODE = process.execPath;
-const MARKER = `bmx-lineage-exp-${process.pid}`;
 
 const procStart = (pid: number): string => {
   const raw = readFileSync(join('/proc', String(pid), 'stat'), 'utf8');
@@ -38,16 +40,18 @@ const procStart = (pid: number): string => {
 };
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
-// Resident helper (marked via MARKER env). Commands on stdin:
+// Resident helper. Commands on stdin:
 //   spawn-child        fork a child resident, print "SPAWNED <pid>"
 //   to-child <text>    forward "<text>\n" to the child resident
-//   connect <port>     fork a connector that opens a loopback client, print
-//                      "CLIENT <pid> <localPort>", self-exits after 3s
+//   connect <port>     fork a connector that opens a loopback client, prints
+//                      "CLIENT <pid> <localPort>", and HOLDS until its stdin
+//                      closes (released when this resident exits)
 const RESIDENT = String.raw`
 const net = require('node:net');
 const { spawn } = require('node:child_process');
 let child;
-const CONNECTOR = "const net=require('node:net');const p=Number(process.argv[1]);const s=net.connect(p,'127.0.0.1',()=>{process.stdout.write('CLIENT '+process.pid+' '+s.localPort+String.fromCharCode(10));});s.on('error',()=>{});setTimeout(()=>process.exit(0),3000);";
+const connectors = [];
+const CONNECTOR = "const net=require('node:net');const p=Number(process.argv[1]);const s=net.connect(p,'127.0.0.1',()=>{process.stdout.write('CLIENT '+process.pid+' '+s.localPort+String.fromCharCode(10));});s.on('error',()=>{});process.stdin.resume();process.stdin.on('end',()=>process.exit(0));";
 process.stdin.setEncoding('utf8');
 let buf='';
 process.stdin.on('data',(c)=>{
@@ -62,32 +66,40 @@ process.stdin.on('data',(c)=>{
     else if((m=t.match(/^connect (\d+)$/))){
       const con=spawn(process.execPath,['-e',CONNECTOR,m[1]],{stdio:['pipe','pipe','inherit'],env:process.env});
       con.stdout.setEncoding('utf8'); con.stdout.on('data',d=>process.stdout.write(d));
+      connectors.push(con);
     }
   }
 });
 process.stdin.on('end',()=>process.exit(0));
 `;
 
-const residents = new Set<ChildProcess>();
+const groupLeaders = new Set<ChildProcess>();
 const sockets = new Set<Socket>();
 let server: Server | undefined;
 
 afterEach(async () => {
   for (const s of sockets) s.destroy();
   sockets.clear();
-  for (const p of residents) { if (p.exitCode === null && p.signalCode === null) { try { p.stdin?.end(); } catch { /* closed */ } p.kill('SIGKILL'); } }
-  residents.clear();
+  // Kill each experiment process group (leader spawned detached) and await exit.
+  const waits: Promise<void>[] = [];
+  for (const p of groupLeaders) {
+    if (p.exitCode === null && p.signalCode === null && p.pid) {
+      waits.push(new Promise<void>((r) => p.once('exit', () => r())));
+      try { process.kill(-p.pid, 'SIGKILL'); } catch { try { p.kill('SIGKILL'); } catch { /* gone */ } }
+    }
+  }
+  groupLeaders.clear();
+  await Promise.race([Promise.all(waits), sleep(3000)]);
   if (server) { await new Promise<void>((r) => server!.close(() => r())); server = undefined; }
-  try { execFileSync('pkill', ['-9', '-f', MARKER], { stdio: 'ignore' }); } catch { /* none left */ }
 });
 
-function spawnResident(): ChildProcess {
+function spawnLeader(): ChildProcess {
   const p = spawn(NODE, ['-e', RESIDENT], {
-    stdio: ['pipe', 'pipe', 'inherit'],
-    env: { ...process.env, RESIDENT_SRC: RESIDENT, BMX_LINEAGE_MARKER: MARKER },
+    stdio: ['pipe', 'pipe', 'inherit'], detached: true,
+    env: { ...process.env, RESIDENT_SRC: RESIDENT },
   });
   p.stdout!.setEncoding('utf8');
-  residents.add(p);
+  groupLeaders.add(p);
   return p;
 }
 
@@ -111,17 +123,13 @@ function activeSession(anchorPid: number, anchorStart: string, snapshot: string[
   return {
     session: { sessionId: 's-real', status: 'active' },
     worker: { pid: process.pid, killed: false },
-    chatId: 'oc_real',
-    larkAppId: 'cli_real',
-    workerGeneration: 1,
+    chatId: 'oc_real', larkAppId: 'cli_real', workerGeneration: 1,
     localProcessAttestation: {
       backendType: 'pty', credentialIsolated: false,
       cliPid: anchorPid, cliProcStart: anchorStart, workerGeneration: 1,
     },
     managedTurnOrigin: {
-      capability: 'ca'.repeat(32),
-      turnId: 'om_turn_real',
-      callerOpenId: 'ou_realuser',
+      capability: 'ca'.repeat(32), turnId: 'om_turn_real', callerOpenId: 'ou_realuser',
       preexistingProcessIdentities: snapshot,
     },
     initConfig: { apiOnly: false },
@@ -129,13 +137,13 @@ function activeSession(anchorPid: number, anchorStart: string, snapshot: string[
 }
 
 describe.skipIf(!linux)('phase-1 real-process host-session lineage attestation', () => {
-  it('rejects a client nested under a snapshotted host runner, passes a direct anchor child', async () => {
+  it('rejects a held client nested under the snapshotted host runner, passes a direct anchor child', async () => {
     server = createServer((s) => { sockets.add(s); s.on('error', () => {}); s.on('close', () => sockets.delete(s)); });
     await new Promise<void>((r) => server!.listen(0, '127.0.0.1', r));
     const serverPort = (server.address() as any).port as number;
 
     // Real tree: anchor (cliPid) -> hostChild (resident runner, before the turn)
-    const anchor = spawnResident();
+    const anchor = spawnLeader();
     await sleep(150);
     anchor.stdin!.write('spawn-child\n');
     const hostChildPid = Number((await waitLine(anchor, /SPAWNED (\d+)/))[1]);
@@ -146,39 +154,54 @@ describe.skipIf(!linux)('phase-1 real-process host-session lineage attestation',
 
     // Daemon snapshot of the anchor lineage — taken BEFORE any turn command
     const snapshot = snapshotProcessIdentities(anchorPid, '/proc');
-    expect(snapshot).toBeDefined();
     expect(snapshot).toContain(`${anchorPid}:${anchorStart}`);
     expect(snapshot).toContain(`${hostChildPid}:${hostChildStart}`);
 
-    const attest = (peerPid: number, peerStart: string) => attestCurrentTurnLoopbackPeer({
-      sessionId: 's-real',
-      peer: { pid: peerPid, procStart: peerStart },
-      findSession: () => activeSession(anchorPid, anchorStart, snapshot),
-      procRoot: '/proc',
-    });
+    const attestWithDiag = (peerPid: number, peerStart: string) => {
+      const diags: AttestationDiagnostic[] = [];
+      const verdict = attestCurrentTurnLoopbackPeer({
+        sessionId: 's-real', peer: { pid: peerPid, procStart: peerStart },
+        findSession: () => activeSession(anchorPid, anchorStart, snapshot),
+        procRoot: '/proc', onDiagnostic: (d) => diags.push(d),
+      });
+      return { verdict, diags };
+    };
     const resolvePeer = (ephem: number) => resolveLoopbackPeerProcesses({
       remoteAddress: '127.0.0.1', remotePort: ephem, localPort: serverPort, procRoot: '/proc',
     });
 
-    // REJECT: current-turn client nested under the snapshotted host runner
+    // REJECT: current-turn client nested under the snapshotted host runner, held open
     anchor.stdin!.write(`to-child connect ${serverPort}\n`);
     const rej = await waitLine(anchor, /CLIENT (\d+) (\d+)/);
+    const rejClientPid = Number(rej[1]);
     await sleep(120);
     const rejPeer = resolvePeer(Number(rej[2]));
     expect(rejPeer.ok).toBe(true);
-    const rejVerdict = rejPeer.ok ? attest(rejPeer.peer.pid, rejPeer.peer.procStart) : null;
-    expect(rejVerdict).toBeNull();
+    if (!rejPeer.ok) throw new Error('peer unresolved');
+    // peer resolved from the kernel socket must be the held client itself
+    expect(rejPeer.peer.pid).toBe(rejClientPid);
+    const rejOut = attestWithDiag(rejPeer.peer.pid, rejPeer.peer.procStart);
+    expect(rejOut.verdict).toBeNull();
+    // the walk hit the snapshotted hostChild before reaching the anchor
+    expect(rejOut.diags).toContainEqual({
+      reason: 'lineage_hit_preexisting',
+      peerPid: rejClientPid, cliPid: anchorPid, ancestorPid: hostChildPid, ancestorStart: hostChildStart,
+    });
 
-    // SUCCESS control: current-turn client spawned directly under the anchor
+    // SUCCESS control: current-turn client spawned directly under the anchor, held open
     anchor.stdin!.write(`connect ${serverPort}\n`);
     const ok = await waitLine(anchor, /CLIENT (\d+) (\d+)/);
+    const okClientPid = Number(ok[1]);
     await sleep(120);
     const okPeer = resolvePeer(Number(ok[2]));
     expect(okPeer.ok).toBe(true);
-    const okVerdict = okPeer.ok ? attest(okPeer.peer.pid, okPeer.peer.procStart) : null;
-    expect(okVerdict).not.toBeNull();
-    expect(okVerdict!.turnId).toBe('om_turn_real');
-    expect(okVerdict!.cliPid).toBe(anchorPid);
-    expect(okVerdict!.callerOpenId).toBe('ou_realuser');
+    if (!okPeer.ok) throw new Error('peer unresolved');
+    expect(okPeer.peer.pid).toBe(okClientPid);
+    const okOut = attestWithDiag(okPeer.peer.pid, okPeer.peer.procStart);
+    expect(okOut.verdict).not.toBeNull();
+    expect(okOut.diags).toContainEqual({ reason: 'ok' });
+    expect(okOut.verdict!.turnId).toBe('om_turn_real');
+    expect(okOut.verdict!.cliPid).toBe(anchorPid);
+    expect(okOut.verdict!.callerOpenId).toBe('ou_realuser');
   }, 30_000);
 });

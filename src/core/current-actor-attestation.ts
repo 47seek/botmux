@@ -136,9 +136,12 @@ export type ProofMode = 'tuple' | 'host_lineage';
  *  the anchor cliPid, and the snapshotted ancestor the upward walk hit first. */
 export type AttestationDiagnostic =
   | { reason: 'ok' }
+  | { reason: 'session_cli_ipc_auth_failed'; detail: string }
   | { reason: 'session_inactive' }
   | { reason: 'transport_disabled' }
   | { reason: 'origin_incomplete' }
+  | { reason: 'tuple_mismatch' }
+  | { reason: 'peer_unresolved'; detail: string }
   | { reason: 'worker_missing_or_stale' }
   | { reason: 'cli_pid_missing' }
   | { reason: 'cli_proc_start_mismatch' }
@@ -146,8 +149,12 @@ export type AttestationDiagnostic =
   | { reason: 'peer_proc_start_mismatch' }
   | { reason: 'lineage_platform_unsupported' }
   | { reason: 'lineage_walk_read_failed'; peerPid: number }
+  | { reason: 'lineage_stat_malformed'; peerPid: number; ancestorPid: number }
   | { reason: 'lineage_hit_preexisting'; peerPid: number; cliPid: number; ancestorPid: number; ancestorStart: string }
-  | { reason: 'lineage_exhausted'; peerPid: number; cliPid: number };
+  | { reason: 'lineage_exhausted'; peerPid: number; cliPid: number }
+  | { reason: 'identity_unresolved_or_non_user' }
+  | { reason: 'identity_email_invalid' }
+  | { reason: 'turn_changed_during_await' };
 
 export type AttestationDiagnosticSink = (d: AttestationDiagnostic) => void;
 
@@ -170,12 +177,15 @@ function peerBelongsToCurrentTurn(input: {
       const fields = raw.slice(raw.lastIndexOf(')') + 2).trim().split(/\s+/);
       const parent = Number(fields[1]);
       const started = fields[19];
-      if (!Number.isSafeInteger(parent) || !/^\d+$/.test(started ?? '')
-        || input.preexistingProcessIdentities.has(`${pid}:${started}`)) {
-        input.onDiagnostic?.({
-          reason: 'lineage_hit_preexisting',
-          peerPid: input.peer.pid, cliPid: input.cliPid, ancestorPid: pid, ancestorStart: started ?? '',
-        });
+      const malformedStat = !Number.isSafeInteger(parent) || !/^\d+$/.test(started ?? '');
+      const isPreexisting = input.preexistingProcessIdentities.has(`${pid}:${started}`);
+      if (malformedStat || isPreexisting) {
+        // Verdict is identical (reject); the reason distinguishes a genuine
+        // snapshot ancestor from an unparseable /proc entry, matching the
+        // clause that actually short-circuited (malformed is checked first).
+        input.onDiagnostic?.(malformedStat
+          ? { reason: 'lineage_stat_malformed', peerPid: input.peer.pid, ancestorPid: pid }
+          : { reason: 'lineage_hit_preexisting', peerPid: input.peer.pid, cliPid: input.cliPid, ancestorPid: pid, ancestorStart: started ?? '' });
         return false;
       }
       pid = parent;
@@ -251,13 +261,17 @@ export function attestCurrentTurnLoopbackPeer(
     || !callerOpenId?.startsWith('ou_') || !capability
     || readProcStart(cliPid, procRoot) !== cliProcStart) {
     if (emit) {
+      // Classify in the SAME order the `||` guard short-circuits, so the reason
+      // names the clause that actually won: turnId is clause 4, but
+      // callerOpenId/capability are clauses 14-15 (after worker/cli/snapshot).
       if (!ds || ds.session.status !== 'active') emit({ reason: 'session_inactive' });
       else if (!larkTransportEnabled({ chatId: ds.chatId, apiOnly: ds.initConfig?.apiOnly })) emit({ reason: 'transport_disabled' });
-      else if (!turnId || !callerOpenId?.startsWith('ou_') || !capability) emit({ reason: 'origin_incomplete' });
+      else if (!turnId) emit({ reason: 'origin_incomplete' });
       else if (generation === undefined || !workerPid || !workerProcStart || ds.worker?.killed === true
         || attestation?.workerGeneration !== generation) emit({ reason: 'worker_missing_or_stale' });
       else if (!cliPid || !cliProcStart) emit({ reason: 'cli_pid_missing' });
       else if (!processIdentities || processIdentities.length === 0) emit({ reason: 'snapshot_missing' });
+      else if (!callerOpenId?.startsWith('ou_') || !capability) emit({ reason: 'origin_incomplete' });
       else emit({ reason: 'cli_proc_start_mismatch' });
     }
     return null;
@@ -303,27 +317,38 @@ export async function resolveDaemonCurrentActor(input: {
   findSession: (sessionId: string) => DaemonSession | undefined;
   resolveIdentity?: typeof resolveVerifiedUserIdentity;
   procRoot?: string;
+  /** Diagnostic sink — receives the discriminating reason for a rejection or
+   *  `ok`. Instrumentation only; passing it never changes the verdict. */
+  onDiagnostic?: AttestationDiagnosticSink;
 }): Promise<CurrentActorDaemonResult> {
   const procRoot = input.procRoot ?? '/proc';
+  const emit = input.onDiagnostic;
+  // Forward only lineage FAILURE reasons up from the attestation stage; the
+  // terminal `ok`/identity/await reason for the whole actor resolution is
+  // emitted once, below, so the handler logs exactly one record per request.
   const attestInput = {
     sessionId: input.sessionId, peer: input.peer,
     findSession: input.findSession, procRoot,
+    onDiagnostic: emit ? (d: AttestationDiagnostic) => { if (d.reason !== 'ok') emit(d); } : undefined,
   };
   const frozen = attestCurrentTurnLoopbackPeer(attestInput);
   if (!frozen) return { ok: false, error: 'current_actor_unverified' };
 
   const identity = await (input.resolveIdentity ?? resolveVerifiedUserIdentity)(frozen.ds.larkAppId, frozen.callerOpenId);
   if (!identity || identity.type !== 'user' || identity.openId !== frozen.callerOpenId) {
+    emit?.({ reason: 'identity_unresolved_or_non_user' });
     return { ok: false, error: 'current_actor_unverified' };
   }
   let email: string;
   try { email = normalizeActorEmail(identity.email); }
-  catch { return { ok: false, error: 'current_actor_unverified' }; }
+  catch { emit?.({ reason: 'identity_email_invalid' }); return { ok: false, error: 'current_actor_unverified' }; }
 
-  if (!currentTurnPeerAttestationStable(frozen, attestInput)) {
+  if (!currentTurnPeerAttestationStable(frozen, { ...attestInput, onDiagnostic: undefined })) {
+    emit?.({ reason: 'turn_changed_during_await' });
     return { ok: false, error: 'current_actor_unverified' };
   }
 
+  emit?.({ reason: 'ok' });
   return {
     ok: true,
     document: {
