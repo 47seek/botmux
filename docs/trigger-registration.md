@@ -1,6 +1,12 @@
 # 按原幂等键只读查询执行注册
 
-调用已认证的 daemon IPC：
+宿主调用公共 CLI（显式 bot/session/原 key，不接受 Worker/relay 上下文）：
+
+    botmux trigger-registration --bot APP --session SESSION --key ORIGINAL_KEY
+
+CLI 使用现有 daemon discovery、host HMAC 和 loopbackFetch；不导入私有状态、创建会话或重新派发。成功结果带 schemaVersion=1 与服务端 larkAppId/sessionId，CLI 核验目标身份后才输出，错路由不返回另一机器人的观察。
+
+也可调用已认证的 daemon IPC：
 
     GET /api/sessions/:sessionId/trigger-registration?turnIdempotencyKey=<原键>
 

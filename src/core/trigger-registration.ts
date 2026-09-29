@@ -22,14 +22,14 @@ export function readTurnRegistration(
     );
     // Missing includes forgotten and foreign records. It cannot prove that the
     // input never executed, even when there is no longer a session row.
-    if (!record) return { status: 200, body: { ok: true, state: 'unknown', sessionId } };
+    if (!record) return { status: 200, body: { ok: true, schemaVersion: 1, larkAppId: ownerLarkAppId, state: 'unknown', sessionId } };
     if (record.kind !== 'turn' || record.sessionId !== sessionId) throw new Error('identity mismatch');
     const persisted = asyncTriggerStore.lookupStrict(sessionId, record.triggerId);
     const result = persisted?.ownerLarkAppId === ownerLarkAppId ? persisted.result : undefined;
     return {
       status: 200,
       body: {
-        ok: true, state: 'registered', sessionId,
+        ok: true, schemaVersion: 1, larkAppId: ownerLarkAppId, state: 'registered', sessionId,
         registration: {
           triggerId: record.triggerId, requestHash: record.requestHash, state: record.state,
           ownerBootId: record.ownerBootId, revision: record.revision,

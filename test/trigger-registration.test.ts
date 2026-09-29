@@ -111,7 +111,7 @@ describe('GET trigger-registration', () => {
     register('app_foreign');
     results.recordCompleted(SID, TURN, 'foreign answer', 4000, 'app_foreign');
     expect(await poll(KEY, SID, '&ownerLarkAppId=app_foreign')).toEqual(absent);
-    expect(absent).toEqual({ status: 200, body: { ok: true, state: 'unknown', sessionId: SID } });
+    expect(absent).toEqual({ status: 200, body: { ok: true, schemaVersion: 1, larkAppId: OWNER, state: 'unknown', sessionId: SID } });
   });
   it('reads retained evidence after an IPC restart without a live session', async () => {
     register(); commit();
