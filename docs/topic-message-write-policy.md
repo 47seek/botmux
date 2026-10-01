@@ -11,3 +11,5 @@ CardKit 的 cardId 不能证明消息归属。已有 CardStreamStore 在原锁�
 `sendMessage` 和 `replyMessage` 的现有 `OutboundMessageOptions` 可接收 `beforeWrite` 回调。它在实际 provider 尝试前执行，失败后不会触发发送后的 outbound hook。回调属于调用者提供的可信上下文，不能来自消息正文。它位于 options 参数：sendMessage 第 7 参数，replyMessage 第 8 参数；hookContext 是另一参数。
 
 此改动只覆盖共享客户端及消息 lease 传递。新建顶层消息没有可从目标反推的原话题，调用者必须自行冻结来源，并通过 beforeWrite 核验；本改动不自动补全所有 CLI、workflow、CoT 或会话业务来源。上层自动回退、独立原生 SDK 路线及恢复语义需要各自的调用方改动和回归，不能以此 PR 代替全出站验证。
+
+Native CoT creation checks its frozen message origin; append, completion and orphan recovery check the existing bubble and root. A policy refusal retains the original recovery marker and never redirects the bubble. Explicit unthreaded origins remain unthreaded. This does not add managed-Ask retirement or business visibility rules.
