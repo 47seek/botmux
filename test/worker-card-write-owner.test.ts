@@ -219,7 +219,7 @@ describe('native worker card publication', () => {
 
 
 describe('queued streaming-card PATCH ownership', () => {
-  const changes = ['nonce', 'generation', 'turn', 'session', 'registry', 'chat', 'card', 'disabled', 'transport'] as const;
+  const changes = ['nonce', 'generation', 'turn', 'session', 'registry', 'chat', 'card', 'disabled', 'transport', 'scope', 'retirement'] as const;
   it.each(changes)('does not retry a PATCH after its %s owner changes', async change => {
     ds.streamCardId = 'om_status'; ds.streamCardNonce = 'nonce_original';
     ds.workerGeneration = 1; ds.currentTurnId = 'turn_original';
@@ -234,6 +234,8 @@ describe('queued streaming-card PATCH ownership', () => {
       if (change === 'card') ds.streamCardId = 'om_replacement';
       if (change === 'disabled') getBot(APP).config.disableStreamingCard = true;
       if (change === 'transport') getBot(APP).config.apiOnly = true;
+      if (change === 'scope') { ds.scope = 'thread'; ds.session.scope = 'thread'; }
+      if (change === 'retirement') ds.remoteCloseState = { phase: 'preparing', requestId: 'close-status' } as any;
       rejected = true;
       throw { isAxiosError: true, response: { status: 429 } };
     });
@@ -331,4 +333,78 @@ it('does not clear a reused card after an old PATCH reports it withdrawn', async
   expect(ds.streamCardId).toBe('om_status');
   expect(ds.streamCardNonce).toBe('nonce_new');
   expect(mocks.patch).toHaveBeenCalledTimes(2);
+});
+
+
+it.each([
+  ['lookup', 'nonce'], ['retry', 'nonce'], ['lookup', 'turn'], ['retry', 'turn'], ['none', 'none'],
+] as const)('keeps restored-card ownership through %s with %s changes', async (timing, change) => {
+  ds.streamCardId = 'om_restored'; ds.streamCardNonce = 'nonce_original';
+  ds.currentTurnId = 'om_turn_old'; ds.lastScreenStatus = 'idle'; ds.displayMode = 'hidden';
+  const worker = Object.assign(new EventEmitter(), {
+    killed: false, send: vi.fn(), kill: vi.fn(), pid: 12345,
+    stdout: new EventEmitter(), stderr: new EventEmitter(),
+  });
+  ds.worker = worker as any;
+  setupWorkerHandlers(ds, worker as any);
+  const replace = () => {
+    if (change === 'nonce') ds.streamCardNonce = 'nonce_replacement';
+    if (change === 'turn') ds.currentTurnId = 'turn_replacement';
+  };
+  if (timing === 'lookup') {
+    const read = mocks.request.getMockImplementation()!;
+    mocks.request.mockImplementationOnce(async request => { const result = await read(request); replace(); return result; });
+  } else if (timing === 'retry') {
+    mocks.patch.mockImplementationOnce(async () => { replace(); throw { isAxiosError: true, response: { status: 429 } }; });
+  }
+  await worker.listeners('message')[0]({ type: 'ready', port: 9999, token: 'fixture', turnId: 'om_turn_old' });
+  expect(mocks.patch).toHaveBeenCalledTimes(timing === 'lookup' ? 0 : 1);
+  expect(mocks.reply).not.toHaveBeenCalled();
+  expect(mocks.create).not.toHaveBeenCalled();
+  expect(ds.streamCardId).toBe('om_restored');
+});
+
+
+it.each(['primary-failure', 'primary-generation', 'post-lookup', 'post-retry', 'patch-lookup', 'patch-retry', 'none'] as const)(
+  'retains fallback-card ownership through %s', async timing => {
+  const localCli = await import('../src/services/local-cli-opener.js');
+  let localReady = false;
+  const enabled = vi.spyOn(localCli, 'isLocalCliOpenEnabled').mockReturnValue(true);
+  const ready = vi.spyOn(localCli, 'isLocalCliOpenReady').mockImplementation(() => localReady);
+  try {
+    prepareStatusCard(); ds.currentTurnId = 'om_turn_old'; ds.lastScreenStatus = 'idle'; ds.displayMode = 'hidden';
+    const worker = Object.assign(new EventEmitter(), {
+      killed: false, send: vi.fn(), kill: vi.fn(), pid: 12345,
+      stdout: new EventEmitter(), stderr: new EventEmitter(),
+    });
+    ds.worker = worker as any; setupWorkerHandlers(ds, worker as any);
+    let primaryFailed = false, fallbackSent = false;
+    const read = mocks.request.getMockImplementation()!;
+    mocks.request.mockImplementation(async request => {
+      const result = await read(request);
+      if (timing === 'post-lookup' && primaryFailed || timing === 'patch-lookup' && fallbackSent) {
+        ds.currentTurnId = 'turn_replacement';
+      }
+      return result;
+    });
+    mocks.reply.mockImplementationOnce(async () => {
+      primaryFailed = true;
+      if (timing === 'primary-failure') ds.currentTurnId = 'turn_replacement';
+      if (timing === 'primary-generation') ds.streamCardTurnGeneration = (ds.streamCardTurnGeneration ?? 0) + 1;
+      throw new Error('primary card failed');
+    });
+    mocks.reply.mockImplementationOnce(async () => {
+      if (timing === 'post-retry') {
+        ds.currentTurnId = 'turn_replacement'; throw { isAxiosError: true, response: { status: 429 } };
+      }
+      localReady = true; fallbackSent = true; return { code: 0, data: { message_id: 'om_sent' } };
+    });
+    if (timing === 'patch-retry') mocks.patch.mockImplementationOnce(async () => {
+      ds.currentTurnId = 'turn_replacement'; throw { isAxiosError: true, response: { status: 429 } };
+    });
+    await worker.listeners('message')[0]({ type: 'ready', port: 9999, token: 'fixture', turnId: 'om_turn_old' });
+    expect(mocks.reply).toHaveBeenCalledTimes(['primary-failure', 'primary-generation', 'post-lookup'].includes(timing) ? 1 : 2);
+    expect(mocks.patch).toHaveBeenCalledTimes(timing === 'patch-retry' || timing === 'none' ? 1 : 0);
+    expect(mocks.create).not.toHaveBeenCalled();
+  } finally { enabled.mockRestore(); ready.mockRestore(); }
 });
