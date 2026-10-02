@@ -1,4 +1,4 @@
-# 现有消息的写前检查
+# 消息写入的原话题检查
 
 机器人配置可以显式设置 `topicUnavailablePolicy: "stop"`。未配置或使用 `"legacy"` 时沿用已有行为，不增加消息状态查询。此策略属于共享飞书客户端的可选能力；不会创建其他群或话题，不修改身份、角色或权限。
 
@@ -10,6 +10,8 @@ CardKit 的 cardId 不能证明消息归属。已有 CardStreamStore 在原锁�
 
 `sendMessage` 和 `replyMessage` 的现有 `OutboundMessageOptions` 可接收 `beforeWrite` 回调。它在实际 provider 尝试前执行，失败后不会触发发送后的 outbound hook。回调属于调用者提供的可信上下文，不能来自消息正文。它位于 options 参数：sendMessage 第 7 参数，replyMessage 第 8 参数；hookContext 是另一参数。
 
-此改动只覆盖共享客户端及消息 lease 传递。新建顶层消息没有可从目标反推的原话题，调用者必须自行冻结来源，并通过 beforeWrite 核验；本改动不自动补全所有 CLI、workflow、CoT 或会话业务来源。上层自动回退、独立原生 SDK 路线及恢复语义需要各自的调用方改动和回归，不能以此 PR 代替全出站验证。
+CLI `send` 在解析 `--top-level`、`--chat-id`、`--into` 或 `--session-id` 时仍保留进程来源会话和当前 turn 的原话题；来源策略与目标策略分别核验。检查在幂等账本重放/预留之前执行，并由 `beforeWrite` 带入每次实际传输与限流重试。引用被撤回且采用 stop 时不改发顶层；explicit chat 来源没有当前话题时不把历史 root 当成来源。
 
-Native CoT creation checks its frozen message origin; append, completion and orphan recovery check the existing bubble and root. A policy refusal retains the original recovery marker and never redirects the bubble. Explicit unthreaded origins remain unthreaded. This does not add managed-Ask retirement or business visibility rules.
+CLI `report` 的直接消息和 Issue 状态通知同样保留来源会话/turn；选择别的接收会话不改变来源。Issue 已保存的状态独立保留，通知被拒绝不能反推状态保存失败。Daemon 内报告 relay 的派发、自动 fallback、`dispatch` 创建和 workflow 等路线仍需对应调用方保护；该配置不能仅靠共享客户端反推出它们的新建顶层消息来源。
+
+原生 CoT 创建检查冻结来源；追加、结束及孤儿恢复检查已有气泡与根。拒绝时保留原恢复 marker，显式无话题来源保持原位置。上述检查不包含受管 Ask 退休或业务展示规则。
