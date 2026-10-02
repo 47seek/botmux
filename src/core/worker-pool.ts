@@ -2874,12 +2874,13 @@ export const CARD_POSTING_SENTINEL = '__posting__';
 function captureStreamingCardReplyTarget(
   ds: DaemonSession,
   turnId?: string,
-): { turnId: string | undefined; replyTargetKey: string } {
+): { turnId: string | undefined; replyTargetKey: string; target: FrozenSessionReplyTarget } {
   const effectiveTurnId = fallbackTurnId(ds, turnId);
   const replyContext = frozenReplyContextForTurn(ds, effectiveTurnId);
   return {
     turnId: effectiveTurnId,
     replyTargetKey: replyTargetKey(replyContext.target),
+    target: { ...replyContext.target },
   };
 }
 
@@ -3908,7 +3909,7 @@ export async function postTurnStartingCard(
     // Reserve the turn before the CLI can call `botmux send`. Its reply uses
     // the same durable record even while the first card POST is in flight.
     replyPost = updateTurnReplyCard(ds, turnId, { kind: 'refresh' },
-      (body, type, uuid) => sessionReply(sessionAnchorId(ds), body, type, ds.larkAppId, turnId, { uuid }))
+      (body, type, uuid, beforeWrite) => sessionReply(sessionAnchorId(ds), body, type, ds.larkAppId, turnId, { uuid, beforeWrite }))
       .then(result => !!result).catch(error => {
         logger.warn(`[reply-card] initial card: ${error instanceof Error ? error.message : String(error)}`);
         return false;
@@ -4001,6 +4002,9 @@ async function postTurnStartingStatusCard(
   try {
     const messageId = await sessionReply(
       displayAnchorAtPost, cardJson, 'interactive', larkAppIdAtPost, cardReplyTarget.turnId,
+      { sourceSessionId: sessionAtPost.sessionId, replyTarget: cardReplyTarget.target, beforeWrite: () => {
+        if (!stillOwnsPost()) throw new Error('Starting card no longer owns delivery');
+      } },
     );
     if (!stillOwnsPost()) {
       void deleteMessage(larkAppIdAtPost, messageId).catch(() => { /* best-effort stale-card cleanup */ });
@@ -4063,7 +4067,7 @@ async function postTurnStartingStatusCard(
  */
 export async function postFreshStreamingCard(
   ds: DaemonSession,
-  sessionReply: (rootId: string, content: string, msgType?: string, larkAppId?: string, turnId?: string) => Promise<string>,
+  sessionReply: Parameters<typeof postTurnStartingCard>[1],
   opts?: { retireMessageId?: string },
 ): Promise<boolean> {
   if (isDocNativeSession(ds)) return false;
@@ -4148,6 +4152,9 @@ export async function postFreshStreamingCard(
   try {
     const messageId = await sessionReply(
       displayAnchorAtPost, cardJson, 'interactive', appIdAtPost, cardReplyTarget.turnId,
+      { sourceSessionId: sessionAtPost.sessionId, replyTarget: cardReplyTarget.target, beforeWrite: () => {
+        if (!stillOwnsPost()) throw new Error('Manual card no longer owns delivery');
+      } },
     );
     if (!stillOwnsPost()) {
       void deleteMessage(appIdAtPost, messageId).catch(() => { /* stale result */ });
@@ -8564,8 +8571,8 @@ function delayOrdinaryImDelivery(record: OrdinaryImDelivery): void {
     // The turn card already represents queued/working state. A slow worker
     // receipt must not create a second message (or expose progress in final-only).
     void updateTurnReplyCard(record.ds, record.turnId, { kind: 'refresh' },
-      (body, type, uuid) => requireCallbacks().sessionReply(
-        sessionAnchorId(record.ds), body, type, record.ds.larkAppId, record.turnId, { uuid },
+      (body, type, uuid, beforeWrite) => requireCallbacks().sessionReply(
+        sessionAnchorId(record.ds), body, type, record.ds.larkAppId, record.turnId, { uuid, beforeWrite },
       )).catch(err => logger.warn(`[${tag(record.ds)}] reply-card delivery wait: ${err.message}`));
     return;
   }
@@ -13145,7 +13152,7 @@ function setupWorkerHandlers(
         if (!managedAuxUiSuppressed(msg.turnId)) {
           ds.replyCardRunningTurnId = msg.turnId;
           void updateTurnReplyCard(ds, msg.turnId, { kind: 'start' },
-            (body, type, uuid) => scopedReply(body, type, msg.turnId, { uuid }),
+            (body, type, uuid, beforeWrite) => scopedReply(body, type, msg.turnId, { uuid, beforeWrite }),
             { owns: ownsLifecycleMutation }).catch(error => logger.warn(`[${t}] reply-card start: ${error.message}`));
         }
         break;
@@ -13549,6 +13556,9 @@ function setupWorkerHandlers(
             streamCardJson,
             'interactive',
             cardReplyTarget.turnId,
+            { replyTarget: cardReplyTarget.target, beforeWrite: () => {
+              if (!ownsLifecycleMutation() || !stillOwnsFreshReadyPost()) throw new Error('Ready card no longer owns delivery');
+            } },
           );
           if (!ownsLifecycleMutation() || !stillOwnsFreshReadyPost()) {
             void deleteMessage(postingAppId, postedCardId).catch(() => { /* best-effort stale-card cleanup */ });
@@ -13908,7 +13918,7 @@ function setupWorkerHandlers(
         if (replyCardModeFor(ds, msg.turnId) !== 'legacy') {
           if (!managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) {
             queueTurnReplyTools(ds, msg,
-              (body, type, uuid) => scopedReply(body, type, msg.turnId, { uuid }), ownsLifecycleMutation);
+              (body, type, uuid, beforeWrite) => scopedReply(body, type, msg.turnId, { uuid, beforeWrite }), ownsLifecycleMutation);
           }
           break;
         }
@@ -14029,7 +14039,7 @@ function setupWorkerHandlers(
           && (ds.lastScreenStatus === 'working' || ds.lastScreenStatus === 'stalled')) {
           void updateTurnReplyCard(ds, msg.turnId,
             { kind: 'phase', phase: ds.lastScreenStatus === 'stalled' ? 'waiting' : 'working' },
-            (body, type, uuid) => scopedReply(body, type, msg.turnId, { uuid }),
+            (body, type, uuid, beforeWrite) => scopedReply(body, type, msg.turnId, { uuid, beforeWrite }),
             { owns: ownsLifecycleMutation }).catch(error => logger.warn(`[${t}] reply-card status: ${error.message}`));
         }
 
@@ -14239,6 +14249,9 @@ function setupWorkerHandlers(
             cardJson,
             'interactive',
             cardReplyTarget.turnId,
+            { replyTarget: cardReplyTarget.target, beforeWrite: () => {
+              if (!ownsLifecycleMutation() || !stillOwnsFreshScreenPost()) throw new Error('Screen card no longer owns delivery');
+            } },
           )
             .then(async msgId => {
               if (!ownsLifecycleMutation() || !stillOwnsFreshScreenPost()) {
@@ -15326,7 +15339,7 @@ function setupWorkerHandlers(
             });
             await updateTurnReplyCard(ds, msg.turnId, {
               kind: 'terminal', phase: msg.status, durationMs: msg.durationMs, completedAtMs: msg.completedAtMs,
-            }, (body, type, uuid) => scopedReply(body, type, msg.turnId, { uuid }),
+            }, (body, type, uuid, beforeWrite) => scopedReply(body, type, msg.turnId, { uuid, beforeWrite }),
             { dispatchAttempt: msg.dispatchAttempt, owns: ownsLifecycleMutation });
           })().catch(error => logger.warn(`[${t}] reply-card terminal: ${error.message}`));
         }
@@ -16911,14 +16924,15 @@ function deliverFinalOutput(
     content: string,
     msgType?: string,
     turnId?: string,
-    opts?: Omit<WorkerSessionReplyOptions, 'sourceSessionId' | 'beforeWrite'>,
+    opts?: Omit<WorkerSessionReplyOptions, 'sourceSessionId'>,
   ) => cb.sessionReply(
     sessionAnchorId(ds),
     content,
     msgType,
     ds.larkAppId,
     fallbackTurnId(ds, turnId),
-    { ...opts, sourceSessionId: ds.session.sessionId, beforeWrite: () => {
+    { ...opts, sourceSessionId: ds.session.sessionId, beforeWrite: async () => {
+      if (opts?.beforeWrite) await opts.beforeWrite();
       if (!isStillOwned()) throw new Error('Final output no longer owns delivery');
     } },
   );
@@ -17344,8 +17358,8 @@ function deliverFinalOutput(
         ? await updateTurnReplyCard(ds, msg.turnId, {
             kind: 'final', text: safeAssistantText, card: cardJson, source: 'bridge',
             ...(feedbackPolicy && feedback ? { feedback: { policy: feedbackPolicy, requesterSubjectId: feedbackRequesterSubjectId } } : {}),
-          }, (body, type, uuid) => scopedReply(body, type, msg.replyTurnId ?? msg.turnId,
-            frozenReplyTarget ? { uuid, replyTarget: frozenReplyTarget } : { uuid }),
+          }, (body, type, uuid, beforeWrite) => scopedReply(body, type, msg.replyTurnId ?? msg.turnId,
+            frozenReplyTarget ? { uuid, beforeWrite, replyTarget: frozenReplyTarget } : { uuid, beforeWrite }),
           { dispatchAttempt: msg.dispatchAttempt, owns: isStillOwned })
         : undefined;
       const messageId = unifiedReply?.messageId ?? await scopedReply(
