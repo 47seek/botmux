@@ -4563,6 +4563,33 @@ export async function deliverEphemeralOrReply(
 // same Feishu message — delivery order is unpredictable and a stale
 // screen_update could overwrite a toggle result.
 
+const pendingStreamingCardPatchFence = new WeakMap<DaemonSession, () => boolean>();
+
+/** An enqueued render belongs to the captured card and route. Closing a
+ * session uses a separate cleanup fence: it must outlive its active worker. */
+function captureStreamingCardPatchFence(ds: DaemonSession, cardId: string, turnId?: string): () => boolean {
+  const session = ds.session;
+  const sessionId = session.sessionId;
+  const status = session.status;
+  const appId = ds.larkAppId;
+  const chatId = ds.chatId;
+  const anchor = sessionAnchorId(ds);
+  const nonce = ds.streamCardNonce;
+  const generation = ds.workerGeneration ?? session.workerGeneration;
+  const currentTurnId = ds.currentTurnId;
+  const runtimeKey = activeSessionKey(ds);
+  return () => ds.session === session && ds.session.sessionId === sessionId && ds.session.status === status
+    && ds.larkAppId === appId && ds.chatId === chatId && sessionAnchorId(ds) === anchor
+    && ds.streamCardId === cardId && ds.streamCardNonce === nonce
+    && larkTransportEnabled({ chatId, apiOnly: getBot(appId).config.apiOnly })
+    && !streamingCardDisabled(ds, turnId)
+    && (status === 'closed'
+      ? !getBot(appId).config.privateCard
+      : activeSessionsRegistry?.get(runtimeKey) === ds
+        && (ds.workerGeneration ?? ds.session.workerGeneration) === generation
+        && ds.currentTurnId === currentTurnId);
+}
+
 /**
  * Queue a card PATCH. If no PATCH is in-flight, sends immediately.
  * Otherwise stores the card JSON on `ds.pendingCardJson` (overwriting
@@ -4589,6 +4616,7 @@ export function scheduleCardPatch(
   if (streamingCardDisabled(ds, turnId)) return false;
   const cardId = ds.streamCardId;
   if (!cardId || cardId === CARD_POSTING_SENTINEL) return false;
+  pendingStreamingCardPatchFence.set(ds, captureStreamingCardPatchFence(ds, cardId, turnId));
   ds.pendingCardJson = cardJson;
   // Capture the card ID now — by the time flushCardPatch runs, ds.streamCardId
   // may have been overwritten by a new turn's card (CARD_POSTING_SENTINEL).
@@ -4606,6 +4634,9 @@ function flushCardPatch(ds: DaemonSession): void {
   const json = ds.pendingCardJson;
   const cardId = ds.pendingCardId;
   const userInitiated = ds.pendingCardUserInitiated === true;
+  const writeFence = pendingStreamingCardPatchFence.get(ds);
+  pendingStreamingCardPatchFence.delete(ds);
+  const appId = ds.larkAppId;
   if (!json || !cardId || cardId === CARD_POSTING_SENTINEL) {
     ds.pendingCardJson = undefined;
     ds.pendingCardId = undefined;
@@ -4617,7 +4648,9 @@ function flushCardPatch(ds: DaemonSession): void {
   ds.pendingCardUserInitiated = undefined;
   ds.cardPatchInFlight = true;
   let patchSucceeded = false;
-  updateMessage(ds.larkAppId, cardId, json)
+  updateMessage(appId, cardId, json, { beforeWrite: () => {
+    if (!writeFence?.()) throw new Error('Streaming-card PATCH no longer owns its original card');
+  } })
     .then(() => {
       patchSucceeded = true;
     })
@@ -4631,7 +4664,7 @@ function flushCardPatch(ds: DaemonSession): void {
         // here as MessageWithdrawnError). Clearing unconditionally would
         // forget the live new card and trigger a duplicate POST on the next
         // screen_update.
-        if (ds.streamCardId === cardId) {
+        if (writeFence?.() && ds.streamCardId === cardId) {
           logger.warn(`[${tag(ds)}] Stream card ${reason}, clearing reference`);
           ds.streamCardId = undefined;
           persistStreamCardState(ds);
@@ -7815,6 +7848,7 @@ export async function closeSession(
       const botCfg = getBot(ds.larkAppId).config;
       if (!botCfg.privateCard && !streamingCardDisabled(ds)
           && larkTransportEnabled({ chatId: ds.chatId, apiOnly: botCfg.apiOnly })) {
+        pendingStreamingCardPatchFence.set(ds, captureStreamingCardPatchFence(ds, ds.streamCardId));
         ds.pendingCardId = ds.streamCardId;
         ds.pendingCardJson = buildClosedSessionCard(ds, localeForBot(ds.larkAppId));
         if (!ds.cardPatchInFlight) flushCardPatch(ds);
