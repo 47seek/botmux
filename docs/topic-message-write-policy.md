@@ -15,3 +15,5 @@ CLI `send` 在解析 `--top-level`、`--chat-id`、`--into` 或 `--session-id` �
 CLI `report` 的直接消息和 Issue 状态通知同样保留来源会话/turn；选择别的接收会话不改变来源。Issue 已保存的状态独立保留，通知被拒绝不能反推状态保存失败。Daemon 内报告 relay 的派发、自动 fallback、`dispatch` 创建和 workflow 等路线仍需对应调用方保护；该配置不能仅靠共享客户端反推出它们的新建顶层消息来源。
 
 原生 CoT 创建检查冻结来源；追加、结束及孤儿恢复检查已有气泡与根。拒绝时保留原恢复 marker，显式无话题来源保持原位置。上述检查不包含受管 Ask 退休或业务展示规则。
+
+线程来源缺少原消息身份时，CLI send/report 返回 TOPIC_SEND_CHECK_FAILED。明确无话题的群会话保持原行为；延迟调度尚未建立话题的既有生命周期单独处理，不能用可选目标数组过滤来推断来源不存在。
