@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import {claudeActionPrompt} from './services/claude-action-prompt.js';
 import { GOAL_ENV } from './workflows/v3/contract.js';
 import { supportsZeroPromptInjection } from './core/prompt-injection.js';
 import { clearBotmuxPromptEnv } from './skills/zero-injection.js';
@@ -13486,6 +13487,9 @@ function startScreenUpdates(): void {
   let lastSentStatus: string | undefined;
   let lastTextSnapshotHash = '';
   let lastContent = '';
+  // Last Claude permission dialog already notified (dedup by projection text;
+  // cleared when the dialog leaves the screen so the next one notifies again).
+  let lastClaudeActionPrompt = '';
   // PTY-activity watermark of the last tick that actually captured. The screen
   // normally reaches us only through onPtyData (it updates lastPtyActivityAtMs
   // and feeds the renderer in the same place), so when this hasn't advanced the
@@ -13588,6 +13592,25 @@ function startScreenUpdates(): void {
       if (!snapshot) return;
 
       const usageAware = usageLimitTracker.classify(snapshot.content, status);
+      // Claude Code's permission dialogs — including one raised by a
+      // background fork agent AFTER the main turn already ended — park the
+      // session on a static screen that idle detection reports as "ready for
+      // input", so without this the thread waits silently for as long as the
+      // dialog stands. Deliberately NOT gated on status==='working' nor on an
+      // active turn: the turn-less parked case is exactly the one that must
+      // reach the user. turnId may be undefined once the turn ended; the
+      // daemon's scopedReply falls back to the session anchor. The projection
+      // is narrow: only the bounded title/question/options leave the
+      // terminal, never tool args.
+      if (lastInitConfig?.cliId === 'claude-code') {
+        const prompt = claudeActionPrompt(lastAnalyzerSnapshot || renderer?.rawSnapshot() || snapshot.content);
+        if (prompt && prompt !== lastClaudeActionPrompt) {
+          lastClaudeActionPrompt = prompt;
+          send({type: 'user_notify', message: prompt, turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt});
+        } else if (!prompt) {
+          lastClaudeActionPrompt = '';
+        }
+      }
       if (snapshot.changed || usageAware.status !== lastSentStatus) {
         lastSentStatus = usageAware.status;
         send({
