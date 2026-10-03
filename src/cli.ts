@@ -245,6 +245,7 @@ import { REPORT_SESSION_RELAY_ROUTE } from './core/report-session-relay.js';
 import { DISPATCH_USER_DELIVERY_ROUTE } from './core/dispatch-user-delegation.js';
 import { DISPATCH_REPORT_REGISTER_ROUTE } from './core/dispatch-report-binding.js';
 import { isRetryableAskHttpStatus } from './core/ask-types.js';
+import { PERMISSION_ALLOW_KEY } from './core/ask-hook/types.js';
 import { linuxIsolationDetected } from './core/linux-isolation.js';
 import {
   hasManagedOriginIsolationMarker,
@@ -14166,8 +14167,11 @@ export async function runHook(
     return { stdout: adapter.passthrough(payload) };
   }
 
-  // 解析问题：非 askUserQuestion 类事件 → passthrough 放行
-  const parsed = adapter.parseQuestions(payload);
+  // 解析问题：askUserQuestion → 提问卡片；终端权限确认框（PermissionRequest）→
+  // 允许/拒绝卡片；其余事件 → passthrough 放行
+  const askParsed = adapter.parseQuestions(payload);
+  const permissionParsed = askParsed ? null : adapter.parsePermissionRequest?.(payload) ?? null;
+  const parsed = askParsed ?? permissionParsed;
   if (!parsed) {
     return { stdout: adapter.passthrough(payload) };
   }
@@ -14273,6 +14277,24 @@ export async function runHook(
       timeoutMs = parsed_timeout;
     }
   }
+  // 权限确认反过来：超时是良性兜底——到点按「拒绝」裁决并把原因回给模型，会话继续跑；
+  // 真正的故障是无限挂在一个飞书侧看不见的终端确认框上。默认 10 分钟，可由
+  // BOTMUX_PERMISSION_TIMEOUT_MS 覆盖，但必须留在 hook 安装侧进程超时之内，
+  // 否则 Claude 先杀掉 hook、照旧弹出没人能点的确认框。
+  if (permissionParsed) {
+    timeoutMs = PERMISSION_DEFAULT_TIMEOUT_MS;
+    const permTimeoutEnv = parseInt(env.BOTMUX_PERMISSION_TIMEOUT_MS ?? '', 10);
+    if (Number.isInteger(permTimeoutEnv) && permTimeoutEnv > 0) {
+      timeoutMs = Math.min(Math.max(permTimeoutEnv, 1_000), PERMISSION_MAX_TIMEOUT_MS);
+    }
+  }
+  // 权限确认一旦路由到 botmux 会话，任何「没拿到人工裁决」的结局都按拒绝处理：
+  // passthrough 会让终端确认框照旧弹出，而这正是本桥要消除的静默卡死。
+  const unresolved = (message: string): { stdout: string } => (
+    permissionParsed && adapter.formatPermissionDecision
+      ? { stdout: adapter.formatPermissionDecision(false, message) }
+      : { stdout: adapter.passthrough(payload) }
+  );
 
   // Per-invocation identity: generated ONCE here (outside the retry loop) and
   // reused across every reconnect POST, so a re-POST after a daemon restart
@@ -14324,16 +14346,20 @@ export async function runHook(
       // as non-retryable.
       const retryable = (err as { retryable?: boolean } | undefined)?.retryable === true;
       if (!retryable || Date.now() >= deadline) {
-        return { stdout: adapter.passthrough(payload) };
+        return unresolved(PERMISSION_DENY_UNDELIVERED);
       }
       attempt++;
       // Backoff: quick first reconnects (daemon usually returns in a few
       // seconds), capped at 5s. Never sleep past the deadline.
       const backoff = Math.min(5_000, 500 * attempt);
       const remaining = deadline - Date.now();
-      if (remaining <= 0) return { stdout: adapter.passthrough(payload) };
+      if (remaining <= 0) return unresolved(PERMISSION_DENY_UNDELIVERED);
       await new Promise((r) => setTimeout(r, Math.min(backoff, remaining)));
     }
+  }
+
+  if (permissionParsed && adapter.formatPermissionDecision) {
+    return { stdout: permissionDecisionFromResult(result, timeoutMs, adapter.formatPermissionDecision) };
   }
 
   if (result.kind === 'answered') {
@@ -14342,6 +14368,38 @@ export async function runHook(
 
   // timedOut / invalidated → passthrough 放行
   return { stdout: adapter.passthrough(payload) };
+}
+
+/** 权限确认默认等 10 分钟；上限必须小于 hook 安装侧的进程超时（见 hook-installer）。 */
+const PERMISSION_DEFAULT_TIMEOUT_MS = 600_000;
+const PERMISSION_MAX_TIMEOUT_MS = 840_000;
+
+// 以下 message 是回给模型看的（Claude 把 deny message 作为工具结果交给模型），
+// 所以用英文并直接给出可执行的下一步。
+const PERMISSION_DENY_UNDELIVERED =
+  'botmux could not deliver this permission request to the user (the terminal confirmation dialog is not visible from Lark/Feishu), so it was denied automatically. '
+  + 'Rewrite the operation so it does not need interactive confirmation, or ask the user in chat.';
+
+function permissionDecisionFromResult(
+  result: import('./core/ask-types.js').AskResult,
+  timeoutMs: number,
+  format: (allow: boolean, message?: string) => string,
+): string {
+  if (result.kind === 'answered') {
+    const selected = result.answers[0] ?? [];
+    const comment = (result.comment ?? '').trim();
+    if (selected.includes(PERMISSION_ALLOW_KEY) && !comment) return format(true);
+    return format(false, comment
+      ? `The user did not approve this operation. They replied in Lark/Feishu: ${comment.slice(0, 1000)}`
+      : 'The user denied this operation in Lark/Feishu. Do not retry it as-is; choose a different approach or ask the user.');
+  }
+  if (result.kind === 'timedOut') {
+    const minutes = Math.max(1, Math.round(timeoutMs / 60_000));
+    return format(false,
+      `No one approved this permission request within ${minutes} min (the terminal confirmation dialog is not visible from Lark/Feishu), so it was denied automatically. `
+      + 'Rewrite the operation so it does not need interactive confirmation (for example, use a literal path or "${VAR:?}" instead of a bare variable in rm), or ask the user in chat.');
+  }
+  return format(false, PERMISSION_DENY_UNDELIVERED);
 }
 
 /**
