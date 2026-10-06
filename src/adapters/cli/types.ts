@@ -441,7 +441,12 @@ export interface CliAdapter {
    *  manifest, and the adapter passes `--plugin-dir {pluginDir}` at spawn so the
    *  skills are scoped to botmux-spawned sessions only — they never land in the
    *  user's global `~/.claude/skills`, so a standalone `claude` won't surface
-   *  (and mis-fire) them. Mutually exclusive with `skillsDir`. */
+   *  (and mis-fire) them. NOT mutually exclusive with `skillsDir`: an adapter
+   *  may set both — pluginDir delivers botmux's built-ins per-session while
+   *  skillsDir stays the discovery root for the user's OWN standalone-CLI
+   *  skills (pi / oh-my-pi / cursor set both). When both are present,
+   *  buildNewTopicBlocks skips the prompt-side built-in catalog so the skills
+   *  are delivered exactly once (native plugin, no inline catalog). */
   readonly pluginDir?: string;
 
   /** Optional native skill delivery support for user/team custom skills.
