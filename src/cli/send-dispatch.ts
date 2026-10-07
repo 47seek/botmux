@@ -10,6 +10,8 @@ import {
   type InteractiveCardCallbackPolicy,
 } from '../core/card-callback-policy.js';
 import type { ManagedHookOrigin } from '../services/hook-runner.js';
+import type { OutboundMessageOptions } from '../im/lark/client.js';
+import type { GroupContextDeliveryBinding } from '../services/group-context-delivery-store.js';
 
 export type SendMessageFn = (
   larkAppId: string,
@@ -18,7 +20,7 @@ export type SendMessageFn = (
   msgType?: string,
   uuid?: string,
   hookContext?: Record<string, unknown>,
-  options?: { beforeWrite?: () => void | Promise<void>; suppressHook?: boolean; beforeHook?: () => void | Promise<void>; hookOrigin?: ManagedHookOrigin },
+  options?: OutboundMessageOptions,
 ) => Promise<string>;
 
 export type ReplyMessageFn = (
@@ -29,7 +31,7 @@ export type ReplyMessageFn = (
   replyInThread?: boolean,
   uuid?: string,
   hookContext?: Record<string, unknown>,
-  options?: { beforeWrite?: () => void | Promise<void>; suppressHook?: boolean; beforeHook?: () => void | Promise<void>; hookOrigin?: ManagedHookOrigin },
+  options?: OutboundMessageOptions,
 ) => Promise<string>;
 
 export type DispatchPrimaryDeps = {
@@ -380,6 +382,7 @@ export type DispatchPrimaryOptions = {
   /** Revalidate immediately before the distinct post-provider hook effect. */
   beforeHook?: () => void | Promise<void>;
   hookOrigin?: ManagedHookOrigin;
+  groupContextAuthorOrigin?: GroupContextDeliveryBinding;
   /** Revalidate any side-effect authority after an awaited quote failure and
    * immediately before the fallback creates a top-level message. */
   beforeQuoteFallback?: () => void | Promise<void>;
@@ -409,15 +412,16 @@ export async function dispatchPrimaryMessage(
     };
   }
 
-  const hookOptions = opts.suppressHook
-    ? { suppressHook: true as const }
-    : opts.beforeHook
-      ? {
+  const hookOptions: OutboundMessageOptions | undefined = opts.suppressHook || opts.beforeHook || opts.groupContextAuthorOrigin || opts.beforeWrite
+    ? {
+        ...(opts.suppressHook ? { suppressHook: true } : opts.beforeHook ? {
           beforeHook: opts.beforeHook,
           ...(opts.hookOrigin ? { hookOrigin: opts.hookOrigin } : {}),
-        }
-      : undefined;
-  const writeOptions = opts.beforeWrite ? { ...hookOptions, beforeWrite: opts.beforeWrite } : hookOptions;
+        } : {}),
+        ...(opts.groupContextAuthorOrigin ? { groupContextAuthorOrigin: opts.groupContextAuthorOrigin } : {}),
+        ...(opts.beforeWrite ? { beforeWrite: opts.beforeWrite } : {}),
+      }
+    : undefined;
   try {
     await opts.beforeEffect?.();
     const args = [
@@ -429,8 +433,8 @@ export async function dispatchPrimaryMessage(
       opts.uuid,
       opts.hookContext,
     ] as const;
-    const messageId = writeOptions
-      ? await deps.replyMessage(...args, writeOptions)
+    const messageId = hookOptions
+      ? await deps.replyMessage(...args, hookOptions)
       : await deps.replyMessage(...args);
     return { messageId, primaryQuotedId: opts.quoteTargetId };
   } catch (err: any) {
@@ -443,9 +447,24 @@ export async function dispatchPrimaryMessage(
       else await opts.beforeEffect?.();
       opts.onQuoteWithdrawn?.(opts.quoteTargetId);
       return {
-        messageId: await (writeOptions
-          ? deps.sendMessage(opts.appId, opts.targetChatId, opts.content, opts.msgType, opts.uuid, opts.hookContext, writeOptions)
-          : deps.sendMessage(opts.appId, opts.targetChatId, opts.content, opts.msgType, opts.uuid, opts.hookContext)),
+        messageId: await (hookOptions
+          ? deps.sendMessage(
+              opts.appId,
+              opts.targetChatId,
+              opts.content,
+              opts.msgType,
+              opts.uuid,
+              opts.hookContext,
+              hookOptions,
+            )
+          : deps.sendMessage(
+              opts.appId,
+              opts.targetChatId,
+              opts.content,
+              opts.msgType,
+              opts.uuid,
+              opts.hookContext,
+            )),
         primaryQuotedId: null,
       };
     }

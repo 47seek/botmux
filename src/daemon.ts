@@ -147,6 +147,14 @@ import { setUsageLedgerPricingResolver, setUsageLedgerRecordSink } from './servi
 import { trackBudgetSpend, formatBudgetAlert } from './services/budget-tracker.js';
 import { resolvePricingConfig } from './services/model-pricing.js';
 import { createImgNumberer, extractPostAtParticipants, isPlaceholderOnlyText, messageMentionsBot, parseApiMessage, parseEventMessage, resolveNonsupportMessage, stripBotMentions, stripLeadingMentions, type MessageResource } from './im/lark/message-parser.js';
+import { getGroupContextSettings } from './services/group-context-settings-store.js';
+import { setGroupContextSettingsResolver } from './services/group-context-ingest.js';
+import { prepareGroupContextForTurn, captureNativeGroupContextInput } from './services/group-context-runtime.js';
+import { groupContextConversationForTurn } from './services/group-context-location.js';
+import { groupContextQuery } from './services/group-context.js';
+import { ensureGroupContextRecallHealth } from './services/group-context-health.js';
+import { groupContextEpoch } from './services/group-context-prompt.js';
+import { confirmNativeGroupContextTurn, confirmNativeGroupContextInput } from './services/group-context-native.js';
 import { resolveInboundAudio } from './im/lark/audio-transcribe.js';
 import { expandMergeForward } from './im/lark/merge-forward.js';
 import { bindResourcesToMessage, composeForwardFollowupContent, mergeMessageMentions } from './im/lark/forward-followup-content.js';
@@ -388,6 +396,7 @@ import {
   buildNewTopicCliInput,
   buildFollowUpCliInput,
   buildBridgeInputContent,
+  buildGroupContextBridgeInput,
   buildReforkCliInput,
   getAvailableBots,
   restoreActiveSessions,
@@ -630,7 +639,7 @@ function republishResolvedAllowedUsers(larkAppId: string, resolved: string[]): v
   try { writeDaemonDescriptor(desc); } catch { /* best effort */ }
 }
 let vcMeetingTerminalReconciler: VcMeetingTerminalReconciler | undefined;
-import { isBotMentioned, getGroupStats, probeBotOpenId, createLarkEventDispatcherRuntime, startLarkEventDispatcher, markForwardFollowupsSessionsReady, writeBotInfoFile, canOperate, canRunDaemonCommand, evaluateTalk, evaluateBotTalk, evaluateAskAnswerTalk, askCustomReplyCandidate, grantCommandRestriction, isKnownPeerBot, resolveSiblingBotNameByUnionId, checkRequiredScopes, ensureVcMeetingEventsSubscribed, ensureMessageUpdatedEventSubscribed, type RoutingContext, type TalkEvaluation, type DocCommentContext, type EventHandlers } from './im/lark/event-dispatcher.js';
+import { isBotMentioned, getGroupStats, probeBotOpenId, createLarkEventDispatcherRuntime, startLarkEventDispatcher, markForwardFollowupsSessionsReady, writeBotInfoFile, canOperate, canRunDaemonCommand, evaluateTalk, evaluateBotTalk, evaluateAskAnswerTalk, askCustomReplyCandidate, grantCommandRestriction, isKnownPeerBot, resolveSiblingBotNameByUnionId, checkRequiredScopes, ensureVcMeetingEventsSubscribed, ensureMessageUpdatedEventSubscribed, ensureMessageRecalledEventSubscribed, type RoutingContext, type TalkEvaluation, type DocCommentContext, type EventHandlers } from './im/lark/event-dispatcher.js';
 import { commitDocCommentPollCursor, docCommentThreadAnchor, getDocSubscription, isDocNativeWatchSubscription, listAllDocSubscriptions, listDocSubscriptionsForSession, normalizeDocNativeWatchSubscription, putDocSubscription, removeDocSubscription, settleDocCommentWsDelivery, type DocSubscription } from './services/doc-subs-store.js';
 import { BOT_REPLY_SENTINEL, subscribeDocFile, unsubscribeDocFile, addCommentReaction, removeCommentReaction, hasBotSentinel, isBotAuthoredReply, listDocComments } from './im/lark/doc-comment.js';
 import { learnFromMentions, resolveSender, flushIdentityCacheSync, type ResolvedSender } from './im/lark/identity-cache.js';
@@ -899,6 +908,10 @@ function mirrorDurableSessionShadow(session: Session): void {
     );
   });
 }
+
+// Observation is independent of routing: registering this never starts a CLI.
+setGroupContextSettingsResolver(getGroupContextSettings);
+const preparedGroupContextRequests = new WeakSet<object>();
 /** False until restoreActiveSessions() finishes. During the startup window the
  *  IPC server is already listening but activeSessions is empty, so a reconnecting
  *  ask hook would fail session lookup and get a 403 origin_unproven — which the
@@ -4190,10 +4203,11 @@ async function sessionReply(
     scope: ds.scope,
     anchor: sessionAnchorId(ds),
   } : undefined;
-  const outboundOptions = opts?.suppressHook || ds?.session.vcMeetingReceiver || opts?.beforeWrite
+  const outboundOptions = opts?.suppressHook || ds?.session.vcMeetingReceiver || opts?.beforeWrite || opts?.groupContextAuthorOrigin
     ? {
         ...(opts?.suppressHook || ds?.session.vcMeetingReceiver ? { suppressHook: true } : {}),
         ...(opts?.beforeWrite ? { beforeWrite: opts.beforeWrite } : {}),
+        ...(opts?.groupContextAuthorOrigin ? { groupContextAuthorOrigin: opts.groupContextAuthorOrigin } : {}),
       }
     : undefined;
   const persistPrincipalLaneOutbound = (messageId: string): string => {
@@ -22112,6 +22126,39 @@ async function notifyOrdinaryIngressFailure(ctx: RoutingContext, err: unknown): 
 
 export const __testOnly_notifyOrdinaryIngressFailure = notifyOrdinaryIngressFailure;
 
+async function prepareGroupBackground(data: any, ctx: RoutingContext): Promise<void> {
+  if (ctx.chatType !== 'group' || preparedGroupContextRequests.has(ctx)
+      || !getGroupContextSettings(ctx.larkAppId, ctx.chatId).enabled) return;
+  preparedGroupContextRequests.add(ctx);
+  try {
+    const parsed = parseEventMessage(data).parsed;
+    const query = groupContextQuery(stripLeadingMentions(parsed.content, parsed.mentions), {
+      configuredTrigger: !!ctx.commandTrigger,
+      renderedPrompt: ctx.commandTrigger ? renderCommandTriggerPrompt(ctx.commandTrigger) : undefined,
+    });
+    if (!query) return;
+    void ensureGroupContextRecallHealth(ctx.larkAppId, () => ensureMessageRecalledEventSubscribed(ctx.larkAppId));
+    const ds = activeSessions.get(sessionKey(ctx.runtimeRoutingAnchor ?? ctx.anchor, ctx.larkAppId));
+    if (ds && sessionPromptInjection(ds) === 'none') return;
+    const cliId = ds?.session.cliLaunchSnapshot?.cliId ?? ds?.session.cliId ?? getBot(ctx.larkAppId).config.cliId;
+    const nativeInputSeqs = captureNativeGroupContextInput(ctx.larkAppId, data);
+    await prepareGroupContextForTurn({
+      appId: ctx.larkAppId, chatId: ctx.chatId, turnId: ctx.messageId, query,
+      nativeInputSeqs,
+      createTime: Number(parsed.createTime) || Date.now(),
+      ...groupContextConversationForTurn(data.message, ctx),
+      ...(ds ? {
+        sessionId: ds.session.sessionId,
+        epoch: groupContextEpoch(ds.session.sessionId, ds.session.cliSessionId, cliId, ctx.messageId),
+      } : {}),
+    });
+  } catch {
+    // Input assembly emits an explicit incomplete-history block on a miss.
+    // A history outage must not swallow an already-authorized user request.
+    logger.warn('[group-context] automatic background preparation failed');
+  }
+}
+
 async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   ctx.ingressAdmission ??= { admitted: false };
   if (getBot(ctx.larkAppId).config.codexInstancePool) {
@@ -22185,6 +22232,7 @@ function shouldSeedSessionGroupTitle(content: string): boolean {
 
 
 async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<void> {
+  await prepareGroupBackground(data, ctx);
   const { chatId, messageId, chatType, larkAppId, replyRootId, substituteTrigger, messageListener } = ctx;
   // Session-group birth re-homes the turn into the new group: replies/quotes
   // anchor on the in-group intro message, while `messageId` (the ORIGINAL
@@ -24476,6 +24524,7 @@ async function handleThreadReplyAdmitted(
   prepared?: PreparedThreadReply,
   replay?: { parsed: LarkMessage; resources: MessageResource[] },
 ): Promise<void> {
+  await prepareGroupBackground(data, ctx);
   const { chatId: ctxChatId, chatType: ctxChatType, scope, anchor, larkAppId, replyRootId, substituteTrigger } = ctx;
   const runtimeSessionKey = sessionKey(ctx.runtimeRoutingAnchor ?? anchor, larkAppId);
   await waitForAutoStartJoinReady(larkAppId, anchor);
@@ -25707,7 +25756,9 @@ async function handleThreadReplyAdmitted(
     if (!isBridge) await resolveSoloSessionForTurn(ds, ctxChatType, turnSender);
     const openingTurn = wantsOpening && claimInitialUserTurn(ds);
     const cliInput = isBridge
-      ? { content: buildBridgeInputContent(promptContent, {
+      ? { content: buildGroupContextBridgeInput(promptContent, ds.session.sessionId, {
+          larkAppId, chatId: ds.chatId, turnId: parsed.messageId, cliId: effectiveCliId,
+          promptInjection: sessionPromptInjection(ds),
           attachments,
           mentions: parsed.mentions,
           selfMention: { name: selfBot.botName, openId: selfBot.botOpenId },
@@ -28322,7 +28373,37 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         message: envelope,
       });
     },
+    onNativeInputConsumed(ds, receipt, context) {
+      // The worker proved this exact input entered its native conversation.
+      // Cover the frozen background now so an in-flight follow-up, a worker
+      // replacement or a daemon restart before the terminal cannot repeat it.
+      if (ds.session.workerGeneration !== context.workerGeneration) return;
+      const knownNative = ds.session.cliSessionId;
+      // A receipt naming a different established native conversation is not
+      // this session's evidence; a provisional first turn may learn its id here.
+      if (knownNative && receipt.nativeSessionId && receipt.nativeSessionId !== knownNative) {
+        logger.warn(`[group-context] native input receipt names another conversation; background may repeat turn=${receipt.turnId.slice(0, 12)}`);
+        return;
+      }
+      try {
+        const cliId = ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? getBot(ds.larkAppId).config.cliId;
+        confirmNativeGroupContextInput({ appId: ds.larkAppId, chatId: ds.chatId, turnId: receipt.turnId,
+          sessionId: ds.session.sessionId, nativeSessionId: receipt.nativeSessionId ?? knownNative, cliId,
+          workerGeneration: context.workerGeneration },
+        { kind: receipt.proofKind, ...(receipt.nativeTurnId ? { nativeTurnId: receipt.nativeTurnId } : {}) });
+      } catch { logger.warn('[group-context] native input receipt unavailable; background may repeat'); }
+    },
     async onTurnTerminal(ds, terminal, context) {
+      // Queue ACKs do not prove consumption. Only a matching completed native
+      // turn confirms that this exact frozen input reached this conversation.
+      if (terminal.status === 'completed' && ds.session.workerGeneration === context.workerGeneration) {
+        try {
+          const cliId = ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? getBot(ds.larkAppId).config.cliId;
+          confirmNativeGroupContextTurn({ appId: ds.larkAppId, chatId: ds.chatId, turnId: terminal.turnId,
+            sessionId: ds.session.sessionId, nativeSessionId: ds.session.cliSessionId, cliId,
+            workerGeneration: context.workerGeneration });
+        } catch { logger.warn('[group-context] completion receipt unavailable; background may repeat'); }
+      }
       // Release only the exact XPI shared-cwd admission. Route/principal
       // authority below has its own lifecycle and is deliberately independent.
       onXpiSharedCwdTurnTerminal(ds, terminal, context);
@@ -29012,6 +29093,12 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       ensureMessageUpdatedEventSubscribed(cfg.larkAppId).catch(err => {
         logger.debug(`[${cfg.larkAppId}] message-updated event subscription check failed: ${err?.message ?? err}`);
       });
+      // Reconcile existing enabled rooms at startup; default-off deployments
+      // do not acquire an extra platform subscription as a side effect.
+      if (sessionStore.listSessions().some(session => session.larkAppId === cfg.larkAppId
+          && session.chatType !== 'p2p' && getGroupContextSettings(cfg.larkAppId, session.chatId).enabled)) {
+        void ensureGroupContextRecallHealth(cfg.larkAppId, () => ensureMessageRecalledEventSubscribed(cfg.larkAppId));
+      }
     }
 
     // 主动开工 — 场景①: the bot.added event can't be self-verified via API, and
