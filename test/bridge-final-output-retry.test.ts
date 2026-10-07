@@ -321,12 +321,12 @@ describe('Bridge final_output delivery (P2 retry)', () => {
 
   it.each(['bridge', 'local-turn', 'local-turn-headless'] as const)('uploads an adopted session screenshot before delivering the %s card', async kind => {
     const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aX1sAAAAASUVORK5CYII=', 'base64');
-    const image = '/tmp/test-sessions/preview.png';
+    const image = `${config.session.dataDir}/preview.png`;
     writeFileSync(image, png);
     const sessionReply = vi.fn(async (_anchor: string, _card: string) => 'om_reply');
-    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp/test-sessions', getActiveCount: () => 1, closeSession: vi.fn() });
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => config.session.dataDir, getActiveCount: () => 1, closeSession: vi.fn() });
     const ds = makeDs();
-    ds.workingDir = '/tmp/test-sessions';
+    ds.workingDir = config.session.dataDir;
     ds.session.cliId = 'codex';
     const { __testOnly_deliverFinalOutput: deliver } = await import('../src/core/worker-pool.js');
     deliver(ds, { ...finalOutputMsg(), kind, content: `Ready.\n\n![Preview](${image})` }, 'tag', 0);
@@ -340,12 +340,12 @@ describe('Bridge final_output delivery (P2 retry)', () => {
 
   it('uploads a Claude adopt preamble screenshot but never uploads paths from its quoted user text', async () => {
     const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aX1sAAAAASUVORK5CYII=', 'base64');
-    writeFileSync('/tmp/test-sessions/preview.png', png);
-    writeFileSync('/tmp/test-sessions/input.png', png);
+    writeFileSync(`${config.session.dataDir}/preview.png`, png);
+    writeFileSync(`${config.session.dataDir}/input.png`, png);
     const sessionReply = vi.fn(async (_anchor: string, _card: string) => 'om_reply');
-    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp/test-sessions', getActiveCount: () => 1, closeSession: vi.fn() });
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => config.session.dataDir, getActiveCount: () => 1, closeSession: vi.fn() });
     const ds = makeDs();
-    ds.workingDir = '/tmp/test-sessions';
+    ds.workingDir = config.session.dataDir;
     if (!ds.worker) throw new Error('Missing fixture worker');
     __testOnly_setupWorkerHandlers(ds, ds.worker);
     ds.worker.emit('message', {
@@ -360,11 +360,11 @@ describe('Bridge final_output delivery (P2 retry)', () => {
 
   it.each(['non-adopted', 'sandbox', 'read-isolation', 'remote', 'api-only'])(
     'does not add host image uploads to %s sessions', async mode => {
-      writeFileSync('/tmp/test-sessions/preview.png', Buffer.from('89504e470d0a1a0a', 'hex'));
+      writeFileSync(`${config.session.dataDir}/preview.png`, Buffer.from('89504e470d0a1a0a', 'hex'));
       const sessionReply = vi.fn(async (_anchor: string, _card: string) => 'om_reply');
-      initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp/test-sessions', getActiveCount: () => 1, closeSession: vi.fn() });
+      initWorkerPool({ sessionReply, getSessionWorkingDir: () => config.session.dataDir, getActiveCount: () => 1, closeSession: vi.fn() });
       const ds = makeDs();
-      ds.workingDir = '/tmp/test-sessions';
+      ds.workingDir = config.session.dataDir;
       if (mode === 'non-adopted') ds.adoptedFrom = undefined;
       if (mode === 'sandbox') ds.session.sandbox = true;
       if (mode === 'remote') ds.session.backendType = 'remote-runner';
@@ -382,11 +382,11 @@ describe('Bridge final_output delivery (P2 retry)', () => {
   );
 
   it('reuses the uploaded key and UUID after a final-output send failure', async () => {
-    writeFileSync('/tmp/test-sessions/preview.png', Buffer.from('89504e470d0a1a0a', 'hex'));
+    writeFileSync(`${config.session.dataDir}/preview.png`, Buffer.from('89504e470d0a1a0a', 'hex'));
     const sessionReply = vi.fn().mockRejectedValueOnce(new Error('network error')).mockResolvedValue('om_reply');
-    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp/test-sessions', getActiveCount: () => 1, closeSession: vi.fn() });
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => config.session.dataDir, getActiveCount: () => 1, closeSession: vi.fn() });
     const ds = makeDs();
-    ds.workingDir = '/tmp/test-sessions';
+    ds.workingDir = config.session.dataDir;
     const { __testOnly_deliverFinalOutput: deliver } = await import('../src/core/worker-pool.js');
     deliver(ds, { ...finalOutputMsg(), content: 'Ready. ![Preview](preview.png)' }, 'tag', 0);
     await vi.advanceTimersByTimeAsync(30_000);
@@ -398,12 +398,12 @@ describe('Bridge final_output delivery (P2 retry)', () => {
   });
 
   it('delivers the body when the automatic image upload fails', async () => {
-    writeFileSync('/tmp/test-sessions/preview.png', Buffer.from('89504e470d0a1a0a', 'hex'));
+    writeFileSync(`${config.session.dataDir}/preview.png`, Buffer.from('89504e470d0a1a0a', 'hex'));
     uploadImageMock.mockRejectedValueOnce(new Error('upload failed'));
     const sessionReply = vi.fn(async (_anchor: string, _card: string) => 'om_reply');
-    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp/test-sessions', getActiveCount: () => 1, closeSession: vi.fn() });
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => config.session.dataDir, getActiveCount: () => 1, closeSession: vi.fn() });
     const ds = makeDs();
-    ds.workingDir = '/tmp/test-sessions';
+    ds.workingDir = config.session.dataDir;
     const { __testOnly_deliverFinalOutput: deliver } = await import('../src/core/worker-pool.js');
     deliver(ds, { ...finalOutputMsg(), content: 'Ready. ![Preview](preview.png)' }, 'tag', 0);
     await vi.advanceTimersByTimeAsync(30_000);
@@ -415,16 +415,16 @@ describe('Bridge final_output delivery (P2 retry)', () => {
   });
 
   it('does not send a completed upload after the adopted worker loses ownership', async () => {
-    writeFileSync('/tmp/test-sessions/preview.png', Buffer.from('89504e470d0a1a0a', 'hex'));
+    writeFileSync(`${config.session.dataDir}/preview.png`, Buffer.from('89504e470d0a1a0a', 'hex'));
     let owned = true;
     uploadImageMock.mockImplementationOnce(async () => {
       owned = false;
       return 'img_v3_uploaded_preview';
     });
     const sessionReply = vi.fn(async () => 'om_reply');
-    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp/test-sessions', getActiveCount: () => 1, closeSession: vi.fn() });
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => config.session.dataDir, getActiveCount: () => 1, closeSession: vi.fn() });
     const ds = makeDs();
-    ds.workingDir = '/tmp/test-sessions';
+    ds.workingDir = config.session.dataDir;
     const complete = vi.fn();
     const { __testOnly_deliverFinalOutput: deliver } = await import('../src/core/worker-pool.js');
     deliver(ds, { ...finalOutputMsg(), content: 'Ready. ![Preview](preview.png)' }, 'tag', 0, complete, () => owned);
