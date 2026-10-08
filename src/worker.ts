@@ -16930,6 +16930,9 @@ async function spawnCli(
   // never less. Mirrors what the riff path already does via mergedEnv.
   if (cfg.apiOnly) childEnv.BOTMUX_API_ONLY = '1';
   else delete childEnv.BOTMUX_API_ONLY;
+  // Scope and topic identity come from this Worker, after configurable envs.
+  childEnv.BOTMUX_SESSION_SCOPE = cfg.rootMessageId?.startsWith('om_') ? 'thread' : 'chat';
+  // Ask/browser approval require this anchor for both thread and chat sessions.
   childEnv.BOTMUX_ROOT_MESSAGE_ID = cfg.rootMessageId;
   applySessionOwnerEnv(childEnv, cfg.ownerOpenId);
   // This bot's resolved brandLabel template, injected so a SANDBOXED `botmux
