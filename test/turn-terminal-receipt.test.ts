@@ -296,7 +296,7 @@ describe('independent turn terminal receipt', () => {
       outputDisposition: 'nothing_to_send',
     }));
 
-    await vi.waitFor(() => expect(updateMessage).toHaveBeenCalledWith('app_test', 'om_stream', '{}'));
+    await vi.waitFor(() => expect(updateMessage).toHaveBeenCalledWith('app_test', 'om_stream', '{}', expect.objectContaining({ beforeWrite: expect.any(Function) })));
     expect(ds.silentIdleTurnId).toBe('om_turn_silent_stream');
     expect(sessionReplyMock).not.toHaveBeenCalled();
   });

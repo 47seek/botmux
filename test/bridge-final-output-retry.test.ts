@@ -11,7 +11,7 @@ import * as registrationStore from '../src/services/idempotency-store.js';
  *   - 3 consecutive failures give up and DO NOT commit the dedup marker
  *     (so any retransmit can still deliver)
  */
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, afterAll, vi } from 'vitest';
 import { config } from '../src/config.js';
 import { normalizeFeedbackPolicy } from '../src/services/feedback-policy.js';
 import { dashboardEventBus } from '../src/core/dashboard-events.js';
@@ -268,6 +268,12 @@ function seedSilentReceiverReceipt(): void {
 }
 
 const SCOPED_DEDUPE_KEY = 'sid-final-out:uuid-1';
+
+afterAll(async () => {
+  const { __testOnly_closeSkillFeedbackStores } = await import('../src/services/skill-feedback-store.js');
+  await __testOnly_closeSkillFeedbackStores();
+  rmSync(config.session.dataDir, { recursive: true, force: true });
+});
 
 describe('Bridge final_output delivery (P2 retry)', () => {
   beforeEach(async () => {

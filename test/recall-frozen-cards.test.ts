@@ -1215,6 +1215,7 @@ describe('scheduleCardPatch withdrawn handling', () => {
     // MessageWithdrawnError — but ds.streamCardId already points at the
     // new live card, so the catch must NOT clear it.
     const ds = makeDs();
+    activate(ds);
     ds.streamCardId = 'om_OLD';
     ds.streamCardNonce = 'nonce_old';
 
@@ -1242,6 +1243,7 @@ describe('scheduleCardPatch withdrawn handling', () => {
     // current card must still null out the reference so a fresh card is
     // POSTed on the next screen_update.
     const ds = makeDs();
+    activate(ds);
     ds.streamCardId = 'om_ACTIVE';
     ds.streamCardNonce = 'nonce';
 
@@ -1268,6 +1270,7 @@ describe('scheduleCardPatch expired (230031) handling', () => {
     // the periodic usage tick must drop the dead id (persisted across restart)
     // instead of replaying the same PATCH every interval.
     const ds = makeDs();
+    activate(ds);
     ds.streamCardId = 'om_OLD14';
     ds.streamCardNonce = 'nonce';
 
@@ -1298,6 +1301,7 @@ describe('scheduleCardPatch expired (230031) handling', () => {
     // card is in flight, a new card becomes active. The old PATCH expiring must
     // not forget the live new card.
     const ds = makeDs();
+    activate(ds);
     ds.streamCardId = 'om_OLD';
     ds.streamCardNonce = 'nonce_old';
 
