@@ -1,6 +1,7 @@
+import { privateReplyEnabled } from './private-reply.js';
 import { handoffCardClosed, handoffCardBlocksStreaming, applyHandoffCardEvent, type HandoffCardEvent } from './handoff-card-lifecycle.js';
 import { assertSendTopicsAvailable, createTopicMessageLookupCache, TopicSendError, type TopicMessageLookup } from '../cli/topic-send-guard.js';
-import { getMessageDetail as getTopicMessageDetail } from '../im/lark/client.js';
+import { getMessageDetail as getTopicMessageDetail, uploadImage } from '../im/lark/client.js';
 import { commitTriggerStreamingCard, discardTriggerStreamingCard, hasPendingTriggerStreamingCard } from './trigger-streaming-card.js';
 import { sessionPromptInjection } from './prompt-injection.js';
 import { sandboxBoolValue, normalizeSandboxMode, normalizeScratchStorage } from '../adapters/cli/sandbox-mode.js';
@@ -31,6 +32,7 @@ import { reclaimIdleWorkersForAdmissionAfterTurnDrain } from './idle-worker-swee
 import { createWorkerStderrRing, WORKER_ERROR_MARKER, type WorkerStderrRing } from './worker-stderr-ring.js';
 import * as sessionStore from '../services/session-store.js';
 import * as asyncTriggerStore from '../services/async-trigger-store.js';
+import { recordTurnInputCommit } from '../services/idempotency-store.js';
 import { drainCodexRollout, findCodexRolloutBySessionId } from '../services/codex-transcript.js';
 import {
   markMessageListenerRunPreviewFailed,
@@ -98,6 +100,8 @@ import {
   type CardUsageSnapshot,
   type LocalHomeLinkMode,
 } from '../im/lark/md-card.js';
+import { replyWithImageFallback } from '../im/lark/card-image-fallback.js';
+import { resolveReplyImages, type ReplyImageState } from '../im/lark/reply-images.js';
 import { getSessionUsageSnapshot } from './cost-calculator.js';
 import { renderBrandTemplate } from '../im/lark/brand-template.js';
 import { handleCotThinkingUpdate, handleCotThinkingSuperseded, finalizeCotMessage, abortCotMessage } from '../im/lark/cot-message.js';
@@ -112,6 +116,11 @@ import { ZmxBackend } from '../adapters/backend/zmx-backend.js';
 import { zmxEnv } from '../setup/ensure-zmx.js';
 import type { PersistentBackendTarget } from '../adapters/backend/types.js';
 import { backendSupportsWebTerminal } from '../adapters/backend/capabilities.js';
+import {
+  normalizeRemoteRunnerBackendState,
+  normalizeRemoteRunnerUsageReport,
+} from '../adapters/backend/remote-runner-protocol.js';
+import type { RemoteRunnerConfig } from '../adapters/backend/remote-runner-config.js';
 import { sandboxEnabled } from '../adapters/backend/sandbox.js';
 import {
   isStrongManagedHerdrAgentName,
@@ -123,12 +132,14 @@ import { recordQuarantinedLauncherEnvKeys } from './mojo-launcher-env-quarantine
 import { freezeMojoIdentityForSession } from './mojo-session-identity.js';
 import { getBot, getAllBots, getOwnerOpenId, loadBotConfigs, resolveBrandLabel, getLoadedConfigPath, getLoadedConfigProvenance, resolveUsageDisplay } from '../bot-registry.js';
 import { resolveHiddenStreamingCardButtons } from '../im/lark/streaming-card-buttons.js';
+import { isLarkContentAuditError, larkErrorCode } from '../im/lark/content-audit.js';
 import { resolvePricingConfig, type ResolvedModelPricing } from '../services/model-pricing.js';
 import { RestartCoordinator, type RestartObserver } from './restart-coordinator.js';
 import { runtimeBuildIdentity } from '../utils/runtime-build-id.js';
 import { scrubWorkflowWorkerEnv } from '../utils/child-env.js';
 import { resolveFeedbackPolicyForDelivery, resolveFeedbackTeamId } from '../services/feedback-policy-resolver.js';
 import { attachOncallGroupButton, recordOncallGroupDelivery } from '../im/lark/oncall-group.js';
+import { beginFinalOutputDelivery } from './final-output-delivery-drain.js';
 
 /** A random id minted once per daemon process (this lifetime). Stamped onto
  *  isolated persistent panes so a suspend→resume reattach (same id) is
@@ -345,6 +356,25 @@ function daemonCardLocalHomeLinkMode(ds: DaemonSession): LocalHomeLinkMode {
     : 'filesystem';
 }
 
+function prepareAdoptedReplyImages(
+  ds: DaemonSession,
+  markdown: string,
+  state: ReplyImageState,
+  owns: () => boolean,
+): Promise<string> {
+  const botCfg = getBot(ds.larkAppId).config;
+  const workingDir = ds.workingDir ?? ds.session.workingDir ?? ds.adoptedFrom?.cwd;
+  if (!(ds.adoptedFrom || ds.session.adoptedFrom) || !workingDir || ds.session.vcMeetingReceiver
+    || botCfg.apiOnly || daemonCardLocalHomeLinkMode(ds) !== 'filesystem'
+    || sandboxBoolValue(ds.session.sandbox ?? ds.initConfig?.sandbox ?? botCfg.sandbox)
+    || (ds.initConfig?.readIsolation ?? botCfg.readIsolation)) return Promise.resolve(markdown);
+  return resolveReplyImages(markdown, {
+    workingDir, state,
+    owns: () => owns() && ds.session.status !== 'closed',
+    upload: bytes => uploadImage(ds.larkAppId, bytes),
+  });
+}
+
 /** Read one frozen native-usage snapshot at the reply boundary. Card delivery
  * remains best-effort even when a CLI has no supported transcript or a usage
  * resolver fails. */
@@ -360,6 +390,19 @@ export function getDaemonSessionUsageSnapshot(
       ?? ds.adoptedFrom?.cliId
       ?? getBot(ds.larkAppId).config.cliId
     ) as CliId;
+    const backendType = ds.initConfig?.backendType ?? ds.session.backendType;
+    if (backendType === 'remote-runner') {
+      const usage = normalizeRemoteRunnerUsageReport(ds.session.remoteRunnerUsage);
+      const state = normalizeRemoteRunnerBackendState(ds.session.remoteBackendState);
+      if (usage && state && usage.generation === state.generation) {
+        return usage.snapshot;
+      }
+      // A Remote Runner transcript lives behind the provider boundary. Falling
+      // through to the daemon-host resolver would inspect the wrong filesystem
+      // and can only produce noise or, worse, collide with an unrelated local
+      // session id.
+      return { context: null, tokens: null };
+    }
     const snapshot = getSessionUsageSnapshot({
       cliId: resolvedCliId,
       sessionId: ds.session.sessionId,
@@ -469,6 +512,10 @@ export function getDaemonStreamingCardUsageSnapshot(
     effectiveCliId,
     { fresh: opts?.fresh ?? false },
   );
+  const remoteRunner = (ds.initConfig?.backendType ?? ds.session.backendType) === 'remote-runner';
+  const remoteModel = remoteRunner ? snapshot.model?.trim() : undefined;
+  const remoteReasoningEffort = remoteRunner ? snapshot.reasoningEffort?.trim() : undefined;
+  const remoteModelBackendVariant = remoteRunner ? snapshot.modelBackendVariant?.trim() : undefined;
   // Model normally comes from an explicitly-wired executor runtime (TRAE/Codex
   // set ds.activeModel) or launch config. Grok's native snapshot is the one
   // exception: its signals.json exposes a stable user-facing primaryModelId.
@@ -478,9 +525,14 @@ export function getDaemonStreamingCardUsageSnapshot(
   const grokReasoningEffort = effectiveCliId === 'grok' ? snapshot.reasoningEffort?.trim() : undefined;
   return {
     ...snapshot,
-    ...(runtimeModel ? { model: runtimeModel } : grokModel ? { model: grokModel } : {}),
-    ...(reasoningEffort ? { reasoningEffort } : grokReasoningEffort ? { reasoningEffort: grokReasoningEffort } : {}),
-    ...(modelBackendVariant ? { modelBackendVariant } : {}),
+    ...(remoteModel ? { model: remoteModel }
+      : runtimeModel ? { model: runtimeModel }
+        : grokModel ? { model: grokModel } : {}),
+    ...(remoteReasoningEffort ? { reasoningEffort: remoteReasoningEffort }
+      : reasoningEffort ? { reasoningEffort }
+        : grokReasoningEffort ? { reasoningEffort: grokReasoningEffort } : {}),
+    ...(remoteModelBackendVariant ? { modelBackendVariant: remoteModelBackendVariant }
+      : modelBackendVariant ? { modelBackendVariant } : {}),
     ...(modelFallback ? { modelFallback } : {}),
     ...(reasoningControl ? { reasoningControl } : {}),
   };
@@ -691,7 +743,7 @@ import {
   readScheduledTaskForProvenance,
   trustedCallerForScheduledTask,
 } from './scheduled-turn-provenance.js';
-import { isTriggerFinalSuppressed } from './trigger-final-suppression.js';
+import { inheritActiveTurnFinalSuppression, isTriggerFinalSuppressed } from './trigger-final-suppression.js';
 import { writeDeferredTopicBinding } from './deferred-topic-binding.js';
 import {
   currentDeviceIsolationFreezeLease,
@@ -720,6 +772,12 @@ import {
 type WorkerStartupState = {
   ready: boolean;
   failureNotified: boolean;
+  onPreReadyExit?: () => void;
+  /** Explicit Remote Runner rebuilds cross two readiness boundaries: the Node
+   * worker can initialize before the provider returns its rebuild `ready`
+   * state. Keep this callback armed across worker `ready` and consume it only
+   * when the backend either publishes that state or exits first. */
+  onRemoteBackendStartupExit?: () => boolean;
   /** Init turn attribution frozen at fork. A durable VC delivery is dispatched
    *  (queued) into a not-yet-ready worker; if that worker dies before ready
    *  (fork ENOENT, syntax/import crash, abrupt exit) the fork-level `error` and
@@ -1049,6 +1107,7 @@ export function isDisposableCommandScratch(ds: DaemonSession): boolean {
 // takes effect without a daemon restart. The `/card` command can override it
 // per-session via `ds.streamingCardForced` (manually summon a live card).
 function streamingCardDisabled(ds: DaemonSession, turnId?: string): boolean {
+  if (privateReplyEnabled(ds.session)) return true;
   if (isDocNativeSession(ds) || handoffCardBlocksStreaming(ds, turnId)) return true;
   if (ds.streamingCardForced) return false;
   try {
@@ -1673,6 +1732,9 @@ export function ensureOrdinaryTurnRecoveryAttached(
     cancel: timer => clearTimeout(timer),
     persist: () => sessionStore.updateSession(ds.session),
     mintContinuationTurnId: logicalTurnId => mintScheduledContinuationTurnId(logicalTurnId),
+    prepare: dispatch => parseScheduledTurnId(dispatch.logicalTurnId)
+      ? callbacks?.prepareRawInputTurn?.(ds, dispatch.turnId)
+      : undefined,
     enqueue: (dispatch: OrdinaryTurnRecoveryDispatch) => {
       if (!ordinaryTurnRecoveryEligible(ds) || !ordinaryTurnRecoveryStillOwnsSession(ds)) return false;
       // A scheduled logical turn continues as the same scheduled turn: same
@@ -4870,9 +4932,10 @@ export function ensureCliEnv(cliId: CliId, cliPathOverride?: string): void {
 const GLOBAL_CLAUDE_SKILLS_DIR = '~/.claude/skills';
 const GLOBAL_PI_SKILLS_DIR = '~/.pi/agent/skills';
 const GLOBAL_OMP_SKILLS_DIR = '~/.omp/agent/skills';
+const GLOBAL_CURSOR_SKILLS_DIR = '~/.cursor/skills';
 
 /** Unconditionally sweep botmux-owned skills out of the user's global
- *  `~/.claude/skills`, `~/.pi/agent/skills`, and `~/.omp/agent/skills`. botmux owns the `botmux-` namespace
+ *  `~/.claude/skills`, `~/.pi/agent/skills`, `~/.omp/agent/skills`, and `~/.cursor/skills`. botmux owns the `botmux-` namespace
  *  there and injects its skills per-session dynamically, so anything matching is a
  *  leak that would otherwise surface (and mis-fire) in the user's standalone CLI.
  *  Idempotent & best-effort — safe to call repeatedly. */
@@ -4880,6 +4943,7 @@ export function sweepGlobalBotmuxSkills(): void {
   removeGlobalBotmuxSkills(GLOBAL_CLAUDE_SKILLS_DIR);
   removeGlobalBotmuxSkills(GLOBAL_PI_SKILLS_DIR);
   removeGlobalBotmuxSkills(GLOBAL_OMP_SKILLS_DIR);
+  removeGlobalBotmuxSkills(GLOBAL_CURSOR_SKILLS_DIR);
 }
 
 let globalBotmuxSkillsCleaned = false;
@@ -5672,6 +5736,11 @@ type RemoteClosePreparation =
         | 'riff_row_inconsistent'
         | 'riff_durable_close_failed'
         | 'riff_close_reconciliation_required'
+        | 'remote_runner_worker_close_failed'
+        | 'remote_runner_row_inconsistent'
+        | 'remote_runner_worker_missing'
+        | 'remote_runner_close_reconciliation_required'
+        | 'remote_runner_durable_close_failed'
         | 'remote_shutdown_fence_in_progress'
         // mojo reuses this preparation contract: same problem (a remote,
         // credential-bearing session that must be proven gone before the row is
@@ -5809,13 +5878,17 @@ async function abortLiveRemoteWorkerClose(
 
 async function prepareLiveRemoteWorkerClose(
   ds: DaemonSession,
-  backendType: 'riff' | 'mojo',
+  backendType: 'riff' | 'mojo' | 'remote-runner',
 ): Promise<RemoteClosePreparation> {
   const worker = ds.worker;
   if (!worker || worker.killed) {
     return {
       ok: false,
-      error: backendType === 'riff' ? 'riff_worker_close_failed' : 'mojo_cancel_failed',
+      error: backendType === 'riff'
+        ? 'riff_worker_close_failed'
+        : backendType === 'mojo'
+          ? 'mojo_cancel_failed'
+          : 'remote_runner_worker_missing',
       retryable: true,
     };
   }
@@ -5890,6 +5963,17 @@ async function prepareLiveRemoteWorkerClose(
   }
   let takenOverRuntimeState: DaemonSession['remoteCloseState'];
   if (ds.remoteCloseState) {
+    if (backendType === 'remote-runner' && ds.remoteCloseState.phase === 'prepared') {
+      return { ok: true };
+    }
+    if (backendType === 'remote-runner' && ds.remoteCloseState.phase === 'uncertain') {
+      return {
+        ok: false,
+        error: 'remote_runner_close_reconciliation_required',
+        retryable: false,
+        recovery: 'uncertain',
+      };
+    }
     const runtimeUncertain = backendType === 'mojo'
       && ds.remoteCloseState.phase === 'uncertain';
     // A runtime `uncertain` fence used to be a dead end: "a blind retry proves
@@ -5953,7 +6037,11 @@ async function prepareLiveRemoteWorkerClose(
     } else {
       return {
         ok: false,
-        error: backendType === 'riff' ? 'riff_worker_close_failed' : 'mojo_cancel_failed',
+        error: backendType === 'riff'
+          ? 'riff_worker_close_failed'
+          : backendType === 'mojo'
+            ? 'mojo_cancel_failed'
+            : 'remote_runner_worker_close_failed',
         retryable: true,
         ...(ds.remoteCloseState.taskId ? { taskId: ds.remoteCloseState.taskId } : {}),
       };
@@ -6013,9 +6101,14 @@ async function prepareLiveRemoteWorkerClose(
     // waiting for system/init, then up to 60s in `mojo session cancel`; aborting
     // at the old 23s Riff budget re-opened admission while that irreversible
     // cancellation was still in flight. Stay above both bounded Mojo phases.
+    const remoteRunnerOperationTimeoutMs = backendType === 'remote-runner'
+      ? ((ds.initConfig?.backendConfig as RemoteRunnerConfig | undefined)?.operationTimeoutMs ?? 30_000)
+      : undefined;
     const closeResultTimeoutMs = backendType === 'mojo'
       ? MOJO_EXPLICIT_CLOSE_RESULT_TIMEOUT_MS
-      : 23_000;
+      : backendType === 'remote-runner'
+        ? Math.min(305_000, Math.max(5_000, remoteRunnerOperationTimeoutMs! + 5_000))
+        : 23_000;
     const timer = setTimeout(
       // A timed-out prepare may still be running remotely; the outcome is unknown.
       () => finish({ ok: false, error: 'worker_close_result_timeout', recovery: 'uncertain' }),
@@ -6038,7 +6131,9 @@ async function prepareLiveRemoteWorkerClose(
     }
   });
 
-  const taskId = result.taskId ?? ds.session.riffParentTaskId;
+  const taskId = backendType === 'remote-runner'
+    ? undefined
+    : result.taskId ?? ds.session.riffParentTaskId;
   if (backendType === 'mojo') {
     if (result.ok) {
       try {
@@ -6272,7 +6367,7 @@ async function prepareLiveRemoteWorkerClose(
     };
   }
 
-  if (result.taskId) {
+  if (backendType === 'riff' && result.taskId) {
     ds.session.riffParentTaskId = result.taskId;
     try {
       sessionStore.updateSession(ds.session);
@@ -6292,17 +6387,29 @@ async function prepareLiveRemoteWorkerClose(
   }
 
   if (!result.ok) {
-    await abortLiveRemoteWorkerClose(ds, requestId, {
-      allowAbsentAfterProvenRestore: matchedCloseResult,
+    const mayRestore = mayRestoreWriteAdmission({
+      ok: false,
+      ...(result.recovery ? { recovery: result.recovery } : {}),
+      ...(result.admission ? { admission: result.admission } : {}),
     });
+    if (mayRestore) {
+      await abortLiveRemoteWorkerClose(ds, requestId, {
+        allowAbsentAfterProvenRestore: matchedCloseResult,
+      });
+    } else {
+      ds.remoteCloseState = { phase: 'uncertain', requestId };
+    }
     logger.warn(
       `[${tag(ds)}] ${backendType} worker close prepare failed: ${result.error ?? 'unknown'}; `
       + `session remains active${taskId ? ` (task ${taskId})` : ''}`,
     );
     return {
       ok: false,
-      error: 'riff_worker_close_failed',
-      retryable: true,
+      error: backendType === 'riff'
+        ? 'riff_worker_close_failed'
+        : 'remote_runner_close_reconciliation_required',
+      retryable: backendType === 'riff' || mayRestore,
+      ...(result.recovery ? { recovery: result.recovery } : {}),
       ...(taskId ? { taskId } : {}),
     };
   }
@@ -6314,6 +6421,199 @@ async function prepareLiveRemoteWorkerClose(
   };
   logger.info(`[${tag(ds)}] ${backendType} worker close prepared and remote cancellation confirmed`);
   return { ok: true, ...(taskId ? { taskId } : {}) };
+}
+
+type RemoteRunnerExplicitCloseWake = (
+  ds: DaemonSession,
+  wakeRequestId: string,
+) => Promise<boolean>;
+type RemoteRunnerCloseFork = typeof forkWorker;
+const REMOTE_RUNNER_CLOSE_WAKE_TIMEOUT_MS = 45_000;
+const REMOTE_RUNNER_CLOSE_WAKE_POLL_MS = 50;
+
+/**
+ * Materialize only the generic provider control channel for an explicit close.
+ *
+ * The empty prompt is load-bearing: the worker receives its normal init/resume
+ * frame with the persisted opaque backend state, but no model turn.  The close
+ * IPC is sent synchronously after this function returns, so Node cannot admit a
+ * competing turn in between; every external close route already owns the bot
+ * mutation gate.  Refuse sessions with unsettled durable input anyway — an
+ * empty recovery fork may otherwise promote an activation tail, which would
+ * execute user work while the caller is trying to abandon the session.
+ */
+async function wakeRemoteRunnerWorkerForExplicitClose(
+  ds: DaemonSession,
+  wakeRequestId: string,
+  forkImpl: RemoteRunnerCloseFork = forkWorker,
+): Promise<boolean> {
+  if (ds.worker && !ds.worker.killed) return true;
+  if (findActiveBySessionId(ds.session.sessionId) !== ds) return false;
+  if (!normalizeRemoteRunnerBackendState(ds.session.remoteBackendState)) return false;
+  if (isSessionTransferring(ds)
+      || hasProtectedSessionMutationOwnership(ds)
+      || ds.pendingRawInput
+      || ds.pendingFollowUpInput) {
+    logger.warn(
+      `[${tag(ds)}] Refused control-only remote runner wake while durable input or transfer is unsettled`,
+    );
+    return false;
+  }
+
+  let admission: WorkerForkAdmission | undefined;
+  try {
+    // forkWorker centrally rejects every remote-retirement fence. Lift only
+    // THIS wake fence for the synchronous empty fork, then restore it before
+    // any child event or competing turn can run on the event loop.
+    if (ds.remoteCloseState?.requestId !== wakeRequestId
+        || ds.remoteCloseState.phase !== 'preparing') return false;
+    ds.remoteCloseState = undefined;
+    const accepted = forkImpl(ds, '', true, {
+      // A close request must not leave a delayed wake callback behind after it
+      // has already returned failure. This also disables marginal-memory
+      // reclaim/re-entry, which shares the same explicit no-defer gate.
+      deferDuringDeviceIsolation: false,
+      onAdmission: value => { admission = value; },
+    });
+    if (!ds.remoteCloseState) {
+      ds.remoteCloseState = { phase: 'preparing', requestId: wakeRequestId };
+    }
+    if (!accepted || admission !== 'accepted' || !ds.worker || ds.worker.killed) {
+      logger.warn(
+        `[${tag(ds)}] Control-only remote runner wake was not synchronously admitted `
+        + `(admission=${admission ?? 'none'})`,
+      );
+      return false;
+    }
+  } catch (err) {
+    if (!ds.remoteCloseState) {
+      ds.remoteCloseState = { phase: 'preparing', requestId: wakeRequestId };
+    }
+    logger.warn(
+      `[${tag(ds)}] Control-only remote runner wake failed: `
+      + `${err instanceof Error ? err.message : String(err)}`,
+    );
+    return false;
+  }
+
+  const worker = ds.worker;
+  const deadline = Date.now() + REMOTE_RUNNER_CLOSE_WAKE_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    if (findActiveBySessionId(ds.session.sessionId) !== ds
+        || ds.session.status !== 'active'
+        || ds.worker !== worker
+        || worker.killed) return false;
+    if (ds.workerReady === true) {
+      logger.info(`[${tag(ds)}] Woke remote runner control worker for explicit close`);
+      return true;
+    }
+    await new Promise(resolve => setTimeout(resolve, REMOTE_RUNNER_CLOSE_WAKE_POLL_MS));
+  }
+  logger.warn(`[${tag(ds)}] Timed out waiting for remote runner control worker readiness`);
+  return false;
+}
+
+let remoteRunnerExplicitCloseWakeImpl: RemoteRunnerExplicitCloseWake =
+  (ds, wakeRequestId) => wakeRemoteRunnerWorkerForExplicitClose(ds, wakeRequestId);
+
+export async function __testOnly_wakeRemoteRunnerWorkerForExplicitClose(
+  ds: DaemonSession,
+  forkImpl: RemoteRunnerCloseFork,
+): Promise<boolean> {
+  const wakeRequestId = `test-wake:${randomUUID()}`;
+  ds.remoteCloseState = { phase: 'preparing', requestId: wakeRequestId };
+  try {
+    return await wakeRemoteRunnerWorkerForExplicitClose(ds, wakeRequestId, forkImpl);
+  } finally {
+    if (ds.remoteCloseState?.requestId === wakeRequestId) ds.remoteCloseState = undefined;
+  }
+}
+
+export function __testOnly_setRemoteRunnerExplicitCloseWake(
+  impl?: RemoteRunnerExplicitCloseWake,
+): void {
+  remoteRunnerExplicitCloseWakeImpl = impl
+    ?? ((ds, wakeRequestId) => wakeRemoteRunnerWorkerForExplicitClose(ds, wakeRequestId));
+}
+
+/**
+ * Generic remote providers prove cancellation only through a live, handshaken
+ * worker. Persisted provider state remains opaque to the daemon: a dormant row
+ * is resumed through the same public worker/provider protocol, never decoded or
+ * cancelled with provider-specific control-plane calls here.
+ */
+async function prepareRemoteRunnerExplicitClose(
+  ds: DaemonSession | undefined,
+  stored: Session | undefined,
+): Promise<RemoteClosePreparation> {
+  const session = ds?.session ?? stored;
+  if (!session || session.status === 'closed') return { ok: true };
+  const backendType = ds?.initConfig?.backendType ?? session.backendType;
+  if (backendType !== 'remote-runner') return { ok: true };
+  if ((ds && isSharedAdoptSession(ds)) || isSharedAdoptPersistedSession(session)) {
+    return { ok: true };
+  }
+  if (!stored || stored.status !== 'active') {
+    return {
+      ok: false,
+      error: 'remote_runner_row_inconsistent',
+      retryable: true,
+    };
+  }
+  if (!ds?.worker || ds.worker.killed) {
+    if (!ds) {
+      return {
+        ok: false,
+        error: 'remote_runner_worker_missing',
+        retryable: true,
+      };
+    }
+    // A live worker may still be in the pre-ready window before its provider
+    // state is persisted; its destroySession() can safely await that startup.
+    // A worker-less wake has no such runtime authority, so it must start only
+    // from a valid opaque durable state and must never create a new provider
+    // session merely to close it.
+    if (!normalizeRemoteRunnerBackendState(stored.remoteBackendState)) {
+      return {
+        ok: false,
+        error: 'remote_runner_row_inconsistent',
+        retryable: true,
+      };
+    }
+    const wakeRequestId = `remote-runner-wake:${randomUUID()}`;
+    if (ds.remoteCloseState) {
+      return {
+        ok: false,
+        error: ds.remoteCloseState.phase === 'uncertain'
+          ? 'remote_runner_close_reconciliation_required'
+          : 'remote_runner_worker_close_failed',
+        retryable: ds.remoteCloseState.phase !== 'uncertain',
+        ...(ds.remoteCloseState.phase === 'uncertain'
+          ? { recovery: 'uncertain' as const }
+          : {}),
+      };
+    }
+    ds.remoteCloseState = { phase: 'preparing', requestId: wakeRequestId };
+    let woke = false;
+    try {
+      woke = await remoteRunnerExplicitCloseWakeImpl(ds, wakeRequestId);
+    } catch (err) {
+      logger.warn(
+        `[${tag(ds)}] Remote runner control-worker wake threw: `
+        + `${err instanceof Error ? err.message : String(err)}`,
+      );
+    } finally {
+      if (ds.remoteCloseState?.requestId === wakeRequestId) ds.remoteCloseState = undefined;
+    }
+    if (!woke || !ds.worker || ds.worker.killed || ds.workerReady !== true) {
+      return {
+        ok: false,
+        error: 'remote_runner_worker_missing',
+        retryable: true,
+      };
+    }
+  }
+  return prepareLiveRemoteWorkerClose(ds, 'remote-runner');
 }
 
 /** Await remote cancellation for any Riff owner before its durable row is
@@ -7605,6 +7905,7 @@ export async function closeSession(
     && !(stored && isSharedAdoptPersistedSession(stored));
   const isOwnedRiffClose = isOwnedClose && closeFrozenBackendType === 'riff';
   const isOwnedMojoClose = isOwnedClose && closeFrozenBackendType === 'mojo';
+  const isOwnedRemoteRunnerClose = isOwnedClose && closeFrozenBackendType === 'remote-runner';
   const closeJournal = ds?.session.mojoCloseJournal ?? stored?.mojoCloseJournal;
   if (closeJournal && !isOwnedMojoClose) {
     // Never let a Mojo cancellation journal silently disappear through another
@@ -7678,7 +7979,9 @@ export async function closeSession(
     ? await prepareRiffExplicitClose(ds, stored)
     : isOwnedMojoClose
       ? await prepareMojoExplicitClose(ds, stored)
-      : { ok: true };
+      : isOwnedRemoteRunnerClose
+        ? await prepareRemoteRunnerExplicitClose(ds, stored)
+        : { ok: true };
   if (!prepared.ok) {
     return { ...prepared, alreadyClosed: false };
   }
@@ -7741,6 +8044,18 @@ export async function closeSession(
           error: 'mojo_durable_close_failed',
           retryable: true,
           ...(prepared.taskId ? { taskId: prepared.taskId } : {}),
+        };
+      }
+      if (isOwnedRemoteRunnerClose && preparedRemoteRequestId) {
+        logger.error(
+          `[${sessionId.slice(0, 8)}] Durable session close failed after Remote Runner cancel; `
+          + `retaining prepared commit: ${err instanceof Error ? err.message : String(err)}`,
+        );
+        return {
+          ok: false,
+          alreadyClosed: false,
+          error: 'remote_runner_durable_close_failed',
+          retryable: true,
         };
       }
       if (!isOwnedRiffClose) throw err;
@@ -11239,6 +11554,9 @@ export function hasQueuedActivationAdmissionGate(ds: DaemonSession): boolean {
 
 export type ForkResumeOrTurnId = boolean | string | {
   resume?: boolean;
+  /** Explicit close reactivation asks a Remote Runner provider to replace the
+   * cancelled remote generation instead of reattaching it. */
+  remoteResumeMode?: 'reattach' | 'rebuild';
   turnId?: string;
   dispatchAttempt?: number;
   /** The payload is an exact retained activation journal. Do not re-read the
@@ -11267,6 +11585,11 @@ export type ForkResumeOrTurnId = boolean | string | {
 export type WorkerForkAdmission = 'accepted' | 'deferred' | 'rejected';
 export type ForkWorkerOptions = {
   onAdmission?: (admission: WorkerForkAdmission) => void;
+  /** Called once when an admitted worker exits before its ready boundary. */
+  onPreReadyExit?: () => void;
+  /** Called once when an admitted Remote Runner worker survives startup but
+   * its backend exits before publishing the rebuilt backend state. */
+  onRemoteBackendStartupExit?: () => boolean;
   deferDuringDeviceIsolation?: boolean;
   /**
    * Internal: this call is the single re-entry after a marginal-admission
@@ -11543,6 +11866,7 @@ export function forkWorker(
     && promptInput !== null
     && promptInput.codexAppSteerable === true;
   let resume = false;
+  let remoteResumeMode: 'reattach' | 'rebuild' | undefined;
   let initTurnId: string | undefined;
   let initDispatchAttempt: number | undefined;
   let restartAttemptId: string | undefined;
@@ -11554,6 +11878,7 @@ export function forkWorker(
     initTurnId = resumeOrTurnId;
   } else if (typeof resumeOrTurnId === 'object' && resumeOrTurnId !== null) {
     resume = resumeOrTurnId.resume === true;
+    remoteResumeMode = resumeOrTurnId.remoteResumeMode;
     initTurnId = resumeOrTurnId.turnId;
     initDispatchAttempt = resumeOrTurnId.dispatchAttempt;
     restartAttemptId = resumeOrTurnId.restartAttemptId;
@@ -12209,6 +12534,8 @@ export function forkWorker(
     ready: false, failureNotified: false,
     initTurnId: initAttributionTurnId,
     initDispatchAttempt,
+    onPreReadyExit: opts.onPreReadyExit,
+    onRemoteBackendStartupExit: opts.onRemoteBackendStartupExit,
   };
 
   // A fork-level failure (spawn ENOENT, etc.) emits 'error'; without a handler
@@ -12427,9 +12754,13 @@ export function forkWorker(
     // messages would silently move a live session from cloud to host execution,
     // or resume it against a different tenant/workspace than the one holding its
     // remote session.
-    backendConfig: botCfg.backendType === 'mojo' || agentCfg.cliId === 'mojo'
-      ? sessionMojoConfig(ds, botCfg, { freeze: true }).config
-      : botCfg.riff,
+    backendConfig: botCfg.backendType === 'remote-runner' || agentCfg.cliId === 'remote-runner'
+      ? botCfg.remoteRunner
+      : botCfg.backendType === 'mojo' || agentCfg.cliId === 'mojo'
+        ? sessionMojoConfig(ds, botCfg, { freeze: true }).config
+        : botCfg.riff,
+    remoteBackendState: ds.session.remoteBackendState,
+    ...(remoteResumeMode ? { remoteResumeMode } : {}),
     riffParentTaskId: ds.session.riffParentTaskId,
     riffRepoDirs: ds.session.riffRepoDirs,
     deferredScheduleRun: ds.session.deferredScheduleRun,
@@ -13122,6 +13453,9 @@ function setupWorkerHandlers(
     }
     const effectiveCliId = sessionCliId(ds, botCfg);
     switch (msg.type) {
+      case 'active_turn_envelope_changed':
+        inheritActiveTurnFinalSuppression(ds, msg.previousTurnId, msg.turnId);
+        break;
       case 'terminal_turn_started': {
         if (sessionPromptInjection(ds) !== 'none' || ds.adoptedFrom || ds.session.adoptedFrom
           || ds.session.vcMeetingReceiver || !ds.chatId.startsWith('oc_')
@@ -13198,6 +13532,23 @@ function setupWorkerHandlers(
         // Compatibility/fallback: a commit also proves receipt if the earlier
         // receipt ACK was delayed or dropped on the reverse IPC channel.
         completeOrdinaryImDelivery(ds, msg.turnId, workerGeneration);
+        const registeredTurn = ds.idempotentAsyncTurns?.get(msg.turnId);
+        if (registeredTurn?.kind === 'turn'
+          && registeredTurn.ownerLarkAppId === ds.larkAppId
+          && registeredTurn.workerGeneration === workerGeneration
+          && !registeredTurn.postBarrierFault) {
+          try {
+            recordTurnInputCommit({
+              ownerLarkAppId: ds.larkAppId, key: registeredTurn.key,
+              sessionId: ds.session.sessionId, triggerId: msg.turnId,
+              ownerBootId: getDaemonBootId(), workerGeneration, observedAt: Date.now(),
+            });
+          } catch {
+            // A failed observation write leaves inputCommitted unknown. Keep
+            // the attempting fence and the normal turn lifecycle intact.
+            logger.warn('Could not persist keyed turn input-commit observation');
+          }
+        }
         commitTriggerStreamingCard(ds, msg.turnId, (target, title, turnId) => {
           if (!managedAuxUiSuppressed(turnId) && !streamingCardDisabled(target, turnId)
             && !getBot(target.larkAppId).config.privateCard) {
@@ -13317,6 +13668,7 @@ function setupWorkerHandlers(
           break;
         }
         startupState.ready = true;
+        startupState.onPreReadyExit = undefined;
         ds.workerReady = true;
         // A generation reached ready: the transient-startup failing streak is
         // over. Clear the budget and any still-pending retry timer (an inbound
@@ -14895,6 +15247,19 @@ function setupWorkerHandlers(
           logger.warn(`[${t}] Suppressed stale claude_exit lifecycle continuation`);
           break;
         }
+        let remoteBackendStartupReconciled = false;
+        if (isRemoteBackendSession(ds) && startupState.onRemoteBackendStartupExit) {
+          const reconcile = startupState.onRemoteBackendStartupExit;
+          startupState.onRemoteBackendStartupExit = undefined;
+          try {
+            remoteBackendStartupReconciled = reconcile() === true;
+          } catch (error) {
+            logger.error(
+              `[${t}] Failed to reconcile remote backend startup exit: `
+              + `${error instanceof Error ? error.message : String(error)}`,
+            );
+          }
+        }
         const suppressExitUi = managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt);
 
         if (msg.codexAppActiveWriter === true && effectiveCliId === 'codex-app') {
@@ -14978,6 +15343,16 @@ function setupWorkerHandlers(
         // context-less replacement, so treating a mojo backend exit as a local
         // CLI crash silently destroyed remote context (fourth-round review).
         if (isRemoteBackendSession(ds)) {
+          if (remoteBackendStartupReconciled) {
+            logger.warn(
+              `[${t}] Remote backend exited before rebuild readiness; restored the durable closed row`,
+            );
+            // The backend is already gone and the explicit-resume row has been
+            // restored to closed. Retire the otherwise-idle Node worker and do
+            // not emit the generic "remote restart unsupported" guidance.
+            retireWorkerProcessOnly(ds, 'remote_rebuild_startup_failed');
+            break;
+          }
           const retirementPhase = remoteRetirementAdmissionPhase(ds);
           logger.warn(
             `[${t}] Remote backend exited; automatic restart is unsupported`
@@ -15183,6 +15558,84 @@ function setupWorkerHandlers(
             `[${t}] Failed to persist Riff lineage ${msg.taskId}: ${err instanceof Error ? err.message : String(err)}`,
           );
         }
+        break;
+      }
+
+      case 'remote_backend_state': {
+        if (ds.worker !== worker || ds.workerGeneration !== workerGeneration) {
+          logger.warn(`[${t}] Ignored remote backend state from stale worker generation`);
+          break;
+        }
+        const state = normalizeRemoteRunnerBackendState(msg.state);
+        if (!state) {
+          logger.error(`[${t}] Ignored invalid remote backend state`);
+          break;
+        }
+        const prior = ds.session.remoteBackendState;
+        if (prior && state.provider !== prior.provider) {
+          logger.error(`[${t}] Ignored remote backend state from a different provider`);
+          break;
+        }
+        if (prior && state.generation < prior.generation) {
+          logger.warn(`[${t}] Ignored stale remote backend generation ${state.generation}`);
+          break;
+        }
+        if (prior
+            && state.generation === prior.generation
+            && prior.remoteSessionId
+            && state.remoteSessionId !== prior.remoteSessionId) {
+          logger.error(`[${t}] Ignored remote backend state that changed or cleared its session id without advancing generation`);
+          break;
+        }
+        const priorUsage = ds.session.remoteRunnerUsage;
+        ds.session.remoteBackendState = state;
+        if (priorUsage && priorUsage.generation !== state.generation) {
+          ds.session.remoteRunnerUsage = undefined;
+        }
+        try {
+          sessionStore.updateSession(ds.session);
+          // RemoteRunnerBackend publishes its normalized ready state before
+          // firing onReady. For an explicit rebuild this is the durable proof
+          // that the provider crossed its second (backend) startup boundary.
+          startupState.onRemoteBackendStartupExit = undefined;
+        } catch (err) {
+          ds.session.remoteBackendState = prior;
+          ds.session.remoteRunnerUsage = priorUsage;
+          logger.error(
+            `[${t}] Failed to persist remote backend state: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+        break;
+      }
+
+      case 'remote_usage': {
+        if (
+          ds.worker !== worker
+          || ds.workerGeneration !== workerGeneration
+          || ds.session.workerGeneration !== workerGeneration
+        ) {
+          logger.warn(`[${t}] Ignored remote usage from stale worker generation`);
+          break;
+        }
+        const usage = normalizeRemoteRunnerUsageReport(msg.usage);
+        const state = normalizeRemoteRunnerBackendState(ds.session.remoteBackendState);
+        if (!usage || !state || usage.generation !== state.generation) {
+          logger.error(`[${t}] Ignored invalid or stale remote usage snapshot`);
+          break;
+        }
+        if (JSON.stringify(ds.session.remoteRunnerUsage) === JSON.stringify(usage)) break;
+        const priorUsage = ds.session.remoteRunnerUsage;
+        ds.session.remoteRunnerUsage = usage;
+        try {
+          sessionStore.updateSession(ds.session);
+        } catch (err) {
+          ds.session.remoteRunnerUsage = priorUsage;
+          logger.error(
+            `[${t}] Failed to persist remote usage snapshot: ${err instanceof Error ? err.message : String(err)}`,
+          );
+          break;
+        }
+        scheduleActiveRuntimePatch(ds);
         break;
       }
 
@@ -16284,14 +16737,7 @@ function setupWorkerHandlers(
         if (msg.turnId.startsWith('mlrp_turn_')) {
           markMessageListenerRunPreviewRunning(msg.turnId);
         }
-        deliverFinalOutput(
-          ds,
-          msg,
-          t,
-          0,
-          undefined,
-          ownsLifecycleMutation,
-        );
+        deliverFinalOutputWithShutdownDrain(ds, msg, t, ownsLifecycleMutation);
         break;
       }
 
@@ -16309,11 +16755,13 @@ function setupWorkerHandlers(
         }
         if (managedAuxUiSuppressed(msg.turnId)) break;
         if (!msg.userText.trim() && !msg.assistantText.trim()) break;
+        const assistantText = await prepareAdoptedReplyImages(ds, msg.assistantText, { omitImages: false }, ownsLifecycleMutation);
+        if (!ownsLifecycleMutation()) break;
         const recipientOpenId = daemonCardFooterRecipientOpenId(ds, effectiveCliId);
         const cardJson = buildContextualReplyCard({
           title: tr('card.adopt_last_round', undefined, localeForBot(ds.larkAppId)),
           userText: msg.userText,
-          assistantText: msg.assistantText,
+          assistantText,
           assistantLabel: sessionCliDisplayName(ds, botCfg),
           recipientOpenId,
           brand: renderBrandTemplate(resolveBrandLabel(ds.larkAppId), ds.workingDir),
@@ -16322,8 +16770,11 @@ function setupWorkerHandlers(
           localHomeLinkMode: daemonCardLocalHomeLinkMode(ds),
           usage: getDaemonReplyCardUsageSnapshot(ds, effectiveCliId),
         });
-        scopedReply(cardJson, 'interactive', msg.turnId).catch((err: any) => {
-          logger.warn(`[${t}] Failed to deliver adopt_preamble to Lark: ${err.message}`);
+        replyWithImageFallback(cardJson, 'interactive', content => {
+          if (!ownsLifecycleMutation()) return Promise.reject(new Error('Adopt worker ownership changed'));
+          return scopedReply(content, 'interactive', msg.turnId);
+        }).catch((err: unknown) => {
+          logger.warn(`[${t}] Failed to deliver adopt_preamble to Lark: ${err instanceof Error ? err.message : String(err)}`);
         });
         break;
       }
@@ -16493,6 +16944,17 @@ function setupWorkerHandlers(
           patch: { webPort: null, workerPid: null },
         },
       });
+      if (preReadyExit) {
+        const onPreReadyExit = startupState.onPreReadyExit;
+        startupState.onPreReadyExit = undefined;
+        try { onPreReadyExit?.(); }
+        catch (error) {
+          logger.error(
+            `[${t}] Failed to reconcile pre-ready worker exit: `
+            + `${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+      }
     }
     if (!transferRetirement) {
       let workerExitReconciled: void | Promise<void> = undefined;
@@ -16566,6 +17028,32 @@ function setupWorkerHandlers(
 
 const FINAL_OUTPUT_RETRY_BACKOFF_MS = [0, 5000, 15000];  // immediate, +5s, +15s
 const codexAppFinalSettlementInFlight = new Map<string, Promise<boolean>>();
+
+/** Ordinary bridge finals are daemon-owned external effects. Keep one exact
+ * shutdown drain registration alive across all bounded retry attempts; the
+ * provider terminal alone must not allow its worker generation to retire while
+ * attempt 0 is still queued on the event loop. */
+function deliverFinalOutputWithShutdownDrain(
+  ds: DaemonSession,
+  msg: Extract<WorkerToDaemon, { type: 'final_output' }>,
+  t: string,
+  isStillOwned: () => boolean,
+): void {
+  const finishDrain = beginFinalOutputDelivery(ds);
+  try {
+    deliverFinalOutput(
+      ds,
+      msg,
+      t,
+      0,
+      () => finishDrain(),
+      isStillOwned,
+    );
+  } catch (error) {
+    finishDrain();
+    throw error;
+  }
+}
 
 // ─── HTTP steer-group fan-out (options.steer → codex-app native turn/steer) ──
 //
@@ -16928,6 +17416,7 @@ function deliverFinalOutput(
   frozenReplyTarget?: FrozenSessionReplyTarget,
   frozenUsage?: CardUsageSnapshot,
   frozenInitiator?: ZeroPromptFinalInitiator | null,
+  imageFallback: ReplyImageState = { omitImages: false },
 ): void {
   if (!isStillOwned()) {
     onComplete?.(false);
@@ -17011,17 +17500,22 @@ function deliverFinalOutput(
     msgType?: string,
     turnId?: string,
     opts?: Omit<WorkerSessionReplyOptions, 'sourceSessionId'>,
-  ) => cb.sessionReply(
-    sessionAnchorId(ds),
-    content,
-    msgType,
-    ds.larkAppId,
-    fallbackTurnId(ds, turnId),
-    { ...opts, sourceSessionId: ds.session.sessionId, ...(topicMessageLookup ? { topicMessageLookup } : {}), beforeWrite: async () => {
-      if (opts?.beforeWrite) await opts.beforeWrite();
-      if (!isStillOwned()) throw new Error('Final output no longer owns delivery');
-    } },
-  );
+  ) => {
+    if (!isStillOwned() || ds.session.status === 'closed') {
+      return Promise.reject(new Error('Final output ownership changed or session closed'));
+    }
+    return cb.sessionReply(
+      sessionAnchorId(ds),
+      content,
+      msgType,
+      ds.larkAppId,
+      fallbackTurnId(ds, turnId),
+      { ...opts, sourceSessionId: ds.session.sessionId, ...(topicMessageLookup ? { topicMessageLookup } : {}), beforeWrite: async () => {
+        if (opts?.beforeWrite) await opts.beforeWrite();
+        if (!isStillOwned() || ds.session.status === 'closed') throw new Error('Final output no longer owns delivery');
+      } },
+    );
+  };
   setTimeout(async () => {
     if (!isStillOwned()) {
       logger.info(`[${t}] Bridge final_output abandoned — worker/session ownership changed`);
@@ -17213,6 +17707,8 @@ function deliverFinalOutput(
       const safeUserText = managedReceiver && msg.userText !== undefined
         ? neutralizeLarkAtTags(msg.userText)
         : msg.userText;
+      const renderedAssistantText = await prepareAdoptedReplyImages(ds, safeAssistantText, imageFallback, isStillOwned);
+      if (!isStillOwned()) { onComplete?.(false); return; }
       const recipientOpenId = managedReceiver
         ? undefined
         : imOrigin?.replyTargetSenderOpenId
@@ -17224,8 +17720,8 @@ function deliverFinalOutput(
         ? failureNoticeFallbackMentionOpenId(ds)
         : undefined;
       const deliveredAssistantText = failureMentionOpenId
-        ? `<at id=${failureMentionOpenId}></at> ${safeAssistantText}`
-        : safeAssistantText;
+        ? `<at id=${failureMentionOpenId}></at> ${renderedAssistantText}`
+        : renderedAssistantText;
       const localHomeLinkMode = daemonCardLocalHomeLinkMode(ds);
       // forkWorker snapshots the effective policy for this worker lifetime.
       // Keep daemon fallback delivery aligned with the same frozen policy the
@@ -17280,7 +17776,7 @@ function deliverFinalOutput(
         ? buildContextualReplyCard({
             title: localTurnTitle,
             userText: msg.kind === 'local-turn' ? safeUserText ?? '' : undefined,
-            assistantText: safeAssistantText,
+            assistantText: renderedAssistantText,
             assistantLabel: storedSessionCliDisplayName(ds),
             recipientOpenId,
             brand: renderBrandTemplate(resolveBrandLabel(ds.larkAppId), ds.workingDir),
@@ -17456,14 +17952,19 @@ function deliverFinalOutput(
             frozenReplyTarget ? { uuid, beforeWrite, replyTarget: frozenReplyTarget } : { uuid, beforeWrite }),
           { dispatchAttempt: msg.dispatchAttempt, owns: isStillOwned })
         : undefined;
-      const messageId = unifiedReply?.messageId ?? await scopedReply(
-        canonicalOutput.content,
+      const sendFinal = (content: string) => scopedReply(
+        content,
         canonicalOutput.msgType,
         msg.replyTurnId ?? msg.turnId,
         frozenReplyTarget && !managedReceiver
           ? { ...deliveryReplyOptions, replyTarget: frozenReplyTarget }
           : deliveryReplyOptions,
       );
+      // Unified cards persist their own image downgrade. Managed VC replies
+      // retain their audited payload; only legacy replies use this fallback.
+      const messageId = unifiedReply?.messageId ?? await (managedReceiver
+        ? sendFinal(canonicalOutput.content)
+        : replyWithImageFallback(canonicalOutput.content, canonicalOutput.msgType, sendFinal, imageFallback));
       if (!isStillOwned()) { onComplete?.(true); return; }
       recordPrimaryOutput(messageId);
       const explicit = unifiedReply?.record.finalSource === 'explicit' ? unifiedReply.record : undefined;
@@ -17522,6 +18023,51 @@ function deliverFinalOutput(
         onComplete?.(true);
         return;
       }
+      if (isLarkContentAuditError(err)) {
+        // The platform PERMANENTLY rejected this payload (tenant DLP / content
+        // audit: e.g. an email address or phone number in the answer). Retrying
+        // unchanged cannot succeed and only burns 22s of backoff while leaving
+        // the thread with zero signal — the CoT bubble already says "done".
+        // Post a fixed, audit-safe notice (never the rejected body), settle the
+        // turn, and light the dashboard attention row.
+        const auditCode = larkErrorCode(err);
+        logger.error(
+          `[${t}] Bridge final_output rejected by Lark content audit code=${auditCode ?? 'unknown'} `
+          + `(turn ${msg.turnId.substring(0, 8)}); not retrying`,
+        );
+        const locale = localeForBot(ds.larkAppId);
+        const notice = tr('worker.final_output_content_audit_blocked', { code: String(auditCode ?? 'unknown') }, locale);
+        // Feishu IM uuid hard cap is 50 chars; raw sessionId(36)+turnId(~35)
+        // concatenation is 80+ and would itself be rejected (silently defeating
+        // this very notice) or truncated so multiple blocks share one dedupe key.
+        // Hash the composite to a stable 50-char token.
+        const noticeUuid = `ab_${createHash('sha256')
+          .update(`audit-blocked:${ds.session.sessionId}:${msg.turnId}`)
+          .digest('hex')
+          .slice(0, 47)}`;
+        try {
+          await scopedReply(
+            notice,
+            'text',
+            msg.replyTurnId ?? msg.turnId,
+            { uuid: noticeUuid },
+          );
+        } catch (noticeError) {
+          logger.warn(`[${t}] content-audit notice delivery failed: ${noticeError instanceof Error ? noticeError.message : String(noticeError)}`);
+        }
+        ds.agentAttention = { kind: 'blocked', reason: `content audit ${auditCode ?? 'unknown'}`, at: Date.now() };
+        publishAttentionPatch(ds);
+        emitSessionLifecycleHook(ds, 'session.requires_attention', {
+          reason: 'content_audit_blocked',
+          message: `Lark content audit ${auditCode ?? 'unknown'} rejected the final reply`,
+          turnId: msg.turnId,
+        });
+        // Same content can never be delivered as-is; settle like an explicit
+        // withdrawal instead of leaving the turn open for identical retransmits.
+        ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
+        onComplete?.(true);
+        return;
+      }
       if (err instanceof TopicSendError && err.code === 'TOPIC_SEND_BLOCKED') {
         // The original topic cannot receive a notice. Surface the failure on the
         // existing Dashboard attention channel without changing the send route.
@@ -17567,7 +18113,7 @@ function deliverFinalOutput(
         return;
       }
       logger.warn(`[${t}] Bridge final_output attempt ${next} failed (${err.message}); retrying in ${FINAL_OUTPUT_RETRY_BACKOFF_MS[next]}ms`);
-      deliverFinalOutput(ds, msg, t, next, onComplete, isStillOwned, frozenReplyTarget, cardUsage, initiator);
+      deliverFinalOutput(ds, msg, t, next, onComplete, isStillOwned, frozenReplyTarget, cardUsage, initiator, imageFallback);
     }
   }, FINAL_OUTPUT_RETRY_BACKOFF_MS[attempt] ?? 0);
 }

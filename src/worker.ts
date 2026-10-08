@@ -107,6 +107,13 @@ import {
   READ_ONLY_REMOTE_SCROLL_WINDOW_MS,
   ReadOnlyRemoteScrollLimiter,
 } from './utils/web-terminal-scroll.js';
+import {
+  formatMobileInputModeOsc,
+  getWebTerminalInputMode,
+  MOBILE_INPUT_MODE_OSC_REGEX,
+  setWebTerminalInputMode,
+  type WebTerminalInputMode,
+} from './services/web-terminal-settings-store.js';
 import { aidenCodexResumeNeedsRedraw, CodexUpdateDialogGuard, codexUpdateDialogSafeKeys } from './utils/codex-update-dialog.js';
 import { EffortConfirmDialogGuard, isEffortLevelCommand } from './utils/effort-confirm-dialog.js';
 import { installStdioEpipeGuard, isIgnorableStreamError } from './utils/stdio-epipe-guard.js';
@@ -126,6 +133,7 @@ import {
   type PendingCliInput,
 } from './utils/pending-input-queue.js';
 import { remoteWorkerShutdownInputBlocker } from './core/remote-worker-shutdown-readiness.js';
+import { sendRemoteRunnerOutboundMessage } from './services/remote-runner-outbound-send.js';
 import { ReadyGate, shouldArmReadyGate } from './utils/ready-gate.js';
 import { shouldRunStartupCommandsOnSpawn, shouldDeferInitialPromptForStartup } from './core/startup-commands.js';
 import { sanitizePerBotEnv } from './core/per-bot-env.js';
@@ -152,6 +160,7 @@ import {
   readScheduledTaskAnchors,
   upsertScheduledTaskAnchor,
 } from './services/bridge-scheduled-anchors.js';
+import { checkpointCodexAdoptTurns, restoreCodexAdoptTurns } from './services/codex-adopt-recovery.js';
 import { defaultGatewayEntry, ensureGatewayEntry } from './core/plugins/mcp/gateway-installer.js';
 import {
   sessionMcpGatewayPathRegex,
@@ -1155,7 +1164,7 @@ function queuePostSubmitNativeSessionTitle(title: string | undefined): boolean {
   if (!supportsPostSubmitRenameSessionTitle(cfg.cliId)) return false;
   if (codexRpcEngine || remoteWsUrl) return false;
   if (!cliAdapter?.buildSessionRenameCommand) return false;
-  if (effectiveBackendType === 'riff' || effectiveBackendType === 'mojo') return false;
+  if (isRemoteBackendType(effectiveBackendType)) return false;
   nativeSessionTitleRevision += 1;
   nativeSessionTitleAppliedThreadId = undefined;
   cfg.nativeSessionTitle = trimmed;
@@ -2412,7 +2421,7 @@ let closeRequested = false;
 let capturedSpawnCommand: string | null = null;
 let deferredTopicOutputTail = '';
 const reportedDeferredTopicRoots = new Set<string>();
-const CLI_DISPLAY_NAMES: Record<string, string> = { 'claude-code': 'Claude', seed: 'Seed', relay: 'Relay', aiden: 'Aiden', coco: 'CoCo', codex: 'Codex', 'codex-app': 'Codex App', cursor: 'Cursor', gemini: 'Gemini', genius: 'Genius', opencode: 'OpenCode', opencode2: 'OpenCode 2', mimocode: 'MiMoCode', antigravity: 'Antigravity', mtr: 'MTR', hermes: 'Hermes', mira: 'Mira', mir: 'Mir CLI', traex: 'TRAE', pi: 'Pi', copilot: 'Copilot', 'oh-my-pi': 'Oh My Pi', ebsd: 'ebsd', kimi: 'Kimi', grok: 'Grok Build', 'kiro-cli': 'Kiro', riff: 'Riff', reasonix: 'Reasonix', dsh: 'DeepSeek Harness', 'dsh-tui': 'DeepSeek Harness TUI', mojo: 'Mojo', minimax: 'MiniMax' };
+const CLI_DISPLAY_NAMES: Record<string, string> = { 'claude-code': 'Claude', seed: 'Seed', relay: 'Relay', aiden: 'Aiden', coco: 'CoCo', codex: 'Codex', 'codex-app': 'Codex App', cursor: 'Cursor', gemini: 'Gemini', genius: 'Genius', opencode: 'OpenCode', opencode2: 'OpenCode 2', mimocode: 'MiMoCode', antigravity: 'Antigravity', mtr: 'MTR', hermes: 'Hermes', mira: 'Mira', mir: 'Mir CLI', traex: 'TRAE', pi: 'Pi', copilot: 'Copilot', 'oh-my-pi': 'Oh My Pi', ebsd: 'ebsd', kimi: 'Kimi', grok: 'Grok Build', 'kiro-cli': 'Kiro', riff: 'Riff', reasonix: 'Reasonix', dsh: 'DeepSeek Harness', 'dsh-tui': 'DeepSeek Harness TUI', mojo: 'Mojo', minimax: 'MiniMax', 'remote-runner': 'Remote Runner' };
 function cliName(): string {
   return (lastInitConfig?.cliRuntime?.source === 'configured'
     ? (lastInitConfig.cliRuntime.displayName?.trim() || lastInitConfig.cliRuntime.id)
@@ -2903,10 +2912,9 @@ async function runStartupCommands(): Promise<void> {
   if (lastInitConfig?.adoptMode) return;
   if (!backend) return;
   // 远端后端：generic startupCommands 是 PTY 语义（sendRawCommandLine = write 文本 +
-  // 200ms 后 write 回车），对 riff/mojo 每条会裂成两个独立远端 turn 并打乱血缘。
-  // riff 的初始化命令走自己的 riff.setupCommands（沙箱内执行）；mojo 无对应机制，
-  // 其环境准备由 --cloud 沙箱镜像负责。两者这里都必须跳过。
-  if (effectiveBackendType === 'riff' || effectiveBackendType === 'mojo') {
+  // 200ms 后 write 回车），对结构化远端后端每条会裂成两个独立 turn 并打乱血缘。
+  // Provider-specific initialization belongs in the provider implementation.
+  if (isRemoteBackendType(effectiveBackendType)) {
     log(`Skipping ${cmds.length} generic startup command(s) — ${effectiveBackendType} backend has no PTY to drive`);
     return;
   }
@@ -3278,7 +3286,10 @@ let currentBotmuxTurnId: string | undefined;
 let currentBotmuxDispatchAttempt: number | undefined;
 let currentVcMeetingImTurnOrigin: VcMeetingImTurnOrigin | undefined;
 let durableTurnInFlight = false;
-const activeTurnAuthority = new ActiveTurnAuthority();
+const activeTurnAuthority = new ActiveTurnAuthority((previousTurnId, turnId) => {
+  // Ordered IPC reaches the daemon before any output attributed to the steer.
+  send({ type: 'active_turn_envelope_changed', previousTurnId, turnId });
+});
 
 function turnAuthorityIdentity(input: {
   turnId?: string;
@@ -5020,6 +5031,7 @@ let codexBridgeOffset = 0;
 let codexBridgeDrainState: CodexDrainState | undefined;
 let codexBridgePendingTail = '';
 let codexBridgeBaselineDone = false;
+let codexAdoptRecoveryAttempted = false;
 let publishedActiveRuntime: TraexRuntimeSnapshot = {};
 let activeRuntimePublished = false;
 const codexBridgeQueue = new CodexBridgeQueue(Date.now, notifyTerminalTurnStarted);
@@ -5216,6 +5228,20 @@ function bridgeTurnJournalFilePath(): string | undefined {
   return join(process.env.SESSION_DATA_DIR, 'turn-marks', `${sessionId}.json`);
 }
 
+function codexAdoptJournalPath(): string | undefined {
+  const base = bridgeTurnJournalFilePath();
+  return base && lastInitConfig?.adoptMode && structuredBridgeIsCodex() ? `${base}.codex-adopt` : undefined;
+}
+
+function checkpointCodexAdoptRecovery(): void {
+  const path = codexAdoptJournalPath();
+  // The first attach must consume the previous generation's journal before a
+  // new pre-path input or an early empty drain can replace it.
+  if (!path || !codexBridgeRolloutPath || !codexAdoptRecoveryAttempted) return;
+  try { checkpointCodexAdoptTurns(path, codexBridgeRolloutPath, codexBridgeQueue); }
+  catch (error: unknown) { log(`Codex adopt checkpoint failed: ${error instanceof Error ? error.message : String(error)}`); }
+}
+
 /** Per-session durable file of built-in CronCreate task → topic anchors.
  *  Sibling of the pending-turn journal; lets a re-attached worker keep
  *  routing scheduled reports to the topic each task was created in. */
@@ -5298,6 +5324,7 @@ function clearBridgeTurnJournalFile(): void {
   const path = bridgeTurnJournalFilePath();
   if (!path) return;
   try { clearBridgeTurnJournal(path); } catch { /* best-effort — session is closing */ }
+  try { clearBridgeTurnJournal(`${path}.codex-adopt`); } catch { /* best-effort */ }
 }
 
 function readSendMarkers(): BridgeSendMarker[] {
@@ -5376,7 +5403,7 @@ function stampMojoTurnMark(turnId: string | undefined, dispatchAttempt: number |
   mojoTurnMark = { turnId, dispatchAttempt, markTimeMs: Date.now() };
 }
 
-function deliverMojoTurnFinal(text: string): void {
+function deliverRemoteTurnFinal(text: string, exactTurnId?: string): void {
   if (!text.trim()) return;
   // A mark from an EARLIER turn must not gate this one: its window opened
   // before the previous turn's sends, which would suppress this answer for the
@@ -5384,12 +5411,12 @@ function deliverMojoTurnFinal(text: string): void {
   // deliver" (shouldSuppressBridgeEmit needs markTimeMs to suppress on sends),
   // which is the safe direction for a bug whose symptom is silence.
   const mark = mojoTurnMark && mojoTurnMark.turnId === currentBotmuxTurnId ? mojoTurnMark : null;
-  const turnId = mark?.turnId ?? currentBotmuxTurnId;
+  const turnId = exactTurnId ?? mark?.turnId ?? currentBotmuxTurnId;
   // Without a turn id the daemon cannot resolve a reply target, and lastUuid
   // would not dedupe a retry. Dropping is right: this can only be output that
   // belongs to no Lark turn.
   if (!turnId) {
-    log('Mojo final bridge skipped: no turn id for this answer');
+    log('Remote final bridge skipped: no turn id for this answer');
     return;
   }
   const dispatchAttempt = mark?.dispatchAttempt ?? currentBotmuxDispatchAttempt;
@@ -5408,7 +5435,7 @@ function deliverMojoTurnFinal(text: string): void {
   );
   if (shouldSuppressBridgeEmit(gateInput, undefined, markers, adoptMode, replyDeliveryMode())) {
     log(
-      `Mojo final bridge suppressed for turn ${turnId.substring(0, 12)} `
+      `Remote final bridge suppressed for turn ${turnId.substring(0, 12)} `
       + `(${isBridgeNothingToSendFinal(text) ? 'nothing-to-send sentinel' : 'model already called botmux send'})`,
     );
     // Same as the structured bridge: an explicit send IS this turn's reply, so
@@ -5429,7 +5456,49 @@ function deliverMojoTurnFinal(text: string): void {
     turnId,
     ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
   });
-  log(`Mojo final bridge delivered ${postContent.length} chars for turn ${turnId.substring(0, 12)}`);
+  log(`Remote final bridge delivered ${postContent.length} chars for turn ${turnId.substring(0, 12)}`);
+}
+
+async function deliverRemoteRunnerOutboundMessage(
+  message: import('./adapters/backend/remote-runner-protocol.js').RemoteRunnerOutboundMessage,
+): Promise<import('./adapters/backend/remote-runner-protocol.js').RemoteRunnerOutboundMessageResult> {
+  const authority = activeTurnAuthority.identity();
+  if (!sessionId || !lastInitConfig
+    || message.turnId !== currentBotmuxTurnId
+    || authority.turnId !== message.turnId
+    || (authority.dispatchAttempt !== undefined
+      && authority.dispatchAttempt !== currentBotmuxDispatchAttempt)) {
+    return {
+      outcome: 'rejected',
+      code: 'outbound_turn_stale',
+      message: 'The outbound message no longer belongs to the worker\'s active turn.',
+    };
+  }
+
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    SESSION_DATA_DIR: process.env.SESSION_DATA_DIR ?? config.session.dataDir,
+    BOTMUX_LARK_APP_ID: lastInitConfig.larkAppId,
+    BOTMUX_CHAT_ID: lastInitConfig.chatId,
+    BOTMUX_SESSION_SCOPE: lastInitConfig.rootMessageId?.startsWith('om_') ? 'thread' : 'chat',
+    BOTMUX_ROOT_MESSAGE_ID: lastInitConfig.rootMessageId,
+    BOTMUX_REPLY_STYLE: JSON.stringify(lastInitConfig.replyStyle ?? {}),
+  };
+  const pinnedConfig = resolveChildBotsConfig(
+    lastInitConfig.loadedBotsConfigPath,
+    lastInitConfig.loadedBotsConfigProvenance,
+  );
+  if (pinnedConfig) env.BOTS_CONFIG = pinnedConfig;
+  else delete env.BOTS_CONFIG;
+
+  return sendRemoteRunnerOutboundMessage(message, {
+    sessionId,
+    turnId: message.turnId,
+    ...(currentBotmuxDispatchAttempt !== undefined
+      ? { dispatchAttempt: currentBotmuxDispatchAttempt }
+      : {}),
+    env,
+  });
 }
 
 function submitActivityEvidenceSince(
@@ -7394,9 +7463,15 @@ function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'bas
     // "iTerm 手动输入飞书没收到" symptom under late-attach.
     const result = structuredBridgeIngestPath(rolloutPath, 0);
     const cutoff = (codexAdoptStartMs ?? Date.now()) - 5_000;
-    const { history, live } = splitCodexEventsByCutoff(result.events, cutoff);
+    const journalPath = codexAdoptJournalPath();
+    const recover = journalPath && !codexAdoptRecoveryAttempted;
+    const { history, live, restored } = recover
+      ? restoreCodexAdoptTurns(journalPath, rolloutPath, codexBridgeQueue, result.events, cutoff)
+      : { ...splitCodexEventsByCutoff(result.events, cutoff), restored: 0 };
+    if (journalPath) codexAdoptRecoveryAttempted = true;
     codexBridgeQueue.absorb(history);
     codexBridgeQueue.ingest(live);
+    if (restored > 0) log(`Codex adopt restored ${restored} pending turn(s) without re-submitting input`);
     pruneExpiredStructuredHeadsAndEmit('structured split-live attach');
     // Late attach can discover an already-completed live turn in the same
     // drain. Re-drive prompt readiness from that terminal event immediately;
@@ -8287,6 +8362,7 @@ function codexBridgeMarkPendingTurn(
   if (!codexBridgeFallbackActive()) return undefined;
   const turnId = preferredTurnId ?? `codex-${randomBytes(8).toString('hex')}`;
   codexBridgeQueue.mark(turnId, messageText, markTimeMs, dispatchAttempt);
+  checkpointCodexAdoptRecovery();
   return turnId;
 }
 
@@ -8691,6 +8767,7 @@ function drainReliableTerminalBeforeInterrupt(): void {
 
 function emitReadyCodexTurns(): void {
   const ready = codexBridgeQueue.drainEmittable();
+  checkpointCodexAdoptRecovery();
   if (ready.length === 0) return;
   // Turns suppressed as GENUINE SILENCE (model terminated with a bare
   // nothing-to-send sentinel, no `botmux send`). Tracked by object identity —
@@ -9050,6 +9127,33 @@ function relayHerdrWebSnapshot(snapshot: string): void {
   }
 }
 
+/** Replace, rather than append, one Remote Runner full-screen snapshot.
+ *
+ * Remote Runner providers publish the complete current viewport.  Replaying
+ * those frames through onPtyData would retain one mostly-overlapping TUI screen
+ * per poll in `scrollback`; a page refresh would faithfully replay that bogus
+ * history and scrolling would expose duplicated UI frames.  Reuse the existing
+ * snapshot-aware browser control frame so every connected xterm resets to one
+ * bounded viewport.  This is O(cols * rows) and independent of session age.
+ */
+function relayRemoteRunnerWebSnapshot(snapshot: string): void {
+  const frame = mergeHerdrWebSnapshot(null, snapshot, null, MAX_SCROLLBACK).state;
+  scrollback = renderHerdrWebHistory(frame);
+  const payload = `\x1b]1989;history;0\x07${scrollback}`;
+  for (const ws of wsClients) {
+    if (ws.readyState !== WebSocket.OPEN) continue;
+    // A view-capability client is a follower: it may inspect the authoritative
+    // remote grid but must not resize that shared TUI. Keep its xterm pinned to
+    // the provider-reported pane size so a narrow browser does not wrap the
+    // snapshot locally after its resize request is rejected below.
+    if (!authedClients.has(ws) && effectiveBackendType === 'remote-runner') {
+      const size = backend?.getPaneSize?.();
+      if (size) ws.send(`\x1b]1989;${size.cols};${size.rows}\x07`);
+    }
+    ws.send(payload);
+  }
+}
+
 function applyHerdrWebBindingResult(
   ws: WebSocket,
   result: ReturnType<HerdrWebTerminalBinding['resize']>,
@@ -9066,6 +9170,26 @@ function applyHerdrWebBindingResult(
       !herdrWebBackend.isWebTerminalOwner(client)
     ) {
       client.send(`\x1b]1989;follower;${size.cols};${size.rows}\x07`);
+    }
+  }
+}
+
+/** Keep already-connected read-only viewers aligned with an owned tmux grid.
+ *
+ * A read-only socket never drives the shared pane, but a writable socket may
+ * resize it later. Without a fresh pin those existing followers keep rendering
+ * at their connection-time dimensions until they reload the page. TmuxPipeBackend
+ * resize/getPaneSize are synchronous, so publish the authoritative post-resize
+ * grid rather than trusting the browser request.
+ */
+function broadcastOwnedTmuxReadOnlyFollowerGrid(): void {
+  if (effectiveBackendType !== 'tmux' || !isPipeMode || lastInitConfig?.adoptMode) return;
+  const size = backend?.getPaneSize?.();
+  if (!size) return;
+  const payload = `\x1b]1989;follower;${size.cols};${size.rows}\x07`;
+  for (const client of wsClients) {
+    if (client.readyState === WebSocket.OPEN && !authedClients.has(client)) {
+      client.send(payload);
     }
   }
 }
@@ -10008,7 +10132,7 @@ function sendTermActionOnce(target: SessionBackend, key: TermActionKey): void | 
 async function handleTermAction(key: TermActionKey): Promise<void> {
   // 远端后端：没有终端可驱动——把控制字符 write 进 riff/mojo 会变成一个内容为
   // ANSI 序列的 follow-up turn（^C 也不会 cancel 远端执行），必须整体拒绝。
-  if (effectiveBackendType === 'riff' || effectiveBackendType === 'mojo') {
+  if (isRemoteBackendType(effectiveBackendType)) {
     log(`term_action '${key}' ignored — ${effectiveBackendType} backend has no local terminal to drive`);
     return;
   }
@@ -10117,6 +10241,7 @@ async function handleExactTurnInterrupt(requestId: string, turnId: string): Prom
       || lastInitConfig?.codexRpcInput === true
       || effectiveBackendType === 'riff'
       || effectiveBackendType === 'mojo'
+      || effectiveBackendType === 'remote-runner'
       || !backend) {
     send({ type: 'turn_interrupt_result', requestId, turnId, delivered: false, reason: 'unsupported' });
     return;
@@ -12061,6 +12186,17 @@ function scheduleSpawnArgvTurnStartFailOpen(): void {
   spawnArgvTurnStartFailOpenTimer.unref?.();
 }
 
+let preserveActiveTurnAuthorityForReady = false;
+
+function markRemoteRunnerStartupReady(): void {
+  preserveActiveTurnAuthorityForReady = true;
+  try {
+    markPromptReady();
+  } finally {
+    preserveActiveTurnAuthorityForReady = false;
+  }
+}
+
 function markPromptReady(): void {
   // Screen probes and timeout fallbacks must honor the same startup evidence
   // as quiescence; a skeleton composer is not a ready CLI.
@@ -12193,7 +12329,13 @@ function markPromptReady(): void {
   // Quiescence is the terminal boundary for PTY adapters that do not emit an
   // explicit turn_terminal. Durable receivers keep authority until their exact
   // terminal receipt so an early screen-idle heuristic cannot release it.
-  if (!durableTurnInFlight) releaseActiveTurnAuthority('prompt_ready');
+  // A structured remote provider's startup `ready` proves only that its
+  // control channel can accept the opening turn.  It is not an execution
+  // terminal for that already-admitted Lark turn, so keep the exact caller
+  // authority until the provider later emits final/failure.
+  if (!durableTurnInFlight && !preserveActiveTurnAuthorityForReady) {
+    releaseActiveTurnAuthority('prompt_ready');
+  }
   isPromptReady = true;
   promptReadyEdges++;
   settleSessionRenameOnPrompt();
@@ -13017,7 +13159,9 @@ async function flushPending(): Promise<void> {
   const rawInputReady = isPromptReady && pendingRawInputs.length > 0;
   const adoptInputReady = isPromptReady && lastInitConfig?.adoptMode === true && pendingAdoptMessages.length > 0;
   let supportedSessionRenameReady = sessionRenameReady;
-  const renameOnRemoteBackend = effectiveBackendType === 'riff' || effectiveBackendType === 'mojo';
+  const renameOnRemoteBackend = effectiveBackendType === 'riff'
+    || effectiveBackendType === 'mojo'
+    || effectiveBackendType === 'remote-runner';
   if (sessionRenameReady && (!cliAdapter.buildSessionRenameCommand || renameOnRemoteBackend)) {
     pendingSessionRename = null;
     supportedSessionRenameReady = false;
@@ -13350,7 +13494,23 @@ async function flushPending(): Promise<void> {
           );
           break;
         }
-        if (writeRpcEngine) {
+        if (writeBackend.submitTurn) {
+          submissionBackend = writeBackend;
+          if (!item.turnId) {
+            result = {
+              submitted: false,
+              failureReason: 'remote-runner requires an authenticated BotMux turn id',
+            };
+          } else {
+            prepareNormalWrite();
+            result = await writeBackend.submitTurn({
+              content: msg,
+              turnId: item.turnId,
+              ...(item.replyTurnId ? { replyTurnId: item.replyTurnId } : {}),
+              ...(item.trustedCaller ? { trustedCaller: item.trustedCaller } : {}),
+            });
+          }
+        } else if (writeRpcEngine) {
           if (item.taskContinuation
             && (item.turnId?.startsWith('bmx-continuation-') !== true
               || item.dispatchAttempt === undefined
@@ -13747,6 +13907,10 @@ async function flushPending(): Promise<void> {
             notifyAmbiguousSubmissionRecovery(recoveryFailureReason, item);
             break;
           }
+          if (result.submissionDisposition === 'dirty_unknown') {
+            inflightInputs.retire(item);
+            break;
+          }
           scheduleSubmitFailureNotify(
             logicalMsg,
             result.recheck,
@@ -13799,7 +13963,14 @@ async function flushPending(): Promise<void> {
       // Keep that optimization only within one authenticated principal: a
       // different sender must wait for this turn's terminal boundary.
       if (activeTurnBlocks(pendingMessages[0] ?? {})) break;
-      if (shouldStopPendingBatch(item, pendingMessages[0], runtimeSupportsTypeAhead)) break;
+      // Only adapters that explicitly couple serial delivery to their
+      // post-terminal composer fence stop after one ordinary write. Preserve
+      // master's same-batch behavior for every other non-type-ahead adapter.
+      if (shouldStopPendingBatch(
+        item,
+        pendingMessages[0],
+        cliAdapter.postTerminalPromptFence !== true,
+      )) break;
     }
   } finally {
     isFlushing = false;
@@ -14569,7 +14740,7 @@ async function spawnCli(
   // These backends currently start user shell processes before our command,
   // or run tools through a separate local/cloud launcher. Refuse to claim a
   // boundary until those launch protocols can express an empty initial env.
-  if (cfg.envPolicy?.mode === 'strict' && ['herdr', 'mojo', 'riff'].includes(cfg.backendType)) {
+  if (cfg.envPolicy?.mode === 'strict' && ['herdr', 'mojo', 'riff', 'remote-runner'].includes(cfg.backendType)) {
     throw new Error('envPolicy strict currently supports pty, tmux, zellij and zmx backends');
   }
   const networkError = networkPolicySupportError({
@@ -15362,6 +15533,7 @@ async function spawnCli(
     sessionId: cfg.sessionId,
     backendType: effectiveBackend,
     backendConfig: riffBackendConfig,
+    remoteBackendState: cfg.remoteBackendState,
     herdrOwnershipScope: isolationRuntimeDataDir,
     persistentBackendTarget: cfg.persistentBackendTarget,
     // Old builds could place managed agents in a user's shared Herdr session.
@@ -16689,6 +16861,7 @@ async function spawnCli(
   if (cfg.chatType) childEnv.BOTMUX_CHAT_TYPE = cfg.chatType;
   else delete childEnv.BOTMUX_CHAT_TYPE;
   childEnv.BOTMUX_LARK_APP_ID = cfg.larkAppId;
+  childEnv.BOTMUX_SESSION_SCOPE = cfg.rootMessageId?.startsWith('om_') ? 'thread' : 'chat';
   if (perBotInjectEnv.BOTMUX_APPEND_SYSTEM_PROMPT) {
     childEnv.BOTMUX_APPEND_SYSTEM_PROMPT = perBotInjectEnv.BOTMUX_APPEND_SYSTEM_PROMPT;
   }
@@ -18194,9 +18367,13 @@ async function spawnCli(
       launchShell: lastInitConfig?.launchShell,
       strictEnv: cfg.envPolicy?.mode === 'strict',
       strictEnvReattach: willReattachPersistent,
+      remoteResumeMode: cfg.remoteResumeMode,
       // spawnBin may now be a launch wrapper (session scope / wrapperCli /
       // credential sandbox); the Herdr facade still needs the real CLI name.
       cliBin: cliAdapter.resolvedBin,
+      model: cfg.model,
+      modelBackendVariant: cfg.modelBackendVariant,
+      reasoningEffort: cfg.reasoningEffort,
     });
     if (!willReattachPersistent) writeEnvPolicyStamp(config.session.dataDir, cfg.sessionId, cfg.envPolicy);
   } catch (err) {
@@ -18870,7 +19047,11 @@ async function spawnCli(
   }
   backend.onScreenResync?.((snapshot) => {
     if (observedBackend !== backend) return;
-    log(`${effectiveBackendType} observer recovered — rebasing screen state from history`);
+    if (effectiveBackendType === 'remote-runner') {
+      relayRemoteRunnerWebSnapshot(snapshot);
+    } else {
+      log(`${effectiveBackendType} observer recovered — rebasing screen state from history`);
+    }
     scheduleBackendScreenResync(snapshot, `${effectiveBackendType} observer recovery`);
   });
   backend.onAccessUrl?.((url) => {
@@ -18899,18 +19080,80 @@ async function spawnCli(
     log(`${cliName()} task finished — re-arming prompt-ready for queued follow-ups`);
     markPromptReady();
   });
-  // Headless final-answer bridge (mojo): deliver the turn's answer to the
+  // Headless final-answer bridge: deliver the turn's answer to the
   // thread when the agent produced one but never called `botmux send`. Same
   // generation fence as onTaskDone above — a late callback from a backend the
   // worker has already replaced must not post into the current turn.
-  backend.onTurnFinal?.((text) => {
+  backend.onTurnFinal?.((text, turnId) => {
     if (fatalWorkerErrorPending) return;
     if (backend !== observedBackend) return;
-    try {
-      deliverMojoTurnFinal(text);
-    } catch (err) {
-      log(`Mojo final bridge failed: ${err instanceof Error ? err.message : String(err)}`);
+    if (turnId && currentBotmuxTurnId && turnId !== currentBotmuxTurnId) {
+      log(`Ignored stale remote final for turn ${turnId.substring(0, 12)}`);
+      return;
     }
+    try {
+      deliverRemoteTurnFinal(text, turnId);
+    } catch (err) {
+      log(`Remote final bridge failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    const completedTurnId = turnId ?? currentBotmuxTurnId;
+    if (completedTurnId) {
+      emitTurnTerminal(
+        completedTurnId,
+        'completed',
+        undefined,
+        currentBotmuxDispatchAttempt,
+      );
+    }
+  });
+  backend.onOutboundMessage?.(async (message) => {
+    if (fatalWorkerErrorPending || backend !== observedBackend) {
+      return {
+        outcome: 'rejected',
+        code: 'outbound_backend_stale',
+        message: 'The backend generation that requested this message is no longer active.',
+      };
+    }
+    return deliverRemoteRunnerOutboundMessage(message);
+  });
+  backend.onTurnFailure?.((failure) => {
+    if (fatalWorkerErrorPending || backend !== observedBackend) return;
+    if (currentBotmuxTurnId && failure.turnId !== currentBotmuxTurnId) {
+      log(`Ignored stale remote failure for turn ${failure.turnId.substring(0, 12)}`);
+      return;
+    }
+    send({
+      type: 'final_output',
+      content: failure.message,
+      lastUuid: failure.turnId,
+      turnId: failure.turnId,
+      dispatchAttempt: currentBotmuxDispatchAttempt,
+      turnFailed: true,
+    });
+    emitTurnTerminal(
+      failure.turnId,
+      failure.status,
+      failure.code,
+      currentBotmuxDispatchAttempt,
+      undefined,
+      failure.retryable,
+    );
+  });
+  backend.onBackendState?.((state) => {
+    if (backend !== observedBackend) return;
+    send({ type: 'remote_backend_state', state });
+  });
+  backend.onUsageSnapshot?.((usage) => {
+    if (backend !== observedBackend) return;
+    send({ type: 'remote_usage', usage });
+  });
+  backend.onReady?.(() => {
+    if (backend !== observedBackend || fatalWorkerErrorPending) return;
+    if (effectiveBackendType === 'remote-runner') {
+      markRemoteRunnerStartupReady();
+      return;
+    }
+    markPromptReady();
   });
   // riff：任务 id 变更同步给 daemon 持久化，daemon 重启后 follow-up 血缘不断。
   backend.onTaskId?.((taskId) => {
@@ -19232,7 +19475,8 @@ async function spawnCli(
   // PTY output), and the first-prompt timeout only flushes for type-ahead
   // adapters, so isPromptReady would otherwise stay false until the ~15s
   // fallback and every first message would be needlessly delayed.
-  if (isRemoteBackendType(effectiveBackendType)) {
+  if (isRemoteBackendType(effectiveBackendType)
+    && effectiveBackendType !== 'remote-runner') {
     // BEFORE markPromptReady, which can flush a queued turn: a replacement
     // backend is built from the original init config, so a rotated — or cleared —
     // credential must be re-applied first or the queued turn runs against the
@@ -19694,7 +19938,11 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
       const localTerminalBackend = effectiveBackendType === 'pty'
         || effectiveBackendType === 'tmux'
         || effectiveBackendType === 'zellij';
-      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      // 避免手机 Webview 或浏览器缓存包含动态首态（如动态 initialMobileInputMode）的 HTML
+      res.writeHead(200, {
+        'Content-Type': 'text/html; charset=utf-8',
+        'Cache-Control': 'no-store',
+      });
       res.end(getTerminalHtml(hasWrite, platformReadonly || platformReadonlyHint, loginUrl, forceRemoteScroll, localTerminalBackend, allowReadOnlyRemoteScroll));
     });
 
@@ -19777,6 +20025,16 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
       // frame #1 of a connection as control, so PTY output can never be mistaken
       // for it. Nothing awaits between `wsClients.add` above and this send.
       try { ws.send(terminalWriteFrame(hasWrite)); } catch { /* already closing */ }
+      const currentInputMode = getWebTerminalInputMode(sessionId);
+      if (hasWrite) {
+        // 带内 OSC 1989 序列：仅下发移动端输入模式 UI 呈现（缓冲上屏 vs 实时输入）。
+        // 安全边界说明：
+        // ① 该帧仅控制客户端工具栏/输入框交互逻辑，不携带或授予任何服务端写权限；
+        // ② 服务端终端输入转发严格受 authedClients 门禁保护；终端内进程若伪造该字节流，
+        //    最多改变前端输入面板交互形态，无法越权写入或绕过授权检查；
+        // ③ 模式帧格式与现有 _hh/_hf/_ho/_fs 同族，遵循相同 OSC 1989 设计规范。
+        try { ws.send(formatMobileInputModeOsc(currentInputMode)); } catch { /* already closing */ }
+      }
       // A signed Dashboard grant is fixed-expiry — for READ scope as much as
       // for write (P1-5). Even if the central proxy's socket invalidation is
       // delayed or bypassed, the worker independently removes any granted
@@ -19976,6 +20234,14 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
         ));
         herdrWebBindings.set(ws, herdrWebBinding);
         const initialHerdrSize = herdrWebBinding.sync().initialSize;
+        // A view capability is observational: it must not resize a shared
+        // terminal. Remote Runner already follows the provider grid; owned
+        // tmux pipe sessions need the same rule because their live pane also
+        // drives the Lark screenshot. Letting a narrow read-only browser resize
+        // that pane leaves later screenshots permanently wrapped at its width.
+        const readOnlyFollowsBackendGrid = !hasWrite
+          && (effectiveBackendType === 'remote-runner'
+            || (effectiveBackendType === 'tmux' && isPipeMode && !lastInitConfig?.adoptMode));
         if (initialHerdrSize) {
           ws.send(`\x1b]1989;follower;${initialHerdrSize.cols};${initialHerdrSize.rows}\x07`);
         }
@@ -19994,6 +20260,13 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
         if (lastInitConfig?.adoptMode && isObserveBackend(backend)) {
           const sz = (backend as ObserveBackend).getPaneSize();
           if (sz && sz.cols > 0 && sz.rows > 0) ws.send(`\x1b]1989;${sz.cols};${sz.rows}\x07`);
+        }
+        // Pin a read-only viewer to the authoritative grid before sending the
+        // seed. Its FitAddon may still report the browser viewport below, but
+        // that resize stays display-local and is not forwarded to the backend.
+        if (readOnlyFollowsBackendGrid) {
+          const sz = backend?.getPaneSize?.() ?? { cols: renderCols, rows: renderRows };
+          ws.send(`\x1b]1989;${sz.cols};${sz.rows}\x07`);
         }
         const seed = usesHerdrSnapshotWebHistory() && scrollback.length > 0
           ? scrollback
@@ -20022,8 +20295,9 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
             if (msg.type === 'resize' && msg.cols > 0 && msg.rows > 0) {
               const result = herdrWebBinding.resize(msg.cols, msg.rows);
               applyHerdrWebBindingResult(ws, result);
-              if (!result.backend) {
+              if (!result.backend && !readOnlyFollowsBackendGrid) {
                 backend?.resize(msg.cols, msg.rows);
+                broadcastOwnedTmuxReadOnlyFollowerGrid();
               }
             } else if (msg.type === 'input' && typeof msg.data === 'string') {
               // Mouse protocols can encode approvals/actions as well as wheel input.
@@ -20044,12 +20318,21 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
               if (!readOnlyRemoteScrollLimiter.tryConsume(parsed.eventCount)) return;
               if (usesHerdrSnapshotWebHistory()) herdrWebScrollDirection = parsed.direction;
               backend?.write(msg.data);
+            } else if (msg.type === 'mobile_input_mode' && (msg.mode === 'buffer' || msg.mode === 'live')) {
+              if (!authedClients.has(ws)) return;
+              setWebTerminalInputMode(msg.mode, sessionId);
+              for (const client of wsClients) {
+                if (client !== ws && authedClients.has(client) && client.readyState === WebSocket.OPEN) {
+                  try { client.send(formatMobileInputModeOsc(msg.mode)); } catch { /* ignore */ }
+                }
+              }
             }
           } catch { /* ignore non-JSON or bad messages */ }
         });
 
         ws.on('close', () => {
           wsClients.delete(ws);
+          authedClients.delete(ws);
           herdrWebBindings.delete(ws);
           const promoted = herdrWebBinding.release() as WebSocket | null;
           if (promoted?.readyState === WebSocket.OPEN) {
@@ -20076,6 +20359,7 @@ function getTerminalHtml(
   forceRemoteScroll = false,
   localTerminalBackend = false,
   allowReadOnlyRemoteScroll = false,
+  initialMobileInputMode: WebTerminalInputMode = getWebTerminalInputMode(sessionId),
 ): string {
   const label = sessionId.substring(0, 8);
   return `<!DOCTYPE html>
@@ -20281,7 +20565,7 @@ ${loginUrl ? `<a id="login-banner" href="${loginUrl}" target="_top" rel="noopene
     </div>
   </div>
 </div>
-<form id="mobile-input-bar" autocomplete="off" data-mode="buffer" aria-label="手机输入">
+<form id="mobile-input-bar" autocomplete="off" data-mode="${initialMobileInputMode}" aria-label="手机输入">
   <div id="mobile-bar-keys">
     <button type="button" data-sk="paste">Paste</button>
     <button type="button" data-sk="ctrlc">Ctrl+C</button>
@@ -20331,6 +20615,10 @@ var platformReadonly=${platformReadonly};
 var remoteScroll=${forceRemoteScroll};
 var localTerminalBackend=${localTerminalBackend};
 var readOnlyRemoteScroll=${allowReadOnlyRemoteScroll};
+var _wbInitialMobileInputMode=${JSON.stringify(initialMobileInputMode)};
+var _wbSetMobileInputMode=null;
+var _wbMimRegex=new RegExp(${JSON.stringify(MOBILE_INPUT_MODE_OSC_REGEX.source)});
+var _wbSyncMobileInputMode=function(m){try{if(ws_&&ws_.readyState===1){ws_.send(JSON.stringify({type:'mobile_input_mode',mode:m}));}}catch(_e){}};
 if(!hasToken){
   if(platformReadonly){var _lb=document.getElementById('login-banner');_lb.classList.add('show');}
   else{var _rb=document.getElementById('readonly-banner');_rb.classList.add('show');_rb.addEventListener('click',function(){_rb.classList.remove('show')});}
@@ -20840,6 +21128,10 @@ if(typeof ResizeObserver!=='undefined'){
     // can't be resized, so FitAddon-to-browser would wrap the snapshot lines).
     var _fs=data.match(/\\x1b\\]1989;(\\d+);(\\d+)\\x07/);
     if(_fs){_setFixedGrid(true);var _c=+_fs[1],_r=+_fs[2];if(_c>0&&_r>0){try{term.resize(_c,_r)}catch(ex){}}data=data.replace(_fs[0],'')}
+    // botmux OSC 1989: 移动端输入模式呈现同步（buffer 缓冲 / live 实时）。
+    // 纯显示/交互态控制帧，不改变服务端权限门禁。使用服务端共享正则编译实例。
+    var _mim=data.match(_wbMimRegex);
+    if(_mim){data=data.replace(_mim[0],'');if(_wbSetMobileInputMode){try{_wbSetMobileInputMode(_mim[1]);}catch(ex){}}if(!data)return;}
     // Intercept OSC 52 clipboard sequence from tmux (set-clipboard on)
     var m=data.match(/\\x1b\\]52;[^;]*;([A-Za-z0-9+/=]+)(?:\\x07|\\x1b\\\\)/);
     if(m){try{_clipBuf=new TextDecoder().decode(Uint8Array.from(atob(m[1]),function(c){return c.charCodeAt(0)}));_doCopy(_clipBuf);_showCopied()}catch(ex){}}
@@ -21313,8 +21605,22 @@ if(isTouch&&hasToken){(function(){
   var sendBtn=document.getElementById('mobile-send');
   var hint=document.getElementById('mobile-live-hint');
   var LIVE='live',BUFFER='buffer';
-  var mode=BUFFER;
+  var mode=(typeof _wbInitialMobileInputMode==='string'&&_wbInitialMobileInputMode===LIVE)?LIVE:BUFFER;
   var controls=bar.querySelectorAll('button,textarea');
+
+  function _syncMode(m){try{if(typeof _wbSyncMobileInputMode==='function')_wbSyncMobileInputMode(m);}catch(_e){}}
+  function setExternalMode(m){
+    if(m!==LIVE&&m!==BUFFER)return;
+    if(m===mode)return;
+    if(mode===LIVE&&!sendLiveKey(''))return;
+    if(mode!==LIVE&&ta.value){
+      if(!sendInput(ta.value.replace(/\\x1b/g,'')))return;
+      ta.value='';resizeTa();
+    }
+    setMode(m);
+    if(m===LIVE){mirror.sent=mirror.held='';hint.textContent='实时输入 · 点击显示键盘';}
+  }
+  _wbSetMobileInputMode=setExternalMode;
 
   function setWriteState(v){
     var disabled=v!==true;
@@ -21488,9 +21794,11 @@ if(isTouch&&hasToken){(function(){
     if(mode!==LIVE&&ta.value){
       if(!sendInput(ta.value.replace(/\\x1b/g,'')))return;
       ta.value='';resizeTa();}
-    setMode(mode===LIVE?BUFFER:LIVE);
-    if(mode===LIVE){mirror.sent=mirror.held='';hint.textContent='实时输入 · 点击显示键盘';}
-    showKeyboard();});
+    var nextMode=mode===LIVE?BUFFER:LIVE;
+    setMode(nextMode);
+    if(nextMode===LIVE){mirror.sent=mirror.held='';hint.textContent='实时输入 · 点击显示键盘';}
+    showKeyboard();
+    _syncMode(nextMode);});
 
   bar.addEventListener('submit',function(e){e.preventDefault();submit();});
 
@@ -21523,7 +21831,9 @@ if(isTouch&&hasToken){(function(){
       sendInput('\\x7f');return;}
     if(e.key==='Enter'&&!e.shiftKey&&!mirror.composing&&!e.isComposing){e.preventDefault();submit();}});
 
-  setMode(BUFFER);resizeTa();setWriteState(wsHasWrite);
+  setMode(mode);
+  if(mode===LIVE){mirror.sent=mirror.held='';hint.textContent='实时输入 · 点击显示键盘';}
+  resizeTa();setWriteState(wsHasWrite);
   if(typeof ResizeObserver!=='undefined'){
     try{new ResizeObserver(measureBar).observe(bar)}catch(_e){}
   }
@@ -23187,7 +23497,7 @@ process.on('message', async (raw: unknown) => {
         shutdownDetachRequestId = msg.requestId;
         shutdownDetachPhase = 'preparing';
         try {
-          result = await backend?.prepareShutdownDetach?.()
+          result = await backend?.prepareShutdownDetach?.(msg.drainTimeoutMs)
             ?? { ok: false, taskId: null, error: 'shutdown_detach_unsupported' };
         } catch (err) {
           result = {

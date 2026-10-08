@@ -1,3 +1,4 @@
+import { readTurnRegistration } from './trigger-registration.js';
 import { normalizeCalendarBinding, normalizeCalendarDayType, listWorkCalendars, previewTaskCalendar } from '../services/work-calendar.js';
 import { resolveWorkspace } from './workspace-metadata.js';
 // src/core/dashboard-ipc-server.ts
@@ -189,7 +190,7 @@ import { matchesExpectedSessionLocateScope, type SessionLocateExpectedScope } fr
 import { buildTerminalUrl } from './terminal-url.js';
 import { dashboardEventBus } from './dashboard-events.js';
 import { validateWorkingDir } from './working-dir.js';
-import { isValidRoleChatId, resolveRole, resolveRoleFile, writeRoleFile, deleteRoleFile, readRoleInjectMode, writeRoleInjectMode, deleteRoleMeta, readRoleDispatchCompletionEnabled, writeRoleDispatchCompletionEnabled, type RoleInjectMode } from './role-resolver.js';
+import { isValidRoleChatId, resolveRole, resolveRoleFile, writeRoleFile, deleteRoleFile, readRoleInjectMode, writeRoleInjectMode, deleteRoleMeta, readRoleDispatchCompletionEnabled, writeRoleDispatchCompletionEnabled, readRoleReplyPrivately, writeRoleReplyPrivately, readRolePrivateReplyNotice, writeRolePrivateReplyNotice, type RoleInjectMode } from './role-resolver.js';
 import {
   deleteRoleProfileEntry,
   deleteRoleProfileIfEmpty,
@@ -1288,6 +1289,33 @@ ipcRoute('GET', '/api/sessions', (_req, res) => {
   // left detached, then closed history. Persisted-active must never be projected
   // through composeRowFromClosed: teardown uncertainty is not a close.
   jsonRes(res, 200, { sessions: composeDashboardSessionRows({ includeTokenUsage: false }) });
+});
+
+// Exact host-installed input bindings. Never added to the session relay allowlist.
+ipcRoute('POST', '/api/sessions/:sessionId/input-capture', async (req, res, params) => {
+  if (!isTrustedHostIpcRequest(req)) return jsonRes(res, 403, { ok: false, error: 'trusted_host_required' });
+  const body = await readJsonBody<Record<string, unknown>>(req).catch(() => undefined);
+  if (!body || body.larkAppId !== cachedLarkAppId) return jsonRes(res, 400, { ok: false, error: 'invalid_input_capture_identity' });
+  const { getInputCaptureRuntime } = await import('./plugins/input-capture/runtime.js');
+  const runtime = getInputCaptureRuntime(cachedLarkAppId);
+  if (!runtime) return jsonRes(res, 503, { ok: false, error: 'input_capture_unavailable' });
+  try {
+    let result: unknown;
+    if (body.operation === 'register') result = runtime.register(params.sessionId, body);
+    else if (body.operation === 'revoke-set') result = runtime.revokeSet(params.sessionId, body.bindings);
+    else if (typeof body.bindingId === 'string' && /^[a-f0-9]{64}$/.test(body.bindingId)) {
+      if (body.operation === 'inspect') result = runtime.inspect(params.sessionId, body.bindingId, { after: body.after, through: body.through });
+      else if (body.operation === 'revoke' && Number.isSafeInteger(body.expectedRevision) && Number(body.expectedRevision) > 0) {
+        result = runtime.revoke(params.sessionId, body.bindingId, Number(body.expectedRevision));
+      } else return jsonRes(res, 400, { ok: false, error: 'invalid_input_capture_operation' });
+    } else return jsonRes(res, 400, { ok: false, error: 'invalid_input_capture_operation' });
+    return jsonRes(res, result ? 200 : 404, { ok: !!result, schemaVersion: 1, result });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : '';
+    const conflict = /^input_capture_(?:identity|anchor|revision|inputs)_conflict$/.test(message);
+    const invalid = ['invalid_input_capture_conditions', 'invalid_input_capture_page'].includes(message);
+    return jsonRes(res, invalid ? 400 : conflict ? 409 : 503, { ok: false, error: invalid || conflict ? message : 'input_capture_unavailable' });
+  }
 });
 
 // Host-authenticated, session-bound lookup: callers cannot supply arbitrary paths.
@@ -3548,6 +3576,14 @@ ipcRoute('GET', '/api/sessions/:sessionId/history', async (req, res, params) => 
   }
 });
 
+// Authenticated host API; deliberately outside the core-only public allowlist.
+ipcRoute('GET', '/api/sessions/:sessionId/trigger-registration', (req, res, params) => {
+  const url = new URL(req.url ?? '/', 'http://localhost');
+  const keys = url.searchParams.getAll('turnIdempotencyKey');
+  const result = readTurnRegistration(cachedLarkAppId, params.sessionId, keys.length === 1 ? keys[0] : null);
+  jsonRes(res, result.status, result.body);
+});
+
 ipcRoute('GET', '/api/sessions/:sessionId/trigger-result', (req, res, params) => {
   const url = new URL(req.url ?? '/', 'http://localhost');
   const triggerId = url.searchParams.get('triggerId') ?? undefined;
@@ -3934,7 +3970,11 @@ ipcRoute('POST', '/api/sessions/:sessionId/resume', async (req, res, params) => 
   const botCfg = ds.larkAppId ? getBot(ds.larkAppId).config : undefined;
   const cliName = sessionConfiguredRuntimeDisplayName(ds.session, botCfg?.cliRuntime)
     ?? getCliDisplayName(cliId ?? botCfg?.cliId ?? 'claude-code');
-  const notice = JSON.stringify({ text: `🔄 会话已通过命令行恢复，发条消息继续与 ${cliName} 对话。` });
+  const notice = JSON.stringify({
+    text: result.recoveryPending
+      ? `🔄 ${cliName} 远程恢复已启动，正在创建新的运行环境并恢复原会话。`
+      : `🔄 会话已通过命令行恢复，发条消息继续与 ${cliName} 对话。`,
+  });
   const postResumeNotice = async (): Promise<void> => {
     if (!ds.larkAppId) return;
     if (!sessionTransportDisabled(ds)) {
@@ -3978,10 +4018,9 @@ ipcRoute('POST', '/api/sessions/:sessionId/resume', async (req, res, params) => 
     void postResumeNotice();
   }
 
-  // Report the EFFECTIVE action, not the raw request flag: only fork when wake
-  // was asked AND there's no live worker to clobber. (resumeSession always hands
-  // back a worker:null ds today, so this matches `wake` in practice — but
-  // reporting the action keeps the response honest if the guard ever broadens.)
+  // Report the EFFECTIVE action, not the raw request flag. Remote Runner resume
+  // materializes its provider immediately inside resumeSession, so an optional
+  // wake request only applies when that path did not already create a worker.
   const woke = wake && (!ds.worker || ds.worker.killed);
   if (woke) {
     forkWorker(ds, '', true);
@@ -3990,6 +4029,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/resume', async (req, res, params) => 
   jsonRes(res, 200, {
     ok: true,
     sessionId,
+    recoveryPending: result.recoveryPending === true,
     wake: woke,
     title: ds.session.title,
     chatId: ds.chatId,
@@ -5530,6 +5570,8 @@ function dashboardRolePayload(larkAppId: string, chatId: string): Record<string,
     hasRole: content !== null,
     injectMode: readRoleInjectMode(larkAppId, chatId),
     dispatchCompletionEnabled: readRoleDispatchCompletionEnabled(larkAppId, chatId),
+    replyPrivately: readRoleReplyPrivately(larkAppId, chatId),
+    privateReplyNotice: readRolePrivateReplyNotice(larkAppId, chatId),
     effectiveContent: effective.content,
     effectiveSource: effective.source,
     effectiveByteLength: effective.content ? Buffer.byteLength(effective.content, 'utf-8') : 0,
@@ -5562,8 +5604,8 @@ ipcRoute('GET', '/api/roles/:chatId', async (_req, res, p) => {
 ipcRoute('PUT', '/api/roles/:chatId', async (req, res, p) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
   if (!isValidRoleChatId(p.chatId)) return jsonRes(res, 400, { ok: false, error: 'invalid_chat_id' });
-  let body: { content?: unknown; injectMode?: unknown; dispatchCompletionEnabled?: unknown };
-  try { body = await readJsonBody<{ content?: string; injectMode?: string; dispatchCompletionEnabled?: boolean }>(req); }
+  let body: { content?: unknown; injectMode?: unknown; dispatchCompletionEnabled?: unknown; replyPrivately?: unknown; privateReplyNotice?: unknown };
+  try { body = await readJsonBody<{ content?: string; injectMode?: string; dispatchCompletionEnabled?: boolean; replyPrivately?: boolean; privateReplyNotice?: string }>(req); }
   catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
   // injectMode is a per-chat setting that can be updated on its own (no content)
   // — e.g. toggling "inject once" for a chat whose effective role is the team
@@ -5573,13 +5615,23 @@ ipcRoute('PUT', '/api/roles/:chatId', async (req, res, p) => {
   const dispatchCompletionEnabled = typeof body.dispatchCompletionEnabled === 'boolean'
     ? body.dispatchCompletionEnabled
     : undefined;
+  if (body.replyPrivately !== undefined && typeof body.replyPrivately !== 'boolean') {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_reply_privately' });
+  }
+  if (body.privateReplyNotice !== undefined
+    && (typeof body.privateReplyNotice !== 'string' || body.privateReplyNotice.length > 500)) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_private_reply_notice' });
+  }
   const hasContentField = typeof body.content === 'string';
   const content = hasContentField ? (body.content as string).trim() : '';
-  if (!hasContentField && injectMode === undefined && dispatchCompletionEnabled === undefined) {
+  if (!hasContentField && injectMode === undefined && dispatchCompletionEnabled === undefined
+    && body.replyPrivately === undefined && body.privateReplyNotice === undefined) {
     return jsonRes(res, 400, { ok: false, error: 'role_setting_required' });
   }
   if (hasContentField && !content) return jsonRes(res, 400, { ok: false, error: 'content_required' });
   try {
+    if (typeof body.replyPrivately === 'boolean') writeRoleReplyPrivately(cachedLarkAppId, p.chatId, body.replyPrivately);
+    if (typeof body.privateReplyNotice === 'string') writeRolePrivateReplyNotice(cachedLarkAppId, p.chatId, body.privateReplyNotice);
     if (hasContentField) writeRoleFile(cachedLarkAppId, p.chatId, content);
     if (injectMode !== undefined) writeRoleInjectMode(cachedLarkAppId, p.chatId, injectMode);
     if (dispatchCompletionEnabled !== undefined) writeRoleDispatchCompletionEnabled(cachedLarkAppId, p.chatId, dispatchCompletionEnabled);

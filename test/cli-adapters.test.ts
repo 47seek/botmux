@@ -32,7 +32,7 @@ import { createAidenAdapter } from '../src/adapters/cli/aiden.js';
 import { createCocoAdapter } from '../src/adapters/cli/coco.js';
 import { createCodexAdapter } from '../src/adapters/cli/codex.js';
 import { createCodexAppAdapter } from '../src/adapters/cli/codex-app.js';
-import { createCursorAdapter } from '../src/adapters/cli/cursor.js';
+import { createCursorAdapter, CURSOR_PLUGIN_DIR } from '../src/adapters/cli/cursor.js';
 import { createGeminiAdapter } from '../src/adapters/cli/gemini.js';
 import { createGeniusAdapter } from '../src/adapters/cli/genius.js';
 import { createOpenCodeAdapter, isOpenCodeSessionId } from '../src/adapters/cli/opencode.js';
@@ -93,11 +93,12 @@ describe('createCliAdapterSync factory', () => {
 
   it.each(ALL_CLI_IDS)('adapter for "%s" has resolvedBin set', (id) => {
     const adapter = createCliAdapterSync(id, `/opt/${id}`);
-    // Remote backends (riff/mojo) never have the worker spawn a local binary —
+    // Riff/Mojo never have the worker spawn a local binary —
     // riff is pure HTTP and MojoBackend shells out per turn from the backend, so
-    // their adapter deliberately reports an empty resolvedBin. Exempting them via
-    // the shared predicate keeps this loop honest for every local CLI.
-    if (isRemoteCliId(id)) expect(adapter.resolvedBin).toBe('');
+    // their adapters deliberately report an empty resolvedBin. Remote Runner is
+    // also off-box execution, but it intentionally launches a local provider
+    // bridge process, so its configured executable must remain observable.
+    if (isRemoteCliId(id) && id !== 'remote-runner') expect(adapter.resolvedBin).toBe('');
     // dsh joins the bundled-Node-runner group (upstream #858): its resolvedBin is
     // the node binary, not the pinned path.
     else if (id === 'codex-app' || id === 'mira' || id === 'mir' || id === 'dsh') expect(adapter.resolvedBin).toBe(process.execPath);
@@ -1858,6 +1859,9 @@ describe('cursor buildArgs', () => {
 
   it('delivers the opening prompt through argv and enables post-ready type-ahead', () => {
     expect(adapter.passesInitialPromptViaArgs).toBe(true);
+    // Positional prompt is inside the tmux launch command. 8192 matches
+    // OpenCode: short turns stay on argv; longer ones defer until readyPattern.
+    expect(adapter.maxInitialPromptArgBytes).toBe(8192);
     expect(adapter.readyPattern?.test('  → Plan, search, build anything')).toBe(true);
     expect(adapter.deferFirstPromptTimeoutUntilReady).toBe(true);
     expect(adapter.supportsTypeAhead).toBe(true);
@@ -1875,6 +1879,39 @@ describe('cursor buildArgs', () => {
     // Guard against over-broad matching: the arrow-prefixed composer glyph is
     // required, so unrelated screen text with the phrase must not false-match.
     expect(adapter.readyPattern?.test('Plan, search, build anything')).toBe(false);
+  });
+
+  it('injects built-in plugin-dir by default and supports session-scoped skillPluginDir', () => {
+    const args = adapter.buildArgs({
+      sessionId: 'sess-cursor',
+      resume: false,
+      skillPluginDir: '/tmp/runtime-skills/sess-cursor/claude-plugin',
+    });
+    expect(args).toContain('--plugin-dir');
+    const pluginIndices = args.flatMap((arg, i) => (arg === '--plugin-dir' ? [i] : []));
+    expect(pluginIndices.length).toBe(2);
+    expect(args[pluginIndices[0] + 1]).toBe(CURSOR_PLUGIN_DIR);
+    expect(args[pluginIndices[1] + 1]).toBe('/tmp/runtime-skills/sess-cursor/claude-plugin');
+  });
+
+  it('omits --plugin-dir when promptInjection is none', () => {
+    const args = adapter.buildArgs({
+      sessionId: 'sess-cursor',
+      resume: false,
+      skillPluginDir: '/tmp/runtime-skills/sess-cursor/claude-plugin',
+      promptInjection: 'none',
+    });
+    expect(args).not.toContain('--plugin-dir');
+  });
+
+  it('declares dynamic pluginDir and claude-plugin skillDelivery capabilities alongside a discoverable skillsDir', () => {
+    expect(adapter.pluginDir).toBe(CURSOR_PLUGIN_DIR);
+    expect(adapter.skillsDir).toBe('~/.cursor/skills');
+    expect(adapter.skillDelivery).toEqual({
+      nativeKind: 'claude-plugin',
+      supportsScopedSession: true,
+      supportsExclusive: false,
+    });
   });
 });
 
@@ -1958,6 +1995,11 @@ describe('gemini buildArgs', () => {
 
   it('passesInitialPromptViaArgs is true', () => {
     expect(adapter.passesInitialPromptViaArgs).toBe(true);
+  });
+
+  it('declares maxInitialPromptArgBytes to guard tmux command-too-long', () => {
+    // -i bakes the full first prompt into argv, same tmux ceiling as OpenCode.
+    expect(adapter.maxInitialPromptArgBytes).toBe(8192);
   });
 
   it('does not include session id', () => {
@@ -2812,6 +2854,11 @@ describe('mtr buildArgs', () => {
 
   it('passesInitialPromptViaArgs is true', () => {
     expect(adapter.passesInitialPromptViaArgs).toBe(true);
+  });
+
+  it('declares maxInitialPromptArgBytes to guard tmux command-too-long', () => {
+    // `--prompt` bakes the full first prompt into argv, same budget as OpenCode.
+    expect(adapter.maxInitialPromptArgBytes).toBe(8192);
   });
 });
 
@@ -3905,6 +3952,8 @@ describe('grok buildArgs', () => {
     const args = adapter.buildArgs({ sessionId: sid, resume: false, initialPrompt: 'hello grok' });
     expect(args[args.length - 1]).toBe('hello grok');
     expect(adapter.passesInitialPromptViaArgs).toBe(true);
+    // Tighter than 8192: `--rules` is already in the tmux command.
+    expect(adapter.maxInitialPromptArgBytes).toBe(4096);
   });
 
   it('resumes with --resume using resumeSessionId when available', () => {
