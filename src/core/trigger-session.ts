@@ -924,6 +924,8 @@ async function triggerSessionTurnAdmitted(
     : buildUntrustedEventPrompt(req, triggerId);
   const prompt = promptForSession();
   const topicMessage = buildExternalEventTopicMessage(req, larkAppId);
+  const hasExplicitTopicMessage = typeof req.presentation?.topicMessage === 'string'
+    && req.presentation.topicMessage.trim().length > 0;
   const codexAppText = buildExternalEventVisibleText(req, larkAppId);
   const codexAppApplicationContext = buildExternalEventApplicationContext(req);
   const codexAppMessageContext = buildExternalEventDataContext(req, triggerId);
@@ -1204,7 +1206,12 @@ async function triggerSessionTurnAdmitted(
   // group's one chat-scope session. Explicit rootMessageId is a stricter target:
   // it always routes to that thread anchor after daemon-side chat ownership check.
   const regularGroupMode: ChatReplyMode = httpVirtual ? 'chat' : resolveRegularGroupMode(larkAppId, chatId);
+  const explicitChatMode = hasExplicitTopicMessage && !rootMessageId && !req.target.sessionId && !httpVirtual
+    ? await getChatMode(larkAppId, chatId, { forceRefresh: true }) : undefined;
+  const opensExplicitTopic = hasExplicitTopicMessage
+    && (regularGroupMode !== 'shared' || explicitChatMode === 'topic');
   if (!ds && !req.target.sessionId && !rootMessageId && !httpVirtual
+      && !opensExplicitTopic
       && (regularGroupMode !== 'new-topic' || topicMessage === null)) {
     ds = deps.activeSessions.get(sessionKey(chatId, larkAppId));
   }
@@ -1688,14 +1695,14 @@ async function triggerSessionTurnAdmitted(
       error: `模型 ${effectiveModel || '（Agent 默认模型）'} 不支持思考强度 ${effectiveReasoningEffort}`,
     };
   }
-  const chatMode: ChatMode = httpVirtual
+  const chatMode: ChatMode = explicitChatMode ?? (httpVirtual
     ? 'group'
-    : await getChatMode(larkAppId, chatId, { forceRefresh: true });
+    : await getChatMode(larkAppId, chatId, { forceRefresh: true }));
   let scope: 'thread' | 'chat' = rootMessageId ? 'thread' : 'chat';
   let anchor = rootMessageId || chatId;
   const shouldOpenOwnTopic = !rootMessageId
     && !httpVirtual
-    && externalEventOpensOwnTopic(chatMode, regularGroupMode);
+    && (opensExplicitTopic || externalEventOpensOwnTopic(chatMode, regularGroupMode));
   if (shouldOpenOwnTopic && topicMessage !== null) {
     anchor = await sendMessage(larkAppId, chatId, topicMessage);
     scope = 'thread';
