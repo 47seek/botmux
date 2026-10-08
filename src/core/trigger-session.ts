@@ -1206,8 +1206,18 @@ async function triggerSessionTurnAdmitted(
   // group's one chat-scope session. Explicit rootMessageId is a stricter target:
   // it always routes to that thread anchor after daemon-side chat ownership check.
   const regularGroupMode: ChatReplyMode = httpVirtual ? 'chat' : resolveRegularGroupMode(larkAppId, chatId);
+  // Only `shared` mode needs the real chat topology to decide the explicit-seed
+  // route: it keeps the one shared session UNLESS the chat is actually a topic
+  // group, which always splits (the topic rule externalEventOpensOwnTopic
+  // enforces below). In every other mode the decision is mode-only, so defer
+  // the chat lookup to the new-session path — this also keeps dryRun free of
+  // the chats API call (it returns before that later lookup).
   const explicitChatMode = hasExplicitTopicMessage && !rootMessageId && !req.target.sessionId && !httpVirtual
+    && regularGroupMode === 'shared'
     ? await getChatMode(larkAppId, chatId, { forceRefresh: true }) : undefined;
+  // Connector owner's explicit non-empty seed requests its own thread in every
+  // regular-group mode except a flat `shared` group; a shared-mode chat that is
+  // really a topic group still opens the thread (topic-group rule wins).
   const opensExplicitTopic = hasExplicitTopicMessage
     && (regularGroupMode !== 'shared' || explicitChatMode === 'topic');
   if (!ds && !req.target.sessionId && !rootMessageId && !httpVirtual

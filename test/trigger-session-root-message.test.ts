@@ -446,6 +446,100 @@ describe('triggerSessionTurn rootMessageId target', () => {
     expect(mockSendMessage).not.toHaveBeenCalled();
   });
 
+  it('splits an explicit seed in a shared-mode topic group even with an incumbent chat session', async () => {
+    mockGetChatMode.mockResolvedValue('topic');
+    mockGetBot.mockReturnValue({
+      config: { larkAppId: APP, cliId: 'claude-code', workingDir: '/tmp', regularGroupReplyMode: 'shared' },
+      botName: 'Bot', botOpenId: 'ou_bot',
+    });
+    const incumbent = existingDs({ scope: 'chat' });
+    incumbent.session.rootMessageId = CHAT;
+    const activeSessions = new Map<string, DaemonSession>([[sessionKey(CHAT, APP), incumbent]]);
+    const req = request({ rootMessageId: undefined });
+    req.presentation = { topicMessage: 'Topic group event' };
+
+    const result = await triggerSessionTurn(req, { larkAppId: APP, activeSessions });
+
+    expect(result).toMatchObject({ ok: true, target: { sessionId: 'sess_new' } });
+    expect(mockSendMessage).toHaveBeenCalledWith(APP, CHAT, 'Topic group event');
+    expect(activeSessions.get(sessionKey(CHAT, APP))).toBe(incumbent);
+    expect(activeSessions.get(sessionKey('om_new_topic', APP))?.scope).toBe('thread');
+  });
+
+  it('folds an explicit seed into a shared incumbent past the new-session model gate', async () => {
+    // traex + xhigh is rejected for a FRESH session; the shared fold must reach
+    // deliverToExisting before that gate instead of bouncing the turn.
+    mockGetChatMode.mockResolvedValue('group');
+    mockGetBot.mockReturnValue({
+      config: { larkAppId: APP, cliId: 'traex', workingDir: '/tmp', model: 'DeepSeek-V4-Pro', regularGroupReplyMode: 'shared' },
+      botName: 'TraeX', botOpenId: 'ou_bot',
+    });
+    const send = vi.fn();
+    const incumbent = existingDs({ scope: 'chat', worker: { killed: false, send } as any });
+    incumbent.session.rootMessageId = CHAT;
+    const activeSessions = new Map<string, DaemonSession>([[sessionKey(CHAT, APP), incumbent]]);
+    const req = request({ rootMessageId: undefined });
+    req.presentation = { topicMessage: 'Shared group event' };
+    req.options = { reasoningEffort: 'xhigh' };
+
+    const result = await triggerSessionTurn(req, { larkAppId: APP, activeSessions });
+
+    expect(result).toMatchObject({ ok: true, target: { sessionId: 'sess_existing' } });
+    expect(mockCreateSession).not.toHaveBeenCalled();
+    expect(mockSendMessage).not.toHaveBeenCalled();
+  });
+
+  it('anchors an explicit seed in a p2p chat to its own seed message', async () => {
+    // Explicit seed = explicit isolation intent regardless of group topology:
+    // a p2p trigger is anchored under its seed thread instead of the flat chat.
+    mockGetChatMode.mockResolvedValue('p2p');
+    const req = request({ rootMessageId: undefined });
+    req.presentation = { topicMessage: 'P2P event' };
+    const activeSessions = new Map<string, DaemonSession>();
+
+    await triggerSessionTurn(req, { larkAppId: APP, activeSessions });
+
+    expect(mockSendMessage).toHaveBeenCalledWith(APP, CHAT, 'P2P event');
+    expect(activeSessions.get(sessionKey('om_new_topic', APP))?.scope).toBe('thread');
+  });
+
+  it('skips the chat lookup for an explicit-seed dryRun outside shared mode', async () => {
+    mockGetBot.mockReturnValue({
+      config: { larkAppId: APP, cliId: 'claude-code', workingDir: '/tmp', regularGroupReplyMode: 'chat' },
+      botName: 'Bot', botOpenId: 'ou_bot',
+    });
+    const incumbent = existingDs({ scope: 'chat' });
+    incumbent.session.rootMessageId = CHAT;
+    const activeSessions = new Map<string, DaemonSession>([[sessionKey(CHAT, APP), incumbent]]);
+    const req = request({ rootMessageId: undefined });
+    req.presentation = { topicMessage: 'Preview event' };
+    req.options = { dryRun: true };
+
+    const result = await triggerSessionTurn(req, { larkAppId: APP, activeSessions });
+
+    expect(result).toMatchObject({ ok: true, action: 'dry_run' });
+    expect(mockGetChatMode).not.toHaveBeenCalled();
+  });
+
+  it('still resolves the shared fold for an explicit-seed dryRun via one chat lookup', async () => {
+    mockGetChatMode.mockResolvedValue('group');
+    mockGetBot.mockReturnValue({
+      config: { larkAppId: APP, cliId: 'claude-code', workingDir: '/tmp', regularGroupReplyMode: 'shared' },
+      botName: 'Bot', botOpenId: 'ou_bot',
+    });
+    const incumbent = existingDs({ scope: 'chat' });
+    incumbent.session.rootMessageId = CHAT;
+    const activeSessions = new Map<string, DaemonSession>([[sessionKey(CHAT, APP), incumbent]]);
+    const req = request({ rootMessageId: undefined });
+    req.presentation = { topicMessage: 'Preview event' };
+    req.options = { dryRun: true };
+
+    const result = await triggerSessionTurn(req, { larkAppId: APP, activeSessions });
+
+    expect(result).toMatchObject({ ok: true, action: 'dry_run', target: { sessionId: 'sess_existing' } });
+    expect(mockGetChatMode).toHaveBeenCalledTimes(1);
+  });
+
   it('suppresses the topic seed and keeps a topicless automation session chat-scoped', async () => {
     const req = request({ rootMessageId: undefined });
     req.presentation = { topicMessage: null };
