@@ -138,6 +138,7 @@ import { resolvePricingConfig, type ResolvedModelPricing } from '../services/mod
 import { RestartCoordinator, type RestartObserver } from './restart-coordinator.js';
 import { runtimeBuildIdentity } from '../utils/runtime-build-id.js';
 import { scrubWorkflowWorkerEnv } from '../utils/child-env.js';
+import { cleanupSessionTempDirAfterExit } from './session-temp.js';
 import { resolveFeedbackPolicyForDelivery, resolveFeedbackTeamId } from '../services/feedback-policy-resolver.js';
 import { attachOncallGroupButton, recordOncallGroupDelivery } from '../im/lark/oncall-group.js';
 import { beginFinalOutputDelivery, waitForTurnFinalOutputDeliveryDrain } from './final-output-delivery-drain.js';
@@ -7988,6 +7989,7 @@ export async function closeSession(
   let killedLive = false;
   const hadWorkerReference = !!ds?.worker;
   const hadLiveWorker = !!ds?.worker && !ds.worker.killed;
+  const closingWorker = ds?.worker ?? undefined;
   const closeWorkerGeneration = ds ? closeFenceGeneration(ds) : undefined;
   // Snapshot ownership + transition state before mutating the live object:
   // sessionStore commonly holds the very same Session reference as `ds`.
@@ -8240,6 +8242,20 @@ export async function closeSession(
     }
   }
   const closedSnapshot = sessionStore.getOwnedSession(sessionId) ?? ds?.session ?? stored;
+  if (known) {
+    cleanupSessionTempDirAfterExit(config.session.dataDir, sessionId, closingWorker, (error) => {
+      logger.warn(
+        `[${sessionId.slice(0, 8)}] failed to clean session scratch: `
+        + `${error instanceof Error ? error.message : String(error)}`,
+      );
+    }, () => {
+      // A close ACK precedes exit. Resume can install a replacement owner
+      // before this callback runs; even a workerless active row owns scratch.
+      if (findActiveBySessionId(sessionId)) return false;
+      if (retiringWorkersForSession(sessionId).some(worker => worker !== closingWorker)) return false;
+      return sessionStore.getOwnedSession(sessionId)?.status === 'closed';
+    });
+  }
   const runClosedLifecycle = async (workerExitProven: boolean): Promise<void> => {
     if (!closedSnapshot || !callbacks?.onSessionClosed) return;
     try {

@@ -69,6 +69,7 @@ import { publishCliSessionIdToDaemon } from './core/cli-session-id-publisher.js'
 import { ActiveTurnAuthority, type TurnAuthorityIdentity } from './core/active-turn-authority.js';
 import { readProcessStartIdentity } from './core/session-marker.js';
 import { roleLibraryRoot, roleLibrarySubtree } from './core/role-library.js';
+import { applySessionTempEnv, ensureSessionTempDir } from './core/session-temp.js';
 // Central no-transport predicate. Aliased because a local `const larkTransportEnabled`
 // (the role-library gate) already binds that name in one function scope.
 import { larkTransportEnabled as sessionLarkTransportEnabled } from './core/types.js';
@@ -14767,6 +14768,13 @@ async function spawnCli(
   const proxyError = networkProxyError(cfg.sandboxNetworkPolicy, { ...process.env, ...cfg.env });
   if (proxyError) throw new Error(proxyError);
   const spawnGeneration = ++cliSpawnGeneration;
+  const isolationRuntimeDataDir = process.env.SESSION_DATA_DIR
+    ?? join(homedir(), '.botmux', 'data');
+  const sessionScratchDir = ensureSessionTempDir(isolationRuntimeDataDir, cfg.sessionId);
+  // A worker owns exactly one logical session. Pin its own os.tmpdir() before
+  // constructing any backend so FIFOs, launch configs and CLI descendants all
+  // share the same collectable scratch tree.
+  applySessionTempEnv(process.env, sessionScratchDir);
   if (cfg.cliInstanceBinding && cfg.cliInstanceBinding.source !== 'legacy' && cfg.backendType === 'tmux') {
     TmuxBackend.assertInstanceIdentity(TmuxBackend.sessionName(cfg.sessionId), codexInstanceIdentity(cfg.cliInstanceBinding, cfg.cliRuntime));
   }
@@ -15472,8 +15480,6 @@ async function spawnCli(
   }
   if (sandboxRequested) appliedIsolationCapabilities.push('read', 'write');
   currentCliCredentialIsolated = appliedIsolationCapabilities.includes('credential');
-  const isolationRuntimeDataDir = process.env.SESSION_DATA_DIR
-    ?? join(defaultBotmuxHome, 'data');
   // The unified Darwin sandbox enforces both read and write isolation. Keep
   // the legacy marker fields because a live persistent pane carries the
   // compiled Seatbelt policy in-process and may only be reattached when that
@@ -15498,9 +15504,7 @@ async function spawnCli(
         ].map(canonicalPolicyPath),
         readOnlyExtraPaths: (cfg.sandboxPaths?.readOnly ?? []).map(canonicalPolicyPath),
         readWriteExtraPaths: (cfg.sandboxPaths?.readWrite ?? []).map(canonicalPolicyPath),
-        writeAllowExtraPaths: process.env.TMPDIR
-          ? [canonicalPolicyPath(process.env.TMPDIR)]
-          : [],
+        writeAllowExtraPaths: [canonicalPolicyPath(sessionScratchDir)],
         workingDir: canonicalPolicyPath(cfg.workingDir),
         homeDir: canonicalPolicyPath(homedir()),
         osUserHomeDir: canonicalPolicyPath(userInfo().homedir),
@@ -16828,6 +16832,8 @@ async function spawnCli(
   // bare creds (forkWorker) for lark-upload. See utils/child-env.ts.
   const childEnv = buildSessionChildEnv(process.env, cfg.envPolicy);
   if (cfg.promptInjection === 'none') clearBotmuxPromptEnv(childEnv);
+  // buildSessionChildEnv preserves TMPDIR/TMP/TEMP in both inheritance modes.
+  // The worker pin above is the single source for CLI and worker scratch.
   childEnv[PLUGIN_CARD_ACTION_CAPABILITIES_ENV] = cardActionCapabilities;
   if (sessionMcpGatewayHost) {
     childEnv[MCP_GATEWAY_SOCKET_ENV] = sessionMcpGatewayHost.socketPath;
@@ -17581,7 +17587,7 @@ async function spawnCli(
       ]),
       botmuxInstallRoot,
       outbox,
-      extraWritePaths: keepExisting([process.env.TMPDIR, canonicalManagedSessionDir]),
+      extraWritePaths: keepExisting([sessionScratchDir, canonicalManagedSessionDir]),
       userPaths,
       serviceCredentialReadOnlyPaths,
       mandatoryDenyPaths,
@@ -17692,6 +17698,7 @@ async function spawnCli(
         home: sandboxHome,
         cliBin: cliAdapter.resolvedBin,
         cliArgs: args,
+        tempDir: canonical(sessionScratchDir),
         trustedBotmuxCommandPaths: [defaultGatewayEntry().command],
         mcpGatewaySocketPath: sessionMcpGatewayHost?.socketPath,
         larkCliDataDir: childLarkDataRoot,

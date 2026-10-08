@@ -9664,7 +9664,7 @@ async function cmdSend(rest: string[]): Promise<void> {
     console.error(
       `不能把 stdin（${stdinAlias}）当作 --file/--image/--video 附件：botmux send 已从 stdin 读取消息正文，\n` +
       `同一个 stdin 没法既当正文又当附件（第二次读到的是 EOF）。\n` +
-      `要发送管道内容，先落到临时文件：  数据来源 > /tmp/x && botmux send --files /tmp/x …`,
+      `要发送管道内容，先落到会话临时文件：  数据来源 > "\${TMPDIR:-/tmp}/x" && botmux send --files "\${TMPDIR:-/tmp}/x" …`,
     );
     process.exit(1);
   }
@@ -10303,7 +10303,7 @@ async function cmdSend(rest: string[]): Promise<void> {
   }
 
   if (!customCard && !content.trim() && !asChoice && images.length === 0 && files.length === 0 && videoAttachments.length === 0) {
-    console.error('没有内容可发送。用法:\n  echo "消息" | botmux send\n  botmux send "消息"\n  botmux send --content-file /tmp/msg.md --images /tmp/chart.png\n  botmux send --videos /tmp/replay.mp4 --video-covers /tmp/cover.png --no-mention "视频预览"');
+    console.error('没有内容可发送。用法:\n  echo "消息" | botmux send\n  botmux send "消息"\n  botmux send --content-file "${TMPDIR:-/tmp}/msg.md" --images "${TMPDIR:-/tmp}/chart.png"\n  botmux send --videos "${TMPDIR:-/tmp}/replay.mp4" --video-covers "${TMPDIR:-/tmp}/cover.png" --no-mention "视频预览"');
     process.exit(1);
   }
 
