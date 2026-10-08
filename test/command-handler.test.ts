@@ -125,6 +125,7 @@ vi.mock('../src/services/lark-cli-auth.js', () => ({
 }));
 
 vi.mock('../src/bot-registry.js', () => ({
+  loadBotConfigs: vi.fn(() => [{ larkAppId: 'app-1' }, { larkAppId: 'app-2' }]),
   normalizeUsageDisplay: (cfg: { usageDisplay?: string }) => cfg.usageDisplay ?? 'streaming',
   getBot: vi.fn((id: string = 'app-1') => ({
     botName: id === 'app-2' ? 'Codex' : 'Claude',
@@ -617,7 +618,7 @@ import * as scheduler from '../src/core/scheduler.js';
 import { deleteMessage, sendMessage, sendUserMessage, replyMessage, listChatBotMembers, getChatModeStrict, getMessageThreadId, getMessageDetail, UserTokenMissingError } from '../src/im/lark/client.js';
 import { buildAdoptSelectCard, buildSlashListCard, buildSessionClosedCard } from '../src/im/lark/card-builder.js';
 import { createGroupWithBots } from '../src/services/group-creator.js';
-import { getAllBots, getBot, findOncallChat, effectiveDefaultWorkingDir } from '../src/bot-registry.js';
+import { getAllBots, getBot, loadBotConfigs, findOncallChat, effectiveDefaultWorkingDir } from '../src/bot-registry.js';
 import { t } from '../src/i18n/index.js';
 import { parseTriggerUserAuthConfig } from '../src/services/trigger-user-auth.js';
 import { hasBytedcliHome, beginBytedcliLogin, completeBytedcliLogin, pendingBytedcliChallenge } from '../src/services/bytedcli-auth.js';
@@ -1697,6 +1698,7 @@ describe('parseSlashCommandInvocation', () => {
 
 describe('handleCommand', () => {
   beforeEach(() => {
+    vi.mocked(loadBotConfigs).mockReturnValue([{ larkAppId: 'app-1' }, { larkAppId: 'app-2' }] as any);
     vi.clearAllMocks();
     vi.mocked(tagClosedSessionGroup).mockResolvedValue({ status: 'skipped' });
     vi.mocked(dismissSessionGroup).mockResolvedValue({ status: 'confirm', state: 'a'.repeat(64) });
@@ -7128,6 +7130,74 @@ describe('handleCommand', () => {
     const mockedCreate = vi.mocked(createGroupWithBots);
     const mockedListBots = vi.mocked(listChatBotMembers);
     const mockedSend = vi.mocked(sendMessage);
+
+    it('applies opt-in defaults using the deployment registry, even without a source-chat peer', async () => {
+      vi.mocked(getBot).mockImplementation(((id: string) => {
+        const bot = defaultGetBot(id);
+        return { ...bot, config: { ...bot.config, groupCreation: { agents: ['Codex'], tag: 'Work', avatar: 'name' } } };
+      }) as any);
+      const deps = makeDeps();
+      await handleCommand('/g', ROOT_ID, makeLarkMessage('/g Project'), deps, LARK_APP_ID);
+      expect(mockedCreate.mock.calls[0][0]).toMatchObject({
+        larkAppIds: ['app-1', 'app-2'], name: 'Project',
+        customization: { tag: 'Work', avatar: 'name', userOpenId: 'ou_sender' },
+      });
+      expect(mockedListBots).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      { flag: '', expected: ['app-1', 'app-2'] },
+      { flag: ' --no-agents', expected: ['app-1'] },
+      { flag: ' --agents app-1', expected: ['app-1'] },
+    ])('completes the default team when only its creator is mentioned: $flag', async ({ flag, expected }) => {
+      vi.mocked(getBot).mockImplementation(((id: string) => {
+        const bot = defaultGetBot(id);
+        return { ...bot, config: { ...bot.config, groupCreation: { agents: ['app-1', 'app-2'] } } };
+      }) as any);
+      mockedListBots.mockResolvedValueOnce([
+        { larkAppId: 'app-1', openId: 'ou_claude', name: 'claude-code', displayName: 'Claude', source: 'configured' },
+      ]);
+      const deps = makeDeps();
+      await handleCommand('/g', ROOT_ID, makeLarkMessage('/g @Claude Project' + flag, {
+        chatId: CHAT_ID, mentions: [{ key: '@_user_1', name: 'Claude', openId: 'ou_claude' }],
+      }), deps, LARK_APP_ID);
+      expect(mockedCreate).toHaveBeenCalledTimes(1);
+      expect(mockedCreate.mock.calls[0][0].larkAppIds).toEqual(expected);
+    });
+
+    it('rejects cached removed or core-only agents before creating a group', async () => {
+      vi.mocked(loadBotConfigs).mockReturnValueOnce([{ larkAppId: 'app-1' }] as any);
+      const removed = makeDeps();
+      await handleCommand('/g', ROOT_ID, makeLarkMessage('/g Project --agents app-2'), removed, LARK_APP_ID);
+      expect(mockedCreate).not.toHaveBeenCalled();
+      expect(vi.mocked(removed.sessionReply).mock.calls[0][1]).toContain('Unknown agent');
+      vi.mocked(loadBotConfigs).mockReturnValueOnce([{ larkAppId: 'app-1' }, { larkAppId: 'app-2', apiOnly: true }] as any);
+      await handleCommand('/g', ROOT_ID, makeLarkMessage('/g Project --agents Codex'), makeDeps(), LARK_APP_ID);
+      expect(mockedCreate).not.toHaveBeenCalled();
+    });
+
+    it.each(['{broken', '{}', '[]'])('resolves configured app IDs with an unavailable name cache: %s', async cache => {
+      const original = vi.mocked(readFileSync).getMockImplementation()!;
+      vi.mocked(readFileSync).mockImplementation(((path: any, ...rest: any[]) =>
+        typeof path === 'string' && path.includes('bots-info.json') ? cache : original(path, ...rest)) as any);
+      try {
+        await handleCommand('/g', ROOT_ID, makeLarkMessage('/g Project --agents app-2'), makeDeps(), LARK_APP_ID);
+        expect(mockedCreate.mock.calls[0][0].larkAppIds).toEqual(['app-1', 'app-2']);
+      } finally { vi.mocked(readFileSync).mockImplementation(original); }
+    });
+
+    it('invites a configured app ID before it has appeared in the probe cache', async () => {
+      vi.mocked(loadBotConfigs).mockReturnValueOnce([{ larkAppId: 'app-1' }, { larkAppId: 'app-new' }] as any);
+      await handleCommand('/g', ROOT_ID, makeLarkMessage('/g Project --agents app-new'), makeDeps(), LARK_APP_ID);
+      expect(mockedCreate.mock.calls[0][0].larkAppIds).toEqual(['app-1', 'app-new']);
+    });
+
+    it('rejects unresolved configured agents before creating any group', async () => {
+      const deps = makeDeps();
+      await handleCommand('/g', ROOT_ID, makeLarkMessage('/g Project --agents Missing'), deps, LARK_APP_ID);
+      expect(mockedCreate).not.toHaveBeenCalled();
+      expect((deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1]).toContain('Missing');
+    });
 
     it('creates a solo group (creator only) when no bots are @-mentioned', async () => {
       const ds = makeDaemonSession();

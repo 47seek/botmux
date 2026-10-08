@@ -1,3 +1,4 @@
+import { parseGroupCreationArgs, resolveGroupCreationAgents, type GroupCreationArgs } from '../services/group-creation-options.js';
 /**
  * Command handler — processes /slash commands from users.
  * Extracted from daemon.ts for modularity.
@@ -8,7 +9,7 @@ import { createHash } from 'node:crypto';
 import { join, resolve, basename } from 'node:path';
 import { config } from '../config.js';
 import { buildTerminalUrl } from './terminal-url.js';
-import { getBot, getAllBots, getBotOpenId, getOwnerOpenId, findOncallChat, effectiveDefaultWorkingDir, type BotConfig } from '../bot-registry.js';
+import { getBot, getAllBots, getBotOpenId, getOwnerOpenId, findOncallChat, effectiveDefaultWorkingDir, loadBotConfigs, type BotConfig } from '../bot-registry.js';
 import { triggerUserAuthApplies } from '../services/trigger-user-auth.js';
 import { beginBytedcliLogin, completeBytedcliLogin, pendingBytedcliChallenge, hasBytedcliHome } from '../services/bytedcli-auth.js';
 import { beginLarkCliLogin, completeLarkCliLogin, pendingLarkCliChallenge, hasLarkCliHome } from '../services/lark-cli-auth.js';
@@ -4674,17 +4675,33 @@ export async function handleCommand(
         for (const m of mentions) {
           if (m.name) rawArgs = rawArgs.split(`@${m.name}`).join(' ');
         }
-        let roleProfileId: string | undefined;
-        const roleProfileArg = rawArgs.match(/(?:^|\s)--role-profile(?:=|\s+)(\S+)/);
-        if (roleProfileArg) {
-          if (!isValidRoleProfileId(roleProfileArg[1])) {
-            await sessionReply(rootId, t('role.profile.invalid', undefined, loc));
-            break;
+        let groupArgs: GroupCreationArgs;
+        let configuredAgentIds: string[] = [];
+        try {
+          groupArgs = parseGroupCreationArgs(rawArgs, getBot(creatorAppId).config.groupCreation);
+          // Keep @ election/invites, and complete the configured team even when
+          // only its creator was mentioned. Explicit --agents/--no-agents have
+          // already overridden defaults in the parser; Set below deduplicates.
+          if (groupArgs.agents?.length) {
+            const configs = loadBotConfigs();
+            const p = join(config.session.dataDir, 'bots-info.json');
+            let bots: Parameters<typeof resolveGroupCreationAgents>[2] = [];
+            try {
+              const cached: unknown = existsSync(p) ? JSON.parse(readFileSync(p, 'utf-8')) : [];
+              if (Array.isArray(cached)) bots = cached.filter(b => b && typeof b === 'object');
+            } catch { /* Names can be unavailable; app IDs still resolve against config. */ }
+            configuredAgentIds = resolveGroupCreationAgents(groupArgs.agents, configs, bots);
           }
-          roleProfileId = roleProfileArg[1];
-          rawArgs = rawArgs.replace(roleProfileArg[0], ' ');
+        } catch (err: any) {
+          await sessionReply(rootId, t('cmd.group.invalid_options', { reason: err?.message ?? String(err) }, loc));
+          break;
         }
-        const firstLine = rawArgs.split(/\r?\n/).map(s => s.trim()).find(Boolean) ?? '';
+        const { roleProfileId } = groupArgs;
+        if (roleProfileId && !isValidRoleProfileId(roleProfileId)) {
+          await sessionReply(rootId, t('role.profile.invalid', undefined, loc));
+          break;
+        }
+        const firstLine = groupArgs.name;
         let baseGroupName: string;
         if (firstLine) {
           baseGroupName = firstLine;
@@ -4697,7 +4714,7 @@ export async function handleCommand(
 
         // Bots to invite: every @-mentioned bot (creator filtered out internally
         // by the service). Empty mentions → solo group (creator only).
-        const larkAppIdsForGroup = mentionedBotAppIds.length > 0 ? mentionedBotAppIds : [creatorAppId];
+        const larkAppIdsForGroup = [...new Set([creatorAppId, ...mentionedBotAppIds, ...configuredAgentIds])];
 
         try {
           const { createGroupWithBots } = await import('../services/group-creator.js');
@@ -4709,6 +4726,9 @@ export async function handleCommand(
             transferOwnerTo: senderOpenId,
             notifyOwnerOpenId: senderOpenId,
             roleProfileId,
+            ...((groupArgs.tag || groupArgs.avatar === 'name') ? {
+              customization: { tag: groupArgs.tag, avatar: groupArgs.avatar, userOpenId: senderOpenId },
+            } : {}),
           });
           // Prefer the shareable join link (others can click to *join*); fall
           // back to the member-only applink URL when Lark's link API failed.
@@ -4717,6 +4737,8 @@ export async function handleCommand(
           // Partial failures are non-fatal — the chat exists; surface them as
           // hints so the user knows whether to expect to be auto-invited.
           const hints: string[] = [];
+          if (result.customization?.avatarError) hints.push(t('cmd.group.avatar_failed', { reason: result.customization.avatarError }, loc));
+          if (result.customization?.tagError) hints.push(t('cmd.group.tag_failed', { reason: result.customization.tagError }, loc));
           if (result.invalidUserIds.includes(senderOpenId)) {
             hints.push(t('cmd.group.warn_invite_rejected', undefined, loc));
           } else if (result.transferError) {
