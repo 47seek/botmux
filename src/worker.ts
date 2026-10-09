@@ -2134,6 +2134,7 @@ let lastSpawnOuterBwrapActive = false;
 // includes bwrap and Forge; keep it separate from lastSpawnOuterBwrapActive
 // because prompt-readiness code has bwrap-specific shell handling.
 let lastSpawnTraexLauncherActive = false;
+let lastSpawnCodexLauncherActive = false;
 /**
  * True only when {@link shouldArmSpawnArgvInitialPromptBusy} says so: argv-
  * baked first prompt + SessionStart ready (Grok-class). First markPromptReady
@@ -7743,9 +7744,11 @@ function codexBridgeDetachFile(): void {
 /** Resolve the pid of the Codex process this worker observes (spawned child or
  *  adopted pane), mirroring the grok/traex pid-follow resolution order. */
 function currentCodexObservedPid(): number | undefined {
-  return (backend as { cliPid?: number } | null)?.cliPid
-    ?? backend?.getChildPid?.()
-    ?? codexAdoptPendingPid;
+  const wired = (backend as { cliPid?: number } | null)?.cliPid;
+  if (wired) return wired;
+  const child = backend?.getChildPid?.();
+  if (child) return resolveCodexOwnershipPid(child, lastSpawnCodexLauncherActive);
+  return codexAdoptPendingPid;
 }
 
 /** The live cursor-agent pid holding the chat's store.db open. backend.cliPid
@@ -7820,6 +7823,20 @@ function codexHistorySidOwnedByCurrentPid(cliSessionId: string): boolean {
     log(`Codex session id ${cliSessionId} not owned by pid ${pid ?? '?'} (open rollouts: ${ownedRollouts ? [...ownedRollouts].join(',') || 'none' : 'unknown'})`);
   }
   return owned;
+}
+
+/** Resolve the pid that actually holds a Codex rollout open, given a candidate
+ *  that may be a bwrap supervisor. Under the file/scratch sandbox, botmux launches
+ *  `bwrap --unshare-pid -- codex`, so the tmux pane leaf / getChildPid() is the
+ *  bwrap process — its /proc/<pid>/fd holds no rollout, and the ownership gate
+ *  would fail. The real codex leaf is host-visible across the pid ns
+ *  (ps -A ppid links), so a comm-based BFS descends to it. Outside launcher
+ *  shapes (or if codex hasn't been forked yet) the candidate already is the
+ *  leaf, so we return it unchanged — fail closed to the launcher pid rather
+ *  than guess. */
+function resolveCodexOwnershipPid(candidatePid: number, launcherActive: boolean): number {
+  if (!launcherActive || !candidatePid) return candidatePid;
+  return findLaunchedCliPid(candidatePid, 'codex') ?? candidatePid;
 }
 
 /** Resolve the pid that actually holds a TRAE rollout open, given a candidate
@@ -11550,9 +11567,11 @@ function settleBackendScreenBeforeIdle(
 /** Submission writes must surface ZMX's explicit false result, while its
  * best-effort navigation/startup keystrokes keep their non-throwing contract. */
 function adapterInputHandle(target: SessionBackend): PtyHandle {
-  return target instanceof ZmxBackend
+  const handle: PtyHandle = target instanceof ZmxBackend
     ? strictInputHandle(target)
     : target;
+  handle.isAdopt = Boolean(lastInitConfig?.adoptMode);
+  return handle;
 }
 
 function codexAdoptComposerConflict(target: SessionBackend): string | undefined {
@@ -17935,6 +17954,7 @@ async function spawnCli(
         mcpGatewaySocketPath: sessionMcpGatewayHost?.socketPath,
         childEnvForce: { CODEX_HOME: nativeCodexHome, TRAE_HOME: nativeTraeHome },
         readOnlyCarvePaths: scratchReadOnlyCarves,
+        useBwrapArgsFile: effectiveBackendType === 'tmux',
       });
       if (!sbx) {
         throw new Error('scratch sandbox requested but could not be established (overlay/bwrap setup failed, or the tmpfs upper was lost in a reboot) — start a new session; never bare-running');
@@ -18617,6 +18637,7 @@ async function spawnCli(
     // filter (which would reject the correct App Server submission).
     (backend as PtyHandle).expectedCodexSessionId = cfg.cliSessionId;
   }
+  (backend as PtyHandle).isAdopt = Boolean(cfg.adoptMode);
   publishLocalProcessAttestation(cliPid ?? undefined);
   if (cliPid && process.env.SESSION_DATA_DIR) {
     const markersDir = join(process.env.SESSION_DATA_DIR, '.botmux-cli-pids');
@@ -18680,6 +18701,8 @@ async function spawnCli(
   lastSpawnOuterBwrapActive = outerBwrapActive;
   const traexLauncherActive = outerBwrapActive || cfg.cliLaunchMode === 'forge-traex';
   lastSpawnTraexLauncherActive = traexLauncherActive;
+  const codexLauncherActive = outerBwrapActive;
+  lastSpawnCodexLauncherActive = codexLauncherActive;
   const startTraexLauncherPidResolve = (launcherPid: number): void => {
     if (cfg.cliId !== 'traex' || !traexLauncherActive) return;
     scheduleWrapperRealCliPid(launcherPid, {
@@ -18688,6 +18711,21 @@ async function spawnCli(
       getChildPid: () => backend?.getChildPid?.(),
       applyRealPid: (realPid) => {
         log(`TRAE launcher: resolved real traex leaf pid ${realPid} under launcher ${launcherPid}; rewiring ownership pid`);
+        (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliPid = realPid;
+        (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliCwd = cfg.workingDir;
+        publishLocalProcessAttestation(realPid);
+      },
+      schedule: (fn, ms) => { setTimeout(fn, ms); },
+    });
+  };
+  const startCodexLauncherPidResolve = (launcherPid: number): void => {
+    if (cfg.cliId !== 'codex' || !codexLauncherActive) return;
+    scheduleWrapperRealCliPid(launcherPid, {
+      findRealPid: (lp) => findLaunchedCliPid(lp, 'codex'),
+      getBackend: () => backend,
+      getChildPid: () => backend?.getChildPid?.(),
+      applyRealPid: (realPid) => {
+        log(`Codex launcher: resolved real codex leaf pid ${realPid} under launcher ${launcherPid}; rewiring ownership pid`);
         (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliPid = realPid;
         (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliCwd = cfg.workingDir;
         publishLocalProcessAttestation(realPid);
@@ -18719,12 +18757,17 @@ async function spawnCli(
   // claudeJsonlPath above is still the initial guess; the resolver corrects
   // it on first write when Claude was started with `--resume`.
   if (cliPid && cliAdapterBindsOwnershipPid(cfg.cliId, claudeDataDir)) {
-    // TRAE under bwrap/Forge launcher: best-effort immediate resolve (leaf may
+    // TRAE/Codex under bwrap/launcher: best-effort immediate resolve (leaf may
     // already be forked), then a bounded retry below covers the not-yet-forked case.
-    const wiredPid = cfg.cliId === 'traex' ? resolveTraexOwnershipPid(cliPid, traexLauncherActive) : cliPid;
+    const wiredPid = cfg.cliId === 'traex'
+      ? resolveTraexOwnershipPid(cliPid, traexLauncherActive)
+      : cfg.cliId === 'codex'
+        ? resolveCodexOwnershipPid(cliPid, codexLauncherActive)
+        : cliPid;
     (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliPid = wiredPid;
     (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliCwd = cfg.workingDir;
     if (cfg.cliId === 'traex' && traexLauncherActive) startTraexLauncherPidResolve(cliPid);
+    if (cfg.cliId === 'codex' && codexLauncherActive) startCodexLauncherPidResolve(cliPid);
   }
 
   // Async pid fallback: tmux/pty resolve the CLI pid synchronously above, but
@@ -18753,10 +18796,15 @@ async function spawnCli(
           }
         }
         if (cliAdapterBindsOwnershipPid(cfg.cliId, claudeDataDir)) {
-          const wiredPid = cfg.cliId === 'traex' ? resolveTraexOwnershipPid(pid, traexLauncherActive) : pid;
+          const wiredPid = cfg.cliId === 'traex'
+            ? resolveTraexOwnershipPid(pid, traexLauncherActive)
+            : cfg.cliId === 'codex'
+              ? resolveCodexOwnershipPid(pid, codexLauncherActive)
+              : pid;
           (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliPid = wiredPid;
           (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliCwd = cfg.workingDir;
           if (cfg.cliId === 'traex' && traexLauncherActive) startTraexLauncherPidResolve(pid);
+          if (cfg.cliId === 'codex' && codexLauncherActive) startCodexLauncherPidResolve(pid);
         }
         // wrapperCli under a late-pid backend (zellij): `pid` here is still the
         // LAUNCHER. Kick the descendant resolver so the bridge gets the real CLI
