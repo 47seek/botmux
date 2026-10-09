@@ -199,7 +199,7 @@ import {
 } from './core/update-check.js';
 import { GITHUB_REPO } from './core/restart-report.js';
 import { DEFAULT_OVERLOAD_THRESHOLDS } from './core/host-overload-alert.js';
-import { spawnDetachedRestart, globalInstallUpdateLockTarget } from './core/maintenance.js';
+import { spawnDetachedRestart, globalInstallUpdateLockTarget, verifyBinaryRestartTarget } from './core/maintenance.js';
 import {
   resolveLocalDevCheckoutDir,
   resolveLocalDevRestartTarget,
@@ -1908,6 +1908,7 @@ let updateInFlight = false;
 // the successful plan (including its stable package root) so follow-up status,
 // update, and restart requests do not reuse the removed old runtime realpath.
 let lastSuccessfulUpdatePlan: GlobalInstallPlan | undefined;
+let pendingBinaryRestart: { target: string; version: string } | undefined;
 
 // Local-dev counterpart: the checkout a successful /api/update/run built, and
 // its post-build HEAD. Pinned so the follow-up /api/update/restart applies THIS
@@ -1990,6 +1991,7 @@ async function cachedRollbackVersions(current: string, force = false): Promise<R
 }
 
 function currentInstalledVersion(): string {
+  if (pendingBinaryRestart) return pendingBinaryRestart.version;
   if (!lastSuccessfulUpdatePlan) return resolveCurrentVersion();
   const version = botmuxVersionAt(lastSuccessfulUpdatePlan.activePackageRoot);
   return version === '0.0.0' ? resolveCurrentVersion() : version;
@@ -4661,7 +4663,7 @@ const server = createServer(async (req, res) => {
       const installPlan = updateStrategy.kind === 'package-manager'
         ? tryResolveGlobalInstallPlan(updateStrategy.packageRoot)
         : null;
-      const selfReplace = updateStrategy.kind === 'self-replace';
+      const selfReplace = updateStrategy.kind === 'self-replace' || updateStrategy.kind === 'install-release';
       // Compare against the npm `latest` dist-tag (always stable; the update
       // button installs `@latest`). isNewerVersion uses semver precedence, so a
       // canary running AHEAD of the latest stable (e.g. 2.87.0-canary.0 vs
@@ -4705,7 +4707,7 @@ const server = createServer(async (req, res) => {
       // not what install.sh last put on disk, so "running daemon vs disk" is
       // undetermined there — say nothing rather than invert after a partial
       // respawn. A Node install reads package.json, which is the disk.
-      const diskVersion = isStandaloneBinary() ? undefined : current;
+      const diskVersion = pendingBinaryRestart?.version ?? (isStandaloneBinary() ? undefined : current);
       const runningDaemonRestartHint = formatRunningDaemonsRestartSummary(
         runningDaemons.map(d => d.version),
         diskVersion,
@@ -4726,6 +4728,7 @@ const server = createServer(async (req, res) => {
         // stays disabled (there is nothing to pull).
         localDevUpdatable: localDev && isGitWorktree(resolveLocalDevCheckoutDir()),
         updateSupported: installPlan !== null || selfReplace,
+        releaseInstallRequired: updateStrategy.kind === 'install-release',
         // Rollback is a SEPARATE capability from update. The web UI used to derive
         // it from `updateSupported`, which now includes the self-replacing binary —
         // but /api/update/rollback only knows how to drive a package manager, so a
@@ -4736,7 +4739,7 @@ const server = createServer(async (req, res) => {
         // its own kind rather than letting the UI claim "npm/pnpm/Bun only".
         updateManager: selfReplace ? 'binary' : (installPlan?.manager ?? installManager),
         updateCommand: selfReplace
-          ? `botmux update（下载并替换 ${updateStrategy.target}）`
+          ? `botmux update（下载官方版本至 ${updateStrategy.target}）`
           : installPlan ? formatGlobalInstallCommand(installPlan) : null,
         node: checkNode(),
         installs: detectBotmuxInstalls(),
@@ -4824,7 +4827,7 @@ const server = createServer(async (req, res) => {
       // 对应平台的 release 资产、校验 SHA-256 后原子替换自身。npm 子包形态不走
       // 这里 —— 那棵树归 npm 所有，交回 npm 更新（见 binary-self-update.ts 头部）。
       const runStrategy = currentUpdateStrategy(botmuxInstallRoot());
-      if (runStrategy.kind === 'self-replace') {
+      if (runStrategy.kind === 'self-replace' || runStrategy.kind === 'install-release') {
         if (updateInFlight) return jsonRes(res, 409, { ok: false, error: 'update_in_flight' });
         updateInFlight = true;
         let acquired = false;
@@ -4842,6 +4845,7 @@ const server = createServer(async (req, res) => {
             acquired = true;
             if (hasActiveRestartLease()) { blockedByRestart = true; return; }
             await replaceStandaloneBinary(newVersion, runStrategy.target);
+            pendingBinaryRestart = { target: runStrategy.target, version: newVersion };
           }, { maxWaitMs: 2_000 });
         } catch (e) {
           if (!acquired) return jsonRes(res, 409, { ok: false, error: 'update_in_flight' });
@@ -5148,10 +5152,24 @@ const server = createServer(async (req, res) => {
       let acquired = false;
       let leaseId: string | null = null;
       let activePackageRoot: string | undefined;
+      let binaryRestartTarget: string | undefined;
       let shouldLaunch = false;
       try {
         await withFileLock(globalInstallUpdateLockTarget(), async () => {
           acquired = true;
+          if (pendingBinaryRestart) {
+            try {
+              verifyBinaryRestartTarget(pendingBinaryRestart);
+              binaryRestartTarget = pendingBinaryRestart.target;
+            } catch (error) {
+              jsonRes(res, 409, {
+                ok: false,
+                error: 'binary_restart_target_changed',
+                detail: error instanceof Error ? error.message : String(error),
+              });
+              return;
+            }
+          }
           const claimed = claimRestartLease();
           if (!claimed) {
             jsonRes(res, 202, { ok: true, alreadyScheduled: true });
@@ -5198,7 +5216,7 @@ const server = createServer(async (req, res) => {
       if (shouldLaunch && leaseId) {
         const launch = () => {
           try {
-            const child = spawnDetachedRestart('dashboard', activePackageRoot, leaseId!);
+            const child = spawnDetachedRestart('dashboard', activePackageRoot, leaseId!, binaryRestartTarget);
             if (!child.pid) throw new Error('restart driver did not start');
           } catch (error) {
             if (!clearRestartLeaseLocked(leaseId!)) {

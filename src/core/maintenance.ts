@@ -281,9 +281,9 @@ export async function applyBotmuxUpdate(
   if (strategy.kind === 'unsupported') {
     throw new UnsupportedGlobalInstallError('unknown', process.execPath);
   }
-  if (strategy.kind === 'self-replace') {
+  if (strategy.kind === 'self-replace' || strategy.kind === 'install-release') {
     const r = await replaceStandaloneBinary(version, strategy.target);
-    return { strategy: 'self-replace', detail: `${r.asset} → ${r.target}` };
+    return { strategy: strategy.kind, detail: `${r.asset} → ${r.target}` };
   }
   const spec = version.startsWith('botmux@') ? version : `botmux@${version}`;
   const plan = resolveGlobalInstallPlan(strategy.packageRoot, process.platform, spec);
@@ -531,12 +531,25 @@ export function resolveRestartInvocation(
   launcherPath: string,
   launcherExists: boolean,
   localDev = false,
+  updatedBinary?: string,
 ): { executable: string; selfDispatching: boolean } {
+  if (updatedBinary) return { executable: updatedBinary, selfDispatching: true };
   const executable = resolveStandaloneRestartExecutable(
     standalone, execPath, shape, launcherPath, launcherExists, localDev,
   );
   // The compiled binary IS the CLI; the launcher shim `exec`s it with "$@".
   return { executable, selfDispatching: standalone || executable === launcherPath };
+}
+
+export function verifyBinaryRestartTarget(update: { target: string; version: string }): void {
+  const result = spawnSync(update.target, ['--version'], {
+    encoding: 'utf-8',
+    timeout: 30_000,
+    env: { ...process.env, BOTMUX_INSTALL_PROBE: '1' },
+  });
+  if (result.error || result.status !== 0 || result.stdout.trim() !== update.version) {
+    throw new Error(`待重启的二进制未通过版本校验：${update.target}（预期 ${update.version}）`);
+  }
 }
 
 /**
@@ -552,6 +565,7 @@ export function spawnDetachedRestart(
   reason: string,
   activePackageRoot?: string,
   restartLeaseId?: string,
+  updatedBinary?: string,
 ): ReturnType<typeof spawn> {
   const logFile = maintenanceRestartLogPath();
   let fd: number | undefined;
@@ -580,6 +594,7 @@ export function spawnDetachedRestart(
     launcher,
     existsSync(launcher),
     isLocalDevInstall(),
+    updatedBinary,
   );
   const { cmd, args } = buildRestartLauncher(executable, cliEntry, setsidAvailable(), selfDispatching);
   const child = spawn(cmd, args, {
@@ -663,7 +678,7 @@ function productionDeps(): MaintenanceDeps {
     runUpdate: () => {
       installedTo = '';
       const strategy = currentUpdateStrategy(botmuxInstallRoot());
-      if (strategy.kind === 'unsupported') {
+      if (strategy.kind === 'unsupported' || strategy.kind === 'install-release') {
         throw new UnsupportedGlobalInstallError('unknown', process.execPath);
       }
       if (strategy.kind === 'self-replace') {

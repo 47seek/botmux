@@ -3468,7 +3468,7 @@ async function cmdUpgrade(args: string[] = []): Promise<void> {
   // Unsupported（实测真实 v3.18.4 二进制就是这条）。改为先按「二进制装在哪」
   // 判形态：npm 子包形态交回 npm/pnpm/bun，install.sh 形态自己换二进制。
   const strategy = currentUpdateStrategy(botmuxInstallRoot());
-  if (strategy.kind === 'self-replace') {
+  if (strategy.kind === 'self-replace' || strategy.kind === 'install-release') {
     try {
       const resolvedVersion = await fetchDistTagVersion(target.tag);
       if (!resolvedVersion) {
@@ -3477,7 +3477,7 @@ async function cmdUpgrade(args: string[] = []): Promise<void> {
       }
       const current = resolveCurrentVersion();
       const decision = shouldApplySelfUpdate(target, resolvedVersion, current);
-      if (!decision.proceed) {
+      if (!decision.proceed && strategy.kind !== 'install-release') {
         if (decision.reason === 'already_latest') {
           console.log(`✅ 已是最新版本（${current}）。`);
         } else {

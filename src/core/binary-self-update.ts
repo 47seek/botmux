@@ -57,10 +57,9 @@
  *           the matching asset, verify its published SHA-256, then atomically
  *           rename over the target. Nothing else owns that path.
  *
- * A shape we cannot positively identify returns null, and every caller keeps its
- * existing "unsupported install" behaviour. Fail closed: guessing wrong here
- * means either writing into a tree npm owns, or downloading a binary for the
- * wrong libc.
+ * Other binary locations require a manual release installation at the default
+ * launcher path. The original binary is retained; scheduled updates are disabled
+ * until the installed release is running.
  */
 import { createHash, randomBytes } from 'node:crypto';
 import {
