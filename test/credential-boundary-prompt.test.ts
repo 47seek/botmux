@@ -49,6 +49,13 @@ describe('buildCredentialBoundaryBlock', () => {
     expect(byted).not.toContain('missing_scope');
     expect(byted).toContain(locale === 'zh' ? 'stderr 已附授权链接' : 'If stderr carries an authorization link');
     expect(byted).toContain(locale === 'zh' ? '只需授权一次、自动续期' : 'authorize just once, it renews automatically');
+    // The Feishu-specific failure flow must follow the same gate as lark-cli.
+    // Discriminate on that line itself: on_auth_link is emitted for every tool
+    // and also mentions `botmux auth request`, so the shared phrase cannot tell
+    // the two branches apart.
+    const feishuFailureLine = locale === 'zh' ? '遇到飞书鉴权失败' : 'On a Feishu auth failure';
+    expect(byted).not.toContain(feishuFailureLine);
+    expect(lark).toContain(feishuFailureLine);
 
     const git = buildCredentialBoundaryBlock({ ...policy, gitHost: 'code.example.com' }, locale);
     expect(git).toContain('git');
