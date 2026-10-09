@@ -8902,12 +8902,7 @@ const transferInputGates = new WeakMap<DaemonSession, TransferInputGate>();
 // cannot forge an option that bypasses the transfer gate.
 const transferReplacementForkBypass = new WeakSet<DaemonSession>();
 
-// IPC transport and worker acknowledgement are separate stages. A transport
-// timeout may retry because the parent never confirmed enqueue; an ACK timeout
-// is only a delayed/ambiguous state because the child may still execute later.
 const ORDINARY_IM_TRANSPORT_TIMEOUT_MS = 2_000;
-const ORDINARY_IM_ACK_SETTLEMENT_TIMEOUT_MS = 2_000;
-const ORDINARY_IM_INIT_COMMIT_TIMEOUT_MS = 90_000;
 const ORDINARY_IM_MAX_ATTEMPTS = 2;
 
 type OrdinaryImDelivery = {
@@ -8920,7 +8915,6 @@ type OrdinaryImDelivery = {
   attempt: number;
   received: boolean;
   transportConfirmed: boolean;
-  delayNotified: boolean;
   /** At most one daemon ownership handoff may run for a logical delivery.
    * Duplicate worker reject events join this promise instead of creating a
    * second durable record. */
@@ -9002,56 +8996,11 @@ function failOrdinaryImDelivery(
   ));
 }
 
-function delayOrdinaryImDelivery(record: OrdinaryImDelivery): void {
-  if (pendingOrdinaryImDeliveries.get(record.key) !== record) return;
-  // A delayed notice is only an intermediate status. Keep the delivery record
-  // so a later explicit rejection or worker exit can still produce the real
-  // terminal outcome instead of silently dropping the turn after telling the
-  // user not to resend it.
-  clearOrdinaryImDeliveryTimer(record);
-  if (record.delayNotified) return;
-  record.delayNotified = true;
-  logger.warn(
-    `[${tag(record.ds)}] Ordinary IM input is still waiting for the worker after IPC enqueue `
-    + `turn=${record.turnId.substring(0, 16)} generation=${record.workerGeneration} `
-    + `attempt=${record.attempt}`,
-  );
-  if (
-    record.turnId.startsWith('bmx-recovery-')
-    || isMeetingDrivenTurn(record.ds, record.turnId)
-    || isSilentScheduledTurn(record.ds, record.turnId)
-  ) return;
-  const loc = botLocale(getBot(record.ds.larkAppId).config);
-  const messageKey = record.received
-    ? 'worker.input_commit_delayed'
-    : 'worker.input_delivery_delayed';
-  if (replyCardModeFor(record.ds, record.turnId) !== 'legacy') {
-    // The turn card already represents queued/working state. A slow worker
-    // receipt must not create a second message (or expose progress in final-only).
-    void updateTurnReplyCard(record.ds, record.turnId, { kind: 'refresh' },
-      (body, type, uuid, beforeWrite) => requireCallbacks().sessionReply(
-        sessionAnchorId(record.ds), body, type, record.ds.larkAppId, record.turnId, { uuid, beforeWrite },
-      )).catch(err => logger.warn(`[${tag(record.ds)}] reply-card delivery wait: ${err.message}`));
-    return;
-  }
-  void requireCallbacks().sessionReply(
-    sessionAnchorId(record.ds),
-    tr(messageKey, { turnId: record.turnId.substring(0, 16) }, loc),
-    'text',
-    record.ds.larkAppId,
-    record.turnId,
-  ).catch(err => logger.error(
-    `[${tag(record.ds)}] Failed to report delayed ordinary IM worker delivery: `
-    + `${err instanceof Error ? err.message : String(err)}`,
-  ));
-}
-
 function retryOrFailOrdinaryImDelivery(
   record: OrdinaryImDelivery,
   reason: string,
   failureMessageKey?: OrdinaryImFailureMessageKey,
-): void {
-  if (pendingOrdinaryImDeliveries.get(record.key) !== record) return;
+): void {  if (pendingOrdinaryImDeliveries.get(record.key) !== record) return;
   if (
     record.attempt < ORDINARY_IM_MAX_ATTEMPTS
     && record.ds.worker === record.worker
@@ -9110,10 +9059,6 @@ function sendOrdinaryImDeliveryAttempt(record: OrdinaryImDelivery): boolean {
         `[${tag(record.ds)}] Ordinary IM input enqueued to worker IPC `
         + `turn=${record.turnId.substring(0, 16)} generation=${record.workerGeneration} attempt=${attempt}`,
       );
-      record.timer = setTimeout(() => {
-        delayOrdinaryImDelivery(record);
-      }, ORDINARY_IM_ACK_SETTLEMENT_TIMEOUT_MS);
-      record.timer.unref?.();
     });
   } catch (err) {
     queueMicrotask(() => retryOrFailOrdinaryImDelivery(
@@ -9187,7 +9132,6 @@ function sendOrdinaryImDeliveryTracked(
     attempt: 0,
     received: false,
     transportConfirmed: false,
-    delayNotified: false,
   };
   pendingOrdinaryImDeliveries.set(key, record);
   onIpcDispatchAttempted?.();
@@ -9225,19 +9169,6 @@ function acknowledgeOrdinaryImDeliveryReceipt(
   if (!record.received) {
     record.received = true;
     clearOrdinaryImDeliveryTimer(record);
-    // Cold start (worker not ready yet) must await web server bind, plugin prep,
-    // and spawnCli before any turn can commit. Native Codex also commits after
-    // history confirms submission rather than on enqueue. Keep the short
-    // settlement budget for steady-state IPC enqueue, not for multi-second process startup.
-    const isColdStart = ds.workerReady !== true;
-    const isNativeCodex = ds.initConfig?.cliId === 'codex' && !ds.initConfig.codexRpcInput;
-    const commitWaitMs = (isColdStart || isNativeCodex)
-      ? ORDINARY_IM_INIT_COMMIT_TIMEOUT_MS
-      : ORDINARY_IM_ACK_SETTLEMENT_TIMEOUT_MS;
-    record.timer = setTimeout(() => {
-      delayOrdinaryImDelivery(record);
-    }, commitWaitMs);
-    record.timer.unref?.();
   }
   logger.info(
     `[${tag(ds)}] Ordinary IM input received by worker `
