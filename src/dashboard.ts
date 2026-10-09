@@ -14,7 +14,7 @@ import { createConfigApi } from './core/plugins/runtime.js';
 import { createHmac, randomBytes } from 'node:crypto';
 import { logger } from './utils/logger.js';
 import { isStandaloneBinary } from './core/self-spawn.js';
-import { currentUpdateStrategy, replaceStandaloneBinary } from './core/binary-self-update.js';
+import { currentUpdateStrategy, replaceStandaloneBinary, releaseAssetName } from './core/binary-self-update.js';
 import { gracefulProcessExitCode } from './pm2-graceful-exit.js';
 import { config, isWildcardBindHost } from './config.js';
 import { createCompanionApi, loadCompanionSecret, type CompanionRuntime } from './dashboard/companion-api.js';
@@ -4663,7 +4663,9 @@ const server = createServer(async (req, res) => {
       const installPlan = updateStrategy.kind === 'package-manager'
         ? tryResolveGlobalInstallPlan(updateStrategy.packageRoot)
         : null;
-      const selfReplace = updateStrategy.kind === 'self-replace' || updateStrategy.kind === 'install-release';
+      // 本平台没有发布资产（如 win32）时保持旧行为：按钮禁用。
+      const releaseInstallAvailable = updateStrategy.kind === 'install-release' && releaseAssetName() !== null;
+      const selfReplace = updateStrategy.kind === 'self-replace' || releaseInstallAvailable;
       // Compare against the npm `latest` dist-tag (always stable; the update
       // button installs `@latest`). isNewerVersion uses semver precedence, so a
       // canary running AHEAD of the latest stable (e.g. 2.87.0-canary.0 vs
@@ -4728,7 +4730,7 @@ const server = createServer(async (req, res) => {
         // stays disabled (there is nothing to pull).
         localDevUpdatable: localDev && isGitWorktree(resolveLocalDevCheckoutDir()),
         updateSupported: installPlan !== null || selfReplace,
-        releaseInstallRequired: updateStrategy.kind === 'install-release',
+        releaseInstallRequired: releaseInstallAvailable,
         rollbackSupported: installPlan !== null || selfReplace,
         // The standalone binary is not owned by a package manager; report it as
         // its own kind rather than letting the UI claim "npm/pnpm/Bun only".
@@ -4823,6 +4825,9 @@ const server = createServer(async (req, res) => {
       // 这里 —— 那棵树归 npm 所有，交回 npm 更新（见 binary-self-update.ts 头部）。
       const runStrategy = currentUpdateStrategy(botmuxInstallRoot());
       if (runStrategy.kind === 'self-replace' || runStrategy.kind === 'install-release') {
+        if (runStrategy.kind === 'install-release' && releaseAssetName() === null) {
+          return jsonRes(res, 400, { ok: false, error: 'release_asset_unavailable' });
+        }
         if (updateInFlight) return jsonRes(res, 409, { ok: false, error: 'update_in_flight' });
         updateInFlight = true;
         let acquired = false;
@@ -4953,6 +4958,9 @@ const server = createServer(async (req, res) => {
       }
 
       const rollbackStrategy = currentUpdateStrategy(botmuxInstallRoot());
+      if (rollbackStrategy.kind === 'install-release' && releaseAssetName() === null) {
+        return jsonRes(res, 400, { ok: false, error: 'release_asset_unavailable' });
+      }
       const binaryTarget = rollbackStrategy.kind === 'self-replace' || rollbackStrategy.kind === 'install-release'
         ? rollbackStrategy.target
         : undefined;
@@ -5158,7 +5166,10 @@ const server = createServer(async (req, res) => {
           acquired = true;
           if (pendingBinaryRestart) {
             try {
-              verifyBinaryRestartTarget(pendingBinaryRestart);
+              const verifiedVersion = verifyBinaryRestartTarget(pendingBinaryRestart);
+              if (verifiedVersion !== pendingBinaryRestart.version) {
+                pendingBinaryRestart = { target: pendingBinaryRestart.target, version: verifiedVersion };
+              }
               binaryRestartTarget = pendingBinaryRestart.target;
             } catch (error) {
               jsonRes(res, 409, {

@@ -57,6 +57,7 @@ import {
   type BinaryInstallShape,
   type UpdateStrategy,
 } from './binary-self-update.js';
+import { compareVersions } from './update-check.js';
 import { globalWrapperPath } from '../utils/local-dev-update.js';
 import {
   captureDetachedRestartEnvFallback,
@@ -541,15 +542,20 @@ export function resolveRestartInvocation(
   return { executable, selfDispatching: standalone || executable === launcherPath };
 }
 
-export function verifyBinaryRestartTarget(update: { target: string; version: string }): void {
+/**
+ * 校验待重启目标仍是可用的官方二进制，返回它实际报告的版本。精确匹配是安装后的
+ * 常态；若重启前被带外升级（如手动跑了更新的 install.sh），接受不低于预期的版
+ * 本并交调用方刷新 pending；更旧、无法执行或不报告合法 semver 版本一律拒绝。
+ */
+export function verifyBinaryRestartTarget(update: { target: string; version: string }): string {
   const result = spawnSync(update.target, ['--version'], {
     encoding: 'utf-8',
     timeout: 30_000,
     env: { ...process.env, BOTMUX_INSTALL_PROBE: '1' },
   });
-  if (result.error || result.status !== 0 || result.stdout.trim() !== update.version) {
-    throw new Error(`待重启的二进制未通过版本校验：${update.target}（预期 ${update.version}）`);
-  }
+  const actual = result.error || result.status !== 0 ? '' : result.stdout.trim();
+  if (actual && compareVersions(actual, update.version) >= 0) return actual;
+  throw new Error(`待重启的二进制未通过版本校验：${update.target}（预期不低于 ${update.version}，实际 ${actual || '无法执行'}）`);
 }
 
 /**

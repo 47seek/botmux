@@ -667,7 +667,7 @@ describe('concurrent updates report mutual exclusion, not lock internals', () =>
     expect(branchStart, 'the self-replace branch moved — update this guard').toBeGreaterThan(0);
     const lockAt = cli.indexOf('withFileLock', branchStart);
     expect(lockAt, 'the self-replace branch no longer takes the update lock').toBeGreaterThan(branchStart);
-    const block = cli.slice(branchStart, lockAt + 1200);
+    const block = cli.slice(branchStart, lockAt + 1800);
     // The friendly notice must be gated on BOTH halves: callback-not-entered AND a
     // genuine lock timeout. Guarding on `!acquired` alone is the over-broad version
     // that reported ENOSPC/ENOENT as "another update is running".
@@ -884,12 +884,18 @@ describe('self-deployed release installation', () => {
     expect(execFileSync(strategy.target, ['restart'], { encoding: 'utf-8' })).toBe('custom:restart\n');
   });
 
-  it('rejects a changed restart target and can retry after the target is restored', () => {
+  it('verifies the pending restart target: accepts an out-of-band upgrade, rejects older builds, and recovers', () => {
     const { strategy } = fixture();
     const pending = { target: strategy.target, version: '3.99.0' };
+    // The untouched launcher forwards to the custom build, which reports 3.100.0:
+    // a newer release landed out of band, so the restart proceeds on it.
+    expect(verifyBinaryRestartTarget(pending)).toBe('3.100.0');
+    writeFileSync(strategy.target, '#!/bin/sh\nprintf "3.98.0\\n"\n', { mode: 0o755 });
+    expect(() => verifyBinaryRestartTarget(pending)).toThrow(/版本校验/);
+    writeFileSync(strategy.target, '#!/bin/sh\nprintf "3.99.0-canary.0\\n"\n', { mode: 0o755 });
     expect(() => verifyBinaryRestartTarget(pending)).toThrow(/版本校验/);
     writeFileSync(strategy.target, '#!/bin/sh\nprintf "3.99.0\\n"\n', { mode: 0o755 });
-    expect(() => verifyBinaryRestartTarget(pending)).not.toThrow();
+    expect(verifyBinaryRestartTarget(pending)).toBe('3.99.0');
   });
 });
 
@@ -1062,5 +1068,53 @@ describe('the compiled dashboard must not compare daemons against its OWN baked 
   it('the history staleHint compares against diskVersion, never against current', () => {
     expect(sessionsPageSrc).toContain('daemonVersionDiffersFromDisk(running, status.diskVersion)');
     expect(sessionsPageSrc).not.toMatch(/daemonVersionDiffersFromDisk\([^)]*status\.current/);
+  });
+});
+
+describe('self-deployed release migration — dashboard HTTP wiring', () => {
+  // 编译态 HTTP 接线无法在单测里起真实服务，沿用本文件 diskVersion 的源码守卫惯
+  // 例：删掉任一分线都会让这里变红，而不是静默退化成按钮能点必失败。
+  const dashboardSrc = readFileSync(fileURLToPath(new URL('../src/dashboard.ts', import.meta.url)), 'utf-8');
+
+  it('status only offers install/release actions when this platform ships an asset', () => {
+    expect(dashboardSrc).toContain(
+      "const releaseInstallAvailable = updateStrategy.kind === 'install-release' && releaseAssetName() !== null;",
+    );
+    expect(dashboardSrc).toContain('const selfReplace = updateStrategy.kind === \'self-replace\' || releaseInstallAvailable;');
+    expect(dashboardSrc).toContain('releaseInstallRequired: releaseInstallAvailable,');
+    expect(dashboardSrc).toContain('rollbackSupported: installPlan !== null || selfReplace,');
+  });
+
+  it('run installs through the launcher, pins the pending restart, and refuses platforms without an asset', () => {
+    expect(dashboardSrc).toContain(
+      "if (runStrategy.kind === 'self-replace' || runStrategy.kind === 'install-release') {",
+    );
+    expect(dashboardSrc).toMatch(/runStrategy\.kind === 'install-release' && releaseAssetName\(\) === null[\s\S]{0,160}release_asset_unavailable/);
+    expect(dashboardSrc).toContain('pendingBinaryRestart = { target: runStrategy.target, version: newVersion };');
+  });
+
+  it('rollback through a release binary is gated on a published asset too', () => {
+    expect(dashboardSrc).toMatch(/rollbackStrategy\.kind === 'install-release' && releaseAssetName\(\) === null[\s\S]{0,160}release_asset_unavailable/);
+    expect(dashboardSrc).toContain("spawnDetachedRestart('dashboard', installPlan?.activePackageRoot, leaseId!, binaryTarget)");
+  });
+
+  it('restart verifies and refreshes the pending target, anchors the driver, and 409s on mismatch', () => {
+    expect(dashboardSrc).toContain('const verifiedVersion = verifyBinaryRestartTarget(pendingBinaryRestart);');
+    expect(dashboardSrc).toContain("error: 'binary_restart_target_changed'");
+    expect(dashboardSrc).toContain(
+      "spawnDetachedRestart('dashboard', activePackageRoot, leaseId!, binaryRestartTarget)",
+    );
+  });
+});
+
+describe('self-deployed release migration — CLI wiring', () => {
+  const cliSrc = readFileSync(fileURLToPath(new URL('../src/cli.ts', import.meta.url)), 'utf-8');
+
+  it('points the post-migration restart hint at the absolute launcher path', () => {
+    expect(cliSrc).toContain('? `"${r.target}" restart`');
+  });
+
+  it('an implicit update does not downgrade a self-deployed build newer than latest', () => {
+    expect(cliSrc).toContain('&& !isNewerVersion(current, resolvedVersion)');
   });
 });
