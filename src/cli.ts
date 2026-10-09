@@ -6738,7 +6738,7 @@ const SEND_HELP_BODY = [
   '                                       显式允许该已启用插件声明的 callback action',
   '       --layout result|progress|risk|blocked|handoff',
   '                                       可选回复卡卡头薄壳；只在关键结果/进度/风险/阻塞/交接节点显式使用',
-  '       --response-kind progress|final|auxiliary  可选；未声明按 progress/非 final，只有 final 挂反馈',
+  '       --response-kind progress|final|auxiliary  可选；未声明按 progress/非 final，只有 final 挂反馈与页脚签名',
   '       --expected-link <url>           要求最终渲染正文原样包含该 URL（可重复）；缺失时在任何外部副作用前拒发',
   '       --as independent|suggestion     对方任务正在跑时声明处理方式：另开任务 / 留给当前任务',
   '       --mention <id:name>             @提及（可重复）。id 默认是 open_id；bot 配置开启',
@@ -11819,8 +11819,9 @@ async function cmdSend(rest: string[]): Promise<void> {
       // the session owner). Bot recipients are filtered out so footer chrome
       // cannot accidentally wake a sibling bot.
       // Brand segment honours this bot's configured brandLabel (unset →
-      // default botmux, '' → suppressed, else custom). Same resolver/rule as
-      // the daemon's card builders so both send paths render identically.
+      // default botmux, '' → suppressed, else custom). Only attached to final
+      // replies (or top-level broadcasts); interim sends (progress / auxiliary)
+      // omit brand to avoid noisy repeated signatures across turns.
       // All real mentions land on one footer line: human addressee first, then
       // explicit @ targets (incl. handoff bots), then cc. Ids already inlined in
       // the body prose are skipped. Top-level publish keeps sendTo empty.
@@ -11831,8 +11832,12 @@ async function cmdSend(rest: string[]): Promise<void> {
         inlinedIds: usedIds,
       });
       const usageSnapshot = await readCardUsageSnapshotForSend(s, appId);
+      const shouldRenderBrand = effectiveResponseKind === 'final' || sendTopLevel;
+      const footerBrand = shouldRenderBrand
+        ? renderBrandTemplate(resolveBrandLabel(appId), s.workingDir)
+        : '';
       const footer = buildReplyCardFooter({
-        brand: renderBrandTemplate(resolveBrandLabel(appId), s.workingDir),
+        brand: footerBrand,
         recipientOpenIds: footerRecipients,
         usage: usageSnapshot,
         locale: localeForBot(appId),
