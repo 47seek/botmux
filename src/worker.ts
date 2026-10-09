@@ -17120,6 +17120,11 @@ async function spawnCli(
     const bl = resolveBrandLabel(cfg.larkAppId);
     if (typeof bl === 'string') childEnv.BOTMUX_BRAND_LABEL = bl;
   }
+  // Machine-wide footer-brand switch (dashboard.cardBrandLabel). The sandboxed
+  // CLI child can't read ~/.botmux/config.json (EPERM), so bridge the resolved
+  // value explicitly: 'false' makes resolveBrandLabel() in the child return ''
+  // for this bot; anything else is 'true' (absent config = default ON).
+  childEnv.BOTMUX_CARD_BRAND_ENABLED = readGlobalConfig().dashboard?.cardBrandLabel === false ? 'false' : 'true';
   childEnv.BOTMUX_USAGE_DISPLAY = resolveUsageDisplay(cfg.larkAppId);
   // The stable native/global skill loader and `botmux send` must see one exact
   // normalized snapshot for the lifetime of this pane. Always inject `{}` for
