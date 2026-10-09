@@ -4729,12 +4729,7 @@ const server = createServer(async (req, res) => {
         localDevUpdatable: localDev && isGitWorktree(resolveLocalDevCheckoutDir()),
         updateSupported: installPlan !== null || selfReplace,
         releaseInstallRequired: updateStrategy.kind === 'install-release',
-        // Rollback is a SEPARATE capability from update. The web UI used to derive
-        // it from `updateSupported`, which now includes the self-replacing binary —
-        // but /api/update/rollback only knows how to drive a package manager, so a
-        // curl-installed binary would be offered a button that always fails.
-        // Report it explicitly instead of letting the UI infer it.
-        rollbackSupported: installPlan !== null,
+        rollbackSupported: installPlan !== null || selfReplace,
         // The standalone binary is not owned by a package manager; report it as
         // its own kind rather than letting the UI claim "npm/pnpm/Bun only".
         updateManager: selfReplace ? 'binary' : (installPlan?.manager ?? installManager),
@@ -4957,38 +4952,36 @@ const server = createServer(async (req, res) => {
         return jsonRes(res, 400, { ok: false, error: 'not_rollback_target' });
       }
 
-      // Rollback only knows how to drive a package manager. Resolve the strategy
-      // first so a compiled binary uses its MAPPED root: on a fresh process there
-      // is no `lastSuccessfulUpdatePlan` yet and `botmuxInstallRoot()` is "/", which
-      // made the very first rollback throw `unsupported_install_method` even though
-      // /api/update/status had just reported `rollbackSupported: true`.
       const rollbackStrategy = currentUpdateStrategy(botmuxInstallRoot());
-      if (rollbackStrategy.kind !== 'package-manager') {
+      const binaryTarget = rollbackStrategy.kind === 'self-replace' || rollbackStrategy.kind === 'install-release'
+        ? rollbackStrategy.target
+        : undefined;
+      let installPlan: GlobalInstallPlan | undefined;
+      if (rollbackStrategy.kind === 'package-manager') {
+        try {
+          const packageRoot = lastSuccessfulUpdatePlan?.activePackageRoot ?? rollbackStrategy.packageRoot;
+          installPlan = withGlobalInstallRegistry(
+            resolveGlobalInstallPlan(packageRoot, process.platform, `botmux@${targetVersion}`),
+          );
+        } catch (error) {
+          if (error instanceof UnsupportedGlobalInstallError) {
+            return jsonRes(res, 400, {
+              ok: false,
+              error: 'unsupported_install_method',
+              manager: error.manager,
+            });
+          }
+          throw error;
+        }
+        const node = checkNode();
+        if (!node.ok) return jsonRes(res, 400, { ok: false, error: 'node_too_old', node });
+      } else if (!binaryTarget) {
         return jsonRes(res, 400, {
           ok: false,
           error: 'unsupported_install_method',
-          manager: rollbackStrategy.kind === 'self-replace' ? 'binary' : 'unknown',
+          manager: 'unknown',
         });
       }
-      let installPlan: GlobalInstallPlan;
-      try {
-        const packageRoot = lastSuccessfulUpdatePlan?.activePackageRoot ?? rollbackStrategy.packageRoot;
-        installPlan = withGlobalInstallRegistry(
-          resolveGlobalInstallPlan(packageRoot, process.platform, `botmux@${targetVersion}`),
-        );
-      } catch (error) {
-        if (error instanceof UnsupportedGlobalInstallError) {
-          return jsonRes(res, 400, {
-            ok: false,
-            error: 'unsupported_install_method',
-            manager: error.manager,
-          });
-        }
-        throw error;
-      }
-
-      const node = checkNode();
-      if (!node.ok) return jsonRes(res, 400, { ok: false, error: 'node_too_old', node });
       if (updateInFlight) return jsonRes(res, 409, { ok: false, error: 'update_in_flight' });
       updateInFlight = true;
 
@@ -5007,21 +5000,27 @@ const server = createServer(async (req, res) => {
             return;
           }
 
-          oldVersion = botmuxVersionAt(installPlan.activePackageRoot);
+          oldVersion = installPlan ? botmuxVersionAt(installPlan.activePackageRoot) : currentInstalledVersion();
           if (compareVersions(targetVersion, oldVersion) >= 0) {
             invalidRollbackTarget = true;
             return;
           }
 
-          await runGlobalInstall(installPlan);
-          // diskVersionAt, not botmuxVersionAt: the baked version of a compiled
-          // binary would never equal the rollback target, so this verification
-          // would report a spurious `installed_version_mismatch` on every rollback.
-          const newVersion = diskVersionAt(installPlan.activePackageRoot);
-          lastSuccessfulUpdatePlan = installPlan;
-          if (newVersion !== targetVersion) {
-            installedVersionMismatch = newVersion;
-            return;
+          let newVersion = targetVersion;
+          if (installPlan) {
+            await runGlobalInstall(installPlan);
+            // diskVersionAt, not botmuxVersionAt: the baked version of a compiled
+            // binary would never equal the rollback target, so this verification
+            // would report a spurious `installed_version_mismatch` on every rollback.
+            newVersion = diskVersionAt(installPlan.activePackageRoot);
+            lastSuccessfulUpdatePlan = installPlan;
+            if (newVersion !== targetVersion) {
+              installedVersionMismatch = newVersion;
+              return;
+            }
+          } else {
+            await replaceStandaloneBinary(targetVersion, binaryTarget!);
+            pendingBinaryRestart = { target: binaryTarget!, version: targetVersion };
           }
 
           leaseId = claimRestartLease();
@@ -5051,7 +5050,7 @@ const server = createServer(async (req, res) => {
               if (launched) return;
               launched = true;
               try {
-                const child = spawnDetachedRestart('dashboard', installPlan.activePackageRoot, leaseId!);
+                const child = spawnDetachedRestart('dashboard', installPlan?.activePackageRoot, leaseId!, binaryTarget);
                 if (!child.pid) throw new Error('restart driver did not start');
               } catch (error) {
                 clearRestartLease(leaseId!);
@@ -5069,7 +5068,7 @@ const server = createServer(async (req, res) => {
                 oldVersion,
                 newVersion,
                 changed: true,
-                manager: installPlan.manager,
+                manager: installPlan?.manager ?? 'binary',
                 operation: 'rollback',
               });
             } finally {

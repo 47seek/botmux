@@ -532,7 +532,7 @@ describe('auto-update support is ONE predicate for UI and save-time validation',
     expect(resolveAutoUpdateSupport(strategy)).toEqual({ supported: false, plan: null });
   });
 
-  it('NO ASYMMETRY: whatever status claims supportable, rollback can resolve too', () => {
+  it('an npm-installed binary resolves a package-manager root for rollback', () => {
     /**
      * The bug this pins: `/api/update/status` reported `rollbackSupported: true`
      * for an npm-installed compiled binary (it resolves the MAPPED package root),
@@ -557,11 +557,9 @@ describe('auto-update support is ONE predicate for UI and save-time validation',
     // ...and the pre-fix root, to show the two really differ (the defect).
     expect(tryResolveGlobalInstallPlan('/', 'linux')).toBeNull();
 
-    // A self-replacing binary is the reverse case: update supported, rollback NOT,
-    // which is why rollbackSupported is reported separately rather than derived.
     const curl = resolveUpdateStrategy(true, '/home/u/.botmux/bin/botmux', '/', {}, '/home/u');
     expect(resolveAutoUpdateSupport(curl).supported).toBe(true);
-    expect(resolveAutoUpdateSupport(curl).plan).toBeNull(); // ⟹ rollbackSupported false
+    expect(resolveAutoUpdateSupport(curl).plan).toBeNull();
   });
 
 });
@@ -729,8 +727,8 @@ describe('concurrent updates report mutual exclusion, not lock internals', () =>
     // asserting against real code rather than passing on an empty search.
     expect(src).toMatch(/runStrategy\.kind === 'package-manager' \? runStrategy\.packageRoot/);
     expect(src).toMatch(/\?\?\s*rollbackStrategy\.packageRoot/);
-    // And rollback must refuse anything that is not package-manager driveable.
-    expect(src).toMatch(/rollbackStrategy\.kind !== 'package-manager'/);
+    expect(src).toMatch(/rollbackStrategy\.kind === 'package-manager'/);
+    expect(src).toMatch(/rollbackSupported: installPlan !== null \|\| selfReplace/);
   });
 });
 
@@ -831,38 +829,48 @@ describe('resolveRestartInvocation — target and calling convention must agree'
 });
 
 describe('self-deployed release installation', () => {
-  function fixture() {
+  function fixture(version = '3.99.0') {
     const home = tmp();
     const custom = join(home, 'custom', 'botmux');
     mkdirSync(join(home, 'custom'));
-    const original = '#!/bin/sh\nprintf "custom:%s\\n" "$1"\n';
+    const original = '#!/bin/sh\nif [ "$1" = "--version" ]; then printf "3.100.0\\n"; else printf "custom:%s\\n" "$1"; fi\n';
     writeFileSync(custom, original, { mode: 0o755 });
     const strategy = resolveUpdateStrategy(true, custom, '/', {}, home);
     if (strategy.kind !== 'install-release') throw new Error('release installation required');
     mkdirSync(join(home, '.botmux', 'bin'), { recursive: true });
     const launcher = `#!/bin/sh\nexec "${custom}" "$@"\n`;
     writeFileSync(strategy.target, launcher, { mode: 0o755 });
-    const payload = Buffer.from('#!/bin/sh\nif [ "$1" = "--version" ]; then printf "3.99.0\\n"; else printf "release:%s\\n" "$1"; fi\n#' + 'x'.repeat(1_100_000));
+    const payload = Buffer.from(`#!/bin/sh\nif [ "$1" = "--version" ]; then printf "${version}\\n"; else printf "release:%s\\n" "$1"; fi\n#` + 'x'.repeat(1_100_000));
     return { home, custom, original, strategy, launcher, payload };
   }
 
-  it('preserves the custom build and starts the installed release through the launcher', async () => {
-    const { home, custom, original, strategy, payload } = fixture();
+  it.each(['self-replace', 'install-release'])('%s installs and restarts an older release', async kind => {
+    const { home, custom, original, strategy: customStrategy, payload } = fixture();
+    const runningBinary = kind === 'self-replace' ? customStrategy.target : custom;
+    if (kind === 'self-replace') writeFileSync(runningBinary, original, { mode: 0o755 });
+    const strategy = resolveUpdateStrategy(true, runningBinary, '/', {}, home);
+    if (strategy.kind !== 'self-replace' && strategy.kind !== 'install-release') throw new Error('binary strategy required');
+    expect(strategy.kind).toBe(kind);
+    expect(execFileSync(runningBinary, ['--version'], { encoding: 'utf-8' }).trim()).toBe('3.100.0');
     await replaceStandaloneBinary('3.99.0', strategy.target, {
-      fetchStream: async () => Readable.from([payload]),
+      fetchStream: async url => {
+        expect(url).toContain('/releases/download/v3.99.0/');
+        return Readable.from([payload]);
+      },
       fetchChecksum: async () => createHash('sha256').update(payload).digest('hex'),
     });
-    expect(readFileSync(custom, 'utf-8')).toBe(original);
+    expect(execFileSync(strategy.target, ['--version'], { encoding: 'utf-8' }).trim()).toBe('3.99.0');
     expect(resolveUpdateStrategy(true, strategy.target, '/', {}, home))
       .toEqual({ kind: 'self-replace', target: strategy.target });
     verifyBinaryRestartTarget({ target: strategy.target, version: '3.99.0' });
-    const invocation = resolveRestartInvocation(true, custom, 'unknown', strategy.target, true, false, strategy.target);
+    const invocation = resolveRestartInvocation(true, runningBinary, kind === 'self-replace' ? 'curl-binary' : 'unknown', strategy.target, true, false, strategy.target);
     const restart = buildRestartLauncher(invocation.executable, '/dist/cli.js', false, invocation.selfDispatching);
     expect(execFileSync(restart.cmd, restart.args, { encoding: 'utf-8' })).toBe('release:restart\n');
+    expect(readFileSync(custom, 'utf-8')).toBe(original);
   });
 
-  it.each(['download', 'checksum', 'probe'])('%s failure preserves the launcher and original build', async failure => {
-    const { custom, original, strategy, launcher, payload } = fixture();
+  it.each(['download', 'checksum', 'probe', 'version'])('%s failure preserves the launcher and original build', async failure => {
+    const { custom, original, strategy, launcher, payload } = fixture(failure === 'version' ? '3.98.0' : '3.99.0');
     await expect(replaceStandaloneBinary('3.99.0', strategy.target, {
       fetchStream: async () => {
         if (failure === 'download') throw new Error('download interrupted');
@@ -887,7 +895,7 @@ describe('self-deployed release installation', () => {
 
 describe('replaceStandaloneBinary — atomic swap of a live executable', () => {
   const BIG = 1_100_000; // over the "this is an error page, not a binary" floor
-  const probeOk = () => ({ status: 0 });
+  const probeOk = () => ({ status: 0, stdout: '3.99.0\n' });
 
   function fakeAsset(byte = 0x41, size = BIG): Buffer {
     return Buffer.alloc(size, byte);
