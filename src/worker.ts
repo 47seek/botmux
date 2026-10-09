@@ -77,7 +77,6 @@ import { drainTranscript, joinAssistantText, trailingAssistantText, findJsonlCon
 import { BridgeTurnQueue, makeFingerprint, normaliseForFingerprint, type BridgePendingTurn } from './services/bridge-turn-queue.js';
 import { createTranscriptTerminalSettle } from './services/transcript-terminal-settle.js';
 import { bridgePostText, composeFailedBridgeFallbackContent, isBridgeNothingToSendFinal, shouldEmitEmptyCompletedBridgeFallback, shouldSuppressBridgeEmit, shouldSuppressStructuredFallback, structuredFallbackKind, stripTrailingBridgeSentinelLine, stripTrailingOaiMemoryCitation, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
-import { codexStatusLineSetupNotice } from './services/codex-statusline-config.js';
 import { buildSubmitMessagePreview } from './services/submit-notification.js';
 import {
   decideHardTimeoutAction,
@@ -241,7 +240,7 @@ import {
 } from './services/bridge-rotation-policy.js';
 import { CodexBridgeQueue, pruneExpiredPreStartHeadsAndEmit } from './services/codex-bridge-queue.js';
 import { detectCodexComposerState } from './services/codex-composer-state.js';
-import { refreshCodexTerminalSession, codexTerminalSessionIsBound, prepareCodexTerminalStatusLine } from './services/codex-terminal-session.js';
+import { refreshCodexTerminalSession, codexTerminalSessionIsBound } from './services/codex-terminal-session.js';
 import {
   generateCodexAppThreadTitle,
   readCodexAppThreadMetadata,
@@ -11668,11 +11667,9 @@ function settleBackendScreenBeforeIdle(
 /** Submission writes must surface ZMX's explicit false result, while its
  * best-effort navigation/startup keystrokes keep their non-throwing contract. */
 function adapterInputHandle(target: SessionBackend): PtyHandle {
-  const handle: PtyHandle = target instanceof ZmxBackend
+  return target instanceof ZmxBackend
     ? strictInputHandle(target)
     : target;
-  handle.isAdopt = Boolean(lastInitConfig?.adoptMode);
-  return handle;
 }
 
 function codexAdoptComposerConflict(target: SessionBackend): string | undefined {
@@ -14499,12 +14496,8 @@ async function setupAdoptTranscriptBridges(cfg: Extract<DaemonToWorker, { type: 
     codexBridgeQueue.setLocalTurns(true, adoptStartMs);
     let rolloutPath: string | undefined;
     const terminalSession = backend ? await refreshCodexTerminalSession(backend) : undefined;
-    if (terminalSession?.kind === 'unavailable' && backend) {
-      const setup = prepareCodexTerminalStatusLine(backend);
-      if (setup) send({ type: 'user_notify', message: codexStatusLineSetupNotice(setup) });
-    }
     const initialSessionId = terminalSession?.kind === 'terminal' ? terminalSession.sessionId
-      : terminalSession?.kind === 'unavailable' ? undefined : cfg.cliSessionId;
+      : cfg.cliSessionId;
     if (initialSessionId) {
       rolloutPath = findCodexRolloutBySessionId(initialSessionId);
       persistCliSessionId(initialSessionId);
@@ -18739,7 +18732,6 @@ async function spawnCli(
     // filter (which would reject the correct App Server submission).
     (backend as PtyHandle).expectedCodexSessionId = cfg.cliSessionId;
   }
-  (backend as PtyHandle).isAdopt = Boolean(cfg.adoptMode);
   publishLocalProcessAttestation(cliPid ?? undefined);
   if (cliPid && process.env.SESSION_DATA_DIR) {
     const markersDir = join(process.env.SESSION_DATA_DIR, '.botmux-cli-pids');
