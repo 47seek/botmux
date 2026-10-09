@@ -4,6 +4,7 @@ import type { PtyHandle } from '../src/adapters/cli/types.js';
 import { findCodexRolloutSetByPid } from '../src/services/codex-transcript.js';
 import {
   refreshCodexTerminalSession,
+  awaitReadyCodexTerminalSession,
   prepareCodexTerminalStatusLine,
   codexTerminalSessionIsBound,
 } from '../src/services/codex-terminal-session.js';
@@ -84,6 +85,67 @@ describe('Codex terminal session identity', () => {
       cursor: { x: 2, y: 1 },
     });
     expect(await refreshCodexTerminalSession(t.pty)).toEqual({ kind: 'unavailable' });
+  });
+
+  describe('cold-start bounded wait', () => {
+    const ready = `\n» Ask Codex to do anything\n\n  gpt-6-astra ultra · ~/work · ${sid}`;
+    const ptyWithScreen = (screenForCall: (call: number) => { viewport: string; cursor: { x: number; y: number } }) => {
+      let calls = 0;
+      return {
+        cliPid: 43212,
+        write: vi.fn(), sendText: vi.fn(), sendSpecialKeys: vi.fn(),
+        captureCurrentScreen: vi.fn(),
+        captureInputState: vi.fn(() => screenForCall(calls++)),
+      } satisfies PtyHandle;
+    };
+
+    it('waits through the initial render and resolves once the footer is painted', async () => {
+      vi.mocked(findCodexRolloutSetByPid).mockReturnValue(new Set());
+      // Loading banner (no composer marker) for the first probes, then ready.
+      const pty = ptyWithScreen(call => call < 4
+        ? { viewport: '>_ OpenAI Codex\ndirectory: loading', cursor: { x: 0, y: 1 } }
+        : { viewport: ready, cursor: { x: 2, y: 1 } });
+      const started = Date.now();
+      const res = await awaitReadyCodexTerminalSession(pty, 1000, 10);
+      expect(res).toEqual({ kind: 'terminal', sessionId: sid });
+      expect(Date.now() - started).toBeGreaterThanOrEqual(15);
+    });
+
+    it('does not wait when the composer settled without a thread ID (configuration problem)', async () => {
+      vi.mocked(findCodexRolloutSetByPid).mockReturnValue(new Set());
+      const pty = ptyWithScreen(() => ({
+        viewport: '\n» Ask Codex to do anything\n\n  gpt-6-astra ultra · ~/work · Main [default]',
+        cursor: { x: 2, y: 1 },
+      }));
+      const started = Date.now();
+      const res = await awaitReadyCodexTerminalSession(pty, 1000, 10);
+      expect(res).toEqual({ kind: 'unavailable' });
+      expect(Date.now() - started).toBeLessThan(200);
+    });
+
+    it('does not wait while a turn is running (esc to interrupt)', async () => {
+      vi.mocked(findCodexRolloutSetByPid).mockReturnValue(new Set());
+      const pty = ptyWithScreen(() => ({
+        viewport: 'Working...\nesc to interrupt',
+        cursor: { x: 0, y: 0 },
+      }));
+      const started = Date.now();
+      const res = await awaitReadyCodexTerminalSession(pty, 1000, 10);
+      expect(res).toEqual({ kind: 'unavailable' });
+      expect(Date.now() - started).toBeLessThan(200);
+    });
+
+    it('gives up after the timeout while still loading', async () => {
+      vi.mocked(findCodexRolloutSetByPid).mockReturnValue(new Set());
+      const pty = ptyWithScreen(() => ({
+        viewport: 'Resuming session',
+        cursor: { x: 0, y: 0 },
+      }));
+      const started = Date.now();
+      const res = await awaitReadyCodexTerminalSession(pty, 60, 15);
+      expect(res).toEqual({ kind: 'unavailable' });
+      expect(Date.now() - started).toBeGreaterThanOrEqual(55);
+    });
   });
 
   // Two-row layouts reproduced from the Linux 0.158 review captures.

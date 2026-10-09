@@ -10,7 +10,7 @@ import { parseDebugModelsJson } from './model-catalog-json.js';
 import type { CliAdapter, PtyHandle } from './types.js';
 import { codexHistoryPath, codexHome, codexSessionsRoot } from '../../services/codex-paths.js';
 import { findCodexRolloutSetByPid } from '../../services/codex-transcript.js';
-import { prepareCodexTerminalStatusLine, refreshCodexTerminalSession } from '../../services/codex-terminal-session.js';
+import { awaitReadyCodexTerminalSession, prepareCodexTerminalStatusLine } from '../../services/codex-terminal-session.js';
 import { discoverRolloutSessions } from '../../services/resumable-session-discovery.js';
 import { delay, scaleMs } from '../../utils/timing.js';
 import { t } from '../../i18n/index.js';
@@ -453,7 +453,10 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
     },
 
     async writeInput(pty: PtyHandle, content: string) {
-      const terminalSession = await refreshCodexTerminalSession(pty);
+      // A fresh/resumed TUI paints composer + thread-id footer seconds after
+      // spawn, and the rollout fd is absent until the first submit — wait for
+      // that initial render instead of rejecting the session's first message.
+      const terminalSession = await awaitReadyCodexTerminalSession(pty);
       if (terminalSession.kind === 'unavailable') {
         const setup = prepareCodexTerminalStatusLine(pty);
         return { submitted: false, failureReason: setup

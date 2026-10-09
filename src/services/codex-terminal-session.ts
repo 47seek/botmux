@@ -2,6 +2,7 @@ import type { PtyHandle } from '../adapters/cli/types.js';
 import { findCodexRolloutSetByPid } from './codex-transcript.js';
 import { codexConfigPathForPid, ensureCodexStatusLineConfig, type CodexStatusLineSetup } from './codex-statusline-config.js';
 import { stripAnsiScreenText } from '../utils/idle-detector.js';
+import { delay } from '../utils/timing.js';
 import { detectCodexComposerState } from './codex-composer-state.js';
 
 type Resolution =
@@ -70,6 +71,44 @@ export function refreshCodexTerminalSession(terminal: PtyHandle): Promise<Resolu
   const task = refresh(terminal).finally(() => pending.delete(terminal));
   pending.set(terminal, task);
   return task;
+}
+
+const COLD_START_LOADING_RE = /(?:model|directory):\s*loading\b|Resuming session|Queued for capacity/i;
+const TUI_TURN_BUSY_RE = /esc to interrupt/i;
+
+/** A spawned/resumed Codex TUI spends its first seconds painting the banner
+ *  before the composer and thread-id footer exist; the first Lark message of a
+ *  fresh worker then fails the identity gate even though a moment later it
+ *  would pass. This distinguishes that transient render window (no composer
+ *  marker yet, or an explicit loading row) from settled states that waiting
+ *  cannot fix (marker present but footer unproven, a human draft, a running
+ *  turn, or any dialog). Read-only; never writes to the TUI. */
+function terminalIsColdStarting(terminal: PtyHandle): boolean {
+  const state = terminal.captureInputState?.();
+  if (!state) return false;
+  const text = stripAnsiScreenText(state.viewport);
+  if (TUI_TURN_BUSY_RE.test(text)) return false;
+  if (COLD_START_LOADING_RE.test(text)) return true;
+  return detectCodexComposerState(state) === 'unknown';
+}
+
+/** Like refreshCodexTerminalSession, but bounded-waits through a fresh TUI's
+ *  initial render. Stops waiting the moment the screen settles into anything
+ *  that is provably not cold start (marker painted, turn running, pane gone),
+ *  so configuration problems and busy turns still fail immediately. */
+export async function awaitReadyCodexTerminalSession(
+  terminal: PtyHandle,
+  timeoutMs = 30_000,
+  intervalMs = 1_000,
+): Promise<Resolution> {
+  let resolution = await refreshCodexTerminalSession(terminal);
+  const deadline = Date.now() + timeoutMs;
+  while (resolution.kind === 'unavailable' && Date.now() < deadline) {
+    if (!terminalIsColdStarting(terminal)) break;
+    await delay(Math.min(intervalMs, deadline - Date.now()));
+    resolution = await refreshCodexTerminalSession(terminal);
+  }
+  return resolution;
 }
 
 async function refresh(terminal: PtyHandle): Promise<Resolution> {
