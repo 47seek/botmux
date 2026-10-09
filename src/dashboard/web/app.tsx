@@ -772,11 +772,7 @@ function TopbarVersionControl(props: {
   const behind = status.behind && !!status.latest;
   const unknown = !status.latest;
   const automatic = behind && status.updateSupported && !status.localDevInstall && status.node.ok;
-  // Rollback is its own capability, reported explicitly by the backend: the
-  // self-replacing binary CAN update but /api/update/rollback only drives a
-  // package manager, so deriving this from `updateSupported` would show a button
-  // that always fails. Older backends omit the field — fall back to the previous
-  // derivation so a stale dashboard/daemon pair behaves as before.
+  // Older backends omit rollbackSupported; retain their update capability fallback.
   const rollbackSupported = (status.rollbackSupported ?? status.updateSupported)
     && !status.localDevInstall && status.node.ok;
   const busy = phase === 'updating' || phase === 'restarting';

@@ -1644,10 +1644,10 @@ export const messages: Record<string, string> = {
   'card.dashboard.settings.footer.security': '🔒 Bot admins only · DM reply · ACK auto-refresh',
   'settings.readOnlyVisitor': 'Read-only visitor mode — settings are not editable.',
   'settings.autoUpdateLocalDev': 'Local-dev install does not support auto-update.',
-  'settings.autoUpdateUnsupportedInstall': 'This install method does not support auto-update yet (npm/pnpm/Bun global installs are supported).',
+  'settings.autoUpdateUnsupportedInstall': 'Scheduled updates are unavailable for this install. Self-deployed binaries can switch to the official release using Update to latest.',
   // Per-toggle disable reasons (more specific than the section hint, PR3 UI revision)
   'settings.autoUpdate.disabled.localDev': '⚠️ Auto-update is unavailable in local-dev install (use an npm/pnpm/Bun global install).',
-  'settings.autoUpdate.disabled.unsupportedInstall': '⚠️ Auto-update supports npm/pnpm/Bun global installs only',
+  'settings.autoUpdate.disabled.unsupportedInstall': '⚠️ Scheduled updates are unavailable; self-deployed binaries can first switch to the official release',
   'settings.autoRestart.disabled.needsAutoUpdate': '⚠️ Enable "Daily auto-update" first.',
   'settings.sectionAccess': 'Access',
   'settings.sectionCards': 'Card behaviour',
