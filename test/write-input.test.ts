@@ -1731,7 +1731,17 @@ describe('codex writeInput submission confirmation', () => {
         cursor: { x: 2, y: 1 },
       }),
     };
-    const result = await createCodexAdapter('/bin/codex').writeInput(pty, 'hi');
+    // A stable footer without an ID is now first treated as a possible startup
+    // render and bounded-waited; advance the clock past the 90s cold-start wait.
+    vi.useFakeTimers();
+    let result: { submitted: boolean; failureReason?: string } | undefined;
+    try {
+      const resultP = createCodexAdapter('/bin/codex').writeInput(pty, 'hi') as Promise<typeof result>;
+      await vi.advanceTimersByTimeAsync(95_000);
+      result = await resultP;
+    } finally {
+      vi.useRealTimers();
+    }
     expect(result?.submitted).toBe(false);
     if (!result || result.submitted !== false) throw new Error('Expected a rejected submission');
     expect(result.failureReason).toContain('/statusline');

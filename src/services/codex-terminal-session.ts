@@ -73,32 +73,33 @@ export function refreshCodexTerminalSession(terminal: PtyHandle): Promise<Resolu
   return task;
 }
 
-const COLD_START_LOADING_RE = /(?:model|directory):\s*loading\b|Resuming session|Queued for capacity/i;
 const TUI_TURN_BUSY_RE = /esc to interrupt/i;
 
-/** A spawned/resumed Codex TUI spends its first seconds painting the banner
- *  before the composer and thread-id footer exist; the first Lark message of a
- *  fresh worker then fails the identity gate even though a moment later it
- *  would pass. This distinguishes that transient render window (no composer
- *  marker yet, or an explicit loading row) from settled states that waiting
- *  cannot fix (marker present but footer unproven, a human draft, a running
- *  turn, or any dialog). Read-only; never writes to the TUI. */
+/** A spawned/resumed Codex TUI paints before it can accept input: the model
+ *  line can stay "loading" for over a minute against a slow endpoint, and the
+ *  thread-id footer may render a few frames after the composer. Waiting covers
+ *  the whole window in which a moment later screen would pass the gate.
+ *  Waiting cannot help only with a human draft/dialog (composer non-empty) or
+ *  a running turn — those fail immediately. Read-only; never writes the TUI. */
 function terminalIsColdStarting(terminal: PtyHandle): boolean {
   const state = terminal.captureInputState?.();
   if (!state) return false;
   const text = stripAnsiScreenText(state.viewport);
   if (TUI_TURN_BUSY_RE.test(text)) return false;
-  if (COLD_START_LOADING_RE.test(text)) return true;
-  return detectCodexComposerState(state) === 'unknown';
+  // A non-empty composer is a human draft or an open picker/dialog: never wait
+  // past it. An empty composer whose footer is not yet proven is still part of
+  // the startup render (as is a screen with no composer marker at all).
+  return detectCodexComposerState(state) !== 'draft';
 }
 
 /** Like refreshCodexTerminalSession, but bounded-waits through a fresh TUI's
- *  initial render. Stops waiting the moment the screen settles into anything
- *  that is provably not cold start (marker painted, turn running, pane gone),
- *  so configuration problems and busy turns still fail immediately. */
+ *  initial render. The model line can remain "loading" for well over half a
+ *  minute against a slow model endpoint (measured >30s on 0.154), hence 90s.
+ *  Stops the moment a draft/dialog appears or a turn starts; configuration
+ *  problems simply exhaust the wait and then report as before. */
 export async function awaitReadyCodexTerminalSession(
   terminal: PtyHandle,
-  timeoutMs = 30_000,
+  timeoutMs = 90_000,
   intervalMs = 1_000,
 ): Promise<Resolution> {
   let resolution = await refreshCodexTerminalSession(terminal);

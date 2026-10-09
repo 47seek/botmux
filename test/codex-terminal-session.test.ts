@@ -111,11 +111,37 @@ describe('Codex terminal session identity', () => {
       expect(Date.now() - started).toBeGreaterThanOrEqual(15);
     });
 
-    it('does not wait when the composer settled without a thread ID (configuration problem)', async () => {
+    it('keeps waiting on a settled-looking composer whose thread ID footer has not rendered yet', async () => {
+      vi.mocked(findCodexRolloutSetByPid).mockReturnValue(new Set());
+      // First probes: composer painted, footer still name-only (startup render
+      // is not atomic); footer gains the ID a few probes later.
+      const pty = ptyWithScreen(call => call < 4
+        ? {
+            viewport: '\n» Ask Codex to do anything\n\n  gpt-6-astra ultra · ~/work · Main [default]',
+            cursor: { x: 2, y: 1 },
+          }
+        : { viewport: ready, cursor: { x: 2, y: 1 } });
+      const res = await awaitReadyCodexTerminalSession(pty, 1000, 10);
+      expect(res).toEqual({ kind: 'terminal', sessionId: sid });
+    });
+
+    it('reports unavailable after the timeout when the footer never shows a thread ID', async () => {
       vi.mocked(findCodexRolloutSetByPid).mockReturnValue(new Set());
       const pty = ptyWithScreen(() => ({
         viewport: '\n» Ask Codex to do anything\n\n  gpt-6-astra ultra · ~/work · Main [default]',
         cursor: { x: 2, y: 1 },
+      }));
+      const started = Date.now();
+      const res = await awaitReadyCodexTerminalSession(pty, 40, 10);
+      expect(res).toEqual({ kind: 'unavailable' });
+      expect(Date.now() - started).toBeGreaterThanOrEqual(30);
+    });
+
+    it('does not wait when the composer holds a draft or a picker is open', async () => {
+      vi.mocked(findCodexRolloutSetByPid).mockReturnValue(new Set());
+      const pty = ptyWithScreen(() => ({
+        viewport: '\n» 1. Update now\n  2. Skip',
+        cursor: { x: 4, y: 1 },
       }));
       const started = Date.now();
       const res = await awaitReadyCodexTerminalSession(pty, 1000, 10);
