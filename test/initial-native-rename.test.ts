@@ -110,6 +110,7 @@ describe('initial native rename is not replayed on in-worker restart', () => {
     const renameRegion = workerSource.slice(renameStart, renameEnd);
     expect(renameRegion).toContain('if (!cmd || hasRunInitialNativeRename) return');
     expect(renameRegion).toContain('if (cliRestartInProgress) return');
+    expect(renameRegion).toContain('hasRunInitialNativeRename = true;');
     expect(renameRegion.indexOf('hasRunInitialNativeRename = true'))
       .toBeLessThan(renameRegion.indexOf('sendRawCommandLineWithRecoveryFence'));
   });
