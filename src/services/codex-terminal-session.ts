@@ -30,7 +30,7 @@ function emptyComposerFooter(terminal: PtyHandle): string | undefined {
   // Cursor position alone cannot distinguish a draft whose cursor is at Home.
   // Accept only an empty row or the known native placeholder, plus a live
   // initialized footer below it. Unknown placeholders fail closed.
-  const prompt = /^(\s*)› (?:Ask Codex to do anything)?\s*$/.exec(line);
+  const prompt = /^(\s*)[›»] (?:Ask Codex to do anything)?\s*$/.exec(line);
   if (!prompt || state.cursor.x !== (prompt[1]?.length ?? 0) + 2) return undefined;
   // Match native state rows, not words inside transcript prose or tool output.
   const below = lines.slice(state.cursor.y + 1);

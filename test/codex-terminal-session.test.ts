@@ -65,6 +65,27 @@ describe('Codex terminal session identity', () => {
     expect(t.sendSpecialKeys).not.toHaveBeenCalled();
   });
 
+  // Codex 0.154 renders the composer marker as U+00BB (») instead of U+203A (›).
+  it('reads the thread ID behind the Codex 0.154 U+00BB composer marker', async () => {
+    vi.mocked(findCodexRolloutSetByPid).mockReturnValue(new Set());
+    const t = terminal('');
+    t.pty.captureInputState = () => ({
+      viewport: `\n» Ask Codex to do anything\n\n  gpt-6-astra ultra · ~/work · ${sid}`,
+      cursor: { x: 2, y: 1 },
+    });
+    expect(await refreshCodexTerminalSession(t.pty)).toEqual({ kind: 'terminal', sessionId: sid });
+  });
+
+  it('refuses the 0.154 marker layout without a thread ID in the footer', async () => {
+    vi.mocked(findCodexRolloutSetByPid).mockReturnValue(new Set());
+    const t = terminal('');
+    t.pty.captureInputState = () => ({
+      viewport: '\n» Ask Codex to do anything\n\n  gpt-6-astra ultra · ~/work · Main [default]',
+      cursor: { x: 2, y: 1 },
+    });
+    expect(await refreshCodexTerminalSession(t.pty)).toEqual({ kind: 'unavailable' });
+  });
+
   // Two-row layouts reproduced from the Linux 0.158 review captures.
   it.each([
     `  GPT-6-Astra xhigh · /tmp · ${sid}\n  ← for agents · ? for shortcuts`,

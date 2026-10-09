@@ -66,10 +66,10 @@ function restoredCodexHistoryReady(history: string): boolean {
   const banner = history.match(/^\s*╭[^\r\n]*╮\r?\n[\s\S]*?╰[^\r\n]*╯/)?.[0];
   const initialized = !!banner && banner.includes('>_ OpenAI Codex') && CODEX_STARTUP_READY_PATTERN.test(banner);
   const lines = history.trimEnd().split(/\r?\n/);
-  const fromBottom = [...lines].reverse().findIndex(line => /^\s*›(?:\s|$)/.test(line));
+  const fromBottom = [...lines].reverse().findIndex(line => /^\s*[›»](?:\s|$)/.test(line));
   if (fromBottom < 0) return false;
   const prompt = lines.length - 1 - fromBottom;
-  if (!/^\s*›\s*(?:Ask Codex to do anything)?\s*$/.test(lines[prompt])) return false;
+  if (!/^\s*[›»]\s*(?:Ask Codex to do anything)?\s*$/.test(lines[prompt])) return false;
   const footer = lines.slice(prompt + 1).filter(line => line.trim());
   if (footer.length !== 1) return false;
   const restoredReady = (restored || initialized)
@@ -89,10 +89,10 @@ function restoredCodexHistoryReady(history: string): boolean {
 function resumedCodexPromptReady(screen: string): boolean {
   if (/(?:model|directory):\s*loading\b|Resuming session|esc to interrupt|Queued for capacity/i.test(screen)) return false;
   const lines = screen.trimEnd().split('\n');
-  const fromBottom = [...lines].reverse().findIndex(line => /^\s*›(?:\s|$)/.test(line));
+  const fromBottom = [...lines].reverse().findIndex(line => /^\s*[›»](?:\s|$)/.test(line));
   if (fromBottom < 0) return false;
   const prompt = lines.length - 1 - fromBottom;
-  if (!/^\s*›\s*(?:Ask Codex to do anything)?\s*$/.test(lines[prompt])) return false;
+  if (!/^\s*[›»]\s*(?:Ask Codex to do anything)?\s*$/.test(lines[prompt])) return false;
   // The composer must be the bottom input surface, followed only by its
   // initialized model/path footer. Pickers, review dialogs and history alone
   // cannot satisfy this shape. Do not depend on a particular model name.
@@ -579,7 +579,7 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
     // the update. Keep accepting the composer marker anywhere in a TUI redraw,
     // but reject numbered menu choices. This remains necessary for wrappers
     // such as Aiden that cannot forward the startup-update config override.
-    readyPattern: /›(?!\s*\d+\.)|\d+% left/,
+    readyPattern: /[›»](?!\s*\d+\.)|\d+% left/,
     // 0.153.x paints a skeleton composer before thread initialization. The
     // `›` and two seconds of silence do not prove it can submit yet; history
     // can remain empty throughout bootstrap even when a TUI input is queued.
