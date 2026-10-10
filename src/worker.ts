@@ -330,6 +330,7 @@ import {
   findLaunchedCliPid,
   scheduleWrapperRealCliPid,
   readComm,
+  cliIdForComm,
   isBareShellComm,
   bareShellLaunchKind,
   bareShellLaunchGuidance,
@@ -2136,6 +2137,10 @@ let lastSpawnOuterBwrapActive = false;
 // because prompt-readiness code has bwrap-specific shell handling.
 let lastSpawnTraexLauncherActive = false;
 let lastSpawnCodexLauncherActive = false;
+// Configured Codex-compatible executable name of the latest spawn, used to
+// recognise a renamed native binary when deciding whether getChildPid() is
+// already the real leaf. undefined for the official `codex` binary.
+let lastSpawnCodexExecutable: string | undefined;
 /**
  * True only when {@link shouldArmSpawnArgvInitialPromptBusy} says so: argv-
  * baked first prompt + SessionStart ready (Grok-class). First markPromptReady
@@ -8122,7 +8127,7 @@ function currentCodexObservedPid(): number | undefined {
   const wired = (backend as { cliPid?: number } | null)?.cliPid;
   if (wired) return wired;
   const child = backend?.getChildPid?.();
-  if (child) return resolveCodexOwnershipPid(child, lastSpawnCodexLauncherActive);
+  if (child) return resolveCodexOwnershipPid(child, lastSpawnCodexLauncherActive, lastSpawnCodexExecutable);
   return codexAdoptPendingPid;
 }
 
@@ -8200,18 +8205,35 @@ function codexHistorySidOwnedByCurrentPid(cliSessionId: string): boolean {
   return owned;
 }
 
+/** The pane process is a Codex-compatible native leaf when its OWN comm
+ *  identifies as one. A direct standalone install lands here; only the npm
+ *  launcher (comm `node`) and sandbox supervisors need descendant discovery. */
+function codexProcessIsNativeLeaf(pid: number, filterExecutable?: string): boolean {
+  const comm = readComm(pid);
+  return !!comm && cliIdForComm(comm, 'codex', filterExecutable) === 'codex';
+}
+
 /** Resolve the pid that actually holds a Codex rollout open, given a candidate
- *  that may be a bwrap supervisor. Under the file/scratch sandbox, botmux launches
- *  `bwrap --unshare-pid -- codex`, so the tmux pane leaf / getChildPid() is the
- *  bwrap process — its /proc/<pid>/fd holds no rollout, and the ownership gate
- *  would fail. The real codex leaf is host-visible across the pid ns
- *  (ps -A ppid links), so a comm-based BFS descends to it. Outside launcher
- *  shapes (or if codex hasn't been forked yet) the candidate already is the
- *  leaf, so we return it unchanged — fail closed to the launcher pid rather
- *  than guess. */
-function resolveCodexOwnershipPid(candidatePid: number, launcherActive: boolean): number {
+ *  that may be a bwrap supervisor or the npm Node launcher. Under the
+ *  file/scratch sandbox, botmux launches `bwrap --unshare-pid -- codex`, so
+ *  the tmux pane leaf / getChildPid() is the bwrap process — its /proc/<pid>/fd
+ *  holds no rollout, and the ownership gate would fail. A standard npm install
+ *  is a resident Node launcher that forks the packaged native binary; the
+ *  recorded pid there is the launcher for the same reason. In both shapes the
+ *  real codex leaf is reachable via ppid links, so a comm-based BFS descends to
+ *  it. When the candidate already IS a codex native leaf (direct standalone
+ *  install, or the leaf already forked at an earlier retry tick), return it
+ *  unchanged WITHOUT scanning descendants — that scan is pure waste and runs
+ *  30+ times per spawn otherwise. Also fail closed to the candidate when no
+ *  leaf has been forked yet, rather than guess. */
+function resolveCodexOwnershipPid(
+  candidatePid: number,
+  launcherActive: boolean,
+  filterExecutable?: string,
+): number {
   if (!launcherActive || !candidatePid) return candidatePid;
-  return findLaunchedCliPid(candidatePid, 'codex') ?? candidatePid;
+  if (codexProcessIsNativeLeaf(candidatePid, filterExecutable)) return candidatePid;
+  return findLaunchedCliPid(candidatePid, 'codex', 6, {}, filterExecutable) ?? candidatePid;
 }
 
 /** Resolve the pid that actually holds a TRAE rollout open, given a candidate
@@ -19166,8 +19188,20 @@ async function spawnCli(
   lastSpawnOuterBwrapActive = outerBwrapActive;
   const traexLauncherActive = outerBwrapActive || cfg.cliLaunchMode === 'forge-traex';
   lastSpawnTraexLauncherActive = traexLauncherActive;
-  const codexLauncherActive = outerBwrapActive;
+  // A standard npm-installed Codex starts as a Node launcher which then forks
+  // the native `codex` binary.  Treat every managed Codex spawn as potentially
+  // launcher-backed so rollout ownership follows the native child.  Direct
+  // native installs remain unchanged: the candidate's own comm already is the
+  // codex leaf, so both the synchronous resolve and the retry loop early-exit
+  // without scanning descendants.
+  const codexLauncherActive = cfg.cliId === 'codex';
   lastSpawnCodexLauncherActive = codexLauncherActive;
+  // Only an explicitly configured Codex-compatible runtime narrows the comm
+  // match to a renamed binary; official/legacy shapes keep the static map.
+  const codexFilterExecutable = cfg.cliId === 'codex' && cfg.cliRuntime?.source === 'configured'
+    ? cfg.cliRuntime.executable
+    : undefined;
+  lastSpawnCodexExecutable = codexFilterExecutable;
   const startTraexLauncherPidResolve = (launcherPid: number): void => {
     if (cfg.cliId !== 'traex' || !traexLauncherActive) return;
     scheduleWrapperRealCliPid(launcherPid, {
@@ -19186,7 +19220,8 @@ async function spawnCli(
   const startCodexLauncherPidResolve = (launcherPid: number): void => {
     if (cfg.cliId !== 'codex' || !codexLauncherActive) return;
     scheduleWrapperRealCliPid(launcherPid, {
-      findRealPid: (lp) => findLaunchedCliPid(lp, 'codex'),
+      findRealPid: (lp) => findLaunchedCliPid(lp, 'codex', 6, {}, codexFilterExecutable),
+      isDirectLeaf: (lp) => codexProcessIsNativeLeaf(lp, codexFilterExecutable),
       getBackend: () => backend,
       getChildPid: () => backend?.getChildPid?.(),
       applyRealPid: (realPid) => {
@@ -19227,7 +19262,7 @@ async function spawnCli(
     const wiredPid = cfg.cliId === 'traex'
       ? resolveTraexOwnershipPid(cliPid, traexLauncherActive)
       : cfg.cliId === 'codex'
-        ? resolveCodexOwnershipPid(cliPid, codexLauncherActive)
+        ? resolveCodexOwnershipPid(cliPid, codexLauncherActive, codexFilterExecutable)
         : cliPid;
     (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliPid = wiredPid;
     (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliCwd = cfg.workingDir;
@@ -19265,7 +19300,7 @@ async function spawnCli(
           const wiredPid = cfg.cliId === 'traex'
             ? resolveTraexOwnershipPid(pid, traexLauncherActive)
             : cfg.cliId === 'codex'
-              ? resolveCodexOwnershipPid(pid, codexLauncherActive)
+              ? resolveCodexOwnershipPid(pid, codexLauncherActive, codexFilterExecutable)
               : pid;
           (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliPid = wiredPid;
           (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliCwd = cfg.workingDir;
