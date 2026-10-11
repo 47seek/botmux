@@ -575,11 +575,18 @@ export async function waitForCodexSideResponse(
   agent: PlaywrightAgent,
   opts?: { marker?: string; timeoutMs?: number },
 ): Promise<void> {
-  const markerClause = opts?.marker
-    ? `要么来自 Codex 的回复包含"${opts.marker}"，`
-    : '';
+  if (opts?.marker) {
+    await agent.aiWaitFor(
+      `主内容区正在显示的测试话题里出现一条来自 Codex 或机器人的独立文本气泡（不是流式卡片、不是仓库选择卡），` +
+        `气泡正文中包含这一串字符"${opts.marker}"（该字符串是本次测试生成的唯一标识，` +
+        '不要把流式卡片标题中的用户提问文字或"已收到"这类系统提示混淆为回复）',
+      { timeoutMs: opts?.timeoutMs ?? 180_000, checkIntervalMs: 5_000 },
+    );
+    return;
+  }
   await agent.aiWaitFor(
-    `主内容区正在显示的测试话题中，当前测试话题已经收到 Codex 侧响应：${markerClause}` +
+    '主内容区正在显示的测试话题中，当前测试话题已经收到 Codex 侧响应：' +
+      '要么来自 Codex 的独立文本气泡回复，' +
       '要么来自 Codex 的回复或流式卡片正文明确包含 usage limit、rate limit、Approaching rate limits、Switch to gpt-5.4-mini 或 lower credit usage 这类额度/限流/模型切换提示；' +
       '同时当前测试话题中没有出现"没能确认提交"或"可能卡在输入框里"的 botmux 提交失败警告',
     { timeoutMs: opts?.timeoutMs ?? 180_000, checkIntervalMs: 5_000 },

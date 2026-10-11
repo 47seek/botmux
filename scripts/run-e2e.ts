@@ -43,6 +43,8 @@ try {
 let mockServer: import('../test/helpers/mock-llm-server/index.js').MockLlmServer | null = null;
 const useMockLlm = process.argv.includes('--mock-llm') || process.env.BOTMUX_MOCK_LLM === 'true' || process.env.BOTMUX_MOCK_LLM === '1';
 let mockServerBaseUrl: string | null = null;
+let previousCodexConfig: string | null = null;
+let codexConfigPathToRestore: string | null = null;
 
 if (useMockLlm) {
   const { MockLlmServer } = await import('../test/helpers/mock-llm-server/index.js');
@@ -80,6 +82,38 @@ if (useMockLlm) {
       CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
     };
     writeFileSync(claudeSettingsPath, JSON.stringify(settings, null, 2), 'utf8');
+  } catch {}
+
+  const codexDir = join(homedir(), '.codex');
+  const codexConfigPath = join(codexDir, 'config.toml');
+  try {
+    mkdirSync(codexDir, { recursive: true });
+    if (existsSync(codexConfigPath)) {
+      previousCodexConfig = readFileSync(codexConfigPath, 'utf8');
+      codexConfigPathToRestore = codexConfigPath;
+    }
+    let baseConfig = previousCodexConfig || '';
+    baseConfig = baseConfig
+      .replace(/^model\s*=.*$/m, '')
+      .replace(/^model_provider\s*=.*$/m, '')
+      .replace(/^check_for_update_on_startup\s*=.*$/m, '');
+
+    const hasProjectsStar = baseConfig.includes('[projects."*"]');
+    const hasMockProvider = baseConfig.includes('[model_providers.mock]');
+
+    let newConfig = `model = "gpt-5.5"\nmodel_provider = "mock"\ncheck_for_update_on_startup = false\n\n` + baseConfig.trimStart();
+    if (!hasMockProvider) {
+      newConfig += `\n[model_providers.mock]\nname = "MockLLM"\nbase_url = "${baseUrl}/v1"\nwire_api = "responses"\nrequires_openai_auth = false\n`;
+    } else {
+      newConfig = newConfig.replace(
+        /(\[model_providers\.mock\][\s\S]*?base_url\s*=\s*)[^\r\n]+/,
+        `$1"${baseUrl}/v1"`,
+      );
+    }
+    if (!hasProjectsStar) {
+      newConfig += `\n[projects."*"]\ntrust_level = "trusted"\n`;
+    }
+    writeFileSync(codexConfigPath, newConfig, 'utf8');
   } catch {}
 }
 
@@ -195,6 +229,14 @@ const cleanup = async () => {
   }
   if (mockServer) {
     await mockServer.stop();
+  }
+  if (previousCodexConfig !== null && codexConfigPathToRestore) {
+    try {
+      const { writeFileSync } = await import('node:fs');
+      writeFileSync(codexConfigPathToRestore, previousCodexConfig, 'utf8');
+    } catch {
+      /* ignore */
+    }
   }
 };
 

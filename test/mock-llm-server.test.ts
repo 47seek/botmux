@@ -224,6 +224,7 @@ describe('MockLlmServer', () => {
       const bodyText = await res.text();
       expect(bodyText).toContain('response.created');
       expect(bodyText).toContain('response.output_text.delta');
+      expect(bodyText).toContain('"type":"output_text"');
       expect(bodyText).toContain('CODEX_E2E_MARKER_999');
       expect(bodyText).toContain('response.completed');
     });

@@ -63,7 +63,7 @@ export function buildOpenAiResponsesTextEvents(opts: {
         output_index: 0,
         content_index: 0,
         part: {
-          type: 'text',
+          type: 'output_text',
           text: '',
         },
       }),
@@ -90,7 +90,7 @@ export function buildOpenAiResponsesTextEvents(opts: {
         output_index: 0,
         content_index: 0,
         part: {
-          type: 'text',
+          type: 'output_text',
           text: opts.text,
         },
       }),
@@ -106,7 +106,7 @@ export function buildOpenAiResponsesTextEvents(opts: {
           status: 'completed',
           content: [
             {
-              type: 'text',
+              type: 'output_text',
               text: opts.text,
             },
           ],
@@ -129,7 +129,7 @@ export function buildOpenAiResponsesTextEvents(opts: {
               status: 'completed',
               content: [
                 {
-                  type: 'text',
+                  type: 'output_text',
                   text: opts.text,
                 },
               ],
