@@ -13612,7 +13612,9 @@ async function cmdReport(rest: string[]): Promise<void> {
   let recipientResolution: ReturnType<typeof resolveReportRecipientForSession>;
   try {
     recipientResolution = resolveReportRecipientForSession({
-      session: s,
+      // A daemon answers the by-id lookup with its dashboard row: display status,
+      // no createdAt or creatorOpenId. Recipient rules need the persisted session.
+      session: sessions.get(sid) ?? s,
       sessions: [...sessions.values()],
       knownPeerBotOpenIds: recipientRoot === undefined
         ? new Set<string>()
