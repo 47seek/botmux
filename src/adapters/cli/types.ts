@@ -1,5 +1,7 @@
 import type { CodexAppTurnInput, TrustedCaller } from '../../types.js';
 import type { TriggerUserAuthConfig } from '../../services/trigger-user-auth.js';
+import type { CodexServiceTier } from '../../services/codex-service-tier.js';
+import type { DebugModelCapabilities } from './model-catalog-json.js';
 
 export interface PtyHandle {
   /** `false` means the backend rejected the write before it could confirm
@@ -231,6 +233,8 @@ export interface CliAdapter {
      *  others ignore. Note the accepted set is per-CLI: `ultra` is codex/traex
      *  only — Claude Code rejects it with a warning, so its adapter filters. */
     reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
+    /** Codex-only thread service tier. Missing inherits the executor's config. */
+    serviceTier?: CodexServiceTier;
     /** Optional TraeX process-scoped backend variant. Missing means inherit
      * the user's TraeX global configuration; all non-TraeX adapters ignore it. */
     modelBackendVariant?: 'standard' | 'max';
@@ -741,6 +745,12 @@ export interface CliAdapter {
    *  - absent = the CLI cannot enumerate its models; the picker shows
    *    `modelChoices` only. */
   readonly detectModels?: () => Promise<readonly string[] | null>;
+
+  /** Optional richer form of {@link detectModels}. Adapters that already parse
+   *  a model catalogue should implement this and derive detectModels from it,
+   *  so one probe can serve both slug enumeration and per-model capabilities. */
+  readonly detectModelCapabilities?: (options?: { env?: NodeJS.ProcessEnv })
+    => Promise<readonly DebugModelCapabilities[] | null>;
 
   /** Claude-family CLIs only (claude-code, seed). The data root holding
    *  `projects/<hash>/<id>.jsonl`, `sessions/<pid>.json`, `tasks/`,
