@@ -225,8 +225,18 @@ describe('MockLlmServer', () => {
       expect(bodyText).toContain('response.created');
       expect(bodyText).toContain('response.output_text.delta');
       expect(bodyText).toContain('"type":"output_text"');
+      expect(bodyText).toContain('【MOCK-REPLY】');
       expect(bodyText).toContain('CODEX_E2E_MARKER_999');
       expect(bodyText).toContain('response.completed');
+
+      const verifiedRes = await fetch(`${baseUrl}/mock/verified?marker=CODEX_E2E_MARKER_999`);
+      expect(verifiedRes.status).toBe(200);
+      const verifiedJson = await verifiedRes.json() as any;
+      expect(verifiedJson.verified).toBe(true);
+
+      const unverifiedRes = await fetch(`${baseUrl}/mock/verified?marker=NON_EXISTENT`);
+      const unverifiedJson = await unverifiedRes.json() as any;
+      expect(unverifiedJson.verified).toBe(false);
     });
   });
 

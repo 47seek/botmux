@@ -25,6 +25,7 @@ import { randomBytes } from 'node:crypto';
 import { resolve } from 'node:path';
 import MarkdownIt from 'markdown-it';
 import type Token from 'markdown-it/lib/token.mjs';
+import StateInline from 'markdown-it/lib/rules_inline/state_inline.mjs';
 import { t, type Locale } from '../../i18n/index.js';
 import type { ModelFallbackState } from '../../types.js';
 import {
@@ -47,6 +48,10 @@ import {
 } from './vega-lite-chart.js';
 import { TURN_REPLY_CARD_MAX_BYTES, turnReplyCardRequestBytes } from './turn-reply-card-size.js';
 import { logger } from '../../utils/logger.js';
+import {
+  cardMarkdownImageReferences,
+  FEISHU_IMG_KEY,
+} from './card-markdown-image-references.js';
 
 /** Room kept for chrome that callers attach *after* a card is built and
  * fitted — today the on-call group button (≈483B of request body), added by
@@ -59,6 +64,13 @@ export type { CardRenderDiagnostic } from './vega-lite-chart.js';
 export { REPLY_CARD_FOOTER_MARKER } from './reply-card-footer-signature.js';
 
 const md = new MarkdownIt({ html: false, linkify: false, breaks: false });
+// This parser only classifies images for removal. Include schemes such as
+// file: that the HTML renderer rejects but Feishu may still treat as images.
+const imageScanMd = new MarkdownIt({ html: false, linkify: false, breaks: false });
+imageScanMd.validateLink = () => true;
+const imageRuleParser = new MarkdownIt();
+imageRuleParser.inline.ruler.enableOnly('image');
+const parseImage = imageRuleParser.inline.ruler.getRules('')[0];
 const MAX_LOCAL_HOME_LINK_REPAIRS = 256;
 /** Keep structured replies readable without letting heading-heavy model output
  *  multiply schema-v2 body elements without bound. Each promoted heading can
@@ -372,12 +384,12 @@ export function normalizeLocalHomeLinks(
 }
 
 /** Default footer brand when a bot has no custom `brandLabel` configured. */
-export const DEFAULT_BRAND_LABEL = '[botmux](https://github.com/deepcoldy/botmux)';
+export const DEFAULT_BRAND_LABEL = 'Powered by [botmux](https://github.com/deepcoldy/botmux) with :LOVE:';
 
 /**
  * Resolve the brand segment to render in a card footer from a bot's configured
  * `brandLabel` (see {@link resolveBrandLabel}):
- *   • `undefined` (unset)  → the default botmux link
+ *   • `undefined` (unset)  → `Powered by [botmux](...) with :LOVE:`
  *   • `''` / whitespace    → `null` (brand suppressed)
  *   • any other string     → one trimmed line (markdown allowed)
  * Returning `null` lets callers drop the brand — and, when there's also no
@@ -890,6 +902,79 @@ function unescapeFenceLines(input: string): string {
   return input.replace(/^[ ]{0,3}(?:\\`){3,}[^\n`]*$/gm, m => m.replace(/\\`/g, '`'));
 }
 
+/** Resolve real Markdown images, preserving code examples and untouched source.
+ * The image-only rule supplies exact source spans; the full parser above
+ * decides which occurrences are actually images rather than literal code. */
+export async function resolveCardMarkdownImages(
+  input: string,
+  resolveSource: (source: string) => Promise<string | undefined>,
+): Promise<string> {
+  input = unescapeFenceLines(input);
+  const references = cardMarkdownImageReferences(input);
+  if (!references.length) return input;
+  const env: Record<string, unknown> = {};
+  imageScanMd.parse(input, env);
+  const parts: string[] = [];
+  let cursor = 0;
+  for (const reference of references) {
+    if (reference.position < cursor || FEISHU_IMG_KEY.test(reference.source)) continue;
+    const state = new StateInline(input, imageScanMd, env, []);
+    state.pos = reference.position;
+    if (!parseImage(state, false)) continue;
+    const token = state.tokens.at(-1);
+    if (token?.type !== 'image' || token.attrGet('src') !== reference.source) continue;
+    const key = await resolveSource(reference.source);
+    if (!key || !FEISHU_IMG_KEY.test(key)) continue;
+    parts.push(input.slice(cursor, reference.position), `![${token.content}](${key})`);
+    cursor = state.pos;
+  }
+  return parts.join('') + input.slice(cursor);
+}
+
+function normalizeCardImages(input: string, omitAll = false): string {
+  const unsupported = new Set(cardMarkdownImageReferences(input)
+    .filter(image => omitAll || !FEISHU_IMG_KEY.test(image.source)).map(image => image.position));
+  return input.replace(/!\[/g, (match: string, offset: number) =>
+    unsupported.has(offset) ? '[Image omitted] [' : match);
+}
+
+/** Last-resort image-free version of a rejected reply card. Keep the card
+ * envelope, text, tables, code and controls so existing delivery accounting
+ * can continue to use the same message type and provider UUID. */
+export function omitReplyCardImages(cardJson: string): string {
+  let card: unknown;
+  try { card = JSON.parse(cardJson); } catch { return cardJson; }
+  let changed = false;
+  const visit = (value: unknown, markdownFields?: ReadonlySet<string>): unknown => {
+    if (Array.isArray(value)) return value.map(child => visit(child, markdownFields));
+    if (!value || typeof value !== 'object') return value;
+    if ('tag' in value && value.tag === 'img') {
+      changed = true;
+      const alt = 'alt' in value ? value.alt : undefined;
+      const text = typeof alt === 'string' ? alt
+        : alt && typeof alt === 'object' && 'content' in alt && typeof alt.content === 'string'
+          ? alt.content : '';
+      return { tag: 'markdown', content: `[Image omitted] ${md.utils.escapeHtml(text).replace(/[\\`*_[\]<>!]/g, '\\$&')}`.trim() };
+    }
+    const tableFields = 'tag' in value && value.tag === 'table' && 'columns' in value && Array.isArray(value.columns)
+      ? new Set<string>(value.columns.flatMap((column: unknown) =>
+        column && typeof column === 'object' && 'data_type' in column && column.data_type === 'lark_md'
+          && 'name' in column && typeof column.name === 'string' ? [column.name] : []))
+      : undefined;
+    return Object.fromEntries(Object.entries(value).map(([key, child]) => {
+      if (typeof child === 'string' && (markdownFields?.has(key)
+        || ('tag' in value && (value.tag === 'markdown' || value.tag === 'lark_md') && key === 'content'))) {
+        const content = normalizeCardImages(child, true);
+        if (content !== child) changed = true;
+        return [key, content];
+      }
+      return [key, visit(child, key === 'rows' ? tableFields : undefined)];
+    }));
+  };
+  const result = visit(card);
+  return changed ? JSON.stringify(result) : cardJson;
+}
+
 /** Normalize source bytes that must be settled before the card is rendered. */
 export function prepareCardMarkdown(
   input: string,
@@ -960,7 +1045,7 @@ export function extractFirstReplyCardHeading(input: string): ExtractedReplyCardH
  *      markdown widget doesn't render ATX `#`).
  *   3. Code fences → re-emitted with the original backtick run, joined with
  *      blank lines on either side (Feishu's widget needs them to recognise the
- *      fence).
+ *      fence). Code nested in lists/quotes becomes a standalone element.
  *   4. Everything else → original source slice, glued by blank lines.
  *
  * Prose between promoted headings/tables/image rows is merged into one
@@ -977,6 +1062,9 @@ export function buildCardBodyElements(
   // Recover model-escaped fences first so markdown-it can classify their
   // contents as code before local-link normalization inspects link tokens.
   input = prepareCardMarkdown(input, cwd, localHomeLinkMode);
+  // Only sanitize at the rendering boundary: sandbox relay preparation runs
+  // before --images uploads resolve img:N placeholders to real image keys.
+  input = normalizeCardImages(input);
   // Pre-pass: a line that is nothing but 2+ images renders as a side-by-side
   // image row (column_set) instead of stacked full-width images. Everything
   // else flows through the markdown element builder unchanged. Fence-aware so
@@ -1088,12 +1176,41 @@ function buildMarkdownElements(
       continue;
     }
 
-    // Generic open token (paragraph_open, bullet_list_open, ordered_list_open,
-    // blockquote_open, …): slice source by the open-token's line map and skip
-    // to the matching close.
+    // Lark can omit fences nested inside lists/quotes. Lift those code blocks
+    // into standalone elements; keep the surrounding source (and numbering)
+    // in order instead of handing the unsupported container to its renderer.
     if (t.type.endsWith('_open') && t.map) {
-      buf.push(sliceLines(lines, t.map as [number, number]));
-      i = findMatchingClose(tokens, i) + 1;
+      const end = findMatchingClose(tokens, i);
+      let startLine = t.map[0];
+      for (let nested = i + 1; nested < end; nested++) {
+        const code = tokens[nested];
+        // A continuation paragraph has lost its opening list item/quote in
+        // the previous element. Use the parsed text so its old indentation
+        // cannot turn prose into an accidental indented code block.
+        if (startLine > t.map[0] && code.type === 'paragraph_open' && code.map
+          && tokens[nested - 1].nesting !== 1) {
+          buf.push(sliceLines(lines, [startLine, code.map[0]]));
+          buf.push(tokens[nested + 1].content);
+          startLine = code.map[1];
+          continue;
+        }
+        if ((code.type !== 'fence' && code.type !== 'code_block') || !code.map) continue;
+        buf.push(sliceLines(lines, [startLine, code.map[0]]));
+        flushBuf();
+        const info = (code.info || '').trim();
+        if (code.type === 'fence' && VEGA_LITE_FENCE_LANGS.has(info.split(/\s+/)[0]!.toLowerCase())) {
+          elements.push(...buildVegaLiteElements(code.content, layoutBudget));
+        } else {
+          const fence = code.markup || '`'.repeat(Math.max(3,
+            ...(code.content.match(/`+/g) ?? []).map(run => run.length + 1)));
+          // Do not run code through flushBuf: its prose whitespace cleanup
+          // would collapse intentional blank lines inside the code block.
+          elements.push({ tag: 'markdown', content: `${fence}${info}\n${code.content}${fence}` });
+        }
+        startLine = code.map[1];
+      }
+      buf.push(sliceLines(lines, [startLine, t.map[1]]));
+      i = end + 1;
       continue;
     }
 
@@ -1262,11 +1379,8 @@ const IMG_ROW_LINE = /^ {0,3}(?:!\[[^\]]*\]\([^)\s]+\)\s*){2,}$/;
  * such key is promoted to a native `img` row — a model reply may emit a
  * `![](https://…) ![](…)` URL line (or other non-key src like `img_v2foo.png`),
  * and a native `img` element with a non-key as its "img_key" makes Feishu reject
- * the whole card. Non-key lines fall through to the markdown widget unchanged
- * (same as before this feature existed).
+ * the whole card. Non-key images are downgraded before this layout pass.
  */
-const FEISHU_IMG_KEY = /^img_v\d+_[A-Za-z0-9_-]+$/i;
-
 type BodySegment = { type: 'text'; content: string } | { type: 'imgrow'; keys: string[] } | { type: 'img'; key: string; alt: string };
 
 /**
@@ -1416,7 +1530,7 @@ export function hasMarkdown(text: string): boolean {
  * addressing line (e.g. top-level broadcasts have no specific recipient).
  *
  * `brand` is the sending bot's configured `brandLabel` (see
- * {@link brandFooterSegment}): unset → default botmux link, `''` → brand
+ * {@link brandFooterSegment}): unset → default `Powered by [botmux](...) with :LOVE:`, `''` → brand
  * suppressed, else custom. When brand, usage, and recipient are all absent the
  * whole footer (HR included) is omitted.
  */
@@ -1543,7 +1657,7 @@ export function buildContextualReplyCard(opts: {
     const u = userText.trim();
     elements.push({
       tag: 'markdown',
-      content: `**👤 ${t('card.you', undefined, locale)}**\n\n${quoteLines(u || t('common.empty_paren', undefined, locale))}`,
+      content: normalizeCardImages(`**👤 ${t('card.you', undefined, locale)}**\n\n${quoteLines(u || t('common.empty_paren', undefined, locale))}`),
     });
   }
 

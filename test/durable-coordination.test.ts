@@ -2,8 +2,14 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import type { SessionLease } from '../src/services/durable-coordination.js';
+import {
+  DURABLE_COORDINATION_CONTRACT_VERSION,
+  DURABLE_INBOX_LANE_LARK_MESSAGE,
+  DURABLE_INBOX_LANE_SESSION_CONTROL,
+  type SessionLease,
+} from '../src/services/durable-coordination.js';
 import { SqliteDurableCoordinationStore } from '../src/services/sqlite-durable-coordination.js';
+import { openDatabaseSyncOrThrow } from '../src/services/sqlite-compat.js';
 
 const tempDirs: string[] = [];
 
@@ -24,6 +30,10 @@ afterEach(() => {
 });
 
 describe('SQLite durable coordination contract', () => {
+  it('pins the lane-aware coordination contract version', () => {
+    expect(DURABLE_COORDINATION_CONTRACT_VERSION).toBe(2);
+  });
+
   it('uses monotonic session epochs and fences stale state writers', async () => {
     let now = 100;
     const store = makeStore(() => now);
@@ -114,6 +124,10 @@ describe('SQLite durable coordination contract', () => {
     expect(await store.enqueueInbox({
       eventId: 'event-1', partitionKey: 'chat-a', payload: { a: 9 }, visibleAt: 0, createdAt: 1,
     })).toEqual({ kind: 'conflict' });
+    expect(await store.enqueueInbox({
+      eventId: 'event-1', lane: DURABLE_INBOX_LANE_SESSION_CONTROL,
+      partitionKey: 'chat-a', payload: { b: 2, a: 1 }, visibleAt: 0, createdAt: 1,
+    })).toEqual({ kind: 'conflict' });
     await store.enqueueInbox({
       eventId: 'event-2', partitionKey: 'chat-a', payload: { n: 2 }, visibleAt: 0, createdAt: 2,
     });
@@ -140,6 +154,144 @@ describe('SQLite durable coordination contract', () => {
     expect(await store.claimNextInbox({ workerId: 'worker-c', leaseDurationMs: 10 }))
       .toMatchObject({ event: { eventId: 'event-2' } });
     await store.close();
+  });
+
+  it('isolates inbox lanes and lets an owner claim only its local partitions', async () => {
+    const store = makeStore(() => 10);
+    await store.enqueueInbox({
+      eventId: 'control-a', lane: DURABLE_INBOX_LANE_SESSION_CONTROL,
+      partitionKey: 'session-a', payload: { action: 'close' }, visibleAt: 0, createdAt: 1,
+    });
+    await store.enqueueInbox({
+      eventId: 'message-a', lane: DURABLE_INBOX_LANE_LARK_MESSAGE,
+      partitionKey: 'session-a', payload: { type: 'message' }, visibleAt: 0, createdAt: 2,
+    });
+    await store.enqueueInbox({
+      eventId: 'control-b', lane: DURABLE_INBOX_LANE_SESSION_CONTROL,
+      partitionKey: 'session-b', payload: { action: 'resume' }, visibleAt: 0, createdAt: 3,
+    });
+
+    expect(await store.claimNextInbox({
+      workerId: 'control-none', lane: DURABLE_INBOX_LANE_SESSION_CONTROL,
+      partitionKeys: [], leaseDurationMs: 20,
+    })).toBeUndefined();
+    const message = await store.claimNextInbox({
+      workerId: 'message-worker', lane: DURABLE_INBOX_LANE_LARK_MESSAGE,
+      leaseDurationMs: 20,
+    });
+    expect(message).toMatchObject({
+      event: { eventId: 'message-a', lane: DURABLE_INBOX_LANE_LARK_MESSAGE },
+    });
+    const controlB = await store.claimNextInbox({
+      workerId: 'owner-b', lane: DURABLE_INBOX_LANE_SESSION_CONTROL,
+      partitionKeys: ['session-b'], leaseDurationMs: 20,
+    });
+    expect(controlB).toMatchObject({
+      event: { eventId: 'control-b', lane: DURABLE_INBOX_LANE_SESSION_CONTROL },
+    });
+    const controlA = await store.claimNextInbox({
+      workerId: 'owner-a', lane: DURABLE_INBOX_LANE_SESSION_CONTROL,
+      partitionKeys: ['session-a', 'session-a'], leaseDurationMs: 20,
+    });
+    expect(controlA).toMatchObject({
+      event: { eventId: 'control-a', lane: DURABLE_INBOX_LANE_SESSION_CONTROL },
+    });
+    await store.close();
+  });
+
+  it('orders one partition by store insertion sequence instead of client timestamps or ids', async () => {
+    let now = 10;
+    const store = makeStore(() => now);
+    await store.enqueueInbox({
+      eventId: 'event-z-first', partitionKey: 'chat-a', payload: { order: 1 },
+      visibleAt: 0, createdAt: 9_000,
+    });
+    await store.enqueueInbox({
+      eventId: 'event-a-second', partitionKey: 'chat-a', payload: { order: 2 },
+      visibleAt: 0, createdAt: 1,
+    });
+
+    const first = await store.claimNextInbox({ workerId: 'worker-a', leaseDurationMs: 20 });
+    expect(first?.event.eventId).toBe('event-z-first');
+    expect(await store.claimNextInbox({ workerId: 'worker-b', leaseDurationMs: 20 })).toBeUndefined();
+    now = 11;
+    expect(await store.completeInboxClaim(first!)).toEqual({ kind: 'applied' });
+    const second = await store.claimNextInbox({ workerId: 'worker-b', leaseDurationMs: 20 });
+    expect(second?.event.eventId).toBe('event-a-second');
+    await store.close();
+  });
+
+  it('backfills deterministic inbox and outbox sequence rows when order tables are missing', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-durable-sequence-migration-'));
+    tempDirs.push(dir);
+    const path = join(dir, 'coordination.db');
+    const first = new SqliteDurableCoordinationStore(path, { now: () => 10 });
+    await first.enqueueInbox({
+      eventId: 'legacy-b', partitionKey: 'chat-a', payload: { order: 2 }, visibleAt: 0, createdAt: 2,
+    });
+    await first.enqueueInbox({
+      eventId: 'legacy-a', partitionKey: 'chat-a', payload: { order: 1 }, visibleAt: 0, createdAt: 1,
+    });
+    const lease = acquired(await first.acquireSessionLease({
+      sessionKey: 'legacy-session', ownerId: 'legacy-worker', leaseDurationMs: 100,
+    }));
+    await first.enqueueOutbox({
+      lease,
+      message: {
+        messageId: 'legacy-outbox-b', sessionKey: 'legacy-session', payload: { order: 2 },
+        visibleAt: 0, createdAt: 2,
+      },
+    });
+    await first.enqueueOutbox({
+      lease,
+      message: {
+        messageId: 'legacy-outbox-a', sessionKey: 'legacy-session', payload: { order: 1 },
+        visibleAt: 0, createdAt: 1,
+      },
+    });
+    await first.close();
+
+    const raw = openDatabaseSyncOrThrow(path);
+    raw.exec('DROP TABLE durable_inbox_order; DROP TABLE durable_outbox_order;');
+    raw.close();
+
+    const reopened = new SqliteDurableCoordinationStore(path, { now: () => 10 });
+    const claim = await reopened.claimNextInbox({ workerId: 'worker-a', leaseDurationMs: 20 });
+    expect(claim?.event.eventId).toBe('legacy-a');
+    const reservation = await reopened.reserveNextOutbox({ workerId: 'sender-a', leaseDurationMs: 20 });
+    expect(reservation?.record.messageId).toBe('legacy-outbox-a');
+    await reopened.close();
+  });
+
+  it('upgrades version 1 inbox rows into the default Lark message lane', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-durable-lane-migration-'));
+    tempDirs.push(dir);
+    const path = join(dir, 'coordination.db');
+    const first = new SqliteDurableCoordinationStore(path, { now: () => 10 });
+    await first.enqueueInbox({
+      eventId: 'legacy-message', partitionKey: 'chat-a', payload: {}, visibleAt: 0, createdAt: 1,
+    });
+    await first.close();
+
+    const raw = openDatabaseSyncOrThrow(path);
+    raw.exec('DROP INDEX durable_inbox_lane_claim_idx;');
+    raw.exec('DROP INDEX durable_inbox_lane_partition_claim_idx;');
+    raw.exec('ALTER TABLE durable_inbox DROP COLUMN lane;');
+    raw.prepare(
+      'UPDATE durable_coordination_meta SET schema_version = 1 WHERE singleton = 1',
+    ).run();
+    raw.close();
+
+    const reopened = new SqliteDurableCoordinationStore(path, { now: () => 10 });
+    const claim = await reopened.claimNextInbox({
+      workerId: 'message-worker',
+      lane: DURABLE_INBOX_LANE_LARK_MESSAGE,
+      leaseDurationMs: 20,
+    });
+    expect(claim).toMatchObject({
+      event: { eventId: 'legacy-message', lane: DURABLE_INBOX_LANE_LARK_MESSAGE },
+    });
+    await reopened.close();
   });
 
   it('retries claimed inbox work only after the requested visibility time', async () => {
@@ -186,6 +338,36 @@ describe('SQLite durable coordination contract', () => {
     now = 12;
     expect(await store.renewInboxClaim({ claim: takeover, leaseDurationMs: 10 }))
       .toMatchObject({ kind: 'applied', claim: { workerId: 'worker-b', claimEpoch: 2, claimUntil: 22 } });
+    await store.close();
+  });
+
+  it('fences stale inbox tokens after the same worker reclaims an expired event', async () => {
+    let now = 1;
+    const store = makeStore(() => now);
+    await store.enqueueInbox({
+      eventId: 'event-same-worker-reclaim', partitionKey: 'chat-a', payload: {}, visibleAt: 0, createdAt: 1,
+    });
+    const first = await store.claimNextInbox({ workerId: 'worker-a', leaseDurationMs: 10 });
+    if (!first) throw new Error('expected first inbox claim');
+
+    now = 11;
+    const reclaimed = await store.claimNextInbox({ workerId: 'worker-a', leaseDurationMs: 10 });
+    if (!reclaimed) throw new Error('expected same-worker inbox reclaim');
+    expect(reclaimed).toMatchObject({ workerId: 'worker-a', claimEpoch: 2, attempts: 2, claimUntil: 21 });
+
+    now = 12;
+    expect(await store.renewInboxClaim({ claim: first, leaseDurationMs: 10 }))
+      .toEqual({ kind: 'stale' });
+    expect(await store.completeInboxClaim(first)).toEqual({ kind: 'stale' });
+    expect(await store.retryInboxClaim({ claim: first, visibleAt: 30 }))
+      .toEqual({ kind: 'stale' });
+
+    const renewed = await store.renewInboxClaim({ claim: reclaimed, leaseDurationMs: 10 });
+    expect(renewed).toMatchObject({
+      kind: 'applied', claim: { workerId: 'worker-a', claimEpoch: 2, claimUntil: 22 },
+    });
+    if (renewed.kind !== 'applied') throw new Error('expected reclaimed inbox renewal');
+    expect(await store.completeInboxClaim(renewed.claim)).toEqual({ kind: 'applied' });
     await store.close();
   });
 
@@ -254,6 +436,40 @@ describe('SQLite durable coordination contract', () => {
     expect(await store.enqueueOutbox({
       lease, message: { ...message, messageId: 'late-message' },
     })).toEqual({ kind: 'stale_lease' });
+    await store.close();
+  });
+
+  it('orders one Session outbox by store insertion sequence instead of client timestamps or ids', async () => {
+    let now = 10;
+    const store = makeStore(() => now);
+    const lease = acquired(await store.acquireSessionLease({
+      sessionKey: 'session-order', ownerId: 'worker-a', leaseDurationMs: 100,
+    }));
+    await store.enqueueOutbox({
+      lease,
+      message: {
+        messageId: 'message-z-first', sessionKey: 'session-order', payload: { order: 1 },
+        visibleAt: 0, createdAt: 9_000,
+      },
+    });
+    await store.enqueueOutbox({
+      lease,
+      message: {
+        messageId: 'message-a-second', sessionKey: 'session-order', payload: { order: 2 },
+        visibleAt: 0, createdAt: 1,
+      },
+    });
+
+    const first = await store.reserveNextOutbox({ workerId: 'sender-a', leaseDurationMs: 20 });
+    expect(first?.record.messageId).toBe('message-z-first');
+    const attempt = await store.beginOutboxAttempt({ reservation: first! });
+    if (attempt.kind !== 'applied') throw new Error('expected first outbox attempt');
+    now = 11;
+    expect(await store.completeOutboxAttempt({
+      attempt: attempt.attempt, receipt: { platformMessageId: 'om_first' },
+    })).toMatchObject({ kind: 'applied', record: { state: 'delivered' } });
+    const second = await store.reserveNextOutbox({ workerId: 'sender-b', leaseDurationMs: 20 });
+    expect(second?.record.messageId).toBe('message-a-second');
     await store.close();
   });
 

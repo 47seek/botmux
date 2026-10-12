@@ -577,9 +577,9 @@ export async function waitForCodexSideResponse(
 ): Promise<void> {
   if (opts?.marker) {
     await agent.aiWaitFor(
-      `主内容区正在显示的测试话题里出现一条来自 Codex 或机器人的独立文本气泡（不是流式卡片、不是仓库选择卡），` +
-        `气泡正文中包含这一串字符"${opts.marker}"（该字符串是本次测试生成的唯一标识，` +
-        '不要把流式卡片标题中的用户提问文字或"已收到"这类系统提示混淆为回复）',
+      `主内容区正在显示的测试话题里出现一条来自 Codex 或机器人的独立文本气泡（不是流式卡片、不是仓库选择卡、绝对不是用户自己发出的提问消息），` +
+        `气泡正文中必须同时包含"【MOCK-REPLY】"和"${opts.marker}"（"【MOCK-REPLY】"是模型回复专用的固定前缀，用户提问中绝无此标记），` +
+        '不要把流式卡片标题或用户提问误认为回复',
       { timeoutMs: opts?.timeoutMs ?? 180_000, checkIntervalMs: 5_000 },
     );
     return;

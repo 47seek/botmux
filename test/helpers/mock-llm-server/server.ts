@@ -24,6 +24,7 @@ export class MockLlmServer {
   private server: ReturnType<typeof createServer> | null = null;
   private config: Required<MockServerConfig>;
   private recorder: TapeRecorder;
+  private recordedMarkers: Set<string> = new Set();
 
   constructor(config?: MockServerConfig) {
     const validModes = ['synthetic', 'record', 'replay'];
@@ -113,6 +114,14 @@ export class MockLlmServer {
       return;
     }
 
+    if (pathname === '/mock/verified') {
+      const marker = url.searchParams.get('marker');
+      const verified = marker ? this.recordedMarkers.has(marker) : false;
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ verified, count: this.recordedMarkers.size }));
+      return;
+    }
+
     // Models catalog (Preflight support)
     if (pathname === '/v1/models' || pathname === '/models') {
       res.writeHead(200, { 'content-type': 'application/json' });
@@ -170,16 +179,20 @@ export class MockLlmServer {
   }
 
   private async handleOpenAiResponses(body: any, res: ServerResponse): Promise<void> {
+    const { extractMarkerFromMessages, extractMarker } = await import('./marker-extractor.js');
     const rawInput = JSON.stringify(body?.input ?? []);
-    const { extractMarker } = await import('./marker-extractor.js');
-    const marker = extractMarker(rawInput) ?? 'ACK-codex-test-received';
+    const marker =
+      extractMarkerFromMessages(body?.input) ??
+      extractMarker(rawInput) ??
+      'ACK-codex-test-received';
     const model = body?.model ?? 'gpt-6-astra';
 
+    this.recordedMarkers.add(marker);
     if (this.config.verbose) {
       console.log(`[mock-llm-server] /responses model=${model}, marker=${marker}`);
     }
 
-    const replyText = `已收到指令并完成操作：${marker}`;
+    const replyText = `【MOCK-REPLY】已收到指令并完成操作：${marker}`;
     const events = buildOpenAiResponsesTextEvents({
       model,
       text: replyText,
@@ -193,6 +206,7 @@ export class MockLlmServer {
     const marker = extractMarkerFromMessages(messages) ?? 'ACK-test-message-received';
     const model = body?.model;
 
+    this.recordedMarkers.add(marker);
     if (this.config.verbose) {
       console.log(`[mock-llm-server] /messages model=${model}, marker=${marker}, lastMsgRole=${lastMsg?.role}`);
       const toolNames = Array.isArray(body?.tools) ? body.tools.map((t: any) => t?.name) : [];

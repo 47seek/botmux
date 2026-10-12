@@ -39,8 +39,17 @@ export function extractMarkerFromMessages(messages: unknown[]): string | null {
 
   // Search backwards starting from the latest messages
   for (let i = messages.length - 1; i >= 0; i--) {
-    const msg = messages[i] as { content?: unknown; role?: string };
-    if (!msg) continue;
+    const item = messages[i];
+    if (!item) continue;
+
+    if (typeof item === 'string') {
+      const marker = extractMarker(item);
+      if (marker) return marker;
+      continue;
+    }
+
+    const msg = item as { content?: unknown; role?: string };
+    if (msg.role === 'assistant' || msg.role === 'system') continue;
 
     if (typeof msg.content === 'string') {
       const marker = extractMarker(msg.content);

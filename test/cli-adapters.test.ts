@@ -32,7 +32,7 @@ import { createAidenAdapter } from '../src/adapters/cli/aiden.js';
 import { createCocoAdapter } from '../src/adapters/cli/coco.js';
 import { createCodexAdapter } from '../src/adapters/cli/codex.js';
 import { createCodexAppAdapter } from '../src/adapters/cli/codex-app.js';
-import { createCursorAdapter } from '../src/adapters/cli/cursor.js';
+import { createCursorAdapter, CURSOR_PLUGIN_DIR } from '../src/adapters/cli/cursor.js';
 import { createGeminiAdapter } from '../src/adapters/cli/gemini.js';
 import { createGeniusAdapter } from '../src/adapters/cli/genius.js';
 import { createOpenCodeAdapter, isOpenCodeSessionId } from '../src/adapters/cli/opencode.js';
@@ -101,7 +101,7 @@ describe('createCliAdapterSync factory', () => {
     if (isRemoteCliId(id) && id !== 'remote-runner') expect(adapter.resolvedBin).toBe('');
     // dsh joins the bundled-Node-runner group (upstream #858): its resolvedBin is
     // the node binary, not the pinned path.
-    else if (id === 'codex-app' || id === 'mira' || id === 'mir' || id === 'dsh') expect(adapter.resolvedBin).toBe(process.execPath);
+    else if (id === 'codex-app' || id === 'mira' || id === 'mir' || id === 'dsh' || id === 'minimax') expect(adapter.resolvedBin).toBe(process.execPath);
     else expect(adapter.resolvedBin).toBe(`/opt/${id}`);
   });
 });
@@ -327,6 +327,24 @@ describe('claude-code buildArgs', () => {
       expect(prompt).toContain('JSON-escaped text as a positional argument');
       expect(prompt).toContain('literal `\\n` back into newlines');
       expect(prompt).toContain('--content-file');
+    }
+  });
+
+  it('points to the send guide in both locales and injection paths', () => {
+    for (const locale of ['zh', 'en'] as const) {
+      const prompts = [
+        buildBotmuxSystemPromptText({ locale }),
+        buildBotmuxShellHints(locale).join('\n'),
+      ];
+      for (const prompt of prompts) {
+        expect(prompt).toContain('botmux skill show botmux-send');
+      }
+      // No-transport and transcript delivery must keep their existing contract:
+      // these modes do not advertise explicit send commands in routing hints.
+      expect(buildBotmuxSystemPromptText({ locale, noTransport: true })).not.toContain('botmux skill show botmux-send');
+      expect(buildBotmuxShellHints(locale, true).join('\n')).not.toContain('botmux skill show botmux-send');
+      expect(buildBotmuxSystemPromptText({ locale, replyDelivery: 'transcript' })).not.toContain('botmux skill show botmux-send');
+      expect(buildBotmuxShellHints(locale, false, 'transcript').join('\n')).not.toContain('botmux skill show botmux-send');
     }
   });
 
@@ -1859,6 +1877,9 @@ describe('cursor buildArgs', () => {
 
   it('delivers the opening prompt through argv and enables post-ready type-ahead', () => {
     expect(adapter.passesInitialPromptViaArgs).toBe(true);
+    // Positional prompt is inside the tmux launch command. 8192 matches
+    // OpenCode: short turns stay on argv; longer ones defer until readyPattern.
+    expect(adapter.maxInitialPromptArgBytes).toBe(8192);
     expect(adapter.readyPattern?.test('  → Plan, search, build anything')).toBe(true);
     expect(adapter.deferFirstPromptTimeoutUntilReady).toBe(true);
     expect(adapter.supportsTypeAhead).toBe(true);
@@ -1876,6 +1897,39 @@ describe('cursor buildArgs', () => {
     // Guard against over-broad matching: the arrow-prefixed composer glyph is
     // required, so unrelated screen text with the phrase must not false-match.
     expect(adapter.readyPattern?.test('Plan, search, build anything')).toBe(false);
+  });
+
+  it('injects built-in plugin-dir by default and supports session-scoped skillPluginDir', () => {
+    const args = adapter.buildArgs({
+      sessionId: 'sess-cursor',
+      resume: false,
+      skillPluginDir: '/tmp/runtime-skills/sess-cursor/claude-plugin',
+    });
+    expect(args).toContain('--plugin-dir');
+    const pluginIndices = args.flatMap((arg, i) => (arg === '--plugin-dir' ? [i] : []));
+    expect(pluginIndices.length).toBe(2);
+    expect(args[pluginIndices[0] + 1]).toBe(CURSOR_PLUGIN_DIR);
+    expect(args[pluginIndices[1] + 1]).toBe('/tmp/runtime-skills/sess-cursor/claude-plugin');
+  });
+
+  it('omits --plugin-dir when promptInjection is none', () => {
+    const args = adapter.buildArgs({
+      sessionId: 'sess-cursor',
+      resume: false,
+      skillPluginDir: '/tmp/runtime-skills/sess-cursor/claude-plugin',
+      promptInjection: 'none',
+    });
+    expect(args).not.toContain('--plugin-dir');
+  });
+
+  it('declares dynamic pluginDir and claude-plugin skillDelivery capabilities alongside a discoverable skillsDir', () => {
+    expect(adapter.pluginDir).toBe(CURSOR_PLUGIN_DIR);
+    expect(adapter.skillsDir).toBe('~/.cursor/skills');
+    expect(adapter.skillDelivery).toEqual({
+      nativeKind: 'claude-plugin',
+      supportsScopedSession: true,
+      supportsExclusive: false,
+    });
   });
 });
 
@@ -1959,6 +2013,11 @@ describe('gemini buildArgs', () => {
 
   it('passesInitialPromptViaArgs is true', () => {
     expect(adapter.passesInitialPromptViaArgs).toBe(true);
+  });
+
+  it('declares maxInitialPromptArgBytes to guard tmux command-too-long', () => {
+    // -i bakes the full first prompt into argv, same tmux ceiling as OpenCode.
+    expect(adapter.maxInitialPromptArgBytes).toBe(8192);
   });
 
   it('does not include session id', () => {
@@ -2052,6 +2111,17 @@ describe('pi buildArgs', () => {
     expect(args[nameIdx + 1]).toBe('[BotMux·Lark] Fix login flow');
     expect(args.at(-1)).toBe('hello pi');
     expect(adapter.buildSessionRenameCommand?.('Renamed in Botmux')).toBe('/name Renamed in Botmux');
+  });
+
+  it('does not pass --name on resume, so a restart cannot overwrite a renamed Pi session', () => {
+    const args = adapter.buildArgs({
+      sessionId: 'sess-pi',
+      resume: true,
+      nativeSessionTitle: 'Original title',
+      initialPrompt: 'hello pi',
+    });
+    expect(args).not.toContain('--name');
+    expect(args).toContain('--session-id');
   });
 
   it('loads the turn-boundary extension on every spawn so mid-turn retries are not read as failures', () => {
@@ -2814,6 +2884,11 @@ describe('mtr buildArgs', () => {
   it('passesInitialPromptViaArgs is true', () => {
     expect(adapter.passesInitialPromptViaArgs).toBe(true);
   });
+
+  it('declares maxInitialPromptArgBytes to guard tmux command-too-long', () => {
+    // `--prompt` bakes the full first prompt into argv, same budget as OpenCode.
+    expect(adapter.maxInitialPromptArgBytes).toBe(8192);
+  });
 });
 
 describe('hermes buildArgs', () => {
@@ -3337,7 +3412,7 @@ describe('readyPattern', () => {
     // on this opt-in being present, so pin it (the worker reads it === true).
     const adapter = createTraexAdapter('/bin/traex');
     expect(adapter.deferFirstPromptTimeoutUntilReady).toBe(true);
-    expect(adapter.supportsTypeAhead).toBe(false);
+    expect(adapter.supportsTypeAhead).toBe(true);
     expect(adapter.postTerminalPromptFence).toBe(true);
     expect(adapter.quarantineUnconfirmedSubmits).toBe(true);
   });
@@ -3823,6 +3898,8 @@ describe('native session rename capability', () => {
       .toBe('/rename new title');
     expect(createGrokAdapter('/usr/bin/grok').buildSessionRenameCommand?.('新标题'))
       .toBe('/rename 新标题');
+    expect(createCursorAdapter('/usr/bin/cursor-agent').buildSessionRenameCommand?.('Cursor 标题'))
+      .toBe('/rename Cursor 标题');
     expect(createPiAdapter('/bin/pi').buildSessionRenameCommand?.('Pi 标题'))
       .toBe('/name Pi 标题');
 
@@ -3906,6 +3983,8 @@ describe('grok buildArgs', () => {
     const args = adapter.buildArgs({ sessionId: sid, resume: false, initialPrompt: 'hello grok' });
     expect(args[args.length - 1]).toBe('hello grok');
     expect(adapter.passesInitialPromptViaArgs).toBe(true);
+    // Tighter than 8192: `--rules` is already in the tmux command.
+    expect(adapter.maxInitialPromptArgBytes).toBe(4096);
   });
 
   it('resumes with --resume using resumeSessionId when available', () => {
@@ -3990,9 +4069,9 @@ describe('grok buildArgs', () => {
     expect(args.includes('--session-id')).toBe(false);
   });
 
-  it('enables type-ahead, ready-hook gate, and grok-hooks SessionStart install', () => {
+  it('enables type-ahead, disables ready-hook gate, and configures grok-hooks SessionStart install', () => {
     expect(adapter.supportsTypeAhead).toBe(true);
-    expect(adapter.injectsReadyHook).toBe(true);
+    expect(adapter.injectsReadyHook).toBeFalsy();
     expect(adapter.deferFirstPromptTimeoutUntilReady).toBe(true);
     expect(adapter.readyPattern?.test('│ ❯')).toBe(true);
     expect(adapter.hookInstall?.format).toBe('grok-hooks');

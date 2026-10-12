@@ -1,3 +1,4 @@
+import { parseGroupCreationDefaults } from './group-creation-options.js';
 import { parseSandboxNetworkPolicy, networkPolicySupportError } from '../core/sandbox-network-policy.js';
 /**
  * `/config` 远程编辑 bot 运营字段。与 oncall-store / grant-prefs-store / brand-store
@@ -32,6 +33,7 @@ import { isReservedPerBotEnvKey, sanitizePerBotEnv } from '../core/per-bot-env.j
 import { normalizeEnvPolicy } from '../core/env-policy.js';
 import { normalizeFeedbackPolicy } from './feedback-policy.js';
 import { normalizeOncallGroupPolicy } from './oncall-group-policy.js';
+import { normalizeNoProgressNotifyPolicy } from './no-progress-notify-policy.js';
 import { normalizeFeedbackPolicyLayer, type FeedbackPolicyLayer } from './feedback-policy-resolver.js';
 import {
   notifyPinStreamingCardChanged,
@@ -106,13 +108,14 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'lang', configKey: 'lang', kind: 'enum', effect: 'immediate', clearable: true, enumValues: ['zh', 'en'], hint: '机器人 UI 语言 zh|en；unset 回全局默认' },
   { key: 'skillInjection', configKey: 'skillInjection', kind: 'enum', effect: 'next-session', clearable: true, enumValues: ['global', 'prompt', 'off'], hint: 'botmux skills 注入方式（仅影响 codex/gemini 等全局 skills 目录的 CLI）：prompt=注入会话不落全局盘(默认)｜global=装进 CLI 全局目录(会被独立 CLI 看到)｜off=只留提示+botmux --help；切到/离开 global 需重启 daemon 才完全生效；unset 回机器级默认' },
   { key: 'defaultWorkingDir', configKey: 'defaultWorkingDir', kind: 'dir', effect: 'next-session', clearable: true, hint: '新话题默认工作目录（跳过仓库选择卡片）' },
-  { key: 'brandLabel', configKey: 'brandLabel', kind: 'string', effect: 'immediate', clearable: true, hint: '卡片页脚品牌文案；unset 回默认 botmux 链接' },
+  { key: 'brandLabel', configKey: 'brandLabel', kind: 'string', effect: 'immediate', clearable: true, hint: '卡片页脚品牌文案；unset 回默认 “Powered by botmux with ❤”' },
   { key: 'usageDisplay', configKey: 'usageDisplay', kind: 'enum', effect: 'immediate', clearable: true, enumValues: ['streaming', 'footer', 'off'], hint: '用量显示位置:streaming=流式卡正文(默认)｜footer=回复卡页脚｜off=不显示' },
   { key: 'showReplyTiming', configKey: 'showReplyTiming', kind: 'boolean', effect: 'immediate', clearable: false, hint: '最终回复页脚分别显示等待和执行耗时 on|off（默认 off）；等待含排队/准备，缺失计时则不显示' },
   { key: 'autoStartPrompt', configKey: 'autoStartOnGroupJoinPrompt', kind: 'string', effect: 'immediate', clearable: true, hint: '被拉进新群主动开工的首轮 prompt（配合 autoStartOnGroupJoin）' },
   { key: 'allowedUsers', configKey: 'allowedUsers', kind: 'allowedUsers', effect: 'immediate', clearable: false, hint: '管理员名单（邮箱/on_/ou_，逗号或空格分隔）；改后需加 确认' },
   { key: 'skills', configKey: 'skills', kind: 'json', effect: 'next-session', clearable: true, hint: 'bot 级 skill policy JSON；unset 回底层 CLI 默认行为' },
   { key: 'feedback', configKey: 'feedback', kind: 'json', effect: 'immediate', clearable: true, hint: '最终回答反馈 JSON；默认关闭，enabled=true 后按本 bot 启用；unset 关闭' },
+  { key: 'groupCreation', configKey: 'groupCreation', kind: 'json', effect: 'immediate', clearable: true, hint: '/g 默认配置 JSON：agents 名称/app ID 数组、tag 个人消息分组名、avatar=name|off；unset 恢复默认' },
   { key: 'oncallGroup', configKey: 'oncallGroup', kind: 'json', effect: 'immediate', clearable: true, hint: '拉起 Oncall 群按钮：enabled 开关及 chatIds 生效群，默认关闭' },
   { key: 'disableStreamingCard', configKey: 'disableStreamingCard', kind: 'boolean', effect: 'immediate', clearable: false, hint: '关闭实时流式卡片 on|off' },
   { key: 'replyCardMode', configKey: 'replyCardMode', kind: 'enum', effect: 'immediate', clearable: true, enumValues: ['legacy', 'unified'], hint: '回答展示方式（下一轮生效）：legacy=默认模式｜unified=动态单卡模式；动态单卡限 Claude Code/Codex 普通飞书对话' },
@@ -131,6 +134,7 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'worktreeMultiPicker', configKey: 'worktreeMultiPicker', kind: 'boolean', effect: 'immediate', clearable: false, hint: 'repo 卡片 worktree 选择器默认多仓库模式 on|off（卡片「切换多仓库选择器」按钮同款）' },
   { key: 'disableCliBypass', configKey: 'disableCliBypass', kind: 'boolean', effect: 'next-session', clearable: false, hint: '不加 CLI 审批/sandbox 绕过参数 on|off' },
   { key: 'codexAppCleanInput', configKey: 'codexAppCleanInput', kind: 'boolean', effect: 'immediate', clearable: false, hint: '实验性：Codex App 用户气泡只保留真实输入，Botmux 元数据走隐藏上下文；默认 off，从下一次 turn 派发生效，不改已有历史' },
+  { key: 'noProgressNotify', configKey: 'noProgressNotify', kind: 'json', effect: 'immediate', clearable: true, hint: 'Codex App 无进展提醒（#1162）：{"enabled":false} 仅静默 Lark 推送（看板 stalled 状态与 requires_attention 保留，立即生效）；{"timeoutMs":300000} 调整阈值（整数 10000–3600000ms，默认 90000，下一个 worker 进程生效，不影响对账超时）；unset 回默认' },
   { key: 'promptInjection', configKey: 'promptInjection', kind: 'enum', effect: 'next-session', clearable: true, enumValues: ['default', 'none'], enumDefault: 'default', hint: '零 botmux 注入：none=仅传任务与附件，自动回传最终回复；default=恢复原有提示/技能配置。支持可自动获取最终回复的本地 CLI；新会话完整生效，已有历史不清除' },
   { key: 'envelopeInjection', configKey: 'envelopeInjection', kind: 'enum', effect: 'immediate', clearable: true, enumValues: ['auto', 'off'], hint: '每轮上下文注入方式：auto=支持的 CLI（claude-code）把提醒/白板经 hook 注入为系统提醒，输入框只留消息本身，不支持的自动回退｜off=内联（默认）；unset 回 off' },
   { key: 'topicUnavailablePolicy', configKey: 'topicUnavailablePolicy', kind: 'enum', effect: 'immediate', clearable: true, enumValues: ['legacy', 'stop'], enumDefault: () => 'legacy', hint: '原话题不可用时：legacy=保持原有发送和兜底行为（默认）｜stop=停止发送，查询异常暂停且不改发；unset 回 legacy' },
@@ -734,7 +738,7 @@ export type CoerceResult =
   | { ok: true; value: unknown }
   // A few reasons carry detail (e.g. which keys were rejected), so this is a
   // union of literals plus those prefixed forms rather than a closed literal set.
-  | { ok: false; reason: 'invalid_bool' | 'invalid_enum' | 'invalid_cli' | 'invalid_dir' | 'invalid_number' | 'invalid_json' | 'reserved_env' | 'empty' | 'too_long' | `invalid_mojo_config: ${string}` | `invalid_remote_runner_config: ${string}` | `invalid_trigger_user_auth: ${string}` };
+  | { ok: false; reason: 'invalid_bool' | 'invalid_enum' | 'invalid_cli' | 'invalid_dir' | 'invalid_number' | 'invalid_json' | 'reserved_env' | 'empty' | 'too_long' | `invalid_mojo_config: ${string}` | `invalid_remote_runner_config: ${string}` | `invalid_trigger_user_auth: ${string}` | `invalid_no_progress_notify: ${string}` };
 
 const isConfigNumberInRange = (spec: ConfigFieldSpec, value: number): boolean => (
   Number.isInteger(value)
@@ -781,7 +785,12 @@ export function coerceConfigValue(spec: ConfigFieldSpec, raw: unknown): CoerceRe
       try {
         const parsed = JSON.parse(s);
         if (spec.configKey === 'sandboxNetworkPolicy') return { ok: true, value: parseSandboxNetworkPolicy(parsed) };
+        if (spec.configKey === 'groupCreation') return { ok: true, value: parseGroupCreationDefaults(parsed) };
         if (spec.configKey === 'oncallGroup') return { ok: true, value: normalizeOncallGroupPolicy(parsed) };
+        if (spec.configKey === 'noProgressNotify') {
+          try { return { ok: true, value: normalizeNoProgressNotifyPolicy(parsed) }; }
+          catch (error) { return { ok: false, reason: `invalid_no_progress_notify: ${error instanceof Error ? error.message : String(error)}` }; }
+        }
         if (spec.configKey === 'skills') {
           const policy = readBotSkillPolicy(parsed);
           return policy ? { ok: true, value: policy } : { ok: false, reason: 'invalid_json' };

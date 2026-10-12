@@ -5,7 +5,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, st
 import { request as httpRequest } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { ipcRoute, startIpcServer, setLarkAppId, setIpcAuthSecret, setBotRenamer, setBotAvatarChanger, setBotDescriptionManager, setExactChatGrantHandler, setCrossPrincipalInterruptionDisableHandler, armCoreOnlyReadinessGate, setCoreOnlyReady, __testOnly_resetCoreOnlyReadiness, __testOnly_resetManagedOriginRuntimeAuthState, __testOnly_setNativeSubagentRuntimeNonceStore, type IpcServerHandle,
+import { ipcRoute, startIpcServer, setLarkAppId, setIpcAuthSecret, setBotRenamer, setBotAvatarChanger, setBotDescriptionManager, setExactChatGrantHandler, setCrossPrincipalInterruptionDisableHandler, setDurableSessionSendHandler, armCoreOnlyReadinessGate, setCoreOnlyReady, __testOnly_resetCoreOnlyReadiness, __testOnly_resetManagedOriginRuntimeAuthState, __testOnly_setNativeSubagentRuntimeNonceStore, type IpcServerHandle,
   __testOnly_agentSwitchBeforePreCloseVerify,
 } from '../src/core/dashboard-ipc-server.js';
 import { rmwBotEntry } from '../src/services/config-store.js';
@@ -201,6 +201,7 @@ afterEach(async () => {
   resetAskBrokerForTest();
   setExactChatGrantHandler(null);
   setCrossPrincipalInterruptionDisableHandler(null);
+  setDurableSessionSendHandler(null);
   clearMessageListenerRunPreviewStore();
 });
 
@@ -2284,7 +2285,15 @@ describe('PUT /api/bot-reply-delivery — 最终回复投递方式', () => {
         expect(getBot(appId).config.topicUnavailablePolicy).toBe(policy);
         expect(await (await fetch(`${base}/api/bot-default-oncall`)).json()).toMatchObject({ topicUnavailablePolicy: policy });
       }
-      expect((await setPolicy('unknown')).status).toBe(400);
+      for (const invalid of ['unknown', undefined, null, 0, {}, []]) {
+        expect((await setPolicy(invalid)).status).toBe(400);
+      }
+      for (const body of ['null', '[]', '3', '{']) {
+        const invalid = await fetch(`${base}/api/bot-topic-unavailable-policy`, {
+          method: 'PUT', headers: { 'content-type': 'application/json' }, body,
+        });
+        expect(invalid.status).toBe(400);
+      }
       expect(persisted(configPath).topicUnavailablePolicy).toBe('legacy');
     });
   });
@@ -4073,6 +4082,94 @@ describe('POST /api/sessions/:sessionId/close', () => {
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.ok).toBe(true);
+  });
+});
+
+describe('POST /api/sessions/:sessionId/durable-send', () => {
+  it('authenticates the Session and returns only the daemon-settled message id', async () => {
+    const active = {
+      session: {
+        sessionId: 'session-durable-send',
+        rootMessageId: 'om_root',
+        chatId: 'oc_chat',
+        scope: 'thread',
+        title: 'fixture',
+        status: 'active',
+        createdAt: Date.now(),
+        larkAppId: 'cli_test',
+      },
+      larkAppId: 'cli_test',
+      chatId: 'oc_chat',
+      chatType: 'group',
+    } as any;
+    const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(active);
+    const deliver = vi.fn(async () => ({ kind: 'delivered' as const, messageId: 'om_outbox' }));
+    setDurableSessionSendHandler(deliver);
+    setIpcAuthSecret(TEST_IPC_SECRET);
+    try {
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+      const path = '/api/sessions/session-durable-send/durable-send';
+      const payload = {
+        turnId: 'om_turn',
+        target: { kind: 'reply', messageId: 'om_root', replyInThread: true },
+        content: '{"schema":"2.0"}',
+        msgType: 'interactive',
+        providerUuid: 'bts_fixture',
+        hookContext: { sessionId: 'session-durable-send' },
+      };
+      const response = await fetch(`http://127.0.0.1:${handle.port}${path}`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          ...trustedHostHeaders('POST', path, handle.port),
+        },
+        body: JSON.stringify(payload),
+      });
+
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({
+        ok: true,
+        kind: 'delivered',
+        messageId: 'om_outbox',
+      });
+      expect(deliver).toHaveBeenCalledWith({
+        daemonSession: active,
+        ...payload,
+      });
+    } finally {
+      findSpy.mockRestore();
+    }
+  });
+
+  it('fails closed when the durable handler is unavailable', async () => {
+    const active = {
+      session: { sessionId: 'session-durable-send', status: 'active' },
+    } as any;
+    const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(active);
+    setIpcAuthSecret(TEST_IPC_SECRET);
+    try {
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+      const path = '/api/sessions/session-durable-send/durable-send';
+      const response = await fetch(`http://127.0.0.1:${handle.port}${path}`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          ...trustedHostHeaders('POST', path, handle.port),
+        },
+        body: JSON.stringify({
+          turnId: 'om_turn',
+          target: { kind: 'reply', messageId: 'om_root', replyInThread: true },
+          content: 'hello',
+          msgType: 'text',
+          providerUuid: 'bts_fixture',
+        }),
+      });
+
+      expect(response.status).toBe(409);
+      expect(await response.json()).toEqual({ ok: false, error: 'durable_primary_unavailable' });
+    } finally {
+      findSpy.mockRestore();
+    }
   });
 });
 
@@ -7233,6 +7330,50 @@ describe('PUT /api/bot-oncall-group', () => {
       expect(JSON.parse(readFileSync(configPath, 'utf8'))[0].oncallGroup.enabled).toBe(true);
       expect((await put({ enabled: false, chatIds: ['oc_test'] })).status).toBe(200);
       expect(JSON.parse(readFileSync(configPath, 'utf8'))[0]).toMatchObject({ feedback, oncallGroup: { enabled: false, chatIds: ['oc_test'] } });
+    } finally {
+      if (previous === undefined) delete process.env.BOTS_CONFIG; else process.env.BOTS_CONFIG = previous;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('PUT /api/bot-no-progress-notify', () => {
+  it('persists, rejects out-of-range values and clears back to default', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-no-progress-ipc-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-no-progress-app';
+    const previous = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{ larkAppId: appId, larkAppSecret: 'secret', cliId: 'codex-app' }]));
+      loadBotConfigs().forEach((bot: any) => registerBot(bot));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle!.port}`;
+      const put = (noProgressNotify: unknown) => fetch(`${base}/api/bot-no-progress-notify`, {
+        method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ noProgressNotify }),
+      });
+
+      // set: 200, response and bots.json agree, in-memory registry updated live.
+      const saved = await put({ enabled: false, timeoutMs: 300000 });
+      expect(saved.status).toBe(200);
+      expect(await saved.json()).toMatchObject({ ok: true, noProgressNotify: { enabled: false, timeoutMs: 300000 } });
+      expect(JSON.parse(readFileSync(configPath, 'utf8'))[0].noProgressNotify)
+        .toEqual({ enabled: false, timeoutMs: 300000 });
+      expect(getBot(appId).config.noProgressNotify).toEqual({ enabled: false, timeoutMs: 300000 });
+
+      // invalid: out-of-range timeoutMs / unknown field → 400, disk untouched.
+      expect((await put({ timeoutMs: 5000 })).status).toBe(400);
+      expect((await put({ unknown: 1 })).status).toBe(400);
+      expect(JSON.parse(readFileSync(configPath, 'utf8'))[0].noProgressNotify)
+        .toEqual({ enabled: false, timeoutMs: 300000 });
+
+      // null: clears back to the built-in default.
+      const cleared = await put(null);
+      expect(cleared.status).toBe(200);
+      expect(await cleared.json()).toMatchObject({ ok: true, noProgressNotify: null });
+      expect(JSON.parse(readFileSync(configPath, 'utf8'))[0].noProgressNotify).toBeUndefined();
+      expect(getBot(appId).config.noProgressNotify).toBeUndefined();
     } finally {
       if (previous === undefined) delete process.env.BOTS_CONFIG; else process.env.BOTS_CONFIG = previous;
       rmSync(dir, { recursive: true, force: true });
@@ -11087,5 +11228,39 @@ describe('PUT /api/bot-card-prefs — tool result preference', () => {
       else process.env.BOTS_CONFIG = prevBotsConfig;
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+
+describe('host interaction context observation', () => {
+  it('authenticates the real IPC route and reads current native talk policy', async () => {
+    const app = 'cli_interaction_test';
+    const sessionId = 'interaction-session';
+    registerBot({ larkAppId: app, larkAppSecret: 'fixture-secret', allowedUsers: ['ou_owner'] });
+    getBot(app).resolvedAllowedUsers = ['ou_owner'];
+    const previous = workerPool.getActiveSessionsRegistry();
+    workerPool.setActiveSessionsRegistry(new Map([['interaction', {
+      larkAppId: app, chatType: 'group',
+      session: { sessionId, larkAppId: app, status: 'active', chatId: 'oc_origin',
+        scope: 'thread', rootMessageId: 'om_origin', ownerOpenId: 'ou_owner' },
+    } as any]]));
+    try {
+      setLarkAppId(app); setIpcAuthSecret(TEST_IPC_SECRET);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+      const path = `/api/sessions/${sessionId}/interaction-context`;
+      const body = JSON.stringify({ larkAppId: app, chatId: 'oc_forged', ownerOpenId: 'ou_forged' });
+      const denied = await requestJson(handle.port, path, { method: 'POST', body });
+      expect(denied.status).toBe(401);
+      const query = () => requestJson(handle!.port, path, { method: 'POST', body,
+        headers: { ...trustedHostHeaders('POST', path, handle!.port), 'content-type': 'application/json' } });
+      const permitted = await query();
+      expect(permitted.status).toBe(200);
+      expect(permitted.json.context).toMatchObject({ sessionId, ownerOpenId: 'ou_owner', actorOpenId: 'ou_owner',
+        chatId: 'oc_origin', rootMessageId: 'om_origin', canTalk: true });
+      getBot(app).config.allowedUsers = ['ou_other'];
+      getBot(app).resolvedAllowedUsers = ['ou_other'];
+      expect((await query()).json.context.canTalk).toBe(false);
+      expect(permitted.bodyText).not.toContain('forged');
+    } finally { workerPool.setActiveSessionsRegistry(previous ?? new Map()); }
   });
 });

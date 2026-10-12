@@ -2,7 +2,7 @@ import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, delimiter, dirname, isAbsolute, join } from 'node:path';
-import * as pty from 'node-pty';
+import * as pty from '../../utils/pty.js';
 import xtermHeadless from '@xterm/headless';
 import type { BackendType, SessionBackend, SpawnOpts, SessionProbe } from './types.js';
 import { logger } from '../../utils/logger.js';
@@ -255,7 +255,6 @@ function envCommandArgs(env: Record<string, string>): string[] {
 function sharedServerEnv(source: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const safeKeys = [
     'PATH', 'HOME', 'USER', 'LOGNAME', 'SHELL',
-    'TMPDIR', 'TMP', 'TEMP',
     'XDG_CONFIG_HOME', 'XDG_RUNTIME_DIR',
     'LANG', 'LC_ALL', 'LC_CTYPE', 'TERM', 'COLORTERM',
   ];

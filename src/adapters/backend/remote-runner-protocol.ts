@@ -32,10 +32,19 @@ export const REMOTE_RUNNER_OUTBOUND_CAPABILITIES = [
   'outbound_message',
 ] as const;
 
+/** Optional provider-to-host access to a small, read-only BotMux session tool
+ * surface.  The provider contributes structured arguments only; the host
+ * freezes the current session/turn and translates them into an allowlisted
+ * local CLI invocation. */
+export const REMOTE_RUNNER_SESSION_TOOL_CAPABILITIES = [
+  'session_tool',
+] as const;
+
 export const REMOTE_RUNNER_CAPABILITIES = [
   ...REMOTE_RUNNER_BASE_CAPABILITIES,
   ...REMOTE_RUNNER_TERMINAL_CAPABILITIES,
   ...REMOTE_RUNNER_OUTBOUND_CAPABILITIES,
+  ...REMOTE_RUNNER_SESSION_TOOL_CAPABILITIES,
 ] as const;
 
 export type RemoteRunnerCapability = typeof REMOTE_RUNNER_CAPABILITIES[number];
@@ -103,6 +112,12 @@ export interface RemoteRunnerTrustedCaller {
 export type RemoteRunnerOutboundResponseKind = 'progress' | 'auxiliary';
 export type RemoteRunnerOutboundMention = 'none' | 'requester';
 
+export interface RemoteRunnerOutboundImage {
+  name: string;
+  mimeType: 'image/png' | 'image/jpeg' | 'image/gif' | 'image/webp';
+  dataBase64: string;
+}
+
 /** A non-terminal message request emitted by a provider for the active turn.
  * Routing is intentionally absent: BotMux derives the only legal destination
  * from the authenticated session/turn that owns the backend. */
@@ -113,12 +128,60 @@ export interface RemoteRunnerOutboundMessage {
   content: string;
   responseKind: RemoteRunnerOutboundResponseKind;
   mention: RemoteRunnerOutboundMention;
+  images?: RemoteRunnerOutboundImage[];
 }
 
 export type RemoteRunnerOutboundMessageResult =
   | {
       outcome: 'delivered';
       messageId: string;
+    }
+  | {
+      outcome: 'rejected' | 'unknown';
+      code: string;
+      message: string;
+    };
+
+export type RemoteRunnerSessionToolRequest =
+  | {
+      tool: 'history';
+      limit?: number;
+      scope?: 'session' | 'thread' | 'chat' | 'ambient';
+      withCardJson?: boolean;
+    }
+  | {
+      tool: 'quoted';
+      messageId: string;
+      raw?: boolean;
+    }
+  | { tool: 'bots.list' }
+  | { tool: 'skill.list' }
+  | { tool: 'skill.show'; name: string }
+  | { tool: 'skill.read'; name: string; path: string }
+  | { tool: 'skill.resources'; name: string };
+
+export interface RemoteRunnerSessionToolOperation {
+  operationId: string;
+  turnId: string;
+  generation: number;
+  request: RemoteRunnerSessionToolRequest;
+}
+
+export interface RemoteRunnerSessionToolAttachment {
+  placeholder: string;
+  name: string;
+  type: 'image' | 'file';
+  mimeType?: string;
+  dataBase64: string;
+}
+
+export type RemoteRunnerSessionToolResult =
+  | {
+      outcome: 'completed';
+      exitCode: number;
+      stdout: string;
+      stderr: string;
+      attachments?: RemoteRunnerSessionToolAttachment[];
     }
   | {
       outcome: 'rejected' | 'unknown';
@@ -175,6 +238,13 @@ export type RemoteRunnerCommand =
       generation: number;
       result: RemoteRunnerOutboundMessageResult;
     })
+  | (RemoteRunnerCommandBase & {
+      type: 'session_tool_result';
+      operationId: string;
+      turnId: string;
+      generation: number;
+      result: RemoteRunnerSessionToolResult;
+    })
   | (RemoteRunnerCommandBase & { type: 'terminal_input'; generation: number; data: string })
   | (RemoteRunnerCommandBase & { type: 'terminal_resize'; generation: number; cols: number; rows: number });
 
@@ -218,6 +288,14 @@ export type RemoteRunnerEvent =
       content: string;
       responseKind: RemoteRunnerOutboundResponseKind;
       mention: RemoteRunnerOutboundMention;
+      images?: RemoteRunnerOutboundImage[];
+    })
+  | (RemoteRunnerEventBase & {
+      type: 'session_tool';
+      operationId: string;
+      turnId: string;
+      generation: number;
+      request: RemoteRunnerSessionToolRequest;
     })
   | (RemoteRunnerEventBase & {
       type: 'final';
@@ -265,6 +343,10 @@ const ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$/;
 const REQUEST_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const ERROR_CODE_RE = /^[a-z][a-z0-9._-]{0,127}$/;
 export const MAX_REMOTE_RUNNER_OUTBOUND_MESSAGE_BYTES = 32 * 1024;
+export const MAX_REMOTE_RUNNER_OUTBOUND_IMAGES = 4;
+export const MAX_REMOTE_RUNNER_OUTBOUND_IMAGE_BYTES = 2 * 1024 * 1024;
+export const MAX_REMOTE_RUNNER_SESSION_TOOL_TEXT_BYTES = 512 * 1024;
+export const MAX_REMOTE_RUNNER_SESSION_TOOL_ATTACHMENT_BYTES = 512 * 1024;
 const SENSITIVE_STATE_KEY_PARTS = [
   'token',
   'secret',
@@ -446,6 +528,152 @@ export function normalizeRemoteRunnerUsageReport(
   };
 }
 
+function hasExactKeys(raw: Record<string, unknown>, keys: readonly string[]): boolean {
+  const actual = Object.keys(raw).sort();
+  const expected = [...keys].sort();
+  return actual.length === expected.length
+    && actual.every((key, index) => key === expected[index]);
+}
+
+const OUTBOUND_IMAGE_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,122}\.(?:png|jpe?g|gif|webp)$/i;
+const OUTBOUND_IMAGE_MIME_TYPES: ReadonlySet<string> = new Set([
+  'image/png',
+  'image/jpeg',
+  'image/gif',
+  'image/webp',
+] as const);
+
+function detectedImageMime(content: Buffer): RemoteRunnerOutboundImage['mimeType'] | undefined {
+  if (content.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) {
+    return 'image/png';
+  }
+  if (content.length >= 3 && content[0] === 0xff && content[1] === 0xd8 && content[2] === 0xff) {
+    return 'image/jpeg';
+  }
+  if (content.subarray(0, 6).toString('ascii') === 'GIF87a'
+      || content.subarray(0, 6).toString('ascii') === 'GIF89a') {
+    return 'image/gif';
+  }
+  if (content.subarray(0, 4).toString('ascii') === 'RIFF'
+      && content.subarray(8, 12).toString('ascii') === 'WEBP') {
+    return 'image/webp';
+  }
+  return undefined;
+}
+
+function imageNameMatchesMime(name: string, mimeType: string): boolean {
+  const extension = name.toLowerCase().split('.').pop();
+  if (mimeType === 'image/png') return extension === 'png';
+  if (mimeType === 'image/jpeg') return extension === 'jpg' || extension === 'jpeg';
+  if (mimeType === 'image/gif') return extension === 'gif';
+  if (mimeType === 'image/webp') return extension === 'webp';
+  return false;
+}
+
+function normalizeRemoteRunnerOutboundImages(
+  value: unknown,
+): RemoteRunnerOutboundImage[] | undefined {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.length > MAX_REMOTE_RUNNER_OUTBOUND_IMAGES) return undefined;
+  const images: RemoteRunnerOutboundImage[] = [];
+  const names = new Set<string>();
+  let totalBytes = 0;
+  for (const item of value) {
+    const raw = record(item);
+    if (!raw || !hasExactKeys(raw, ['name', 'mimeType', 'dataBase64'])) return undefined;
+    const name = nonEmptyString(raw.name, 160);
+    const mimeType = raw.mimeType;
+    const dataBase64 = raw.dataBase64;
+    if (!name || !OUTBOUND_IMAGE_NAME_RE.test(name) || names.has(name)
+        || typeof mimeType !== 'string' || !OUTBOUND_IMAGE_MIME_TYPES.has(mimeType)
+        || !imageNameMatchesMime(name, mimeType)
+        || typeof dataBase64 !== 'string'
+        || dataBase64.length > Math.ceil(MAX_REMOTE_RUNNER_OUTBOUND_IMAGE_BYTES / 3) * 4 + 4) {
+      return undefined;
+    }
+    const content = Buffer.from(dataBase64, 'base64');
+    if (content.length === 0 || content.toString('base64') !== dataBase64
+        || detectedImageMime(content) !== mimeType) return undefined;
+    totalBytes += content.length;
+    if (totalBytes > MAX_REMOTE_RUNNER_OUTBOUND_IMAGE_BYTES) return undefined;
+    names.add(name);
+    images.push({
+      name,
+      mimeType: mimeType as RemoteRunnerOutboundImage['mimeType'],
+      dataBase64,
+    });
+  }
+  return images;
+}
+
+export function normalizeRemoteRunnerSessionToolRequest(
+  value: unknown,
+): RemoteRunnerSessionToolRequest | undefined {
+  const raw = record(value);
+  if (!raw || typeof raw.tool !== 'string') return undefined;
+
+  if (raw.tool === 'history') {
+    const allowed = new Set(['tool', 'limit', 'scope', 'withCardJson']);
+    if (Object.keys(raw).some(key => !allowed.has(key))) return undefined;
+    const limit = raw.limit === undefined ? undefined : nonNegativeInteger(raw.limit);
+    if (raw.limit !== undefined && (limit === undefined || limit < 1 || limit > 100)) {
+      return undefined;
+    }
+    const scope = raw.scope === undefined ? undefined : String(raw.scope);
+    if (scope !== undefined && !['session', 'thread', 'chat', 'ambient'].includes(scope)) {
+      return undefined;
+    }
+    if (raw.withCardJson !== undefined && typeof raw.withCardJson !== 'boolean') {
+      return undefined;
+    }
+    return {
+      tool: 'history',
+      ...(limit !== undefined ? { limit } : {}),
+      ...(scope !== undefined ? { scope: scope as 'session' | 'thread' | 'chat' | 'ambient' } : {}),
+      ...(raw.withCardJson !== undefined ? { withCardJson: raw.withCardJson } : {}),
+    };
+  }
+
+  if (raw.tool === 'quoted') {
+    const allowed = new Set(['tool', 'messageId', 'raw']);
+    if (Object.keys(raw).some(key => !allowed.has(key))) return undefined;
+    const messageId = nonEmptyString(raw.messageId, 256);
+    if (!messageId || !/^om_[A-Za-z0-9_-]+$/.test(messageId)) return undefined;
+    if (raw.raw !== undefined && typeof raw.raw !== 'boolean') return undefined;
+    return {
+      tool: 'quoted',
+      messageId,
+      ...(raw.raw !== undefined ? { raw: raw.raw } : {}),
+    };
+  }
+
+  if (raw.tool === 'bots.list' || raw.tool === 'skill.list') {
+    return hasExactKeys(raw, ['tool']) ? { tool: raw.tool } : undefined;
+  }
+
+  if (raw.tool === 'skill.show' || raw.tool === 'skill.resources') {
+    const name = nonEmptyString(raw.name, 256);
+    if (!hasExactKeys(raw, ['tool', 'name']) || !name || !ID_RE.test(name)) return undefined;
+    return { tool: raw.tool, name };
+  }
+
+  if (raw.tool === 'skill.read') {
+    const name = nonEmptyString(raw.name, 256);
+    const path = nonEmptyString(raw.path, 1024);
+    if (!hasExactKeys(raw, ['tool', 'name', 'path']) || !name || !ID_RE.test(name) || !path) {
+      return undefined;
+    }
+    const normalizedPath = path.replace(/\\/g, '/');
+    const parts = normalizedPath.split('/');
+    if (normalizedPath.startsWith('/') || parts.some(part => !part || part === '.' || part === '..')) {
+      return undefined;
+    }
+    return { tool: 'skill.read', name, path: normalizedPath };
+  }
+
+  return undefined;
+}
+
 export function parseRemoteRunnerEvent(value: unknown): RemoteRunnerEvent | undefined {
   const raw = record(value);
   if (!raw || !validBase(raw) || typeof raw.type !== 'string') return undefined;
@@ -499,6 +727,7 @@ export function parseRemoteRunnerEvent(value: unknown): RemoteRunnerEvent | unde
   if (raw.type === 'outbound_message') {
     const operationId = nonEmptyString(raw.operationId, 256);
     const turnId = nonEmptyString(raw.turnId, 256);
+    const images = normalizeRemoteRunnerOutboundImages(raw.images);
     if (!operationId || !ID_RE.test(operationId)
         || !turnId || !ID_RE.test(turnId)
         || !Number.isSafeInteger(raw.generation) || Number(raw.generation) < 0
@@ -506,7 +735,8 @@ export function parseRemoteRunnerEvent(value: unknown): RemoteRunnerEvent | unde
         || !raw.content.trim()
         || Buffer.byteLength(raw.content, 'utf8') > MAX_REMOTE_RUNNER_OUTBOUND_MESSAGE_BYTES
         || !['progress', 'auxiliary'].includes(String(raw.responseKind))
-        || !['none', 'requester'].includes(String(raw.mention))) {
+        || !['none', 'requester'].includes(String(raw.mention))
+        || images === undefined) {
       return undefined;
     }
     return {
@@ -519,6 +749,28 @@ export function parseRemoteRunnerEvent(value: unknown): RemoteRunnerEvent | unde
       content: raw.content,
       responseKind: raw.responseKind as RemoteRunnerOutboundResponseKind,
       mention: raw.mention as RemoteRunnerOutboundMention,
+      ...(images.length ? { images } : {}),
+    };
+  }
+
+  if (raw.type === 'session_tool') {
+    const operationId = nonEmptyString(raw.operationId, 256);
+    const turnId = nonEmptyString(raw.turnId, 256);
+    const request = normalizeRemoteRunnerSessionToolRequest(raw.request);
+    if (!operationId || !ID_RE.test(operationId)
+        || !turnId || !ID_RE.test(turnId)
+        || !Number.isSafeInteger(raw.generation) || Number(raw.generation) < 0
+        || !request) {
+      return undefined;
+    }
+    return {
+      protocol: REMOTE_RUNNER_PROTOCOL,
+      version: REMOTE_RUNNER_PROTOCOL_VERSION,
+      type: 'session_tool',
+      operationId,
+      turnId,
+      generation: Number(raw.generation),
+      request,
     };
   }
 

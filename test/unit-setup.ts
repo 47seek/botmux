@@ -87,10 +87,6 @@ afterAll(() => {
   process.env.SESSION_DATA_DIR = dataDir;
   // A debug terminal's bash may still be exiting and writing history after
   // shutdown; retry the disposable home tree if removal races that final write.
-  try {
-    rmSync(fileRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
-  } catch {
-    // Leaked background process racing temp directory removal; best-effort cleanup
-  }
+  rmSync(fileRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 });
 

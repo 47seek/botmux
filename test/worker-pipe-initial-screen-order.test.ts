@@ -82,7 +82,7 @@ describe('worker pipe initial screen ordering', () => {
   });
 
   it('cold-start argv prompts seed working for card-off; Grok holds busy, quiescence seeds idle', () => {
-    // Grok: argv + SessionStart → hold working until assistant_final.
+    // Grok: argv + reliable turn terminal → hold working until assistant_final.
     // Pi/Gemini: argv but first ready IS turn end → seed working then idle.
     // Arming is centralized (not bare preparedInitialPrompt) so Riff is safe.
     const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
@@ -318,9 +318,9 @@ describe('worker pipe initial screen ordering', () => {
     // adapter.)
     const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
     const fallbackStart = source.indexOf('const releaseFirstPromptTimeout =');
-    const decideIdx = source.indexOf("decideHardTimeoutAction(cliAdapter?.supportsTypeAhead === true)", fallbackStart);
+    const decideIdx = source.indexOf("decideHardTimeoutAction(runtimePtyInputPolicy().supportsTypeAhead)", fallbackStart);
     const markReadyIdx = source.indexOf('markPromptReady();', decideIdx);
-    const flushIdx = source.indexOf("if (decideHardTimeoutAction(cliAdapter?.supportsTypeAhead === true) === 'flush')", fallbackStart);
+    const flushIdx = source.indexOf("if (decideHardTimeoutAction(runtimePtyInputPolicy().supportsTypeAhead) === 'flush')", fallbackStart);
 
     expect(fallbackStart).toBeGreaterThan(-1);
     expect(decideIdx).toBeGreaterThan(fallbackStart);
@@ -415,7 +415,7 @@ describe('worker pipe initial screen ordering', () => {
     expect(finalizeIdx).toBeGreaterThan(spawnIdx);
     expect(onDataIdx).toBeGreaterThan(finalizeIdx);
     expect(finalize).toContain("codexAppControlProven && codexAppControlStateValue?.status === 'active'");
-    expect(source).toContain("const APP_RUNNER_OSC_CLI_IDS = new Set(['mira', 'mir', 'dsh']);");
+    expect(source).toContain("const APP_RUNNER_OSC_CLI_IDS = new Set(['mira', 'mir', 'dsh', 'minimax']);");
     expect(source).not.toContain('CODEX_APP_CONTROL_NONCE_ENV');
     expect(source).not.toContain('codexAppControlNonceForSpawn');
   });
@@ -802,10 +802,13 @@ describe('worker pipe initial screen ordering', () => {
 
   it('wires reasonix cliPid/cliCwd in both immediate and late pid paths', () => {
     const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
-    // reasonix joins the inline pid/cwd-wiring condition alongside grok/traex at
-    // BOTH sites (synchronous tmux/pty resolve + async zellij late-pid fallback).
-    const matches = source.match(/cfg\.cliId === 'grok' \|\| cfg\.cliId === 'traex' \|\| cfg\.cliId === 'reasonix'/g) ?? [];
+    // The pid/cwd-wiring gate is one shared predicate used at BOTH sites
+    // (synchronous tmux/pty resolve + async zellij late-pid fallback); reasonix
+    // is named in it alongside grok/traex/codex.
+    const matches = source.match(/cliAdapterBindsOwnershipPid\(cfg\.cliId, claudeDataDir\)/g) ?? [];
     expect(matches.length).toBeGreaterThanOrEqual(2);
+    const predicate = readFileSync(join(process.cwd(), 'src/adapters/cli/ownership-pid.ts'), 'utf8');
+    expect(predicate).toContain("cliId === 'reasonix'");
   });
 
   it('wires Herdr adopt snapshots before seeding the initial screen', () => {

@@ -1,4 +1,5 @@
 import type { CodexAppTurnInput, TrustedCaller } from '../../types.js';
+import type { TriggerUserAuthConfig } from '../../services/trigger-user-auth.js';
 
 export interface PtyHandle {
   /** `false` means the backend rejected the write before it could confirm
@@ -52,6 +53,9 @@ export interface PtyHandle {
 export type SubmitRecheckResult = boolean | {
   submitted: boolean;
   cliSessionId?: string;
+  /** Positive native ownership of the matched record (see the Codex adapter).
+   *  Absent means "submitted, but not proven to be THIS pane's conversation". */
+  ownershipProven?: boolean;
 };
 
 /** What the adapter can prove about a failed runner-protocol write.
@@ -105,6 +109,20 @@ export interface McpGatewayInstallSpec {
   readonly configPath: string;
   readonly format: 'codex-toml' | 'claude-json';
 }
+
+/** UTF-8 budget for a first prompt baked into tmux launch argv.
+ *  tmux 3.3a rejects the whole `new-session` command around 16 KB (~12 KB ok,
+ *  16,384 "command too long"). 8 KB plus a ~3.5 KB shell wrapper stays under
+ *  that ceiling when the launch argv is mostly this prompt (routing envelope
+ *  included). Adapters that also bake a large non-prompt arg need a tighter
+ *  budget — Grok's `--rules` uses {@link GROK_TMUX_INITIAL_PROMPT_ARG_BUDGET}. */
+export const TMUX_INITIAL_PROMPT_ARG_BUDGET = 8192;
+
+/** Grok bakes `buildBotmuxSystemPromptText` via `--rules` (~4.5 KB, more with
+ *  a skill catalog) into the same tmux command as the positional user turn.
+ *  An 8192-byte user prompt on top of that and the shell wrapper crosses the
+ *  ~16 KB ceiling. 4096 keeps the sum near 14 KB. */
+export const GROK_TMUX_INITIAL_PROMPT_ARG_BUDGET = 4096;
 
 export interface CliAdapter {
   /** Unique identifier */
@@ -173,7 +191,7 @@ export interface CliAdapter {
      *  system prompt: the session acts with ONE person's credentials while the
      *  on-disk store holds everyone else's, and nothing in the OS currently
      *  stops an agent from reading those files. Off → no extra prompt text. */
-    triggerUserAuth?: boolean;
+    triggerUserAuth?: TriggerUserAuthConfig;
     /** Env the CLI must forward to the SHELL COMMANDS it runs, not merely hold
      *  itself. Codex does not pass its own environment to shell subprocesses,
      *  so the trigger-user wrapper vars (BOTMUX_IDENTITY_BIN / ZDOTDIR /
@@ -390,6 +408,8 @@ export interface CliAdapter {
   ): Promise<void | {
     submitted: boolean;
     cliSessionId?: string;
+    /** Positive native ownership of the submit evidence; see SubmitRecheckResult. */
+    ownershipProven?: boolean;
     submissionDisposition?: RunnerSubmissionDisposition;
     /** Non-transient reason when the adapter knows submission is impossible
      *  without waiting for transcript confirmation (for example an unsupported
@@ -427,7 +447,12 @@ export interface CliAdapter {
    *  manifest, and the adapter passes `--plugin-dir {pluginDir}` at spawn so the
    *  skills are scoped to botmux-spawned sessions only — they never land in the
    *  user's global `~/.claude/skills`, so a standalone `claude` won't surface
-   *  (and mis-fire) them. Mutually exclusive with `skillsDir`. */
+   *  (and mis-fire) them. NOT mutually exclusive with `skillsDir`: an adapter
+   *  may set both — pluginDir delivers botmux's built-ins per-session while
+   *  skillsDir stays the discovery root for the user's OWN standalone-CLI
+   *  skills (pi / oh-my-pi / cursor set both). When both are present,
+   *  buildNewTopicBlocks skips the prompt-side built-in catalog so the skills
+   *  are delivered exactly once (native plugin, no inline catalog). */
   readonly pluginDir?: string;
 
   /** Optional native skill delivery support for user/team custom skills.
@@ -564,6 +589,28 @@ export interface CliAdapter {
    *  exactly as before). */
   readonly injectsReadyHook?: boolean;
 
+  /** When true, the adapter injects `BOTMUX_TURN_IDLE_COMMAND`
+   *  (`botmux __turn-idle-v2`) so an integration running INSIDE the CLI process can
+   *  report a structured end-of-turn idle edge (dsh-tui: its cordis wrapper
+   *  plugin listens to `agent/status === 'idle'`). The worker forwards such a
+   *  report to `idleDetector.fireIdle()` only when it names the worker's own
+   *  current turn — a PTY-quiescence-free completion path for TUIs that
+   *  repaint while idle, and never a bypass of the turn fence.
+   *  undefined/false → no env, no channel (every other CLI is unchanged). */
+  readonly injectsTurnIdleHook?: boolean;
+
+  /** Explicit opt-in for `injectsReadyHook` adapters whose ready-gate fallback
+   *  must not pre-empt their own first-prompt hard cap: the fallback is aligned
+   *  with FIRST_PROMPT_HARD_TIMEOUT_MS instead of the shared 45s (see
+   *  `resolveReadySignalTimeoutMs`). Only dsh-tui sets it — it defers the first
+   *  prompt to a readyPattern that a type-ahead write would otherwise bypass at
+   *  ~45-51s, into a composer that may not be mounted yet.
+   *
+   *  Deliberately NOT derived from `deferFirstPromptTimeoutUntilReady` +
+   *  readyPattern: the other adapters carrying both of those (Hermes, Grok)
+   *  do not arm the gate at all. undefined/false → the shared 45s fallback, unchanged. */
+  readonly readyGateFallbackAlignedWithHardCap?: boolean;
+
   /** CLI-specific system hints injected into the initial prompt.
    *  e.g. "use Read tool for attachments", "don't use PlanMode" */
   readonly systemHints: string[];
@@ -600,6 +647,12 @@ export interface CliAdapter {
    *  Durable meeting delivery is fail-closed for adapters without this
    *  capability; `queued` and `final_output` are not completion receipts. */
   readonly reliableTurnTerminal?: boolean;
+
+  /** Whether the CLI supports the Program Status Protocol (OSC 7501).
+   *  When true, the worker mounts a ProgramStatusFramingStream on the PTY stream
+   *  to handle the \x1b]7501;?\x1b\ handshake probe, strip 7501 control codes,
+   *  and observe authoritative program status events in IdleDetector. */
+  readonly supportsProgramStatus?: boolean;
 
   /** A structured terminal closes the business turn but does not by itself
    *  prove the PTY composer is writable. On an authoritative local screen,

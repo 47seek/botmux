@@ -405,7 +405,7 @@ botmux send --urgent=phone --mention-back "P0 故障，请立即上线处理"
 
 ### 纯文本（最常见）
 
-**正文输入契约**：\`botmux send [content]\` 接收原始正文，不是 JSON；只有 \`--card-json\` / \`--card-file\` 的卡片输入才按 JSON 解析。不要先对普通正文执行 \`JSON.stringify\`、把换行手动替换成 \`\\n\`，再把结果塞进位置参数；外层工具协议会自行编码命令字符串，shell / botmux 也不会把字面量 \`\\n\` 反解成换行。
+**正文输入契约**：\`botmux send [content]\` 接收原始正文，不是 JSON；只有 \`--card-json\` / \`--card-file\` 的卡片输入才按 JSON 解析。不要先对普通正文执行 \`JSON.stringify\`、把换行手动替换成 \`\\n\`，再把结果塞进位置参数；外层工具协议会自行编码命令字符串，shell / botmux 也不会把字面量 \`\\n\` 反解成换行。仅纯位置参数的单行文本会把字面量 \`\\n\\n\` 还原为段落空行；多行正文仍应使用 heredoc / stdin 或 \`--content-file\`。
 
 位置参数只用于单行正文。多行正文不要写成 \`botmux send "第一行\\n第二行"\`，必须直接走 quoted heredoc / stdin；在 Windows/PowerShell 里发送包含中文或 emoji 的多行内容时，必须先写 UTF-8 文件，再用 \`--content-file\`，不要把中文直接通过 here-string、\`echo\` 或管道送进 stdin。
 
@@ -468,11 +468,27 @@ botmux send --content-file $msg
 
 \`--images <path>\` 上传本地图片（可重复）。在 markdown 正文中用占位符 \`![alt](img:N)\` 标记位置（\`N\` 是 0-based 索引，按 \`--images\` 给出的顺序对应）；不写占位符的图片自动追加到消息末尾。
 
+**独立单图尺寸**：按图片用途选择 \`--image-mode\`。二维码、图标等小图优先用 \`small\`，避免占满卡片；需要直接阅读文字或细节的截图、图表保留全宽，或用 \`medium\`；用户明确要求的尺寸优先。
+
+| 参数 | 展示宽度 |
+|---|---|
+| 不传 / \`fit_horizontal\` | 卡片可用宽度的全宽（默认） |
+| \`medium\` | 卡片可用宽度的 1/2 |
+| \`small\` | 卡片可用宽度的 1/3 |
+| \`tiny\` | 卡片可用宽度的 1/4 |
+
+缩小档位保留完整画面和宽高比，不裁剪，仍可点击预览。比例相对卡片可用宽度，不是固定像素尺寸。该参数只控制末尾追加的图片、独占一行的 \`![说明](img:N)\` 或 \`![说明](img_v3_...)\`；正文行内图片和下面的并排多图保持原布局。二维码缩小后仍需清晰可扫，空间不足时选更大档位或提示点击预览。
+
+当前任务必须等用户扫码授权才能继续时，同一条授权请求加 \`--attention=authz\`，发完结束本轮、等用户回复；只是展示二维码、任务还能继续时，不加举手标记。
+
 **多图一行（图片组合）**：一个占位符里写多个逗号分隔的索引，就把这几张图排成一行并列显示（自动等宽缩放、保留完整画面不裁剪）——\`![](img:0,1)\` 两张一行，\`![](img:0,1,2)\` 三张一行。每个占位符是一行，想多行就写多个占位符。适合菜单、多图对比这类「一屏看完」的场景，避免单图全宽纵向堆很长。
 
 \`\`\`bash
-# 单图：默认追加到末尾
-botmux send --images /tmp/screenshot.png "截图如上，红框部分是问题所在。"
+# 需要读细节的截图：默认全宽，追加到末尾
+botmux send --images "$TMPDIR/screenshot.png" --mention-back "截图如上，红框部分是问题所在。"
+
+# 等待扫码授权才能继续：1/3 宽预览，并标进「需要你」
+botmux send --images "$TMPDIR/qrcode.png" --image-mode small --attention=authz --mention-back "需要你扫码授权才能继续；若看不清，可点击图片放大。"
 
 # 图文混排：占位符控制图片位置
 botmux send --images chart.png --images table.png <<'EOF'
@@ -495,7 +511,7 @@ EOF
 ### 带文件附件
 
 \`\`\`bash
-botmux send --files /tmp/report.pdf "报告已生成，请查收附件。"
+botmux send --files "$TMPDIR/report.pdf" "报告已生成，请查收附件。"
 \`\`\`
 
 ### 带视频预览
@@ -503,7 +519,7 @@ botmux send --files /tmp/report.pdf "报告已生成，请查收附件。"
 \`--videos <path>\` 发送本地 H.264 MP4 预览消息，可重复；\`--video-covers <path>\` 按顺序提供每个视频的封面图片（当前必须显式提供 cover）。视频会作为飞书/Lark media message 单独发送；正文存在时先发正文卡片，再发视频。
 
 \`\`\`bash
-botmux send --videos /tmp/replay.mp4 --video-covers /tmp/cover.png --no-mention "RRH replay preview"
+botmux send --videos "$TMPDIR/replay.mp4" --video-covers "$TMPDIR/cover.png" --no-mention "RRH replay preview"
 \`\`\`
 
 ### 图表（vega-lite）
@@ -537,7 +553,7 @@ EOF
 安全边界：自定义卡片是**纯展示 + open_url 跳转**——所有会触发回调的交互控件（回调按钮、下拉 select、person 选择、overflow、日期/时间选择、input、表单提交等）都会被拒绝，只保留展示元素（markdown/图片/多列/图表…）与 open_url 按钮。这样外部卡片无法误触 botmux 内部 close/restart/ask/relay/dashboard 等处理器。\`--card-file/--card-json\` 暂不和 \`--images\`/\`--files\`/\`--videos\`/\`--content-file\`/\`--voice\` 混用；素材需要先上传成飞书资源并写入卡片 JSON。
 
 \`\`\`bash
-botmux send --card-file /tmp/card.json --no-mention
+botmux send --card-file "$TMPDIR/card.json" --no-mention
 botmux send --card-json '{"schema":"2.0","body":{"direction":"vertical","elements":[{"tag":"markdown","content":"**Done**"}]}}' --mention-back
 \`\`\`
 
@@ -548,8 +564,8 @@ botmux send --card-json '{"schema":"2.0","body":{"direction":"vertical","element
 流程是 \`send\` 拿 \`messageId\` → \`card patch\` 按它更新：
 
 \`\`\`bash
-MID=$(botmux send --card-file /tmp/progress.json --no-mention | jq -r .messageId)
-botmux card patch --message-id "$MID" --card-file /tmp/progress-50.json
+MID=$(botmux send --card-file "$TMPDIR/progress.json" --no-mention | jq -r .messageId)
+botmux card patch --message-id "$MID" --card-file "$TMPDIR/progress-50.json"
 botmux card patch --message-id "$MID" --card-json '{"schema":"2.0","body":{"direction":"vertical","elements":[{"tag":"markdown","content":"进度: 100%"}]}}'
 \`\`\`
 
@@ -568,12 +584,12 @@ botmux card patch --message-id "$MID" --card-json '{"schema":"2.0","body":{"dire
 需要连续输出感时，不要高频整卡 \`patch\`。先发送 Card 2.0 卡片，并给需要流式写入的 \`markdown\` 或 \`plain_text\` 组件设置唯一 \`element_id\`（字母开头、最多 20 字符），然后用 CardKit 原生流：
 
 \`\`\`bash
-MID=$(botmux send --card-file /tmp/progress.json --no-mention | jq -r .messageId)
+MID=$(botmux send --card-file "$TMPDIR/progress.json" --no-mention | jq -r .messageId)
 OPEN=$(botmux card stream open --message-id "$MID" --summary "执行中")
 STREAM_ID=$(printf '%s' "$OPEN" | jq -r .streamId)
 
 # write 传该 element 的完整最新内容；新增后缀由飞书原生打字机动画呈现
-botmux card stream write --stream-id "$STREAM_ID" --element-id work_log --content-file /tmp/work-log.md
+botmux card stream write --stream-id "$STREAM_ID" --element-id work_log --content-file "$TMPDIR/work-log.md"
 botmux card stream finish --stream-id "$STREAM_ID" --summary "已完成"
 \`\`\`
 
@@ -686,6 +702,7 @@ sandbox dispatch 暂不支持
 | (positional 或 stdin) | 消息文本（支持 markdown，自动选择卡片/文本模式） |
 | \`--content-file <path>\` | 从文件读取内容（优先于 stdin/positional） |
 | \`--images <path>\` | 内联图片，可重复多次 |
+| \`--image-mode <mode>\` | 独立单图尺寸：默认 \`fit_horizontal\` 全宽；\`medium\` / \`small\` / \`tiny\` 分别占宽 1/2、1/3、1/4 |
 | \`--files <path>\` | 附件文件，可重复多次，每个单独发送 |
 | \`--videos <path>\` | 视频预览 MP4，可重复；每个必须有对应 \`--video-covers\` |
 | \`--video-covers <path>\` | 视频封面图片，可重复，按顺序对应 \`--videos\` |
@@ -1247,8 +1264,10 @@ humanGate：
 
 export const ASK_SKILL = `---
 name: botmux-ask
-description: 在当前飞书/Lark 话题里向用户发起阻塞式选择题并等待回答。触发场景：你需要用户在多个明确选项中做选择、确认风险动作、决定继续/回滚/中止，且后续命令需要拿到机器可解析的答案。使用 botmux ask buttons，stdout 只返回选中的 key，适合 shell 脚本和 CLI agent 继续执行。
+description: 在当前飞书/Lark 会话里向用户发起阻塞式选择题并等待回答。触发场景：你需要用户在多个明确选项中做选择、确认风险动作、决定继续/回滚/中止，且后续命令需要拿到机器可解析的答案。使用 botmux ask buttons，单题返回选中的 key，多题可用 --questions-file 返回 JSON；支持推荐项预选与整卡提交。
 ---
+
+发送位置跟随真实会话：群级（chat）会话发到群顶层消息流（不进话题），话题级（thread）会话发到对应话题。群级会话允许没有 BOTMUX_ROOT_MESSAGE_ID；不要用项目卡或其他消息 ID 补填该变量。缺少身份变量时先核对当前会话，不猜测身份或发送位置。
 
 # botmux-ask — 阻塞式向用户提问
 
@@ -1265,8 +1284,21 @@ description: 在当前飞书/Lark 话题里向用户发起阻塞式选择题并�
 ## 不要用
 
 - 只是给用户汇报进展：用 \`botmux send\`
-- 需要自由文本长回答：v0.1.7 不支持，先用 \`botmux send\` 问用户
+- 无法提供有意义选项的长篇开放问题：直接向用户提问；选择卡也支持话题文字答复，用 JSON 的 comment 读取
 - workflow 节点审批：workflow 已经有 humanGate / decision，不要套两层 ask
+
+## 多题与推荐项预选
+
+需求澄清时把当前可独立回答的问题放进同一张卡，用户换选后点底部“提交”。将 JSON 数组保存到绝对路径，再运行 \`botmux ask buttons --questions-file /absolute/round.json --json --timeout 3600\`；文件模式总是返回 JSON，与 \`--options\`、\`--multi\` 和位置问题文本互斥。
+
+\`\`\`json
+[
+  {"prompt":"先覆盖哪些入口？","multiSelect":false,"options":[{"key":"editor","label":"当前编辑页（推荐）"},{"key":"all","label":"所有入口"}],"defaultSelectedKeys":["editor"]},
+  {"prompt":"验证哪些状态？","multiSelect":true,"options":[{"key":"pending","label":"待确认（推荐）"},{"key":"done","label":"已确认（推荐）"}],"defaultSelectedKeys":["pending","done"]}
+]
+\`\`\`
+
+每题的 \`defaultSelectedKeys\` 必须来自选项，单选最多一项；空数组表示无预选，也保留提交按钮。默认选择不是用户回答，必须等真人提交；超时或失效不能当作接受推荐。\`answers[i]\` 对应第 i 题。若用户文字回复，读取 \`comment\`，不得把未提交的推荐项混入答案。CLI 与 daemon 需同时升级才支持此功能。
 
 ## Canonical 用法
 
@@ -1324,6 +1356,9 @@ stdout 为一行 JSON。注意：\`--json\` 覆盖所有结果类型；超时 / 
 - daemon 不可达或 ask 被 daemon restart 失效：默认模式 stdout 为空，exit 3；\`--json\` 时 \`selected:null\`
 
 所有人类可读提示都在 stderr，调用方不要 parse stderr。
+
+等待真人回答期间，无输出是正常状态。必须复用原等待进程直到回答或 Ask 正常超时；禁止发送 Ctrl-C、kill、结束等待 cell 或另发相同问题来结束当前轮。Ctrl-C 不取消 Ask。连接暂时中断会按原请求身份重连；进程确实退出时，后台保留结果并在原会话空闲后接续。超时、传输错误和机器人回答不能当作真人批准。
+
 
 ## 选项规则
 
@@ -1464,9 +1499,9 @@ description: 多 bot 长期项目编排。仅当任务同时需要「多个 bot 
 建完把任务清单链接用 \`botmux send\` 发给用户，让他确认能在飞书任务里看到。
 
 ### 5. 逐个派活（开话题）
-对每个子项目，把简报写进 /tmp/brief-X.md，再：
+对每个子项目，把简报写进会话专属临时目录（如 \`$TMPDIR/brief-X.md\`），再：
 \`\`\`bash
-botmux dispatch --title "<子项目标题>" --bot "<coder_open_id>:名字:coder" --bot "<reviewer_open_id>:名字:reviewer" --repo "<工作目录>" --brief-file /tmp/brief-X.md
+botmux dispatch --title "<子项目标题>" --bot "<coder_open_id>:名字:coder" --bot "<reviewer_open_id>:名字:reviewer" --repo "<工作目录>" --brief-file "$TMPDIR/brief-X.md"
 \`\`\`
 若任务明确要求目标 Bot 创建持久定时任务，改用稳定 \`--bot-app\` 派发并显式加
 \`--delegate schedule:create\`；该权限必须由当前真人回合和宿主策略共同批准，
@@ -1492,7 +1527,7 @@ botmux dispatch --title "<子项目标题>" --bot "<coder_open_id>:名字:coder"
 所有子项目完成 → 读各任务产出 → 给用户一份总汇总（做了什么、产出在哪、遗留项）。
 
 ## 登记（别丢上下文）
-把「子项目 ↔ task_guid ↔ 话题root ↔ 指派bot」记一张小表（可写本地 scratch，如 /tmp/orchestrate-<项目>.json）；断点续跑/被唤起时据此恢复。
+把「子项目 ↔ task_guid ↔ 话题root ↔ 指派bot」记一张小表（可写本地 scratch，如 \`$TMPDIR/orchestrate-<项目>.json\`）；断点续跑/被唤起时据此恢复。
 
 ## 注意
 - **没通过用户审批不要建板/派活。**

@@ -13,6 +13,7 @@ import {
   fallbackCliOptionsState,
   fetchBotDefaults,
   fetchCliOptions,
+  fetchCardBrandLabelEnabled,
   fetchDetectedModels,
   fetchDshProfiles,
   createDshProfile,
@@ -811,6 +812,10 @@ export function BotDefaultsPage() {
   const refreshGateRef = useRef(createRefreshGate());
   const [bots, setBots] = useState<BotDefaultsRow[]>([]);
   const [cliState, setCliState] = useState<CliOptionsState>(fallbackCliOptionsState);
+  // Machine-wide footer-brand switch; when false every per-bot brand editor is
+  // greyed out with a jump link to the global Settings page. Fail-open default
+  // true until GET /api/settings answers (see fetchCardBrandLabelEnabled).
+  const [brandEnabled, setBrandEnabled] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
@@ -826,7 +831,11 @@ export function BotDefaultsPage() {
     const req = refreshGateRef.current.begin();
     setLoading(true);
     try {
-      const [nextBots, nextCli] = await Promise.all([fetchBotDefaults(), fetchCliOptions()]);
+      const [nextBots, nextCli, nextBrandEnabled] = await Promise.all([
+        fetchBotDefaults(),
+        fetchCliOptions(),
+        fetchCardBrandLabelEnabled(),
+      ]);
       // Drop a stale response: a newer refresh() started after us (e.g. a
       // bots.changed fired while this request was in flight) — committing here
       // would overwrite the fresher roster and re-hide the new bot.
@@ -834,6 +843,7 @@ export function BotDefaultsPage() {
       setBots(nextBots.bots);
       setLoadError(nextBots.error);
       setCliState(nextCli);
+      setBrandEnabled(nextBrandEnabled);
     } finally {
       // Only the latest request owns the loading flag — an out-of-order earlier
       // response must not flip loading off while the newest is still pending.
@@ -917,6 +927,7 @@ export function BotDefaultsPage() {
         bots={bots}
         cliState={cliState}
         patchBot={patchBot}
+        brandEnabled={brandEnabled}
         activeTab={activeTab}
         onTabChange={setActiveTab}
       />
@@ -1045,6 +1056,7 @@ function BotDefaultsCard(props: {
   bots: BotDefaultsRow[];
   cliState: CliOptionsState;
   patchBot: PatchBot;
+  brandEnabled: boolean;
   activeTab: BotDefaultsTab;
   onTabChange(tab: BotDefaultsTab): void;
 }) {
@@ -1183,7 +1195,7 @@ function BotDefaultsCard(props: {
             <section className="bd-tile bd-tile-wide"><FeedbackSettingsSection bot={bot} patchBot={patchBot} active={props.activeTab === 'cards'} /></section>
             <section className="bd-tile bd-tile-wide"><ReplyStyleSection bot={bot} patchBot={patchBot} /></section>
             <section className="bd-tile"><AskOptionLayoutSection bot={bot} patchBot={patchBot} /></section>
-            <section className="bd-tile"><BrandSection bot={bot} patchBot={patchBot} /></section>
+            <section className="bd-tile"><BrandSection bot={bot} patchBot={patchBot} brandEnabled={props.brandEnabled} /></section>
           </BdTabGrid>
         </div>
         <div
@@ -1204,7 +1216,7 @@ function BotDefaultsCard(props: {
             {/* Codex App 历史显示只对 codex-app agent 有意义（其它 CLI 无此渲染通道），
                 选了别的 agent 就隐藏，避免无效开关。 */}
             {bot.cliId === 'codex-app' ? (
-              <section className="bd-tile"><CodexAppDisplaySection bot={bot} putCardPref={putCardPref} /></section>
+              <section className="bd-tile"><CodexAppDisplaySection bot={bot} putCardPref={putCardPref} patchBot={patchBot} /></section>
             ) : null}
             {/* #794 hook 注入目前只验证了 claude-code，其它 CLI 隐藏避免误开。 */}
             {bot.cliId === 'claude-code' ? (
@@ -4752,12 +4764,24 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
   );
 }
 
-export function CodexAppDisplaySection(props: { bot: BotDefaultsRow; putCardPref(patch: CardPrefPatch): Promise<JsonResponse> }) {
+export function CodexAppDisplaySection(props: { bot: BotDefaultsRow; putCardPref(patch: CardPrefPatch): Promise<JsonResponse>; patchBot: PatchBot }) {
   const tr = useT();
   const [cleanInput, setCleanInput] = useState(props.bot.codexAppCleanInput === true);
   const [browserEnabled, setBrowserEnabled] = useState(props.bot.codexBrowser === true);
   const [status, setStatus] = useState<StatusMessage>(null);
-  const [busy, setBusy] = useState<'clean-input' | 'browser' | null>(null);
+  const [busy, setBusy] = useState<'clean-input' | 'browser' | 'no-progress' | null>(null);
+  // 无进展提醒（#1162）：null 配置 = 默认（开启，90s）。UI 状态与 bot 配置同步，
+  // 两个控件独立保存但总是提交完整对象，避免 toggle 顺手丢掉已配置的阈值。
+  const noProgress = props.bot.noProgressNotify ?? null;
+  const nudgeOn = noProgress?.enabled !== false;
+  const nudgeTimeoutSec = noProgress?.timeoutMs != null ? Math.round(noProgress.timeoutMs / 1000) : null;
+  const nudgeLabel = useId();
+  const [nudgeInput, setNudgeInput] = useState(nudgeTimeoutSec == null ? '' : String(nudgeTimeoutSec));
+  useEffect(() => {
+    const policy = props.bot.noProgressNotify ?? null;
+    const sec = policy?.timeoutMs != null ? Math.round(policy.timeoutMs / 1000) : null;
+    setNudgeInput(sec == null ? '' : String(sec));
+  }, [props.bot.noProgressNotify]);
 
   useEffect(() => setCleanInput(props.bot.codexAppCleanInput === true), [props.bot.codexAppCleanInput]);
   useEffect(() => setBrowserEnabled(props.bot.codexBrowser === true), [props.bot.codexBrowser]);
@@ -4804,6 +4828,36 @@ export function CodexAppDisplaySection(props: { bot: BotDefaultsRow; putCardPref
     }
   }
 
+  async function saveNoProgress(next: { enabled: boolean; timeoutMs?: number } | null): Promise<void> {
+    setBusy('no-progress');
+    setStatus(null);
+    try {
+      const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/no-progress-notify`, { noProgressNotify: next });
+      if (res.ok && res.body.ok) {
+        const saved = res.body.noProgressNotify ?? null;
+        props.patchBot(props.bot.larkAppId, { noProgressNotify: saved });
+        const sec = saved?.timeoutMs != null ? Math.round(saved.timeoutMs / 1000) : null;
+        setNudgeInput(sec == null ? '' : String(sec));
+        setStatus({ text: `✓ ${tr('botDefaults.cardPrefSaved')}`, ok: true });
+      } else {
+        setStatus({ text: `✗ ${responseErrorText(res)}` });
+      }
+    } catch (e: any) {
+      setStatus({ text: `✗ ${caughtErrorText(e)}` });
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  function saveNudgeTimeout(): void {
+    const sec = Number(nudgeInput);
+    if (!Number.isInteger(sec) || sec < 10 || sec > 3600) {
+      setStatus({ text: `✗ ${tr('botDefaults.noProgressNotifyTimeoutRange')}` });
+      return;
+    }
+    void saveNoProgress({ enabled: nudgeOn, timeoutMs: sec * 1000 });
+  }
+
   return (
     <section className="bd-section" data-codex-app-display>
       <h3 className="bd-section-title">{tr('botDefaults.sectionCodexAppDisplay')}</h3>
@@ -4826,6 +4880,36 @@ export function CodexAppDisplaySection(props: { bot: BotDefaultsRow; putCardPref
         onChange={checked => void saveBrowser(checked)}
       />
       <small className="bd-section-note">{tr('botDefaults.codexBrowserRestartNote')}</small>
+      <ToggleRow
+        checked={nudgeOn}
+        disabled={busy !== null}
+        dataAction="toggle-codex-app-no-progress"
+        title={tr('botDefaults.noProgressNotify')}
+        help={tr('botDefaults.noProgressNotifyHelp')}
+        onChange={checked => void saveNoProgress({ enabled: checked, ...(nudgeTimeoutSec != null ? { timeoutMs: nudgeTimeoutSec * 1000 } : {}) })}
+      />
+      <div className="bd-row">
+        <label htmlFor={nudgeLabel}>{tr('botDefaults.noProgressNotifyTimeoutLabel')}</label>
+        <input
+          id={nudgeLabel}
+          type="number"
+          min={10}
+          max={3600}
+          step={1}
+          data-input="no-progress-timeout-sec"
+          placeholder="90"
+          value={nudgeInput}
+          disabled={busy !== null || !nudgeOn}
+          onChange={event => setNudgeInput(event.currentTarget.value)}
+        />
+        <button type="button" className="primary" data-action="save-no-progress-timeout" disabled={busy !== null || !nudgeOn} onClick={saveNudgeTimeout}>
+          {tr('botDefaults.noProgressNotifyTimeoutSave')}
+        </button>
+        <button type="button" data-action="reset-no-progress" disabled={busy !== null || noProgress === null} onClick={() => void saveNoProgress(null)}>
+          {tr('botDefaults.noProgressNotifyReset')}
+        </button>
+      </div>
+      <small className="bd-section-note">{tr('botDefaults.noProgressNotifyTimeoutHelp')}</small>
       <div className="actions">
         <StatusSpan status={status} attr={{ 'data-codex-app-clean-input-status': '' }} />
       </div>
@@ -7405,13 +7489,17 @@ function AskOptionLayoutSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
   );
 }
 
-function BrandSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
+function BrandSection(props: { bot: BotDefaultsRow; patchBot: PatchBot; brandEnabled: boolean }) {
   const tr = useT();
   const initial = props.bot.brandLabel ?? null;
   const [brand, setBrand] = useState<string | null>(initial);
   const [input, setInput] = useState(initial ?? '');
   const [status, setStatus] = useState<StatusMessage>(null);
   const [busy, setBusy] = useState(false);
+  // Global kill-switch (Settings → 卡片): when off the signature is hidden on
+  // every bot, so editing a per-bot label here has no visible effect — grey the
+  // whole editor out and point to the global toggle instead.
+  const brandDisabled = !props.brandEnabled;
 
   useEffect(() => {
     const next = props.bot.brandLabel ?? null;
@@ -7446,13 +7534,20 @@ function BrandSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
       <div className="bd-row bd-brand">
         <label>
           <FieldTitle help={tr('botDefaults.brandLabelHelp')}>{tr('botDefaults.brandLabel')}</FieldTitle>
-          <input type="text" data-input="brandLabel" placeholder={tr('botDefaults.brandLabelPlaceholder')} value={input} disabled={busy} onChange={event => setInput(event.currentTarget.value)} />
+          <input type="text" data-input="brandLabel" placeholder={tr('botDefaults.brandLabelPlaceholder')} value={input} disabled={busy || brandDisabled} onChange={event => setInput(event.currentTarget.value)} />
         </label>
-        <small data-brand-state>{brandStateLabel(brand, tr)}</small>
+        {brandDisabled
+          ? (
+              <small className="muted" data-brand-global-off>
+                {tr('botDefaults.brandGloballyDisabled')}{' '}
+                <a href="#/settings">{tr('botDefaults.brandGloballyDisabledLink')}</a>
+              </small>
+            )
+          : <small data-brand-state>{brandStateLabel(brand, tr)}</small>}
       </div>
       <div className="actions">
-        <button type="button" className="primary" data-action="save-brand" disabled={busy} onClick={() => void save(input)}>{tr('botDefaults.brandSave')}</button>
-        <button type="button" data-action="reset-brand" disabled={busy} onClick={() => void save(null)}>{tr('botDefaults.brandReset')}</button>
+        <button type="button" className="primary" data-action="save-brand" disabled={busy || brandDisabled} onClick={() => void save(input)}>{tr('botDefaults.brandSave')}</button>
+        <button type="button" data-action="reset-brand" disabled={busy || brandDisabled} onClick={() => void save(null)}>{tr('botDefaults.brandReset')}</button>
         <StatusSpan status={status} attr={{ 'data-brand-status': '' }} />
       </div>
     </section>
