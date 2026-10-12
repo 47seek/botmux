@@ -14,7 +14,7 @@ import { createConfigApi } from './core/plugins/runtime.js';
 import { createHmac, randomBytes } from 'node:crypto';
 import { logger } from './utils/logger.js';
 import { isStandaloneBinary } from './core/self-spawn.js';
-import { currentUpdateStrategy, replaceStandaloneBinary, releaseAssetName } from './core/binary-self-update.js';
+import { currentUpdateStrategy, replaceStandaloneBinary, releaseAssetName, type BinaryUpdatePhase } from './core/binary-self-update.js';
 import { gracefulProcessExitCode } from './pm2-graceful-exit.js';
 import { config, isWildcardBindHost } from './config.js';
 import { createCompanionApi, loadCompanionSecret, type CompanionRuntime } from './dashboard/companion-api.js';
@@ -1914,6 +1914,15 @@ let updateInFlight = false;
 // update, and restart requests do not reuse the removed old runtime realpath.
 let lastSuccessfulUpdatePlan: GlobalInstallPlan | undefined;
 let pendingBinaryRestart: { target: string; version: string } | undefined;
+// Live progress of a standalone-binary download running in THIS dashboard
+// process (the ~174MB asset makes the run request long-lived). Surfaced via
+// /api/update/status for the UI poller; undefined outside a binary swap.
+let binaryUpdateProgress: {
+  version: string;
+  phase: BinaryUpdatePhase;
+  bytesReceived: number;
+  bytesTotal: number | null;
+} | undefined;
 
 // Local-dev counterpart: the checkout a successful /api/update/run built, and
 // its post-build HEAD. Pinned so the follow-up /api/update/restart applies THIS
@@ -4745,6 +4754,12 @@ const server = createServer(async (req, res) => {
           : installPlan ? formatGlobalInstallCommand(installPlan) : null,
         node: checkNode(),
         installs: detectBotmuxInstalls(),
+        // In-process only: a CLI/maintenance update in another process holds
+        // the same file lock but does not flip this flag. The UI treats a 409
+        // plus `updateInFlight === false` as a cross-process update with unknown
+        // progress rather than declaring success.
+        updateInFlight,
+        ...(binaryUpdateProgress ? { binaryUpdate: binaryUpdateProgress } : {}),
       });
     }
 
@@ -4849,7 +4864,11 @@ const server = createServer(async (req, res) => {
           await withFileLock(globalInstallUpdateLockTarget(), async () => {
             acquired = true;
             if (hasActiveRestartLease()) { blockedByRestart = true; return; }
-            await replaceStandaloneBinary(newVersion, runStrategy.target);
+            await replaceStandaloneBinary(newVersion, runStrategy.target, {
+              onProgress: (progress) => {
+                binaryUpdateProgress = { version: newVersion, ...progress };
+              },
+            });
             pendingBinaryRestart = { target: runStrategy.target, version: newVersion };
           }, { maxWaitMs: 2_000 });
         } catch (e) {
@@ -4857,6 +4876,7 @@ const server = createServer(async (req, res) => {
           return jsonRes(res, 500, { ok: false, error: 'install_failed', detail: e instanceof Error ? e.message : String(e) });
         } finally {
           updateInFlight = false;
+          binaryUpdateProgress = undefined;
         }
         if (blockedByRestart) return jsonRes(res, 409, { ok: false, error: 'restart_in_flight' });
         return jsonRes(res, 200, {
@@ -5032,7 +5052,11 @@ const server = createServer(async (req, res) => {
               return;
             }
           } else {
-            await replaceStandaloneBinary(targetVersion, binaryTarget!);
+            await replaceStandaloneBinary(targetVersion, binaryTarget!, {
+              onProgress: (progress) => {
+                binaryUpdateProgress = { version: targetVersion, ...progress };
+              },
+            });
             pendingBinaryRestart = { target: binaryTarget!, version: targetVersion };
           }
 
@@ -5120,6 +5144,7 @@ const server = createServer(async (req, res) => {
         return;
       } finally {
         updateInFlight = false;
+        binaryUpdateProgress = undefined;
       }
     }
 

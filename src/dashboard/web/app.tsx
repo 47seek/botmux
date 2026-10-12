@@ -31,7 +31,18 @@ import { InfoTip } from './dashboard-components.js';
 import { initFloatingScrollbars } from './floating-scrollbars.js';
 import { initIconTooltips } from './icon-tooltip.js';
 import { PLUGIN_PINS_CHANGED_EVENT } from './plugin-events.js';
-import { updateAndRestartBotmux, type BotmuxUpdatePhase } from './update-action.js';
+import {
+  updateAndRestartBotmux,
+  type BotmuxUpdatePhase,
+  type BinaryUpdateStatus,
+  type UpdateStatusSnapshot,
+  type OtherUpdateState,
+  updateActionErrorCode,
+  classifyOtherUpdate,
+  pollUpdateStatus,
+  binaryProgressRingValue,
+  binaryProgressText,
+} from './update-action.js';
 import {
   canonicalDashboardClientShellUrl,
   dashboardClientShellRedirect,
@@ -70,6 +81,9 @@ type BotmuxUpdateStatus = {
   installs: { entries: Array<{ binPath: string }>; multiple: boolean };
   runningDaemons?: Array<{ larkAppId: string; version?: string }>;
   runningDaemonRestartHint?: string;
+  // Present on backends that report live binary-download progress.
+  updateInFlight?: boolean;
+  binaryUpdate?: BinaryUpdateStatus | null;
 };
 
 type NavItem = {
@@ -634,6 +648,8 @@ function TopbarVersionControl(props: {
   const [open, setOpen] = useState(false);
   const [phase, setPhase] = useState<TopbarUpdatePhase>('idle');
   const [progress, setProgress] = useState(0);
+  const [binaryStatus, setBinaryStatus] = useState<BinaryUpdateStatus | null>(null);
+  const [observeKind, setObserveKind] = useState<OtherUpdateState | null>(null);
   const [refreshing, setRefreshing] = useState(false);
   const [refreshFailed, setRefreshFailed] = useState(false);
   const [errorDetail, setErrorDetail] = useState('');
@@ -647,6 +663,14 @@ function TopbarVersionControl(props: {
   const actionInFlightRef = useRef(false);
   const reconnectTimerRef = useRef<number | null>(null);
   const progressTimerRef = useRef<number | null>(null);
+  const stopPollingRef = useRef<(() => void) | null>(null);
+  // After a 409 update_in_flight we attach to the update that blocked us, which
+  // may run in another tab (flag visible) or in the CLI/maintenance process
+  // (flag invisible — completion is detected from version state only).
+  const observingRef = useRef(false);
+  const observeRollbackRef = useRef(false);
+  const observeStartVersionRef = useRef('');
+  const observeDeadlineRef = useRef(0);
   const rootRef = useRef<HTMLDivElement>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
   const popoverRef = useRef<HTMLElement>(null);
@@ -666,8 +690,13 @@ function TopbarVersionControl(props: {
 
   useEffect(() => {
     actionInFlightRef.current = false;
+    observingRef.current = false;
+    stopPollingRef.current?.();
+    stopPollingRef.current = null;
     setPhase('idle');
     setProgress(0);
+    setBinaryStatus(null);
+    setObserveKind(null);
     setRefreshing(false);
     setRefreshFailed(false);
     setErrorDetail('');
@@ -683,12 +712,18 @@ function TopbarVersionControl(props: {
   // Faux progress bar. npm install gives no reliable percentage, so we creep a
   // deliberately-capped bar per phase: install climbs toward 50% (the real
   // install ends there), restart+reconnect climbs toward ~95%; the actual
-  // reconnect reload finishes the job, so we never fake a 100%. Reset to 0 on
+  // reconnect reload finishes the job, so we never fake a 100%. A live binary
+  // download replaces the creep with its measured byte progress. Reset to 0 on
   // idle/error clears it.
   useEffect(() => {
     clearProgressTimer();
     if (phase === 'idle' || phase === 'error') {
       setProgress(0);
+      return;
+    }
+    if (phase === 'updating' && binaryStatus) {
+      const ring = binaryProgressRingValue(binaryStatus);
+      if (ring !== null) setProgress(ring);
       return;
     }
     const cap = phase === 'updating' ? 50 : 95;
@@ -697,7 +732,7 @@ function TopbarVersionControl(props: {
       setProgress(value => (value >= cap ? cap : value + Math.max(0.5, (cap - value) * 0.08)));
     }, 400);
     return () => clearProgressTimer();
-  }, [phase]);
+  }, [phase, binaryStatus]);
 
   useEffect(() => {
     if (status) setRefreshFailed(status.versionLookupOk === false);
@@ -747,7 +782,7 @@ function TopbarVersionControl(props: {
     };
   }, [open]);
 
-  useEffect(() => () => { clearReconnectTimer(); clearProgressTimer(); }, []);
+  useEffect(() => () => { clearReconnectTimer(); clearProgressTimer(); stopPollingRef.current?.(); }, []);
 
   useEffect(() => {
     if (!open) return;
@@ -816,6 +851,59 @@ function TopbarVersionControl(props: {
     reconnectTimerRef.current = window.setTimeout(() => void tick(), 3_000);
   };
 
+  // Called by the status poller both while OUR OWN POST is in flight (live byte
+  // progress) and after a 409, while observing an update running elsewhere.
+  const handleStatusSnapshot = (snapshot: UpdateStatusSnapshot): void => {
+    if (!observingRef.current) {
+      setBinaryStatus(snapshot.binaryUpdate ?? null);
+      return;
+    }
+    if (Date.now() > observeDeadlineRef.current) {
+      observingRef.current = false;
+      actionInFlightRef.current = false;
+      setBinaryStatus(null);
+      setObserveKind(null);
+      setPhase('error');
+      setErrorDetail(t('update.inProgressSlow'));
+      return;
+    }
+    // A cross-process updater never flips this dashboard's in-memory flag, so
+    // completion comes from version state: the new version is running (rollback
+    // moves current, update makes `behind` false).
+    const completed = observeRollbackRef.current
+      ? snapshot.current !== observeStartVersionRef.current
+      : classifyOtherUpdate(snapshot) === 'completed';
+    if (completed) {
+      location.reload();
+      return;
+    }
+    const kind = classifyOtherUpdate(snapshot);
+    setObserveKind(kind);
+    setBinaryStatus(kind === 'progress' ? snapshot.binaryUpdate ?? null : null);
+  };
+
+  const startStatusPolling = (): (() => void) =>
+    pollUpdateStatus(fetch, handleStatusSnapshot, 1000);
+
+  // Our POST lost to an update running in another tab/process: stay in the
+  // updating UI and track that update instead of reporting a failure.
+  const beginObserve = (isRollback: boolean): void => {
+    observingRef.current = true;
+    observeRollbackRef.current = isRollback;
+    observeStartVersionRef.current = status?.current ?? '';
+    observeDeadlineRef.current = Date.now() + 10 * 60_000;
+    setBinaryStatus(null);
+    setObserveKind('busy');
+    setPhase('updating');
+    setErrorDetail('');
+  };
+
+  const stopStatusPolling = (): void => {
+    stopPollingRef.current?.();
+    stopPollingRef.current = null;
+    setBinaryStatus(null);
+  };
+
   const run = async () => {
     if (!behind) return;
     if (!automatic) {
@@ -826,12 +914,18 @@ function TopbarVersionControl(props: {
     if (actionInFlightRef.current) return;
 
     actionInFlightRef.current = true;
+    observingRef.current = false;
     setActiveRollback(null);
     setRefreshFailed(false);
     setErrorDetail('');
+    setBinaryStatus(null);
+    setObserveKind(null);
+    stopPollingRef.current?.();
+    stopPollingRef.current = startStatusPolling();
     try {
       const previousInstance = await dashboardInstance();
       const result = await updateAndRestartBotmux(fetch, setPhase);
+      stopStatusPolling();
       if (!result.restarted) {
         // Update installed but the restart handoff failed — surface it
         // directly instead of polling for a reconnect that will never come.
@@ -842,6 +936,11 @@ function TopbarVersionControl(props: {
       }
       pollReconnect(previousInstance);
     } catch (error) {
+      if (updateActionErrorCode(error) === 'update_in_flight') {
+        beginObserve(false);
+        return; // the status poller keeps tracking the winner
+      }
+      stopStatusPolling();
       actionInFlightRef.current = false;
       setPhase('error');
       setErrorDetail(error instanceof Error ? error.message : String(error));
@@ -883,14 +982,25 @@ function TopbarVersionControl(props: {
     if (!selectedRollback || !rollbackSupported || rollbackLoading || actionInFlightRef.current) return;
 
     actionInFlightRef.current = true;
+    observingRef.current = false;
     setActiveRollback(selectedRollback);
     setRefreshFailed(false);
     setErrorDetail('');
+    setBinaryStatus(null);
+    setObserveKind(null);
+    stopPollingRef.current?.();
+    stopPollingRef.current = startStatusPolling();
     try {
       const previousInstance = await dashboardInstance();
       await updateAndRestartBotmux(fetch, setPhase, selectedRollback);
+      stopStatusPolling();
       pollReconnect(previousInstance);
     } catch (error) {
+      if (updateActionErrorCode(error) === 'update_in_flight') {
+        beginObserve(true);
+        return;
+      }
+      stopStatusPolling();
       actionInFlightRef.current = false;
       setPhase('error');
       setErrorDetail(error instanceof Error ? error.message : String(error));
@@ -911,9 +1021,15 @@ function TopbarVersionControl(props: {
   };
 
   const message = phase === 'updating'
-    ? activeRollback
-      ? t('update.rollbackInstalling', { version: activeRollback })
-      : t('update.updating', { command })
+    ? binaryStatus
+      ? binaryProgressText(binaryStatus, t)
+      : observeKind === 'busy'
+        ? t('update.inProgressBusy')
+        : observeKind === 'waiting'
+          ? t('update.inProgressExternal')
+          : activeRollback
+            ? t('update.rollbackInstalling', { version: activeRollback })
+            : t('update.updating', { command })
     : phase === 'restarting'
       ? activeRollback
         ? t('update.rollbackRestarting', { version: activeRollback })
