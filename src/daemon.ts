@@ -18432,6 +18432,9 @@ function buildReservedInitialInput(
         : (ds.pendingTurnId ?? ds.session.pendingRepoSetup?.turnId),
       sessionBackendType: ds.session.backendType,
       promptInjection: sessionPromptInjection(ds),
+      // Reserved initial admission is the fresh launch owned by this session.
+      // Reforks of restored/live workers use the explicit opening paths below.
+      larkToolResume: false,
       // transcript + solo（resolveSoloSessionForTurn 在注册会话后算好）：首轮去壳。
       solo: ds.soloSession,
       selfMention: { name: selfBot.botName, openId: selfBot.botOpenId },
@@ -26054,6 +26057,11 @@ async function handleThreadReplyAdmitted(
             // sendWorkerInput 的权威 turnId（parsed.messageId）一致，sidecar 可被 claim。
             turnId: parsed.messageId,
             sessionBackendType: ds.session.backendType,
+            // This opening is being delivered to an already-running worker.
+            // Preserve the identity mode that worker was actually launched
+            // with; legacy empty-start sessions can reach this path after a
+            // daemon restore with resume=true and no managed binding.
+            larkToolResume: ds.initConfig?.resume === true,
             promptInjection: sessionPromptInjection(ds),
             solo: ds.soloSession,
             selfMention: { name: selfBot.botName, openId: selfBot.botOpenId },
@@ -26382,6 +26390,7 @@ async function handleThreadReplyAdmitted(
     // its normal `--resume` instead of being cold-spawned over.
     const hadPriorCliInput = !!(ds.lastCliInput ?? ds.session.lastCliInput);
     const openingTurn = wantsOpening && claimInitialUserTurn(ds);
+    const openingResume = ds.hasHistory && !(openingTurn && !hadPriorCliInput);
     // 先选 builder：opening 轮用 buildNewTopicCliInput，非 opening 才 buildRefork。
     // 不能无条件先跑 buildRefork——它现在有副作用（写 follow-up sidecar），opening 时
     // 结果会被 buildNewTopicCliInput 覆盖丢弃，但 sidecar 已写入 opening 的 turnId，
@@ -26415,6 +26424,7 @@ async function handleThreadReplyAdmitted(
           // queued dashboard 场景的 turnId 是合成的，权威流不同，保持 inline。
           turnId: queuedHasDurableTail ? undefined : parsed.messageId,
           sessionBackendType: ds.session.backendType,
+          larkToolResume: openingResume,
           promptInjection: sessionPromptInjection(ds),
         },
       );
@@ -26458,7 +26468,7 @@ async function handleThreadReplyAdmitted(
         userPrompt: promptContent,
         title: stripCrossPrincipalAsToken(parsed.content).text,
         cliInput: wrappedInput,
-        resume: ds.hasHistory && !(openingTurn && !hadPriorCliInput),
+        resume: openingResume,
         ...(codexAppSteerable ? { codexAppSteerable: true as const } : {}),
       });
       markIngressAdmitted(ctx);
@@ -26483,7 +26493,7 @@ async function handleThreadReplyAdmitted(
           caller: threadTrustedCaller,
           userPrompt: promptContent,
           cliInput: wrappedInput,
-          resume: ds.hasHistory && !(openingTurn && !hadPriorCliInput),
+          resume: openingResume,
         });
         markIngressAdmitted(ctx);
         if (openingTurn) releaseInitialUserTurn(ds);
@@ -26520,7 +26530,7 @@ async function handleThreadReplyAdmitted(
                       caller: threadTrustedCaller!,
                       userPrompt: promptContent,
                       cliInput: wrappedInput,
-                      resume: ds.hasHistory && !(openingTurn && !hadPriorCliInput),
+                      resume: openingResume,
                     });
                     if (xpiAdmission.kind !== 'acquired') {
                       throw new Error('XPI shared-cwd admission changed at the adopt reservation boundary');
@@ -26546,7 +26556,7 @@ async function handleThreadReplyAdmitted(
         reforkAccepted = forkWorker(ds, wrappedInput, {
           // See `hadPriorCliInput` above — an opening on a CLI that never took any
           // input cold-spawns rather than `--resume`-ing an empty session.
-          resume: ds.hasHistory && !(openingTurn && !hadPriorCliInput),
+          resume: openingResume,
           turnId: queuedHasDurableTail
             ? (ds.session.queuedActivationTurnId ?? `queued-opening:${ds.session.sessionId}`)
             : parsed.messageId,
@@ -26562,7 +26572,7 @@ async function handleThreadReplyAdmitted(
                     caller: threadTrustedCaller!,
                     userPrompt: promptContent,
                     cliInput: wrappedInput,
-                    resume: ds.hasHistory && !(openingTurn && !hadPriorCliInput),
+                    resume: openingResume,
                   });
                   if (xpiAdmission.kind !== 'acquired') {
                     throw new Error('XPI shared-cwd admission changed at the worker reservation boundary');
@@ -26593,7 +26603,7 @@ async function handleThreadReplyAdmitted(
           caller: threadTrustedCaller,
           userPrompt: promptContent,
           cliInput: wrappedInput,
-          resume: ds.hasHistory && !(openingTurn && !hadPriorCliInput),
+          resume: openingResume,
         });
         markIngressAdmitted(ctx);
       }

@@ -44,6 +44,7 @@ import type { CodexServiceTier } from './services/codex-service-tier.js';
 import { CodexAppCotCollector, prepareCodexAppCotMarker } from './services/codex-app-cot.js';
 
 import { bridgeCodexUserInput } from './services/codex-user-input.js';
+import { larkToolPromptFromEnv } from './core/lark-tool-binding.js';
 
 type JsonObject = Record<string, any>;
 
@@ -319,6 +320,7 @@ function appDeveloperInstructions(args: Args): string {
       args.browserFamily
         ? '当 `botmux_browser` 工具存在时，Chrome/Edge 操作必须使用该工具；不要寻找或回退到 `node_repl`、Playwright 服务或其它浏览器控制面。'
         : '',
+      larkToolPromptFromEnv('zh'),
       identity ? `<identity>\n${identity}\n</identity>` : '',
     ].filter(Boolean).join('\n\n');
   }
@@ -332,6 +334,7 @@ function appDeveloperInstructions(args: Args): string {
     args.browserFamily
       ? 'When the `botmux_browser` tool is present, use it for Chrome/Edge operations. Do not look for or fall back to node_repl, standalone Playwright, or another browser-control surface.'
       : '',
+    larkToolPromptFromEnv('en'),
     identity ? `<identity>\n${identity}\n</identity>` : '',
   ].filter(Boolean).join('\n\n');
 }
