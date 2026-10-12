@@ -232,7 +232,7 @@ import {
   writeManualIntentIfAbsent,
   writeRestartIntent,
 } from './services/restart-intent-store.js';
-import { withFileLock } from './utils/file-lock.js';
+import { withFileLock, FileLockTimeoutError } from './utils/file-lock.js';
 // Host children the dashboard forks (start/stop-bot, global install). They live
 // in their own module because every one of them must run on a REDACTED env —
 // see dashboard/managed-spawn.ts.
@@ -4791,7 +4791,7 @@ const server = createServer(async (req, res) => {
             result = await runLocalDevUpdate();
           }, { maxWaitMs: 2_000 });
         } catch (e) {
-          if (!acquired) return jsonRes(res, 409, { ok: false, error: 'update_in_flight' });
+          if (!acquired && e instanceof FileLockTimeoutError) return jsonRes(res, 409, { ok: false, error: 'update_in_flight' });
           const code = (e as { code?: string }).code;
           if (code === 'dirty_worktree') {
             return jsonRes(res, 409, {
@@ -4855,7 +4855,7 @@ const server = createServer(async (req, res) => {
             pendingBinaryRestart = { target: runStrategy.target, version: newVersion };
           }, { maxWaitMs: 2_000 });
         } catch (e) {
-          if (!acquired) return jsonRes(res, 409, { ok: false, error: 'update_in_flight' });
+          if (!acquired && e instanceof FileLockTimeoutError) return jsonRes(res, 409, { ok: false, error: 'update_in_flight' });
           return jsonRes(res, 500, { ok: false, error: 'install_failed', detail: e instanceof Error ? e.message : String(e) });
         } finally {
           updateInFlight = false;
@@ -4917,7 +4917,7 @@ const server = createServer(async (req, res) => {
           await runGlobalInstall(installPlan);
         }, { maxWaitMs: 2_000 });
       } catch (e) {
-        if (!acquired) return jsonRes(res, 409, { ok: false, error: 'update_in_flight' });
+        if (!acquired && e instanceof FileLockTimeoutError) return jsonRes(res, 409, { ok: false, error: 'update_in_flight' });
         return jsonRes(res, 500, { ok: false, error: 'install_failed', detail: e instanceof Error ? e.message : String(e) });
       } finally {
         updateInFlight = false;
@@ -5110,7 +5110,7 @@ const server = createServer(async (req, res) => {
         if (leaseId && !clearRestartLeaseLocked(leaseId)) {
           logger.warn('[dashboard] rollback lease cleanup deferred because the update lock is busy');
         }
-        if (!acquired) return jsonRes(res, 409, { ok: false, error: 'update_in_flight' });
+        if (!acquired && error instanceof FileLockTimeoutError) return jsonRes(res, 409, { ok: false, error: 'update_in_flight' });
         if (!res.headersSent) {
           return jsonRes(res, 500, {
             ok: false,
@@ -5224,7 +5224,7 @@ const server = createServer(async (req, res) => {
           shouldLaunch = true;
         }, { maxWaitMs: 2_000 });
       } catch (error) {
-        if (!acquired) return jsonRes(res, 409, { ok: false, error: 'update_in_flight' });
+        if (!acquired && error instanceof FileLockTimeoutError) return jsonRes(res, 409, { ok: false, error: 'update_in_flight' });
         throw error;
       }
       // Spawn the detached driver after the lock is released. The lease guards
