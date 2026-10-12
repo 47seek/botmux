@@ -39,6 +39,7 @@ import {
   type OtherUpdateState,
   updateActionErrorCode,
   classifyOtherUpdate,
+  observedInstallCompleted,
   pollUpdateStatus,
   binaryProgressRingValue,
   binaryProgressText,
@@ -666,11 +667,12 @@ function TopbarVersionControl(props: {
   const stopPollingRef = useRef<(() => void) | null>(null);
   // After a 409 update_in_flight we attach to the update that blocked us, which
   // may run in another tab (flag visible) or in the CLI/maintenance process
-  // (flag invisible — completion is detected from version state only).
+  // (flag invisible — install completion is detected from version state, and
+  // the actual reload only after the dashboard instance changes).
   const observingRef = useRef(false);
   const observeRollbackRef = useRef(false);
   const observeStartVersionRef = useRef('');
-  const observeDeadlineRef = useRef(0);
+  const observeInstanceRef = useRef('');
   const rootRef = useRef<HTMLDivElement>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
   const popoverRef = useRef<HTMLElement>(null);
@@ -858,23 +860,21 @@ function TopbarVersionControl(props: {
       setBinaryStatus(snapshot.binaryUpdate ?? null);
       return;
     }
-    if (Date.now() > observeDeadlineRef.current) {
+    // A cross-process updater never flips this dashboard's in-memory flag, so
+    // install completion comes from version state: rollback moves current, an
+    // update makes `behind` false. But "installed on disk" is NOT "running":
+    // the winner may still be sitting on a restart confirmation (Settings) or
+    // be a CLI update that never restarts. So we only switch to the restart
+    // phase here and let the /__selfcheck instance watcher decide about the
+    // reload — never reload on version state alone.
+    if (observedInstallCompleted(snapshot, observeStartVersionRef.current, observeRollbackRef.current)) {
       observingRef.current = false;
-      actionInFlightRef.current = false;
+      stopPollingRef.current?.();
+      stopPollingRef.current = null;
       setBinaryStatus(null);
       setObserveKind(null);
-      setPhase('error');
-      setErrorDetail(t('update.inProgressSlow'));
-      return;
-    }
-    // A cross-process updater never flips this dashboard's in-memory flag, so
-    // completion comes from version state: the new version is running (rollback
-    // moves current, update makes `behind` false).
-    const completed = observeRollbackRef.current
-      ? snapshot.current !== observeStartVersionRef.current
-      : classifyOtherUpdate(snapshot) === 'completed';
-    if (completed) {
-      location.reload();
+      setPhase('restarting');
+      pollReconnect(observeInstanceRef.current);
       return;
     }
     const kind = classifyOtherUpdate(snapshot);
@@ -882,20 +882,36 @@ function TopbarVersionControl(props: {
     setBinaryStatus(kind === 'progress' ? snapshot.binaryUpdate ?? null : null);
   };
 
+  // Progress-only polling while our own POST is in flight (no timeout: the
+  // POST settling ends it).
   const startStatusPolling = (): (() => void) =>
     pollUpdateStatus(fetch, handleStatusSnapshot, 1000);
 
+  // Polling after a 409: bounded by an independent timer so persistent 503s /
+  // dead network / a hung request still reach a terminal state.
+  const startObservePolling = (): (() => void) =>
+    pollUpdateStatus(fetch, handleStatusSnapshot, 1000, 10 * 60_000, () => {
+      observingRef.current = false;
+      actionInFlightRef.current = false;
+      setBinaryStatus(null);
+      setObserveKind(null);
+      setPhase('error');
+      setErrorDetail(t('update.inProgressSlow'));
+    });
+
   // Our POST lost to an update running in another tab/process: stay in the
   // updating UI and track that update instead of reporting a failure.
-  const beginObserve = (isRollback: boolean): void => {
+  const beginObserve = (isRollback: boolean, instance: string): void => {
     observingRef.current = true;
     observeRollbackRef.current = isRollback;
     observeStartVersionRef.current = status?.current ?? '';
-    observeDeadlineRef.current = Date.now() + 10 * 60_000;
+    observeInstanceRef.current = instance;
     setBinaryStatus(null);
     setObserveKind('busy');
     setPhase('updating');
     setErrorDetail('');
+    stopPollingRef.current?.();
+    stopPollingRef.current = startObservePolling();
   };
 
   const stopStatusPolling = (): void => {
@@ -922,8 +938,17 @@ function TopbarVersionControl(props: {
     setObserveKind(null);
     stopPollingRef.current?.();
     stopPollingRef.current = startStatusPolling();
+    let previousInstance: string;
     try {
-      const previousInstance = await dashboardInstance();
+      previousInstance = await dashboardInstance();
+    } catch (error) {
+      stopStatusPolling();
+      actionInFlightRef.current = false;
+      setPhase('error');
+      setErrorDetail(error instanceof Error ? error.message : String(error));
+      return;
+    }
+    try {
       const result = await updateAndRestartBotmux(fetch, setPhase);
       stopStatusPolling();
       if (!result.restarted) {
@@ -937,7 +962,7 @@ function TopbarVersionControl(props: {
       pollReconnect(previousInstance);
     } catch (error) {
       if (updateActionErrorCode(error) === 'update_in_flight') {
-        beginObserve(false);
+        beginObserve(false, previousInstance);
         return; // the status poller keeps tracking the winner
       }
       stopStatusPolling();
@@ -990,14 +1015,23 @@ function TopbarVersionControl(props: {
     setObserveKind(null);
     stopPollingRef.current?.();
     stopPollingRef.current = startStatusPolling();
+    let previousInstance: string;
     try {
-      const previousInstance = await dashboardInstance();
+      previousInstance = await dashboardInstance();
+    } catch (error) {
+      stopStatusPolling();
+      actionInFlightRef.current = false;
+      setPhase('error');
+      setErrorDetail(error instanceof Error ? error.message : String(error));
+      return;
+    }
+    try {
       await updateAndRestartBotmux(fetch, setPhase, selectedRollback);
       stopStatusPolling();
       pollReconnect(previousInstance);
     } catch (error) {
       if (updateActionErrorCode(error) === 'update_in_flight') {
-        beginObserve(true);
+        beginObserve(true, previousInstance);
         return;
       }
       stopStatusPolling();

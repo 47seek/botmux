@@ -8,6 +8,7 @@ import {
   binaryProgressRingValue,
   binaryProgressText,
   classifyOtherUpdate,
+  observedInstallCompleted,
   pollUpdateStatus,
   type BinaryUpdateStatus,
 } from '../src/dashboard/web/update-action.js';
@@ -256,6 +257,41 @@ describe('classifyOtherUpdate after a 409', () => {
   });
 });
 
+describe('observedInstallCompleted — install state, never a reload gate', () => {
+  it('update: completed once behind clears', () => {
+    expect(observedInstallCompleted(
+      { current: '3.40.0', latest: '3.41.0', behind: false }, '3.40.0', false,
+    )).toBe(true);
+  });
+
+  it('update: still behind with the in-process flag false is NOT completed (cross-process lock holder)', () => {
+    expect(observedInstallCompleted(
+      { current: '3.40.0', latest: '3.41.0', behind: true, updateInFlight: false }, '3.40.0', false,
+    )).toBe(false);
+  });
+
+  it('update: a moved current also completes even when latest is unknown', () => {
+    expect(observedInstallCompleted(
+      { current: '3.41.0', latest: null, behind: true }, '3.40.0', false,
+    )).toBe(true);
+  });
+
+  it('rollback: completes only when current moves to the rolled-back version', () => {
+    expect(observedInstallCompleted(
+      { current: '3.41.0', latest: '3.41.0', behind: false }, '3.41.0', true,
+    )).toBe(false);
+    expect(observedInstallCompleted(
+      { current: '3.40.0', latest: '3.41.0', behind: true }, '3.41.0', true,
+    )).toBe(true);
+  });
+
+  it('rollback ignores the update-style behind=false signal while current has not moved', () => {
+    expect(observedInstallCompleted(
+      { current: '3.41.0', latest: '3.40.0', behind: false }, '3.41.0', true,
+    )).toBe(false);
+  });
+});
+
 describe('pollUpdateStatus', () => {
   it('pushes parsed status snapshots until stopped', async () => {
     const snapshots: unknown[] = [];
@@ -270,5 +306,58 @@ describe('pollUpdateStatus', () => {
     expect(snapshots.length).toBeGreaterThan(0);
     expect((snapshots[0] as { updateInFlight: boolean }).updateInFlight).toBe(true);
     expect(fetchImpl.mock.calls.length).toBe(callsAfterStop);
+  });
+
+  it('fires the timeout even when every request fails, then stops polling', async () => {
+    vi.useFakeTimers();
+    try {
+      const fetchImpl = vi.fn().mockRejectedValue(new Error('network down'));
+      const onTimeout = vi.fn();
+      const stop = pollUpdateStatus(fetchImpl, () => {}, 1000, 10_000, onTimeout);
+      await vi.advanceTimersByTimeAsync(9_999);
+      expect(onTimeout).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(2);
+      expect(onTimeout).toHaveBeenCalledTimes(1);
+      // Timeout is terminal: the poller stopped itself.
+      const callsAtTimeout = fetchImpl.mock.calls.length;
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(fetchImpl.mock.calls.length).toBe(callsAtTimeout);
+      stop(); // stopping again is a no-op, not a second timeout
+      expect(onTimeout).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('fires the timeout while the server keeps answering non-200 (no successful snapshot)', async () => {
+    vi.useFakeTimers();
+    try {
+      const fetchImpl = vi.fn().mockResolvedValue(Response.json({ error: 'unavailable' }, { status: 503 }));
+      const onStatus = vi.fn();
+      const onTimeout = vi.fn();
+      pollUpdateStatus(fetchImpl, onStatus, 1000, 5_000, onTimeout);
+      await vi.advanceTimersByTimeAsync(5_001);
+      expect(onStatus).not.toHaveBeenCalled();
+      expect(onTimeout).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('never fires the timeout after an explicit stop (update finished normally)', async () => {
+    vi.useFakeTimers();
+    try {
+      const fetchImpl = vi.fn().mockResolvedValue(Response.json({
+        current: '3.40.0', latest: '3.41.0', behind: false,
+      }));
+      const onTimeout = vi.fn();
+      const stop = pollUpdateStatus(fetchImpl, () => {}, 1000, 10_000, onTimeout);
+      await vi.advanceTimersByTimeAsync(2_000);
+      stop();
+      await vi.advanceTimersByTimeAsync(20_000);
+      expect(onTimeout).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

@@ -9,6 +9,7 @@ import {
   updateResponseNeedsRestart,
   pollUpdateStatus,
   classifyOtherUpdate,
+  observedInstallCompleted,
   binaryProgressText,
 } from './update-action.js';
 import { ui } from './ui.js';
@@ -632,22 +633,21 @@ function SettingsPage() {
         // Another update (another dashboard tab, the CLI, or scheduled
         // maintenance) owns the shared install lock. Track it via status rather
         // than reporting a failure: the cross-process flag is invisible, so
-        // completion is decided from version state only.
+        // install completion is decided from version state. "Installed" does NOT
+        // reload the page — the winner may be sitting on its own restart
+        // confirmation, and a CLI update never restarts; surface the pending
+        // restart and let the existing restart flow apply it.
         if (body?.error === 'update_in_flight') {
-          const deadline = Date.now() + 10 * 60_000;
           const startVersion = String(s.current);
           stopUpdatePoll();
           updatePollStopRef.current = pollUpdateStatus(fetch, snap => {
             if (!mountedRef.current) return;
-            if (Date.now() > deadline) {
+            const kind = classifyOtherUpdate(snap);
+            if (observedInstallCompleted(snap, startVersion, false)) {
               stopUpdatePoll();
               setUpBusy(false);
-              setUpMsg({ text: tr('update.inProgressSlow'), cls: 'hint-warn-inline' });
-              return;
-            }
-            const kind = classifyOtherUpdate(snap);
-            if (kind === 'completed' || snap.current !== startVersion) {
-              location.reload();
+              setUpMsg({ text: tr('update.noRestartHint'), cls: 'hint-ok' });
+              void fetchStatus();
               return;
             }
             if (kind === 'progress' && snap.binaryUpdate) {
@@ -655,7 +655,14 @@ function SettingsPage() {
             } else {
               setUpMsg({ text: tr(kind === 'busy' ? 'update.inProgressBusy' : 'update.inProgressExternal') });
             }
-          }, 1000);
+          }, 1000, 10 * 60_000, () => {
+            // Independent of status responses: persistent 503s, a dead
+            // network, or a hung request must still reach this terminal state.
+            if (!mountedRef.current) return;
+            updatePollStopRef.current = null;
+            setUpBusy(false);
+            setUpMsg({ text: tr('update.inProgressSlow'), cls: 'hint-warn-inline' });
+          });
           return;
         }
         stopUpdatePoll();

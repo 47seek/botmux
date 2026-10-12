@@ -133,15 +133,32 @@ export function binaryProgressText(status: BinaryUpdateStatus, t: Translate): st
 
 /** Poll GET /api/update/status while a (possibly cross-tab or cross-process)
  *  update runs. Returns a stop function. Errors are swallowed: the dashboard
- *  becomes briefly unreachable during the restart handoff. */
+ *  becomes briefly unreachable during the restart handoff.
+ *
+ *  `timeoutMs`/`onTimeout` run on an INDEPENDENT timer, so a server that keeps
+ *  returning 503, a dead network, or a request that hangs forever still reaches
+ *  the terminal state. On timeout polling stops itself before invoking
+ *  `onTimeout` — the callback must not keep polling. */
 export function pollUpdateStatus(
   fetchImpl: FetchLike,
   onStatus: (status: UpdateStatusSnapshot) => void,
   intervalMs = 1000,
+  timeoutMs?: number,
+  onTimeout?: () => void,
 ): () => void {
   let stopped = false;
   let timer: ReturnType<typeof setTimeout> | null = null;
+  let timeoutTimer: ReturnType<typeof setTimeout> | null = null;
+  const clearScheduled = (): void => {
+    if (timer !== null) { clearTimeout(timer); timer = null; }
+  };
+  const stop = (): void => {
+    stopped = true;
+    clearScheduled();
+    if (timeoutTimer !== null) { clearTimeout(timeoutTimer); timeoutTimer = null; }
+  };
   const tick = async (): Promise<void> => {
+    timer = null;
     try {
       const response = await fetchImpl('/api/update/status', { cache: 'no-store' });
       if (response.ok) {
@@ -153,11 +170,14 @@ export function pollUpdateStatus(
     } catch { /* transient — poll again */ }
     if (!stopped) timer = setTimeout(tick, intervalMs);
   };
+  if (timeoutMs !== undefined && onTimeout) {
+    timeoutTimer = setTimeout(() => {
+      stop();
+      onTimeout();
+    }, timeoutMs);
+  }
   timer = setTimeout(tick, 0);
-  return () => {
-    stopped = true;
-    if (timer !== null) clearTimeout(timer);
-  };
+  return stop;
 }
 
 export type OtherUpdateState = 'progress' | 'busy' | 'waiting' | 'completed';
@@ -173,6 +193,23 @@ export function classifyOtherUpdate(status: UpdateStatusSnapshot): OtherUpdateSt
   if (status.updateInFlight) return 'busy';
   if (status.latest && status.behind === false) return 'completed';
   return 'waiting';
+}
+
+/**
+ * Whether the observed update finished INSTALLING, from version state alone:
+ * a rollback moves `current`, an update makes `behind` false (and either may
+ * move `current`). This is deliberately NOT the reload gate: install
+ * completion precedes the restart, another tab may still be showing a restart
+ * confirmation, and a CLI-driven update never restarts at all. Callers gate any
+ * reload on the dashboard INSTANCE changing (/__selfcheck), not on this.
+ */
+export function observedInstallCompleted(
+  status: UpdateStatusSnapshot,
+  startVersion: string,
+  isRollback: boolean,
+): boolean {
+  if (status.current !== startVersion) return true;
+  return !isRollback && classifyOtherUpdate(status) === 'completed';
 }
 
 /** Install the latest, or atomically roll back to an allow-listed older version. */
