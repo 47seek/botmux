@@ -256,9 +256,10 @@ import { normalizeTriggerCommand } from '../services/command-trigger-normalize.j
 import {
   MAX_MESSAGE_LISTENER_PROMPT_BYTES,
   normalizeMessageListenerPreviewLimit,
-  previewMessageListenerMatches,
+  evaluateMessageListenerWithDocumentTitles,
   buildListenerBotAppIdToOpenId,
   collectListenerBotAppIds,
+  resolveListenerSenderIdentity,
   renderMessageListenerInstruction,
   resolveEffectiveMessageListener,
   type MessageListenerPreviewMatch,
@@ -6090,19 +6091,27 @@ async function collectMessageListenerPreviewMatches(
   });
   const candidateBotAppIds = collectListenerBotAppIds(messages, dashboardHistoryMessageSender);
   const appIdToOpenId = await buildListenerBotAppIdToOpenId(larkAppId, chatId, candidateBotAppIds);
-  const matches = previewMessageListenerMatches({
-    bot: previewBot,
-    chatId,
-    messages,
-    limit,
-    senderForMessage: dashboardHistoryMessageSender,
-    appIdToOpenId,
+  const matches: MessageListenerPreviewMatch[] = [];
+  for (const message of messages) {
+    const messageId = String(message?.message_id ?? '');
+    if (!messageId) continue;
+    const sender = dashboardHistoryMessageSender(message);
+    const resolved = resolveListenerSenderIdentity(sender, appIdToOpenId);
+    const match = await evaluateMessageListenerWithDocumentTitles({
+      bot: previewBot, chatId, message,
+      senderOpenId: resolved.senderOpenId,
+      senderName: sender.senderName,
+      senderTypeRaw: sender.senderTypeRaw,
+      senderIdentityUnverified: resolved.identityUnverified,
     // Mirror realtime/poll routing: a message that explicitly @mentions this bot
     // hands off to normal @-routing, NOT the listener — so preview/run-preview
     // must apply the same gate (else preview over-counts and run-preview would
     // spawn a session for a message live routing never sends to the listener).
-    explicitlyMentionedThisBot: (message) => messageMentionsBot(message, larkAppId, bot.botOpenId),
-  });
+      explicitlyMentionedThisBot: messageMentionsBot(message, larkAppId, bot.botOpenId),
+    });
+    if (match) matches.push({ ...match, messageId, createTime: message?.create_time ? String(message.create_time) : undefined });
+  }
+  matches.splice(0, Math.max(0, matches.length - limit));
   // The listener matcher extracts card text from the SIMPLIFIED history view,
   // which drops button jump URLs. The live delivery path (handleNewTopic) fixes
   // this by re-extracting after resolveNonsupportMessage merges the card's two

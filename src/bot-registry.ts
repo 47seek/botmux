@@ -293,6 +293,9 @@ export interface MessageListenerConfig {
   contentPolicy?: {
     includeKeywords?: string[];
     matchMode?: 'any' | 'all';
+    /** Default false. Resolve supported document titles using only this bot's
+     * application identity when local keyword matching missed. */
+    resolveDocumentTitles?: boolean;
   };
   replyPolicy?: {
     /** `thread` replies under the triggering message; `chat` posts at group top level. */
@@ -1189,6 +1192,7 @@ function normalizeMessageListenerConfig(raw: unknown, botIndex: number, chatId: 
       contentPolicy = {
         includeKeywords,
         ...(contentRaw.matchMode === 'all' ? { matchMode: 'all' as const } : {}),
+        ...(contentRaw.resolveDocumentTitles === true ? { resolveDocumentTitles: true } : {}),
       };
     }
   }

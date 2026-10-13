@@ -73,7 +73,7 @@ import { buildSummaryCommandPrompt, type SummaryChatKind, type SummaryCommandMat
 import { DEFAULT_SUMMARY_PROMPT, summaryRangeFromBotConfig } from '../../services/summary-range-store.js';
 import { isSubstituteEnabledForChat } from '../../services/substitute-chat-toggle-store.js';
 import { isP2pForceTopicRoot, recordP2pForceTopicRoot } from '../../services/p2p-force-topic-store.js';
-import { evaluateMessageListener, resolveListenerSenderIdentity, buildListenerBotAppIdToOpenId, collectListenerBotAppIds, type MessageListenerMatch } from '../../services/message-listener.js';
+import { evaluateMessageListenerWithDocumentTitles, resolveListenerSenderIdentity, buildListenerBotAppIdToOpenId, collectListenerBotAppIds, type MessageListenerMatch } from '../../services/message-listener.js';
 import {
   parseVcMeetingPushEvent,
   VC_BOT_MEETING_ACTIVITY_EVENT,
@@ -2897,7 +2897,7 @@ async function pollMessageListenersOnce(larkAppId: string, handlers: EventHandle
       const data = larkReceiveEventFromHistoryMessage(message, chatId);
       const rawSender = historyMessageSender(message);
       const resolved = resolveListenerSenderIdentity(rawSender, appIdToOpenId);
-      const match = evaluateMessageListener({
+      const match = await evaluateMessageListenerWithDocumentTitles({
         bot,
         chatId,
         message: data.message,
@@ -4311,7 +4311,7 @@ export function createLarkEventDispatcherRuntime(
           return;
         }
         const botMessageListener = chatType === 'group'
-          ? evaluateMessageListener({
+          ? await evaluateMessageListenerWithDocumentTitles({
               bot: getBot(larkAppId),
               chatId,
               message,
@@ -4650,7 +4650,7 @@ export function createLarkEventDispatcherRuntime(
       }
       const explicitlyMentionedThisBot = isBotMentioned(larkAppId, message, senderOpenId);
       const messageListener = chatType === 'group'
-        ? evaluateMessageListener({
+        ? await evaluateMessageListenerWithDocumentTitles({
             bot: getBot(larkAppId),
             chatId,
             message,
