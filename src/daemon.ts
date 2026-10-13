@@ -420,7 +420,7 @@ import { resolveUnionIdFromOpenId } from './im/lark/client.js';
 import { ScheduleAuthorityStore } from './services/schedule-authority-store.js';
 import { computeInputHash } from './utils/canonical-input-hash.js';
 import { authorizeDelegatedScheduleRun, authorizeDelegatedScheduleSelfManage } from './core/schedule-delegated-runtime.js';
-import { parseScheduledTurnId } from './core/scheduled-turn-provenance.js';
+import { parseScheduledTurnId, trustedCallerForScheduledTask } from './core/scheduled-turn-provenance.js';
 import { TRIGGER_USER_AUTH_TOOLS } from './services/trigger-user-auth.js';
 import { triggerSessionTurn, reconcileIdempotencyLeasesOnBoot, convergeIdempotentAsyncTurnOnWorkerExit, externalEventOpensOwnTopic } from './core/trigger-session.js';
 import {
@@ -3892,7 +3892,7 @@ function triggerUserAuthEnabledFor(ds: DaemonSession): boolean {
 function prepareTurnCliIdentity(ds: DaemonSession, turnId: string): Promise<void> | undefined {
   if (!triggerUserAuthEnabledFor(ds)) return;
   if (turnId.startsWith('schedule:')) {
-    return prepareDelegatedScheduledTurnIdentity(ds, turnId).then(() => undefined);
+    return prepareScheduledTurnCliIdentity(ds, turnId);
   }
   return refreshTurnCliIdentity(ds, turnId);
 }
@@ -3953,6 +3953,42 @@ function delegatedScheduleCliIdentity(
     tools: [...authority.runScopes],
     dispatchRoot: authority.sourceMessageId ?? authority.task.rootMessageId ?? authority.task.chatId,
   };
+}
+
+async function prepareScheduledTurnCliIdentity(ds: DaemonSession, turnId: string): Promise<void> {
+  if (await prepareDelegatedScheduledTurnIdentity(ds, turnId)) return;
+  const taskId = parseScheduledTurnId(turnId);
+  if (!taskId) throw new Error('invalid scheduled turn');
+  const authority = scheduleAuthorityStore?.getRecord(ds.larkAppId, taskId);
+  if (!authority) throw new Error('schedule authority record missing');
+  const task = authority.task;
+  // Read the host authority, never the CLI-writable schedules.json projection
+  // or the session's last sender. A completed one-shot may still have an
+  // admitted turn to restore/continue; manual disables and revocations cannot.
+  const completedOnce = authority.state === 'completed'
+    && task.parsed?.kind === 'once' && task.disabledReason === 'once_completed';
+  if (authority.state !== 'active' && !completedOnce) {
+    throw new Error(`schedule authority state is ${authority.state}; refusing identity`);
+  }
+  if ((task.larkAppId && task.larkAppId !== ds.larkAppId)
+    || !scheduleStore.effectiveScheduleChatIds(task).includes(ds.chatId)) {
+    throw new Error('scheduled turn target does not match its authority');
+  }
+  const caller = trustedCallerForScheduledTask(task, ds.larkAppId);
+  // open_id is app-scoped. Ownerless/legacy tasks and creators whose access
+  // was removed receive a denial, even if this session once held valid tokens.
+  const senderOpenId = caller?.requestLarkAppId === ds.larkAppId
+    && caller.requestUserOpenId
+    && canOperate(ds.larkAppId, ds.chatId, caller.requestUserOpenId, caller.requestUserUnionId)
+    ? caller.requestUserOpenId : undefined;
+  await publishTurnCliIdentity({
+    botConfig: getBot(ds.larkAppId).config,
+    sessionDataDir: config.session.dataDir,
+    sessionId: ds.session.sessionId,
+    senderOpenId,
+    locale: localeForBot(ds.larkAppId),
+    turnId,
+  });
 }
 
 async function prepareDelegatedScheduledTurnIdentity(
@@ -29920,7 +29956,6 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   scheduler.setExecuteCallback(async (task, executionContext) => {
     const effectiveAppId = task.larkAppId ?? cfg.larkAppId;
     const authority = scheduleAuthorityStore?.getRecord(effectiveAppId, task.id);
-    let delegatedTask = false;
     if (!authority) {
       throw new Error('schedule authority record missing; refusing unregistered task');
     }
@@ -29937,7 +29972,6 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         delegatedScheduleRuntimeDeps(effectiveAppId),
       );
       task = authorized.task;
-      delegatedTask = true;
     }
     let targetResults: ScheduleRunTargetResult[] | undefined;
     let precondition: ScheduledTaskPreconditionObservation = {
@@ -29990,10 +30024,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
                   activeSessions,
                   refreshCliVersion,
                   additionalPrompt,
-                  delegatedTask ? {
+                  {
                     prepareTurnIdentity: (session, turnId) =>
                       prepareTurnCliIdentity(session, turnId),
-                  } : undefined,
+                  },
                 ),
               ),
             );

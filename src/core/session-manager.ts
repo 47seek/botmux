@@ -4324,6 +4324,12 @@ export async function executeScheduledTask(
             + `(running on ${existing.session.model ?? 'the CLI default'})`,
           );
         }
+        // Identity preparation may reject after a concurrent pause/revocation.
+        // Run it before changing the retained conversation's routing or prompt.
+        await runtime?.prepareTurnIdentity?.(existing, scheduledTurnId);
+        if (activeSessions.get(key) !== existing || existing.session.status !== 'active') {
+          throw new Error(`scheduled continuation lost active session ${existing.session.sessionId}`);
+        }
         markSessionActivity(existing);
         ensureSessionWhiteboard(existing);
         if (existing.session.deferredScheduleRun
@@ -4351,7 +4357,6 @@ export async function executeScheduledTask(
           turnId: scheduledTurnId,
           trustedCaller: scheduledTrustedCaller,
         });
-        await runtime?.prepareTurnIdentity?.(existing, scheduledTurnId);
         rememberLastCliInput(existing, task.prompt, input);
         if (silent) armSilentScheduledTurn(existing, scheduledTurnId);
         if (existing.worker && !existing.worker.killed) {
@@ -4477,6 +4482,15 @@ export async function executeScheduledTask(
       // below receives no resume flag.
       larkToolResume: false,
     });
+    // Keep the candidate out of the live registry until authorization succeeds.
+    // On rejection there is no worker or activation journal to recover: close
+    // its durable row so the next fire can create a fresh candidate.
+    try {
+      await runtime?.prepareTurnIdentity?.(ds, scheduledTurnId);
+    } catch (err) {
+      sessionStore.closeSession(session.sessionId);
+      throw err;
+    }
     // Compare-and-set registration (master): a concurrent creator/restore may
     // have claimed this anchor between the scratch cleanup above and here.
     // Refuse to overwrite the live occupant, retire THIS rejected candidate's
@@ -4492,7 +4506,6 @@ export async function executeScheduledTask(
     rememberLastCliInput(ds, task.prompt, prompt);
     if (silent) armSilentScheduledTurn(ds, scheduledTurnId);
     try {
-      await runtime?.prepareTurnIdentity?.(ds, scheduledTurnId);
       forkWorker(ds, prompt, scheduledTurnId);
     } catch (err) {
       if (silent) disarmSilentScheduledTurn(ds, scheduledTurnId);
