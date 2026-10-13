@@ -2173,6 +2173,12 @@ export interface BotConfig {
    */
   privateCard?: boolean;
   /**
+   * Per-bot opt-in for the compact overflow action menu (open terminal /
+   * switch model / close session) on ordinary reply cards. Default
+   * (undefined) keeps reply cards unchanged.
+   */
+  replyCardActions?: boolean;
+  /**
    * bot@bot 同目录拉起 (cross-bot working-dir inheritance). When a bot is @-ed
    * into a chat/thread where a sibling bot already has an active session, it
    * reuses that sibling's workingDir and skips its own repo-selection card.
@@ -4121,6 +4127,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         : undefined,
       writableTerminalLinkInCard: entry.writableTerminalLinkInCard === true || undefined,
       privateCard: entry.privateCard === true || undefined,
+      replyCardActions: entry.replyCardActions === true || undefined,
       // Default ON: only an explicit false is meaningful/persisted (undefined = on).
       botToBotSameDir: entry.botToBotSameDir === false ? false : undefined,
       // 平台团队展示默认 ON：只有显式 false 有意义/落盘（undefined = 展示）。

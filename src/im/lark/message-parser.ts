@@ -1430,6 +1430,9 @@ export function extractCardContent(rawContent: string, numberer?: ImgNumberer, m
               if (ph) buttons.push(`[输入框: ${ph}]`);
             }
             else if (node.tag === 'select_static' || node.tag === 'multi_select_static' || node.tag === 'overflow') {
+              // botmux's own callback controls (reply-card menu/model picker,
+              // effort/config selects) are pure UI chrome — drop them.
+              if (isBotmuxCallbackButton(node)) continue;
               const ph = typeof node.placeholder === 'string' ? node.placeholder : node.placeholder?.content;
               const opts = Array.isArray(node.options)
                 ? node.options.map((o: any) => (typeof o.text === 'string' ? o.text : o.text?.content)).filter(Boolean)
@@ -2038,7 +2041,10 @@ function extractElementText(el: any, parts: string[], imgLabel: (key: string) =>
   }
 
   // select / multi-select / overflow — surface placeholder + selectable
-  // options so the choices the card offers aren't lost.
+  // options so the choices the card offers aren't lost. botmux's own callback
+  // controls (reply card menu/model picker, effort/config selects) are dropped.
+  if ((tag === 'select_static' || tag === 'multi_select_static' || tag === 'overflow')
+    && isBotmuxCallbackButton(el)) return;
   if (tag === 'select_static' || tag === 'multi_select_static' || tag === 'overflow') {
     const ph = el.placeholder?.content;
     const opts = Array.isArray(el.options)

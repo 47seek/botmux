@@ -25,6 +25,14 @@ function modeFromEnv(env: NodeJS.ProcessEnv): DurableCoordinationMode {
   return mode;
 }
 
+/** Cheap render/callback-time check: card lifecycle actions only reach the
+ * durable-control queue from the canonical streaming card (see
+ * authorizeBeforeAck). Off-card controls (reply-card menu confirm, write-link
+ * cards) cannot be fenced, so callers must hide/redirect them in primary mode. */
+export function durableCoordinationPrimaryActive(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.BOTMUX_COORDINATION_MODE?.trim() === 'primary';
+}
+
 function optionalTimeout(value: string | undefined, name: string): number | undefined {
   if (value === undefined || !value.trim()) return undefined;
   const parsed = Number(value);

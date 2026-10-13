@@ -34,6 +34,7 @@ import {
   replyCardHeadingElementId,
 } from './reply-card-footer-signature.js';
 import { buildFeedbackElement } from './skill-feedback-card.js';
+import { buildReplyCardActionOverflow, buildReplyCardChromeRow, type ReplyCardActionBinding } from './reply-card-actions.js';
 import type { FeedbackPolicy } from '../../services/feedback-policy.js';
 import type { StatuslineQuota } from '../../services/statusline-snapshot.js';
 import type { ReplyCardHeader } from './reply-card-style.js';
@@ -1575,6 +1576,8 @@ export function buildCanonicalFinalReplyCard(opts: {
   usage?: CardUsageSnapshot;
   executionDurationMs?: number;
   waitingDurationMs?: number;
+  /** Per-bot opt-in reply-card action menu binding. */
+  cardActions?: ReplyCardActionBinding;
 }): string {
   const elements = opts.markdown
     ? buildCardBodyElements(opts.markdown, opts.workingDir, opts.localHomeLinkMode ?? 'filesystem')
@@ -1588,7 +1591,11 @@ export function buildCanonicalFinalReplyCard(opts: {
     waitingDurationMs: opts.waitingDurationMs,
     locale: opts.locale,
   });
-  if (footer) elements.push({ tag: 'hr' }, footer.element);
+  const chromeRow = buildReplyCardChromeRow({
+    footer,
+    controls: opts.cardActions ? [buildReplyCardActionOverflow(opts.cardActions, opts.locale)] : [],
+  });
+  if (chromeRow) elements.push({ tag: 'hr' }, chromeRow);
   const card = createReplyCard(elements);
   fitBuiltCard(card, 'final_reply');
   return JSON.stringify(card);
@@ -1632,6 +1639,8 @@ export function buildContextualReplyCard(opts: {
   executionDurationMs?: number;
   waitingDurationMs?: number;
   feedback?: { policy: FeedbackPolicy };
+  /** Per-bot opt-in reply-card action menu binding. */
+  cardActions?: ReplyCardActionBinding;
 }): string {
   const {
     title,
@@ -1682,9 +1691,13 @@ export function buildContextualReplyCard(opts: {
     executionDurationMs: opts.executionDurationMs,
     waitingDurationMs: opts.waitingDurationMs,
   });
-  if (footer) {
+  const chromeRow = buildReplyCardChromeRow({
+    footer,
+    controls: opts.cardActions ? [buildReplyCardActionOverflow(opts.cardActions, locale)] : [],
+  });
+  if (chromeRow) {
     elements.push({ tag: 'hr' });
-    elements.push(footer.element);
+    elements.push(chromeRow);
   }
 
   const card = createReplyCard(elements);

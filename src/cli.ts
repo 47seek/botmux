@@ -8624,6 +8624,7 @@ import {
   type ReplyLayout,
 } from './im/lark/reply-card-style.js';
 import { buildFeedbackElement } from './im/lark/skill-feedback-card.js';
+import { buildReplyCardActionOverflow, buildReplyCardChromeRow, REPLY_CARD_ACTIONS_ELEMENT_ID } from './im/lark/reply-card-actions.js';
 import { resolveFeedbackPolicyForDelivery, resolveFeedbackTeamId } from './services/feedback-policy-resolver.js';
 import { normalizeFeedbackPolicy } from './services/feedback-policy.js';
 import { attachOncallGroupButton, recordOncallGroupDelivery } from './im/lark/oncall-group.js';
@@ -12020,46 +12021,49 @@ async function cmdSend(rest: string[]): Promise<void> {
         } catch { /* voice module/config unavailable → no button */ }
       }
       const footerContent = footer?.content ?? '';
-      if (footerContent || voiceOn) {
+      const anchorId = (isChatScope ? s.chatId : s.rootMessageId) ?? s.chatId;
+      const chromeControls: Array<Record<string, unknown>> = [];
+      if (voiceOn) {
+        chromeControls.push({
+          tag: 'button',
+          text: { tag: 'plain_text', content: '🔊 语音总结' },
+          type: 'default',
+          behaviors: [{
+            type: 'callback',
+            value: { action: 'voice_summary', session_id: sid, root_id: anchorId, lark_app_id: appId, chat_id: targetChatId },
+          }],
+        });
+      }
+      // Per-bot opt-in reply-card menu: final answers only, same scope gates as
+      // the voice button (no top-level broadcast / cross-chat publish / managed
+      // VC receiver), and only when the card is bound to a live session.
+      // Sandboxed/read-isolated sends carry no control-card surface.
+      if (effectiveResponseKind === 'final'
+        && !sendTopLevel && !vcMeetingManagedSendOrigin
+        && !overrideChatId && !sendInto
+        && !(s.sandbox === true || s.sandbox === 'oncall' || s.sandbox === 'scratch'
+          || process.env.BOTMUX_READ_ISOLATION === '1' || process.env.BOTMUX_SANDBOX === '1')
+        && sid && anchorId
+        && getBot(appId)?.config?.replyCardActions === true) {
+        chromeControls.push(buildReplyCardActionOverflow({
+          larkAppId: appId,
+          chatId: targetChatId,
+          rootId: anchorId,
+          sessionId: sid,
+          adopt: !!s.adoptedFrom,
+        }, localeForBot(appId)));
+      }
+      const chromeRow = buildReplyCardChromeRow({ footer, controls: chromeControls });
+      if (footerContent || chromeControls.length > 0) {
         elements.push({ tag: 'hr' });
-        if (voiceOn) {
-          const anchorId = (isChatScope ? s.chatId : s.rootMessageId) ?? s.chatId;
-          elements.push({
-            tag: 'column_set',
-            flex_mode: 'none',
-            horizontal_spacing: 'default',
-            columns: [
-              {
-                tag: 'column', width: 'weighted', weight: 1, vertical_align: 'center',
-                elements: [footer?.element ?? {
-                  tag: 'markdown',
-                  text_size: 'notation',
-                  content: ' ',
-                }],
-              },
-              {
-                tag: 'column', width: 'auto', vertical_align: 'center',
-                elements: [{
-                  tag: 'button',
-                  text: { tag: 'plain_text', content: '🔊 语音总结' },
-                  type: 'default',
-                  behaviors: [{
-                    type: 'callback',
-                    value: { action: 'voice_summary', session_id: sid, root_id: anchorId, lark_app_id: appId, chat_id: targetChatId },
-                  }],
-                }],
-              },
-            ],
-          });
-        } else {
-          if (footer) elements.push(footer.element);
-        }
+        if (chromeRow) elements.push(chromeRow);
       }
 
       const canonicalCard = createReplyCard([...elements], layoutHeader);
       if (feedbackPolicy && effectiveResponseKind === 'final') {
         const feedbackElement = buildFeedbackElement(feedbackPolicy);
-        const footerIndex = canonicalCard.body.elements.findIndex((element: any) => element?.element_id === 'botmux_reply_footer');
+        const footerIndex = canonicalCard.body.elements.findIndex((element: any) =>
+          element?.element_id === 'botmux_reply_footer' || element?.element_id === REPLY_CARD_ACTIONS_ELEMENT_ID);
         canonicalCard.body.elements.splice(footerIndex >= 0 ? footerIndex : canonicalCard.body.elements.length, 0, feedbackElement);
         feedbackBaseCard = canonicalCard as unknown as Record<string, unknown>;
       }
