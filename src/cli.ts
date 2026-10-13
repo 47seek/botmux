@@ -6773,6 +6773,7 @@ const SEND_HELP_BODY = [
   '       --layout result|progress|risk|blocked|handoff',
   '                                       可选回复卡卡头薄壳；只在关键结果/进度/风险/阻塞/交接节点显式使用',
   '       --response-kind progress|final|auxiliary  可选；未声明按 progress/非 final，只有 final 挂反馈与页脚签名',
+  '       --completion-proposal-file <path>  仅限标准 final；附一个 requester-only 的二选一可选后续动作',
   '       --expected-link <url>           要求最终渲染正文原样包含该 URL（可重复）；缺失时在任何外部副作用前拒发',
   '       --as independent|suggestion     对方任务正在跑时声明处理方式：另开任务 / 留给当前任务',
   '       --mention <id:name>             @提及（可重复）。id 默认是 open_id；bot 配置开启',
@@ -8624,6 +8625,15 @@ import {
   type ReplyLayout,
 } from './im/lark/reply-card-style.js';
 import { buildFeedbackElement } from './im/lark/skill-feedback-card.js';
+import { buildCompletionProposalElement } from './im/lark/completion-proposal-card.js';
+import { composeFinalCardSections } from './im/lark/final-card-sections.js';
+import {
+  completionProposalCardDispatchUuid,
+  createCompletionProposalStore,
+  normalizeCompletionProposalInput,
+  type CompletionProposalRecord,
+  type CompletionProposalVisibleInput,
+} from './core/completion-proposal.js';
 import { resolveFeedbackPolicyForDelivery, resolveFeedbackTeamId } from './services/feedback-policy-resolver.js';
 import { normalizeFeedbackPolicy } from './services/feedback-policy.js';
 import { attachOncallGroupButton, recordOncallGroupDelivery } from './im/lark/oncall-group.js';
@@ -8680,6 +8690,10 @@ async function relaySend(
   relayDir: string,
   replyLayout?: ReplyLayout,
 ): Promise<void> {
+  if (flagPresentButValueMissing(rest, '--completion-proposal-file')) {
+    console.error('relay: --completion-proposal-file 需要路径参数');
+    process.exit(2);
+  }
   const unsupportedRouting = ['--chat-id', '--into', '--top-level']
     .filter(flag => rest.some(token => token === flag || token.startsWith(`${flag}=`)));
   if (unsupportedRouting.length > 0) {
@@ -8709,6 +8723,7 @@ async function relaySend(
     console.error('relay: --plugin-card-action 只能与 --card-file/--card-json 一起使用');
     process.exit(2);
   }
+  const completionProposalFile = argValue(rest, '--completion-proposal-file');
   let cardContent = '';
   if (cardJsonArg !== undefined && cardFile !== undefined) {
     console.error('relay: --card-json 与 --card-file 不能同时使用');
@@ -8772,6 +8787,26 @@ async function relaySend(
     cardOutfile = join(relayDir, cardBase);
     writeFileSync(cardOutfile, cardContent);
   }
+  let completionProposalBase: string | undefined;
+  let completionProposalOutfile: string | undefined;
+  if (completionProposalFile !== undefined) {
+    if (!existsSync(completionProposalFile)) {
+      console.error(`relay: 文件不存在: ${completionProposalFile}`);
+      process.exit(1);
+    }
+    if (!statSync(completionProposalFile).isFile()) {
+      console.error(`relay: 不是普通文件: ${completionProposalFile}`);
+      process.exit(1);
+    }
+    const proposalBytes = readFileSync(completionProposalFile);
+    if (proposalBytes.byteLength > 8192) {
+      console.error('relay: --completion-proposal-file 不能超过 8 KiB');
+      process.exit(2);
+    }
+    completionProposalBase = `${id}.completion-proposal.json`;
+    completionProposalOutfile = join(relayDir, completionProposalBase);
+    writeFileSync(completionProposalOutfile, proposalBytes);
+  }
 
   // Copy attachments into the outbox; carry only basenames.
   const copyOutboxAttachment = (p: string, out: string[]): void => {
@@ -8821,6 +8856,7 @@ async function relaySend(
     contentFile: contentBase,
     preparedContentFile: preparedContentBase,
     cardFile: cardBase,
+    completionProposalFile: completionProposalBase,
     attachments,
     videos,
     videoCovers,
@@ -8838,6 +8874,7 @@ async function relaySend(
         try { unlinkSync(cfile); } catch { /* */ }
         if (preparedContentOutfile) { try { unlinkSync(preparedContentOutfile); } catch { /* */ } }
         if (cardOutfile) { try { unlinkSync(cardOutfile); } catch { /* */ } }
+        if (completionProposalOutfile) { try { unlinkSync(completionProposalOutfile); } catch { /* */ } }
         if (res.stdout) process.stdout.write(res.stdout);
         if (res.stderr) process.stderr.write(res.stderr);
         process.exit(res.code ?? 0);
@@ -9666,8 +9703,13 @@ async function cmdSend(rest: string[]): Promise<void> {
     console.error('botmux send: --plugin-card-action 需要 plugin id');
     process.exit(2);
   }
+  if (flagPresentButValueMissing(rest, '--completion-proposal-file', true)) {
+    console.error('botmux send: --completion-proposal-file 需要路径参数');
+    process.exit(2);
+  }
   const cardJsonArg = argValue(rest, '--card-json');
   const cardFile = argValue(rest, '--card-file');
+  const completionProposalFile = argValue(rest, '--completion-proposal-file');
   const customCardRequested = cardJsonArg !== undefined || cardFile !== undefined;
   const pluginCardActionId = argValue(rest, '--plugin-card-action');
   if (pluginCardActionId !== undefined && !isValidPluginId(pluginCardActionId)) {
@@ -10994,6 +11036,10 @@ async function cmdSend(rest: string[]): Promise<void> {
     // bug #750 fixed). pickTurnReplyTarget already enforces
     // quoteTargetId===currentTurnId for its own hit.
     ?? (currentTurnId ? undefined : s.quoteTargetSenderOpenId);
+  const proposalRequesterIsExactHuman = !!currentTurnId
+    && !!replyTargetSenderOpenId
+    && collectTurnWindowParticipants(s, currentTurnId).participants
+      .some(participant => participant.openId === replyTargetSenderOpenId && participant.isBot === false);
 
   // @ hard-gate (config.send.requireMentionDecision, default on): force the
   // model to make an explicit @ decision before sending. --top-level publish
@@ -11151,6 +11197,58 @@ async function cmdSend(rest: string[]): Promise<void> {
     console.error('botmux send: --response-kind final 仅支持当前会话内的普通最终答案卡片');
     process.exit(2);
   }
+  let completionProposalVisible: CompletionProposalVisibleInput | undefined;
+  let completionProposalOmittedReason: string | undefined;
+  if (completionProposalFile !== undefined) {
+    if (!existsSync(completionProposalFile)) {
+      console.error(`文件不存在: ${completionProposalFile}`);
+      process.exit(1);
+    }
+    if (!statSync(completionProposalFile).isFile()) {
+      console.error(`不是普通文件: ${completionProposalFile}`);
+      process.exit(1);
+    }
+    if (effectiveResponseKind !== 'final') {
+      console.error('botmux send: --completion-proposal-file 只能与 --response-kind final 同时使用');
+      process.exit(2);
+    }
+    if (customCardRequested || asVoice || sendTopLevel || !!overrideChatId || !!sendInto || !!vcMeetingManagedSendOrigin || isSlashSend) {
+      console.error('botmux send: Completion Proposal 仅支持当前会话内的标准 final 卡');
+      process.exit(2);
+    }
+    const proposalJson = readFileSync(completionProposalFile, 'utf8');
+    if (Buffer.byteLength(proposalJson, 'utf8') > 8192) {
+      console.error('botmux send: --completion-proposal-file 不能超过 8 KiB');
+      process.exit(2);
+    }
+    let raw: unknown;
+    try { raw = JSON.parse(proposalJson); }
+    catch {
+      console.error('botmux send: --completion-proposal-file 必须包含有效 JSON');
+      process.exit(2);
+    }
+    try { completionProposalVisible = normalizeCompletionProposalInput(raw); }
+    catch (error) {
+      console.error(`botmux send: ${error instanceof Error ? error.message : String(error)}`);
+      process.exit(2);
+    }
+    if (!currentTurnId) completionProposalOmittedReason = 'missing_origin_turn';
+    else if (!replyTargetSenderOpenId?.startsWith('ou_') || !proposalRequesterIsExactHuman) {
+      completionProposalOmittedReason = 'missing_exact_human_requester';
+    }
+    else if (!isSuspendableBackendType(s.backendType)) completionProposalOmittedReason = 'backend_not_restart_safe';
+    if (completionProposalOmittedReason) {
+      content = [
+        content.trimEnd(),
+        '',
+        `> **${completionProposalVisible.title}**`,
+        `> ${completionProposalVisible.body}`,
+        '> 如需继续，请直接在当前话题回复。',
+      ].join('\n');
+      completionProposalVisible = undefined;
+      console.error(`botmux send: Completion Proposal 已降级为静态提示 (${completionProposalOmittedReason})`);
+    }
+  }
 
   // Ambiguity gate for --mention-back. --mention-back means "@ back the one
   // counterpart who triggered this turn"; that is only unambiguous when this
@@ -11194,6 +11292,29 @@ async function cmdSend(rest: string[]): Promise<void> {
   const sendTarget = !sendInto && !sendTopLevel && !overrideChatId && frozenTurnReplyTarget
     ? frozenTurnReplyTarget
     : resolveSendTarget({ into: sendInto, topLevel: sendTopLevel, chatScope: isChatScope, chatId: targetChatId, rootMessageId: s.rootMessageId, replyTargetRootId: turnReplyTarget?.rootMessageId, replyTargetTurnId: turnReplyTarget?.turnId, replyTargetQuoteOnly: turnReplyTarget?.quoteOnly, currentTurnId });
+
+  let completionProposalRecord: CompletionProposalRecord | undefined;
+  let completionProposalStore: ReturnType<typeof createCompletionProposalStore> | undefined;
+  if (completionProposalVisible && currentTurnId && replyTargetSenderOpenId) {
+    try {
+      completionProposalStore = createCompletionProposalStore(dataDir);
+      completionProposalRecord = completionProposalStore.prepare({
+        visible: completionProposalVisible,
+        larkAppId: s.larkAppId,
+        sessionId: sid,
+        chatId: targetChatId,
+        chatType: s.chatType === 'p2p' ? 'p2p' : 'group',
+        scope: sendTarget.mode === 'thread' ? 'thread' : 'chat',
+        anchor: sendTarget.mode === 'thread' ? sendTarget.rootMessageId : targetChatId,
+        originTurnId: currentTurnId,
+        ...(originDispatchAttempt !== undefined ? { originDispatchAttempt } : {}),
+        requesterOpenId: replyTargetSenderOpenId,
+      });
+    } catch (error) {
+      console.error(`botmux send: Completion Proposal 初始化失败: ${error instanceof Error ? error.message : String(error)}`);
+      process.exit(2);
+    }
+  }
   const deferredBinding = !sendInto && (!overrideChatId || overrideChatId === s.chatId)
     ? readDeferredTopicBinding(dataDir, s.sessionId)
     : undefined;
@@ -12057,10 +12178,16 @@ async function cmdSend(rest: string[]): Promise<void> {
       }
 
       const canonicalCard = createReplyCard([...elements], layoutHeader);
+      if (effectiveResponseKind === 'final') {
+        composeFinalCardSections(canonicalCard, {
+          ...(completionProposalRecord
+            ? { completionProposal: buildCompletionProposalElement(completionProposalRecord) }
+            : {}),
+          ...(feedbackPolicy ? { feedback: buildFeedbackElement(feedbackPolicy) } : {}),
+        });
+      }
       if (feedbackPolicy && effectiveResponseKind === 'final') {
-        const feedbackElement = buildFeedbackElement(feedbackPolicy);
-        const footerIndex = canonicalCard.body.elements.findIndex((element: any) => element?.element_id === 'botmux_reply_footer');
-        canonicalCard.body.elements.splice(footerIndex >= 0 ? footerIndex : canonicalCard.body.elements.length, 0, feedbackElement);
+
         feedbackBaseCard = canonicalCard as unknown as Record<string, unknown>;
       }
       // Fit charts to Feishu's 30KB request limit on the fully assembled card;
@@ -12105,7 +12232,7 @@ async function cmdSend(rest: string[]): Promise<void> {
                 ...(feedbackPolicy ? { feedback: { policy: feedbackPolicy, requesterSubjectId: feedbackRequesterSubjectId } } : {}) }
             : { kind: 'progress', text }, {
             beforeEffect: async () => { await revalidateIsolatedOriginBeforeEffect(); revalidateVcMeetingManagedSend(); },
-            send: (body, uuid) => dispatchPrimaryUnlocked(body, 'interactive', undefined, uuid ?? providerUuid),
+            send: (body, uuid) => dispatchPrimaryUnlocked(body, 'interactive', undefined, completionProposalRecord ? completionProposalCardDispatchUuid(completionProposalRecord) : (uuid ?? providerUuid)),
             patch: (id, body) => patchPublishedGroupCard(appId, targetChatId, id, body, replyRecord.rootId,
               effectiveResponseKind === 'final' ? groupContextAuthorOrigin : undefined,
               async (lookup) => {
@@ -12139,8 +12266,26 @@ async function cmdSend(rest: string[]): Promise<void> {
       } else {
         const standaloneCard = responseKind === undefined ? replyCardJson
           : markGroupContextCardPurpose(replyCardJson, responseKind === 'progress' ? 'runtime' : 'message');
-        messageId = await dispatchPrimary(standaloneCard, 'interactive');
+        messageId = await dispatchPrimary(
+          standaloneCard,
+          'interactive',
+          false,
+          completionProposalRecord ? completionProposalCardDispatchUuid(completionProposalRecord) : undefined,
+        );
       }
+
+    if (completionProposalRecord && completionProposalStore) {
+      try {
+        completionProposalRecord = completionProposalStore.bindMessage(
+          completionProposalRecord.proposalId,
+          completionProposalRecord.nonce,
+          messageId,
+        );
+      } catch (error) {
+        completionProposalOmittedReason = 'bind_failed';
+        console.error(`botmux send: Completion Proposal 绑定失败，按钮将保持不可执行: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
     }
 
     // The cheap preflight above catches ordinary retries. A concurrent retry
@@ -12431,6 +12576,11 @@ async function cmdSend(rest: string[]): Promise<void> {
       ...(attachmentMessageIds.length > 0 ? { attachmentMessageIds } : {}),
       ...(videoMessageIds.length > 0 ? { videoMessageIds } : {}),
       ...(urgent.requested ? { urgent: { mode: urgent.mode, sent: urgentSent, error: urgentError } } : {}),
+      ...(completionProposalRecord && !completionProposalOmittedReason
+        ? { proposalId: completionProposalRecord.proposalId, proposalStatus: completionProposalRecord.status }
+        : completionProposalFile !== undefined
+          ? { proposalStatus: 'omitted', proposalReason: completionProposalOmittedReason ?? 'unavailable' }
+          : {}),
       ...(failedAttachments.length > 0
         ? { failedAttachments: failedAttachments.map(f => f.path) }
         : {}),

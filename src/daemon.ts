@@ -67,7 +67,7 @@ import { botmuxVersion } from './utils/install-info.js';
 import { SESSION_STORE_PROTOCOL } from './utils/daemon-version-display.js';
 import { readSupervisorProcessStartIdentity } from './core/process-start-identity.js';
 import { statSync } from 'node:fs';
-import { addReaction, deleteMessage, getChatContext, getChatMode, getChatModeStrict, getChatNameAndMode, getMessageChatId, lookupMessageChatId, listChatMemberOpenIds, listChatMessages, listThreadMessages, MessageWithdrawnError, patchCardStreamElement, replyMessage, resolveAllowedUsersWithMap, resolveCurrentChatBotOpenIdsByLarkAppIds, resolveTargetAppOpenId, sendMessage, sendUserMessage, updateCardStreamElementContent, updateMessage, type EntryResolveStatus } from './im/lark/client.js';
+import { addReaction, deleteMessage, getChatContext, getChatMode, getChatModeStrict, getChatNameAndMode, getMessageChatId, getMessageDetail, lookupMessageChatId, listChatMemberOpenIds, listChatMessages, listThreadMessages, MessageWithdrawnError, patchCardStreamElement, replyMessage, resolveAllowedUsersWithMap, resolveCurrentChatBotOpenIdsByLarkAppIds, resolveTargetAppOpenId, sendMessage, sendUserMessage, updateCardStreamElementContent, updateMessage, type EntryResolveStatus } from './im/lark/client.js';
 import { resolveGroupJoinPrompt, waitForAllowedUserInChat } from './core/auto-start.js';
 import {
   loadBotConfigAtIndex,
@@ -722,6 +722,12 @@ import {
   submitCustomReply,
 } from './core/ask-broker.js';
 import { createAskPersistStore } from './core/ask-persist-store.js';
+import {
+  createCompletionProposalStore,
+  type CompletionProposalRecord,
+} from './core/completion-proposal.js';
+import { runCompletionProposalContinuation } from './core/completion-proposal-continuation.js';
+import { renderCompletionProposalCard } from './im/lark/completion-proposal-card.js';
 import { parseAskBody, registerAskForResponse } from './core/ask-api.js';
 import { shouldReturnAskStartupNotReady } from './core/ask-types.js';
 import { computeCocoPickerKeys } from './core/coco-picker-keys.js';
@@ -6405,12 +6411,114 @@ const handleCodexNotifierCardAction = createCodexNotifierCardActionHandler({
   logError: message => logger.error(message),
 });
 
+const completionProposalStore = createCompletionProposalStore(config.session.dataDir);
+
+async function readCompletionProposalBaseCard(messageId: string, larkAppId: string): Promise<Record<string, unknown> | undefined> {
+  const detail = await getMessageDetail(larkAppId, messageId);
+  const content = detail?.items?.[0]?.body?.content ?? detail?.body?.content;
+  if (typeof content !== 'string') return undefined;
+  try {
+    const parsed = JSON.parse(content);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+async function patchCompletionProposalRecord(record: CompletionProposalRecord): Promise<void> {
+  if (!record.cardMessageId) return;
+  const base = await readCompletionProposalBaseCard(record.cardMessageId, record.larkAppId);
+  if (!base) return;
+  await updateMessage(
+    record.larkAppId,
+    record.cardMessageId,
+    JSON.stringify(renderCompletionProposalCard(base, record)),
+  );
+}
+
+async function startCompletionProposalContinuation(record: CompletionProposalRecord): Promise<void> {
+  const settled = await runCompletionProposalContinuation(record, {
+    store: completionProposalStore,
+    sessionCanResume: current => {
+      const ds = findActiveBySessionId(current.sessionId);
+      return !!ds && getSessionPersistentBackendType(ds) !== undefined;
+    },
+    dispatch: async ({ record: current, turnId, prompt }) => {
+      const data = {
+        sender: { sender_id: { open_id: current.requesterOpenId }, sender_type: 'user' },
+        message: {
+          message_id: turnId,
+          ...(current.scope === 'thread' ? { root_id: current.anchor } : {}),
+          chat_id: current.chatId,
+          chat_type: current.chatType,
+          message_type: 'text',
+          content: JSON.stringify({ text: prompt }),
+          create_time: String(Date.now()),
+        },
+      };
+      const ctx: RoutingContext = {
+        larkAppId: current.larkAppId,
+        chatId: current.chatId,
+        chatType: current.chatType,
+        messageId: turnId,
+        scope: current.scope,
+        anchor: current.anchor,
+        completionProposalContinuation: true,
+        ingressAdmission: { admitted: false },
+      };
+      await handleThreadReply(data, ctx);
+      return ctx.ingressAdmission?.admitted ? 'admitted' : 'rejected';
+    },
+    publishState: patchCompletionProposalRecord,
+  });
+  logger.info(
+    `[completion-proposal:audit] proposal=${settled.proposalId} by=${settled.decision?.by ?? '-'} `
+    + `decidedAt=${settled.decision?.decidedAt ?? '-'} snapshot=${settled.visibleHash} `
+    + `dispatch=${settled.dispatch?.state ?? '-'}`,
+  );
+}
+
+function scheduleCompletionProposalStartupRecovery(larkAppId: string): void {
+  try {
+    const recovered = completionProposalStore.recoverAtBootstrap(Date.now(), larkAppId);
+    if (recovered.changed.length > 0 || recovered.removed > 0) {
+      logger.warn(
+        `[completion-proposal] recovered ${recovered.changed.length} uncertain/expired record(s); `
+        + `removed ${recovered.removed} retained record(s)`,
+      );
+    }
+    for (const record of recovered.changed) {
+      if (record.cardMessageId) {
+        setTimeout(() => {
+          void patchCompletionProposalRecord(record)
+            .catch(error => logger.warn(`[completion-proposal] failed to patch recovered state: ${error}`));
+        }, 0);
+      }
+    }
+    for (const record of recovered.pending) {
+      setTimeout(() => {
+        void startCompletionProposalContinuation(record)
+          .catch(error => logger.warn(`[completion-proposal] failed to resume accepted proposal: ${error}`));
+      }, 0);
+    }
+  } catch (e) {
+    logger.warn(`[completion-proposal] recovery failed: ${e instanceof Error ? e.message : String(e)}`);
+  }
+}
+
 const cardDeps: CardHandlerDeps = {
   activeSessions,
   sessionReply,
   lastRepoScan,
   vcMeetingCardAction: (data, appId) => handleVcMeetingCardAction(data, appId),
   codexNotifierCardAction: (data, appId) => handleCodexNotifierCardAction(data, appId),
+  completionProposalDeps: {
+    store: completionProposalStore,
+    loadBaseCard: (messageId, larkAppId) => readCompletionProposalBaseCard(messageId, larkAppId),
+    startContinuation: startCompletionProposalContinuation,
+  },
   v3GateDeps: {
     driveRun: (runId) => v3GateRunner.driveDetached(runId),
     // 审批权限：复用 canOperate（话题 owner / allowedUsers / oncall）。无 binding（corrupt /
@@ -24909,7 +25017,7 @@ async function handleThreadReplyAdmitted(
     resources.push(...extraResources);
   }
 
-  if (!prepared && !ctx.cascadeBodyReentry) learnFromMentions(larkAppId, parsed.mentions);
+  if (!prepared && !ctx.cascadeBodyReentry && !ctx.completionProposalContinuation) learnFromMentions(larkAppId, parsed.mentions);
 
   // 语音消息转写：必须排在会话群自愈命名之前，让转写文本（而非 '[语音]'
   // 占位符）喂给标题生成。prepared 重投路径下 content 已带前缀时幂等跳过。
@@ -24935,7 +25043,8 @@ async function handleThreadReplyAdmitted(
   // titled 标记幂等），把偶发失败自动治愈，而不是永远留疤。
   // 同样跳过纯占位符种子（见出生侧注释）：自愈闸本就是为「停在占位名」兜底的，
   // 拿一张图片去改名只会把错名焊死，反而堵死后面真消息的自愈机会。
-  if (ctxChatType === 'group' && isSessionGroup(ctxChatId)) {
+  // Completion Proposal 合成续跑不是真人新消息，同样不触发改名。
+  if (!ctx.completionProposalContinuation && ctxChatType === 'group' && isSessionGroup(ctxChatId)) {
     const sgEntry = getSessionGroup(ctxChatId);
     if (sgEntry && !sgEntry.titled && shouldSeedSessionGroupTitle(parsed.content)) {
       scheduleSessionGroupTitle({ larkAppId, chatId: ctxChatId, userText: parsed.content });
@@ -25010,7 +25119,7 @@ async function handleThreadReplyAdmitted(
       + stripCrossPrincipalAsToken(parsed.content).text;
   let promptContent = initialPromptContent;
   let rewrittenCodexAppMessageContext: string | undefined;
-  if (!prepared && !ctx.cascadeBodyReentry) {
+  if (!prepared && !ctx.cascadeBodyReentry && !ctx.completionProposalContinuation) {
     const existingHookSession = activeSessions.get(runtimeSessionKey);
     emitHookEvent('thread.reply', {
       larkAppId,
@@ -25432,7 +25541,7 @@ async function handleThreadReplyAdmitted(
     // quoteTargetId changes every inbound message (always a new message_id), so
     // — unlike lastCallerOpenId — persist unconditionally. Powers `botmux send`'s
     // default chat-scope quote chain + --mention-back.
-    ds.session.quoteTargetId = parsed.messageId;
+    if (!ctx.completionProposalContinuation) ds.session.quoteTargetId = parsed.messageId;
     ds.session.quoteTargetSenderOpenId = callerOpenId;
     ds.session.quoteTargetSenderIsBot = isForeignBot;
     publishLastInputFromBotPatch(ds);
@@ -25502,7 +25611,7 @@ async function handleThreadReplyAdmitted(
     isBotSenderType,
     explicitBotSteer: botSteerDirective.requested,
     substituteTrigger: !!substituteTrigger,
-    controlRewrite: !!threadGrill,
+    controlRewrite: !!threadGrill || !!ctx.completionProposalContinuation,
     messageListener: !!ctx.messageListener,
     vcMeetingReceiver: ds?.session.vcMeetingReceiver !== undefined,
     vcMeetingImTurnOrigin: !!ctx.vcMeetingImTurnOrigin,
@@ -25782,6 +25891,10 @@ async function handleThreadReplyAdmitted(
   }
 
   if (!ds) {
+    if (ctx.completionProposalContinuation) {
+      logger.warn('[completion-proposal] source session disappeared before continuation admission; refusing auto-create');
+      return;
+    }
     // No active session at this anchor — auto-create. This branch is mostly a
     // safety net; the dispatcher routes here only when isSessionOwner() returns
     // true, but races (between check and execution, or session-closed events)
@@ -26199,7 +26312,9 @@ async function handleThreadReplyAdmitted(
         promptInjection: sessionPromptInjection(ds),
         turnId: parsed.messageId,
         });
-    await noteTurnReceived(ds, parsed.messageId, parsed.content, turnSender, parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
+    if (!ctx.completionProposalContinuation) {
+      await noteTurnReceived(ds, parsed.messageId, parsed.content, turnSender, parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
+    }
     if (threadTrustedCaller) {
       cliInput.rerouteEnvelope = {
         turnId: parsed.messageId,
@@ -26566,7 +26681,7 @@ async function handleThreadReplyAdmitted(
         logger.warn(`[${tag(ds)}] Legacy queued dashboard task has no clean-input text; using the full legacy activation prompt`);
       }
     }
-    if (!queuedHasDurableTail) {
+    if (!queuedHasDurableTail && !ctx.completionProposalContinuation) {
       await noteTurnReceived(ds, parsed.messageId, parsed.content, reforkSender, parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
     }
     // A dead worker must not let a newly-arrived turn jump ahead of a durable
@@ -28498,7 +28613,6 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   } catch (e) {
     logger.warn(`[ask] restorePersistedAsks failed: ${e instanceof Error ? e.message : String(e)}`);
   }
-
   writePidFile();
   const memoryDiagnostics = startMemoryDiagnostics();
 
@@ -29981,6 +30095,15 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     driveRestoredXpiGroup: groupId => { void driveNextXpiSharedCwdTurn(groupId); },
     driveRestoredPrincipalLane: ds => { driveNextPrincipalLaneTurn(ds); },
   });
+  // Completion Proposal may resume an accepted pending decision immediately.
+  // Schedule it only after restore populated activeSessions; doing this before
+  // the awaited startup I/O deterministically marks every pending record failed.
+  scheduleCompletionProposalStartupRecovery(cfg.larkAppId);
+
+  // Completion Proposal may resume an accepted pending decision immediately.
+  // Run only after restore populated activeSessions: running this before the
+  // awaited restore would mark every pending record dispatch_failed.
+  scheduleCompletionProposalStartupRecovery(cfg.larkAppId);
 
   // Recover target-owned launch operations only after the canonical session
   // registry exists. Start is checkpointed, so re-entry resumes pre-launch
