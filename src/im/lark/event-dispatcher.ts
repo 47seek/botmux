@@ -2662,6 +2662,68 @@ const MESSAGE_LISTENER_BACKFILL_PAGE_SIZE = Math.min(50, Math.max(
   1,
   Number(process.env.BOTMUX_MESSAGE_LISTENER_BACKFILL_PAGE_SIZE) || 50,
 ));
+/**
+ * 单个群的 chat-history 拉取截止时间（含翻页）。到点即 abort 底层请求并跳过该群，
+ * 避免某次请求卡住把整轮轮询（以及 in-flight 锁）永久挂住。
+ */
+const MESSAGE_LISTENER_CHAT_REQUEST_TIMEOUT_MS = Math.max(
+  1_000,
+  Number(process.env.BOTMUX_MESSAGE_LISTENER_REQUEST_TIMEOUT_MS) || 15_000,
+);
+/** 轮询前 bot open_id 探测的等待上限（探测本身是共享 in-flight，不可取消，只限时等待）。 */
+const MESSAGE_LISTENER_OPEN_ID_PROBE_TIMEOUT_MS = 10_000;
+/**
+ * 整轮轮询的看门狗：兜住单请求超时覆盖不到的卡点（成员解析、文档标题、分发等）。
+ * 到点即 abort 本轮并释放 in-flight 锁，下一拍重新开始；被放弃的那轮在 abort 后
+ * 不再分发任何消息。默认取较宽的 2 分钟，避免误杀群多但仍在推进的正常轮次。
+ */
+const MESSAGE_LISTENER_POLL_RUN_TIMEOUT_MS = Math.max(
+  MESSAGE_LISTENER_CHAT_REQUEST_TIMEOUT_MS + 5_000,
+  Number(process.env.BOTMUX_MESSAGE_LISTENER_POLL_RUN_TIMEOUT_MS) || 120_000,
+);
+
+/**
+ * 在 deadline 内跑一个可取消的异步任务：到点（或外层 parent 被 abort）时 abort
+ * 传给任务的 signal 并立即 reject，不等任务自己收尾——即使底层请求无视 signal
+ * 永不返回，调用方也能继续往下走。
+ */
+function runWithAbortDeadline<T>(
+  run: (signal: AbortSignal) => Promise<T>,
+  timeoutMs: number,
+  label: string,
+  parent?: AbortSignal,
+): Promise<T> {
+  const controller = new AbortController();
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const finish = (fn: () => void) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      parent?.removeEventListener('abort', onParentAbort);
+      fn();
+    };
+    const fail = (err: Error) => finish(() => {
+      controller.abort(err);
+      reject(err);
+    });
+    const onParentAbort = () => fail(new Error(`${label} aborted`));
+    const timer = setTimeout(() => fail(new Error(`${label} timed out after ${timeoutMs}ms`)), timeoutMs);
+    if (parent?.aborted) { onParentAbort(); return; }
+    parent?.addEventListener('abort', onParentAbort, { once: true });
+    let task: Promise<T>;
+    try {
+      task = run(controller.signal);
+    } catch (err) {
+      finish(() => reject(err));
+      return;
+    }
+    task.then(
+      value => finish(() => resolve(value)),
+      err => finish(() => reject(err)),
+    );
+  });
+}
 
 function enabledMessageListenerChatIds(bot: BotState): string[] {
   // Global listeners potentially apply to every joined group. The polling
@@ -2851,7 +2913,39 @@ async function dispatchPolledMessageListenerMatch(input: {
   }));
 }
 
-async function pollMessageListenersOnce(larkAppId: string, handlers: EventHandlers, now = Date.now()): Promise<void> {
+/**
+ * 轮询游标：整轮看门狗放弃某一轮时记下进行到的群，下一轮从这里接着轮，避免
+ * 「前缀群累计耗时稳定超时 → 每轮都从头开始 → 靠后的群永远轮不到」。
+ * skip=true 表示上一轮连第一个群都没做完就被放弃——这时从它的下一个群开始，
+ * 保证每一轮要么至少完成一个群、要么越过卡死的那个群，所有群最终都会被轮到。
+ */
+const messageListenerPollCursor = new Map<string, { chatId: string; skip: boolean }>();
+
+interface MessageListenerPollProgress {
+  /** 本轮实际轮询顺序的第一个群。 */
+  firstChatId?: string;
+  /** 本轮正在处理的群。 */
+  currentChatId?: string;
+}
+
+function orderChatIdsFromCursor(larkAppId: string, chatIds: string[]): string[] {
+  const cursor = messageListenerPollCursor.get(larkAppId);
+  if (!cursor) return chatIds;
+  const idx = chatIds.indexOf(cursor.chatId);
+  if (idx < 0) return chatIds;
+  const start = cursor.skip ? (idx + 1) % chatIds.length : idx;
+  return [...chatIds.slice(start), ...chatIds.slice(0, start)];
+}
+
+async function pollMessageListenersOnce(
+  larkAppId: string,
+  handlers: EventHandlers,
+  now = Date.now(),
+  signal?: AbortSignal,
+  progress?: MessageListenerPollProgress,
+): Promise<void> {
+  // signal 被 abort 说明本轮已被看门狗放弃、锁已释放、下一轮可能已在跑——
+  // 之后每个 await 恢复点都要先检查，绝不能再用这轮的陈旧结果去分发消息。
   const bot = getBot(larkAppId);
   const configuredChatIds = enabledMessageListenerChatIds(bot);
   let chatIds = configuredChatIds;
@@ -2867,23 +2961,48 @@ async function pollMessageListenersOnce(larkAppId: string, handlers: EventHandle
       );
     }
   }
-  if (chatIds.length === 0) return;
+  if (signal?.aborted || chatIds.length === 0) return;
 
   const cutoff = now - MESSAGE_LISTENER_BACKFILL_WINDOW_MS;
-  await ensureBotOpenId(larkAppId).catch(() => { /* degrade; heartbeat retries */ });
+  await runWithAbortDeadline(
+    () => ensureBotOpenId(larkAppId),
+    MESSAGE_LISTENER_OPEN_ID_PROBE_TIMEOUT_MS,
+    'ensure bot open_id',
+    signal,
+  ).catch(() => { /* 探测失败/超时：下面按身份未知处理 */ });
+  if (signal?.aborted) return;
+  // 自身 open_id 未知时不能轮询：历史消息里 bot 发送者优先按 open_bot_id（ou_）
+  // 识别，而自排除只比对 [botOpenId, larkAppId]——botOpenId 缺失时 bot 自己发的
+  // 消息会漏过 excludeSelf 自触发。本轮跳过，下一拍重新探测（实时事件路径不受影响）。
+  if (!getBot(larkAppId).botOpenId) {
+    logger.warn(`[message-listener:${larkAppId}] bot open_id unresolved; skipping this poll to keep self-exclusion intact`);
+    return;
+  }
 
-  for (const chatId of chatIds) {
+  const orderedChatIds = orderChatIdsFromCursor(larkAppId, chatIds);
+  if (progress) progress.firstChatId = orderedChatIds[0];
+  for (const chatId of orderedChatIds) {
+    if (signal?.aborted) return;
+    if (progress) progress.currentChatId = chatId;
     let messages: any[];
     try {
-      messages = await listChatMessagesUntil(larkAppId, chatId, {
-        pageSize: MESSAGE_LISTENER_BACKFILL_PAGE_SIZE,
-        stopAfter: (message, seenCount) => {
-          const createdAt = messageCreateTimeMs(message);
-          return seenCount >= MESSAGE_LISTENER_BACKFILL_SCAN_LIMIT ||
-            (Number.isFinite(createdAt) && (createdAt as number) < cutoff);
-        },
-      });
+      messages = await runWithAbortDeadline(
+        requestSignal => listChatMessagesUntil(larkAppId, chatId, {
+          pageSize: MESSAGE_LISTENER_BACKFILL_PAGE_SIZE,
+          timeoutMs: MESSAGE_LISTENER_CHAT_REQUEST_TIMEOUT_MS,
+          signal: requestSignal,
+          stopAfter: (message, seenCount) => {
+            const createdAt = messageCreateTimeMs(message);
+            return seenCount >= MESSAGE_LISTENER_BACKFILL_SCAN_LIMIT ||
+              (Number.isFinite(createdAt) && (createdAt as number) < cutoff);
+          },
+        }),
+        MESSAGE_LISTENER_CHAT_REQUEST_TIMEOUT_MS,
+        `poll chat ${chatId.substring(0, 12)}`,
+        signal,
+      );
     } catch (err) {
+      if (signal?.aborted) return;
       logger.warn(`[message-listener:${larkAppId}] failed to poll chat=${chatId.substring(0, 12)}: ${err instanceof Error ? err.message : String(err)}`);
       continue;
     }
@@ -2893,6 +3012,7 @@ async function pollMessageListenersOnce(larkAppId: string, handlers: EventHandle
     // filters keyed on open_id, and unprovable bots fail closed on exclusion.
     const candidateBotAppIds = collectListenerBotAppIds(messages, historyMessageSender);
     const appIdToOpenId = await buildListenerBotAppIdToOpenId(larkAppId, chatId, candidateBotAppIds);
+    if (signal?.aborted) return;
 
     for (const message of messages) {
       const messageId = String(message?.message_id ?? '');
@@ -2912,6 +3032,7 @@ async function pollMessageListenersOnce(larkAppId: string, handlers: EventHandle
         senderIdentityUnverified: resolved.identityUnverified,
         explicitlyMentionedThisBot: isBotMentioned(larkAppId, data.message, resolved.senderOpenId),
       });
+      if (signal?.aborted) return;
       if (!match) continue;
 
       await dispatchPolledMessageListenerMatch({
@@ -2926,8 +3047,41 @@ async function pollMessageListenersOnce(larkAppId: string, handlers: EventHandle
   }
 }
 
-export async function __pollMessageListenersOnceForTest(larkAppId: string, handlers: EventHandlers, now = Date.now()): Promise<void> {
-  await pollMessageListenersOnce(larkAppId, handlers, now);
+export async function __pollMessageListenersOnceForTest(
+  larkAppId: string,
+  handlers: EventHandlers,
+  now = Date.now(),
+  signal?: AbortSignal,
+): Promise<void> {
+  await pollMessageListenersOnce(larkAppId, handlers, now, signal);
+}
+
+/**
+ * 带整轮看门狗的一次轮询：超时即 abort 本轮并 reject，让调用方的 finally 释放锁；
+ * 同时记下轮询游标，下一轮从未完成的群接着轮。正常跑完一整轮则清掉游标。
+ */
+async function runMessageListenerPoll(larkAppId: string, handlers: EventHandlers, label: string): Promise<void> {
+  const progress: MessageListenerPollProgress = {};
+  try {
+    await runWithAbortDeadline(
+      signal => pollMessageListenersOnce(larkAppId, handlers, Date.now(), signal, progress),
+      MESSAGE_LISTENER_POLL_RUN_TIMEOUT_MS,
+      `${label} message-listener poll`,
+    );
+    if (progress.firstChatId !== undefined) messageListenerPollCursor.delete(larkAppId);
+  } catch (err) {
+    if (progress.currentChatId !== undefined) {
+      messageListenerPollCursor.set(larkAppId, {
+        chatId: progress.currentChatId,
+        skip: progress.currentChatId === progress.firstChatId,
+      });
+    }
+    throw err;
+  }
+}
+
+export function __resetMessageListenerPollCursorForTest(): void {
+  messageListenerPollCursor.clear();
 }
 
 function usesForwardFollowupDelay(mentionMode: GroupMentionMode): boolean {
@@ -5773,7 +5927,7 @@ export function createLarkEventDispatcherRuntime(
     listenerPollTimer = setInterval(() => {
       if (listenerPollInFlight) return;
       listenerPollInFlight = true;
-      void pollMessageListenersOnce(larkAppId, handlers)
+      void runMessageListenerPoll(larkAppId, handlers, 'scheduled')
         .catch(err => logger.error(`[message-listener:${larkAppId}] poll failed: ${err instanceof Error ? err.message : String(err)}`))
         .finally(() => { listenerPollInFlight = false; });
     }, MESSAGE_LISTENER_POLL_INTERVAL_MS);
@@ -5785,7 +5939,7 @@ export function createLarkEventDispatcherRuntime(
       initialListenerPollTimer = setTimeout(() => {
         if (listenerPollInFlight) return;
         listenerPollInFlight = true;
-        void pollMessageListenersOnce(larkAppId, handlers)
+        void runMessageListenerPoll(larkAppId, handlers, 'initial')
           .catch(err => logger.error(`[message-listener:${larkAppId}] initial poll failed: ${err instanceof Error ? err.message : String(err)}`))
           .finally(() => { listenerPollInFlight = false; });
       }, 2_000);

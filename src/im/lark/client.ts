@@ -2355,6 +2355,10 @@ export async function listChatMessages(
 export interface ChatMessageScanOptions {
   /** Lark page size per request. Clamped to the API max of 50. */
   pageSize?: number;
+  /** 每页请求的 HTTP 超时（透传给 Axios）；不设置时保持 SDK 默认行为。 */
+  timeoutMs?: number;
+  /** 取消信号：透传给每页请求，且在翻页前检查——被取消后不再发起下一页。 */
+  signal?: AbortSignal;
   /**
    * Called while scanning newest -> oldest. Returning true stops after the
    * current message has been included in the returned chronological list.
@@ -2376,6 +2380,7 @@ export async function listChatMessagesUntil(
   const pageSize = Math.min(Math.max(rawPageSize, 1), LARK_MESSAGE_LIST_MAX_PAGE);
 
   do {
+    options.signal?.throwIfAborted();
     const res = await larkGet(c, '/open-apis/im/v1/messages', {
       container_id_type: 'chat',
       container_id: chatId,
@@ -2383,7 +2388,8 @@ export async function listChatMessagesUntil(
       sort_type: 'ByCreateTimeDesc',
       with_sender_name: 'true',
       ...(pageToken ? { page_token: pageToken } : {}),
-    });
+    }, { timeoutMs: options.timeoutMs, signal: options.signal });
+    options.signal?.throwIfAborted();
 
     if (res.code !== 0) {
       throw new Error(`Failed to list chat messages: ${res.msg} (code: ${res.code})`);
