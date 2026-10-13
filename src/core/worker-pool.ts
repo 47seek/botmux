@@ -14922,6 +14922,13 @@ function setupWorkerHandlers(
         }
         ds.activeModel = model;
         ds.activeReasoningEffort = reasoningEffort;
+        if (ds.session.dispatchLaunchSpec && model) {
+          ds.session.dispatchLaunchSpec.effectiveRuntime = {
+            model, ...(reasoningEffort ? { reasoningEffort } : {}),
+            workerGeneration, observedAt: new Date().toISOString(),
+          };
+          sessionStore.updateSession(ds.session);
+        }
         scheduleActiveRuntimePatch(ds);
         break;
       }

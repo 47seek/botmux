@@ -16,6 +16,7 @@ import type { DurableLarkOutboxTarget } from '../services/durable-lark-outbox.js
 import { cliAuthBind, loadDashboardSecret, verifyHmac } from '../dashboard/auth.js';
 import { UnsafeHostAuthorityFileError } from '../platform/secure-host-file.js';
 import { WORKFLOW_DAEMON_IPC_ROUTE_PREFIX } from '../workflows/v3/daemon-ipc-auth.js';
+import { DISPATCH_LAUNCH_IPC_ROUTE_PREFIX } from './dispatch-launch-ipc-auth.js';
 import { V3_SESSION_RUN_MUTATION_ROUTE_PREFIX } from '../workflows/v3/session-relay.js';
 import { REPORT_SESSION_RELAY_ROUTE } from './report-session-relay.js';
 import { DISPATCH_USER_DELIVERY_ROUTE } from './dispatch-user-delegation.js';
@@ -893,7 +894,19 @@ function routeIsCoreOnlyPublic(method: string, pathname: string): boolean {
   return false;
 }
 
-function routeHasNarrowUntrustedAuth(method: string, pathname: string): boolean {
+export function routeHasNarrowUntrustedAuth(method: string, pathname: string): boolean {
+  // Dispatch-launch daemon traffic carries its own full-envelope HMAC bound to
+  // the target app, bound port, boot instance, method, path and exact body.
+  // Let those handlers authenticate it instead of requiring the unrelated
+  // dashboard trusted-host envelope first.
+  const dispatchMatch = pathname.match(new RegExp(
+    `^${DISPATCH_LAUNCH_IPC_ROUTE_PREFIX}/(dl_[0-9a-f]{32})(?:/(prepare|start|cancel))?$`,
+  ));
+  if (dispatchMatch) {
+    const action = dispatchMatch[2];
+    if ((method === 'GET' && action === undefined)
+        || (method === 'POST' && action !== undefined)) return true;
+  }
   if (method === 'POST' && /^\/api\/sessions\/[^/]+\/lark-tool-identity$/.test(pathname)) return true;
   // The receiver action endpoint performs its own rotating worker-capability
   // verification and then enters the durable action ledger. Keeping this one
