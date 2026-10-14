@@ -88,6 +88,20 @@ export function sessionActiveTurnPath(sessionDataDir: string, sessionId: string)
 }
 
 /**
+ * The live turn id (first line) from the active-turn file, or undefined when
+ * absent/empty. Shared by every TS consumer so the file's two-line layout
+ * (turn, then caller) is parsed in exactly one place.
+ */
+export function readActiveTurnLine(sessionDataDir: string, sessionId: string): string | undefined {
+  try {
+    const first = readFileSync(sessionActiveTurnPath(sessionDataDir, sessionId), 'utf8').split('\n', 1)[0]!;
+    return first.trim() || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * Machine-readable companion to {@link sessionActiveTurnPath}:
  * `{"turnId":…,"dispatchAttempt":…}` (one JSON object, 0600).
  *
@@ -102,20 +116,6 @@ export function sessionActiveTurnPath(sessionDataDir: string, sessionId: string)
  */
 export function sessionActiveTurnIdentityPath(sessionDataDir: string, sessionId: string): string {
   return join(sessionIdentityDataDir(sessionDataDir, sessionId), 'turn.json');
-}
-
-/**
- * Shell-readable companion to {@link sessionActiveTurnPath}: one line holding
- * the open id of the human whose turn the worker is executing.
- *
- * The identity wrapper compares it against the credential file's stamped
- * principal: turns rotate while the same person keeps talking, and a turn
- * mismatch between two of the SAME person's credentials must not deny the
- * tail of their previous turn. Plain text for the same no-jq reason as
- * {@link sessionActiveTurnPath}.
- */
-export function sessionActiveTurnCallerPath(sessionDataDir: string, sessionId: string): string {
-  return join(sessionIdentityDataDir(sessionDataDir, sessionId), 'turn.caller');
 }
 
 /**
@@ -136,10 +136,18 @@ export function publishActiveTurn(
   const dir = sessionIdentityDataDir(sessionDataDir, sessionId);
   try {
     mkdirSync(dir, { recursive: true, mode: 0o700 });
-    atomicWriteFileSync(sessionActiveTurnPath(sessionDataDir, sessionId), `${turnId ?? ''}\n`, { mode: 0o600 });
-    // Empty on an unknown/absent principal: the wrapper only relaxes a turn
-    // mismatch when BOTH sides name the same person, so an empty line denies.
-    atomicWriteFileSync(sessionActiveTurnCallerPath(sessionDataDir, sessionId), `${callerOpenId ?? ''}\n`, { mode: 0o600 });
+    // turn + caller live in ONE file so the wrapper reads them in a single
+    // open: two separate files cannot be updated atomically together, and a
+    // reader landing between the two writes would see a turn from one
+    // generation with a caller from another (a cross-principal misattribution).
+    // Line 1 = the turn the CLI is executing now; line 2 = the open id of the
+    // human whose turn it is. Both may be empty (unknown turn / absent
+    // principal), which the wrapper treats as a refusal, never an allowance.
+    atomicWriteFileSync(
+      sessionActiveTurnPath(sessionDataDir, sessionId),
+      `${turnId ?? ''}\n${callerOpenId ?? ''}\n`,
+      { mode: 0o600 },
+    );
   } catch { /* best-effort: a stale/absent turn file refuses, never misattributes */ }
   try {
     atomicWriteFileSync(
@@ -366,11 +374,23 @@ export function refreshSessionIdentity(
   identity: CliIdentity & { turnId: string },
 ): boolean {
   const path = sessionIdentityPath(sessionDataDir, sessionId, identity.tool);
-  const turnPath = sessionActiveTurnPath(sessionDataDir, sessionId);
-  const suffix = `${TURN_VAR}=${quoteFor(TURN_VAR, identity.turnId)}\n`;
+  const turnLine = `${TURN_VAR}=${quoteFor(TURN_VAR, identity.turnId)}`;
+  const openId = 'openId' in identity ? identity.openId : undefined;
   try {
-    if (!readFileSync(path, 'utf8').endsWith(suffix)
-      || readFileSync(turnPath, 'utf8').trim() !== identity.turnId) return false;
+    // Match the TURN line by line, not by suffix: renderIdentityEnv appends the
+    // OPEN_ID line after TURN for every principal-stamped identity, so
+    // `endsWith(TURN=…)` is false for exactly the files this feature produces.
+    const lines = readFileSync(path, 'utf8').split('\n');
+    if (!lines.includes(turnLine)) return false;
+    // Incidental consistency: a file already stamped for one principal must not
+    // be refreshed into another principal's token. An UNSTAMPED file (the
+    // first-authorization denial, or a pre-binding credential) is not evidence
+    // of a mismatch and is allowed through — that is the path that just
+    // completed the device grant.
+    const stamped = lines.find(line => line.startsWith(`${OPEN_ID_VAR}=`));
+    if (stamped && stamped !== `${OPEN_ID_VAR}=${quoteFor(OPEN_ID_VAR, openId ?? '')}`) return false;
+    // The active-turn file is two lines (turn, caller); compare only the turn.
+    if (readActiveTurnLine(sessionDataDir, sessionId) !== identity.turnId) return false;
   } catch {
     return false;
   }
@@ -465,6 +485,12 @@ export function renderIdentityWrapper(tool: TriggerUserAuthTool, realBinaryPath:
     '# would hand it the machine account\'s login, not the bot\'s.',
     `${MODE_VAR}=`,
     `${DENY_MSG_VAR}=`,
+    // Clear inherited copies before sourcing: a parent process that exports a
+    // forged OPEN_ID/TURN could otherwise flip a cross-principal refusal into
+    // the same-principal allowance. Depths of defence only — the values are
+    // re-set from the credential file below when it carries them.
+    `${TURN_VAR}=`,
+    `${OPEN_ID_VAR}=`,
     'if [ -n "$SESSION_DATA_DIR" ] && [ -n "$BOTMUX_SESSION_ID" ]; then',
     `  __botmux_cred="$SESSION_DATA_DIR/cli-identity/$BOTMUX_SESSION_ID.bin/.data/${tool}.env"`,
     '  if [ -f "$__botmux_cred" ]; then',
@@ -481,11 +507,11 @@ export function renderIdentityWrapper(tool: TriggerUserAuthTool, realBinaryPath:
     '__botmux_live_caller=',
     'if [ -n "$SESSION_DATA_DIR" ] && [ -n "$BOTMUX_SESSION_ID" ]; then',
     '  __botmux_d="$SESSION_DATA_DIR/cli-identity/$BOTMUX_SESSION_ID.bin/.data"',
+    // ONE open, two reads: the file is (turn, caller) written by a single
+    // atomic rename, so this pair is always from one generation. Two separate
+    // reads could interleave with a rewrite and mix generations.
     '  if [ -f "$__botmux_d/turn" ]; then',
-    '    read -r __botmux_live < "$__botmux_d/turn" || __botmux_live=',
-    '  fi',
-    '  if [ -f "$__botmux_d/turn.caller" ]; then',
-    '    read -r __botmux_live_caller < "$__botmux_d/turn.caller" || __botmux_live_caller=',
+    '    { read -r __botmux_live; read -r __botmux_live_caller; } < "$__botmux_d/turn" || true',
     '  fi',
     '  unset __botmux_d',
     'fi',
@@ -573,7 +599,6 @@ export function ensureSessionIdentityPlaceholders(
     // Same existence-filter reason: the wrapper reads the active turn on every
     // invocation, and a path missing at spawn stays unreadable afterwards.
     sessionActiveTurnPath(sessionDataDir, sessionId),
-    sessionActiveTurnCallerPath(sessionDataDir, sessionId),
   ];
   for (const path of paths) {
     if (existsSync(path)) continue;

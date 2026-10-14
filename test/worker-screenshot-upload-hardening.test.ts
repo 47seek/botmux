@@ -708,3 +708,36 @@ describe('R2 turn-only capture acceptance', () => {
     expect(send).toHaveBeenCalledWith(expect.objectContaining({ turnId: 'new_turn' }));
   });
 });
+
+describe('turn caller persistence across crash recovery', () => {
+  it('persists the live caller in the PID marker JSON', () => {
+    const at = source.indexOf('function writeCliPidMarker(');
+    const body = source.slice(at, source.indexOf('\n}\n', at));
+    expect(body).toContain('...(currentBotmuxCallerOpenId ? { callerOpenId: currentBotmuxCallerOpenId } : {})');
+  });
+
+  it('persists the queued type-ahead caller so a marker replay does not drop it', () => {
+    const at = source.indexOf('function writeCliPidMarker(');
+    const body = source.slice(at, source.indexOf('\n}\n', at));
+    expect(body).toContain("...(t.turnCallerOpenId ? { callerOpenId: t.turnCallerOpenId } : {})");
+  });
+
+  it('restores the caller when adopting the initial active turn, falling back to trusted provenance', () => {
+    const at = source.indexOf('function adoptInitialActiveTurn(');
+    const body = source.slice(at, source.indexOf('\n}\n', at));
+    expect(body).toContain('parsed.callerOpenId ?? parsed.trustedCaller?.requestUserOpenId');
+  });
+
+  it('replays queued-turn callers from the marker back into the type-ahead queue', () => {
+    // Two replay sites: writeCliPidMarker's read-back and syncQueuedTurnsFromMarkerDisk.
+    const occurrences = source.split("...(typeof qt.callerOpenId === 'string' && qt.callerOpenId ? { turnCallerOpenId: qt.callerOpenId } : {})").length - 1
+      + source.split("...(typeof t.callerOpenId === 'string' && t.callerOpenId ? { turnCallerOpenId: t.callerOpenId } : {})").length - 1;
+    expect(occurrences).toBeGreaterThanOrEqual(3);
+  });
+
+  it('advances the marker-synced turn with its persisted or queued caller', () => {
+    const at = source.indexOf('function syncQueuedTurnsFromMarkerDisk(');
+    const body = source.slice(at, source.indexOf('\n}\n', at));
+    expect(body).toContain('parsed.callerOpenId ?? advancedRecord.turnCallerOpenId');
+  });
+});

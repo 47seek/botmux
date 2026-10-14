@@ -2606,6 +2606,7 @@ for (const action of ['auth-request', 'auth-status']) {
       if (isCurrent() && request.isCurrent()) {
         if (!boundTool && !refreshSessionIdentity(config.session.dataDir, params.sessionId, {
           tool: 'lark-cli', appId: cfg.larkAppId, userAccessToken: result.token, turnId,
+          openId: callerOpenId,
         })) {
           return jsonRes(res, 409, { ok: false, error: 'auth_turn_changed' });
         }

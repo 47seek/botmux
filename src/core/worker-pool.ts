@@ -9858,9 +9858,6 @@ function bufferTransferInput(
   return true;
 }
 
-/** Route user/automation input through the transfer fence. Messages accepted
- * during detach are replayed byte-for-byte to the replacement generation.
- */
 /** Resolve the human open id whose turn a given turn id belongs to, at the
  *  moment a daemon->worker IPC is dispatched. The acceptance-time reply target
  *  is the durable source; the active interactive turn covers callers that only
@@ -9885,6 +9882,8 @@ function withTurnCaller(ds: DaemonSession, message: TransferBufferedInput): Tran
   return { ...message, turnCallerOpenId: openId } as TransferBufferedInput;
 }
 
+/** Route user/automation input through the transfer fence. Messages accepted
+ * during detach are replayed byte-for-byte to the replacement generation. */
 export function sendWorkerSessionInput(
   ds: DaemonSession,
   message: TransferBufferedInput,
@@ -12033,8 +12032,13 @@ export function promoteQueuedActivationTail(
       ...(exactInput.codexAppSteerable === true ? { codexAppSteerable: true as const } : {}),
       ...(exactInput.trustedCaller ? { trustedCaller: exactInput.trustedCaller } : {}),
       ...(exactInput.trustedController ? { trustedController: exactInput.trustedController } : {}),
-      ...(turnCallerOpenIdFor(ds, head.turnId)
-        ? { turnCallerOpenId: turnCallerOpenIdFor(ds, head.turnId)! }
+      // Take the caller from the FROZEN promote record, not a live replyTargets
+      // lookup: a tail that sat in the queue past the replyTargets eviction
+      // window would find nothing and publish an empty caller, and the wrapper
+      // reads an empty caller as "not the same person" — a legitimate
+      // same-principal continuation would be refused.
+      ...(exactInput.trustedCaller?.requestUserOpenId
+        ? { turnCallerOpenId: exactInput.trustedCaller.requestUserOpenId }
         : {}),
       queuedActivationToken: token,
       ...(vcMeetingImTurnOrigin ? { vcMeetingImTurnOrigin } : {}),

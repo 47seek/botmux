@@ -184,6 +184,7 @@ describe('agent authorization', () => {
     expect(await ready.json()).toEqual({ ok: true, status: 'ready' });
     expect(cliIdentity.refreshSessionIdentity).toHaveBeenCalledWith(expect.any(String), 'auth-session', {
       tool: 'lark-cli', appId: 'cli_test', userAccessToken: 'test-user-token', turnId: 'om_turn',
+      openId: 'ou_sender',
     });
   });
 
@@ -321,6 +322,7 @@ describe.skipIf(process.platform !== 'linux')('agent authorization over a manage
     expect(await ready.json()).toEqual({ ok: true, status: 'ready' });
     expect(cliIdentity.refreshSessionIdentity).toHaveBeenCalledWith(expect.any(String), 'host-session', {
       tool: 'lark-cli', appId: 'cli_test', userAccessToken: 'host-user-token', turnId: 'om_host',
+      openId: 'ou_host',
     });
   });
 });
