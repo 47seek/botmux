@@ -412,6 +412,8 @@ import {
   startOutboxWatcher,
   sandboxEnabled,
   localSandboxApplies,
+  resolveLocalSandboxMode,
+  autoWorktreeFallbackSandboxError,
 } from './adapters/backend/sandbox.js';
 import {
   prepareScratchSandbox,
@@ -424,7 +426,6 @@ import {
   attachMacScratchSession,
 } from './adapters/backend/scratch-sandbox-darwin.js';
 import { enumerateScratchSecretPaths } from './adapters/backend/scratch-credentials.js';
-import { resolveSandboxMode } from './adapters/cli/sandbox-mode.js';
 import { registerScratchView, scratchViewPath, scratchLinuxMappings } from './services/scratch-host-view.js';
 import {
   DEVICE_AUTHORITY_DIRECTORY,
@@ -16226,13 +16227,19 @@ async function spawnCli(
   // 'scratch' (full-root COW, adapters/backend/scratch-sandbox.ts). The env
   // override is the operator's global force switch; legacy readIsolation
   // implies oncall.
-  const sandboxMode = !riffRemoteBackend
-    ? resolveSandboxMode({
-      configSandbox: cfg.sandbox,
-      readIsolation: cfg.readIsolation === true,
-      envValue: process.env.BOTMUX_SANDBOX,
-    })
-    : 'off' as const;
+  //
+  // Shared with the auto-worktree fail-closed gate (services/default-worktree.ts)
+  // via resolveLocalSandboxMode, so "which local sandbox does this spawn get"
+  // is decided by ONE function on both sides and can never drift again.
+  const sandboxMode = resolveLocalSandboxMode({
+    backendType: effectiveBackendType,
+    mojoConfig: effectiveBackendType === 'mojo'
+      ? (riffBackendConfig as EffectiveMojoConfig | undefined)
+      : undefined,
+    configSandbox: cfg.sandbox,
+    readIsolation: cfg.readIsolation === true,
+    envValue: process.env.BOTMUX_SANDBOX,
+  });
   if (riffRemoteBackend && sandboxMode !== 'off') {
     log(`Sandbox flag set (${sandboxMode}) but backend is ${effectiveBackendType} (remote sandbox, no local process) — local sandbox bypassed`);
   }
@@ -16266,6 +16273,15 @@ async function spawnCli(
     codexRpcInput: cfg.codexRpcInput === true,
   })) {
     throw new Error('零注入需要本地 CLI 支持自动获取最终回复；暂不支持远端后端、v3 workflow；Cursor/Antigravity 暂不支持 scratch 全根 COW 沙箱（oncall 沙箱可用），Antigravity 暂不支持 zmx 后端（其静默终态确认依赖视口证据）');
+  }
+  {
+    // The auto-worktree gate's degrade verdict may only be strengthened here.
+    const fallbackError = autoWorktreeFallbackSandboxError({
+      sandboxMode,
+      workingDir: cfg.workingDir,
+      fallbackDir: cfg.autoWorktreeFallbackDir,
+    });
+    if (fallbackError) throw new Error(fallbackError);
   }
   if (cfg.cliLaunchMode === 'forge-traex' && sandboxRequested) {
     throw new Error('Forge x TraeX does not support sandbox/readIsolation yet');
