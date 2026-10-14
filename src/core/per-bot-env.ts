@@ -201,17 +201,6 @@ export function parsePerBotEnvText(text: string): PerBotEnvTextParse {
     if ('error' in logical) return { ok: false, reason: 'invalid_env_line', line: logical.line };
     const { words, line } = logical;
     if (words.length === 0) continue;
-    // dotenv-style `KEY = value` / `KEY =value` (spaces around `=`): one
-    // assignment, exactly one value word — never silently skipped.
-    if (words.length >= 2 && !words[0].quoted && ENV_KEY_RE.test(words[0].text)
-        && !words[1].nameQuoted && words[1].text.startsWith('=')) {
-      // A bare unquoted `=` word takes the next word as the value; `=v` / `=""`
-      // already carries it. Anything beyond that is an error, not a skip.
-      const bareEquals = words[1].text === '=' && !words[1].quoted;
-      if (words.length > (bareEquals ? 3 : 2)) return { ok: false, reason: 'invalid_env_line', line };
-      env[words[0].text] = bareEquals ? (words[2]?.text ?? '') : words[1].text.slice(1);
-      continue;
-    }
     let i = 0;
     let launcher = false;
     let afterEnv = false;
@@ -220,6 +209,13 @@ export function parsePerBotEnvText(text: string): PerBotEnvTextParse {
       if (words[i].text === 'env') afterEnv = true;
       i++;
     }
+    // dotenv-style spacing around `=` (`KEY = v`, `KEY =v`, `KEY= v`, also
+    // after `export`): one assignment with exactly one value word. Checked
+    // after prefix stripping so `export KEY = v` can't fall through to the
+    // "not an assignment" skip; extra words are an error, never a skip.
+    const spaced = launcher ? null : dotenvSpacedAssignment(words.slice(i));
+    if (spaced === 'invalid') return { ok: false, reason: 'invalid_env_line', line };
+    if (spaced) { env[spaced[0]] = spaced[1]; continue; }
     const assignments: Array<[string, string]> = [];
     for (; i < words.length; i++) {
       const m = /^([A-Za-z_][A-Za-z0-9_]*)=/.exec(words[i].text);
@@ -236,6 +232,31 @@ export function parsePerBotEnvText(text: string): PerBotEnvTextParse {
   }
   if (Object.keys(env).length === 0) return { ok: false, reason: 'invalid_env_line', line: ignoredLines[0] };
   return { ok: true, format: 'dotenv', env, ignoredLines };
+}
+
+/**
+ * Recognize a dotenv assignment written with whitespace around `=`:
+ * `KEY = v` / `KEY =v` / `KEY =""` (name word, then a word starting with `=`)
+ * or `KEY= v` (empty `KEY=` followed by a single non-assignment value word).
+ * Returns `null` when the words are not in that shape, `'invalid'` when they
+ * are but carry extra words (likely a missing quote).
+ */
+function dotenvSpacedAssignment(words: ShellWord[]): [string, string] | 'invalid' | null {
+  if (words.length < 2 || words[0].quoted) return null;
+  const head = words[0].text;
+  if (ENV_KEY_RE.test(head) && !words[1].nameQuoted && words[1].text.startsWith('=')) {
+    // A bare unquoted `=` takes the next word as the value; `=v` / `=""` carries it.
+    const bareEquals = words[1].text === '=' && !words[1].quoted;
+    if (words.length > (bareEquals ? 3 : 2)) return 'invalid';
+    return [head, bareEquals ? (words[2]?.text ?? '') : words[1].text.slice(1)];
+  }
+  const m = /^([A-Za-z_][A-Za-z0-9_]*)=$/.exec(head);
+  // `A= B=2` stays two shell assignments (A empty), handled by the caller.
+  if (m && !words[0].nameQuoted && !/^[A-Za-z_][A-Za-z0-9_]*=/.test(words[1].text)) {
+    if (words.length > 2) return 'invalid';
+    return [m[1], words[1].text];
+  }
+  return null;
 }
 
 /** Unquoted leading words allowed before assignments on one logical line. */

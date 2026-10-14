@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { nextPerBotEnv, parsePerBotEnvText } from '../src/core/per-bot-env.js';
+import { createDashboardTranslator } from '../src/dashboard/web/i18n.js';
 
 describe('parsePerBotEnvText', () => {
   it('parses a JSON object and unwraps a Claude settings {"env":{…}} snippet', () => {
@@ -94,6 +95,24 @@ describe('parsePerBotEnvText', () => {
     expect(parsePerBotEnvText('MODEL=x\nTOKEN = a b c')).toEqual({ ok: false, reason: 'invalid_env_line', line: 2 });
     expect(parsePerBotEnvText('TOKEN ="" secret')).toEqual({ ok: false, reason: 'invalid_env_line', line: 1 });
     expect(parsePerBotEnvText('TOKEN =""\nEMPTY =')).toMatchObject({ ok: true, env: { TOKEN: '', EMPTY: '' } });
+  });
+
+  it('applies dotenv spacing compatibility after an export prefix and for `KEY= v`', () => {
+    // Regression: `export A = 1` used to fall through to the "ignored" skip,
+    // so saving `export A = 1\nB=2` stored only B.
+    expect(parsePerBotEnvText('export A = 1\nB=2')).toMatchObject({ ok: true, env: { A: '1', B: '2' }, ignoredLines: [] });
+    expect(parsePerBotEnvText('A= 1\nC= "x y"\nD=')).toMatchObject({ ok: true, env: { A: '1', C: 'x y', D: '' } });
+    expect(parsePerBotEnvText('A= B=2')).toMatchObject({ ok: true, env: { A: '', B: '2' } });
+    expect(parsePerBotEnvText('A= 1 2')).toEqual({ ok: false, reason: 'invalid_env_line', line: 1 });
+    expect(parsePerBotEnvText('export A = 1 2')).toEqual({ ok: false, reason: 'invalid_env_line', line: 1 });
+  });
+
+  it('parses the editor placeholder example in every locale', () => {
+    for (const locale of ['zh', 'en'] as const) {
+      const r = parsePerBotEnvText(createDashboardTranslator(locale)('botDefaults.envPlaceholder'));
+      expect(r, locale).toMatchObject({ ok: true });
+      if (r.ok) expect(Object.keys(r.env), locale).toEqual(['ANTHROPIC_BASE_URL', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_MODEL']);
+    }
   });
 
   it('accepts quoted NAME=value arguments of an env launcher', () => {
