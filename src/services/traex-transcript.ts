@@ -55,6 +55,10 @@ import {
   CODEX_OUTPUT_LIMIT_ERROR_CODE,
   isExactCodexOutputLimitError,
   safeFailureSummary,
+  codexHistorySidIsOwned,
+  readLatestRolloutRuntime,
+  rolloutAbortErrorCode,
+  runtimeFromTurnContext,
 } from './codex-transcript.js';
 import {
   BRIDGE_NOTHING_TO_SEND_SENTINEL,
@@ -62,7 +66,7 @@ import {
 } from './bridge-fallback-gate.js';
 import { isInternalCodexSessionMeta } from './codex-session-meta.js';
 import { openDatabaseSyncNow } from './sqlite-compat.js';
-import { baselineJsonlCursor } from './jsonl-cursor.js';
+import { beginJsonlDrain, iterateJsonlLines } from './jsonl-cursor.js';
 import { traeSessionsRoot, traeStateDbPath } from './traex-paths.js';
 import { listProcessOpenFiles } from '../utils/process-open-files.js';
 
@@ -638,45 +642,12 @@ function eventTimestampMs(value: unknown): number {
   return Number.isFinite(parsed) ? parsed : Date.now();
 }
 
-function abortErrorCode(reason: unknown): string {
-  const normalized = (typeof reason === 'string' ? reason : 'unknown')
-    .toLowerCase()
-    .replace(/[^a-z0-9._-]+/g, '_')
-    .replace(/^_+|_+$/g, '')
-    .slice(0, 64) || 'unknown';
-  return `traex_turn_aborted:${normalized}`;
-}
-
-function runtimeFromTraexEntry(entry: any): TraexRuntimeSnapshot | undefined {
-  if (entry?.type !== 'turn_context') return undefined;
-  const settings = entry?.payload?.collaboration_mode?.settings;
-  const model = entry?.payload?.model ?? settings?.model;
-  const reasoningEffort = entry?.payload?.reasoning_effort
-    ?? entry?.payload?.effort
-    ?? settings?.reasoning_effort;
-  const normalizedModel = typeof model === 'string' && model.trim()
-    ? model.trim()
-    : undefined;
-  const normalizedReasoningEffort = typeof reasoningEffort === 'string' && reasoningEffort.trim()
-    ? reasoningEffort.trim()
-    : undefined;
-  if (!normalizedModel && !normalizedReasoningEffort) return undefined;
-  return {
-    ...(normalizedModel ? { model: normalizedModel } : {}),
-    ...(normalizedReasoningEffort ? { reasoningEffort: normalizedReasoningEffort } : {}),
-  };
-}
-
 function* completeTraexRolloutRecords(
   text: string,
   fromOffset: number,
   sourceSessionId?: string,
 ): Generator<{ entry: any; offset: number; displayIndex?: number }> {
-  let cursor = fromOffset;
-  for (const line of text.split('\n')) {
-    const offset = cursor;
-    cursor += Buffer.byteLength(line, 'utf8') + 1;
-    if (!line) continue;
+  for (const { line, lineStart: offset } of iterateJsonlLines(text, fromOffset)) {
     let entry: any;
     try { entry = JSON.parse(line); } catch { continue; }
     const completions = new Set(traexDisplayCompletions(entry?.payload, sourceSessionId));
@@ -724,21 +695,10 @@ export function drainTraexRollout(
 ): TraexDrainResult {
   const adoptMode = opts?.adoptMode === true;
   const probe = opts?.probe === true;
-  if (!existsSync(path)) return { events: [], newOffset: 0, pendingTail: '' };
-  let size: number;
-  try { size = statSync(path).size; } catch { return { events: [], newOffset: fromOffset, pendingTail: '' }; }
-  let start = fromOffset;
-  if (size < start) start = 0;
-  if (size === start) return { events: [], newOffset: start, pendingTail: '' };
-
-  const buf = Buffer.alloc(size - start);
-  const fd = openSync(path, 'r');
-  try { readSync(fd, buf, 0, buf.length, start); } finally { closeSync(fd); }
-  const text = buf.toString('utf8');
-  const lastNl = text.lastIndexOf('\n');
-  const completeText = lastNl >= 0 ? text.slice(0, lastNl + 1) : '';
-  const pendingTail = lastNl >= 0 ? text.slice(lastNl + 1) : text;
-  const newOffset = start + Buffer.byteLength(completeText, 'utf8');
+  const step = beginJsonlDrain(path, fromOffset);
+  if (step.kind !== 'read') return { events: [], newOffset: step.newOffset, pendingTail: '' };
+  const start = step.start;
+  const { completeText, pendingTail, newOffset } = step.window;
   const sourceSessionId = traexSessionIdFromRolloutPath(path);
 
   const events: CodexBridgeEvent[] = [];
@@ -777,7 +737,7 @@ export function drainTraexRollout(
   for (const { entry: obj, offset: lineStart, displayIndex } of completeTraexRolloutRecords(
     completeText, start, sourceSessionId,
   )) {
-    const runtime = runtimeFromTraexEntry(obj);
+    const runtime = runtimeFromTurnContext(obj);
     latestModel = runtime?.model ?? latestModel;
     latestReasoningEffort = runtime?.reasoningEffort ?? latestReasoningEffort;
     const payload = obj?.payload;
@@ -1037,7 +997,7 @@ export function drainTraexRollout(
         kind: 'assistant_final',
         text: '',
         terminalStatus: 'ambiguous',
-        terminalErrorCode: abortErrorCode(payload.reason),
+        terminalErrorCode: rolloutAbortErrorCode('traex_turn_aborted', payload.reason),
         ...(sourceTurnId ? { sourceTurnId } : {}),
       });
     }
@@ -1065,69 +1025,7 @@ export function drainTraexRollout(
  * trailing partial is excluded via baselineJsonlCursor, so a crash mid-write
  * cannot surface a half-written model — matching drainTraexRollout. */
 export function readLatestTraexRuntime(path: string): TraexRuntimeSnapshot {
-  if (!path || !existsSync(path)) return {};
-  let completeEnd: number;
-  try { completeEnd = baselineJsonlCursor(path).newOffset; } catch { return {}; }
-  if (completeEnd <= 0) return {};
-
-  let latestModel: string | undefined;
-  let latestReasoningEffort: string | undefined;
-  const emit = (): TraexRuntimeSnapshot => ({
-    ...(latestModel ? { model: latestModel } : {}),
-    ...(latestReasoningEffort ? { reasoningEffort: latestReasoningEffort } : {}),
-  });
-  // Backward scan keeps the first (newest) value seen for each field; returns
-  // true once both are known so the scan can stop early.
-  const consider = (line: string): boolean => {
-    if (!line.trim()) return false;
-    let runtime: TraexRuntimeSnapshot | undefined;
-    try { runtime = runtimeFromTraexEntry(JSON.parse(line)); } catch { return false; }
-    if (latestModel === undefined && runtime?.model) latestModel = runtime.model;
-    if (latestReasoningEffort === undefined && runtime?.reasoningEffort) {
-      latestReasoningEffort = runtime.reasoningEffort;
-    }
-    return latestModel !== undefined && latestReasoningEffort !== undefined;
-  };
-
-  const floor = Math.max(0, completeEnd - TRAEX_RUNTIME_SCAN_MAX_BYTES);
-  const chunkBytes = 64 * 1024;
-  let fd: number | undefined;
-  try {
-    fd = openSync(path, 'r');
-    let end = completeEnd;
-    let carry = Buffer.alloc(0);
-    while (end > floor) {
-      const start = Math.max(floor, end - chunkBytes);
-      const chunk = Buffer.alloc(end - start);
-      readSync(fd, chunk, 0, chunk.length, start);
-      const block = carry.length > 0 ? Buffer.concat([chunk, carry]) : chunk;
-      let lineEnd = block.length;
-      if (lineEnd > 0 && block[lineEnd - 1] === 0x0a) lineEnd--;
-      let carryEnd = lineEnd;
-      for (let i = lineEnd - 1; i >= 0; i--) {
-        if (block[i] !== 0x0a) continue;
-        const line = block.subarray(i + 1, lineEnd).toString('utf8');
-        lineEnd = i;
-        carryEnd = i;
-        if (consider(line)) return emit();
-      }
-      // Carry the partial leading fragment back to the previous chunk. The one
-      // exception is the byte-cap floor (floor > 0 && start === floor): there
-      // the leading fragment is a truncated historical partial and is dropped.
-      // At true file start (start === 0) the fragment is the complete first
-      // record and must be considered.
-      carry = start === floor && floor > 0
-        ? Buffer.alloc(0)
-        : block.subarray(0, carryEnd);
-      end = start;
-    }
-    if (carry.length > 0) consider(carry.toString('utf8'));
-  } catch {
-    return emit();
-  } finally {
-    if (fd !== undefined) closeSync(fd);
-  }
-  return emit();
+  return readLatestRolloutRuntime(path, TRAEX_RUNTIME_SCAN_MAX_BYTES);
 }
 
 function normaliseInputText(text: string): string {
@@ -1394,15 +1292,16 @@ export function findTraexRolloutSetByPid(pid: number): Set<string> | undefined {
  *  FAIL CLOSED — a missing set or a non-member id returns false so the caller
  *  never binds the bridge (or persists a resume id) it can't prove the pid owns.
  *  Extracted so the exact predicate the worker's persist/attach gates use is
- *  unit-testable without a live pid. Mirrors codexHistorySidIsOwned. */
+ *  unit-testable without a live pid. Byte-for-byte the same predicate as
+ *  codexHistorySidIsOwned, so it delegates. A call-time wrapper rather than a
+ *  `const` alias: reading the import at module load makes this module fail to
+ *  load under any partial mock of codex-transcript. */
 export function traexHistorySidIsOwned(
   cliSessionId: string,
   ownedRollouts: Set<string> | undefined,
 ): boolean {
-  if (!ownedRollouts) return false;
-  return ownedRollouts.has(cliSessionId.toLowerCase());
+  return codexHistorySidIsOwned(cliSessionId, ownedRollouts);
 }
-
 
 function readTraexDirectory(path: string): Dirent[] {
   try {
