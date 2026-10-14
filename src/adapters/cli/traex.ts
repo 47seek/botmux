@@ -15,6 +15,7 @@ import {
 } from '../../services/traex-transcript.js';
 import { discoverRolloutSessions } from '../../services/resumable-session-discovery.js';
 import { delay } from '../../utils/timing.js';
+import { traexViewportFooterBusy } from './traex-footer.js';
 
 /**
  * TRAE CLI (a.k.a. traex / traecli) adapter.
@@ -134,7 +135,7 @@ export const TRAE_MIGRATION_DONE_MARKERS = [
  */
 const TRAEX_SPINNER_FRAMES = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏';
 
-const TRAEX_SPINNER_LABELS = [
+export const TRAEX_SPINNER_LABELS = [
   // Set 1 — thinking/working rotation (compiled-in spinner string table).
   'Thinking longer…',
   'Deep in thought…',
@@ -413,6 +414,19 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
     // required.
     busyPattern: TRAEX_ACTIVE_BUSY_PATTERN,
     idleToBusyPattern: TRAEX_ACTIVE_BUSY_PATTERN,
+    // TraeX 0.209's glyph status row is recognisable only by its position
+    // above the composer, which needs the WHOLE viewport (busyPattern sees a
+    // tail region). The worker consults this before busyPattern in both the
+    // prompt-ready veto and the idle probe, and supplies the getter only for
+    // an authoritative screen. See traex-footer.ts.
+    isSessionBusy({ getCurrentScreen }) {
+      try {
+        const screen = getCurrentScreen?.();
+        return !!screen && traexViewportFooterBusy(screen);
+      } catch {
+        return false;
+      }
+    },
     // Pre-idle latch for the static capacity-queue screen — holds the session
     // busy before the first idle on backends (ZMX) where the busyPattern
     // viewport probe is forbidden from mutating state. See the
