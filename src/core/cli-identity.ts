@@ -105,6 +105,20 @@ export function sessionActiveTurnIdentityPath(sessionDataDir: string, sessionId:
 }
 
 /**
+ * Shell-readable companion to {@link sessionActiveTurnPath}: one line holding
+ * the open id of the human whose turn the worker is executing.
+ *
+ * The identity wrapper compares it against the credential file's stamped
+ * principal: turns rotate while the same person keeps talking, and a turn
+ * mismatch between two of the SAME person's credentials must not deny the
+ * tail of their previous turn. Plain text for the same no-jq reason as
+ * {@link sessionActiveTurnPath}.
+ */
+export function sessionActiveTurnCallerPath(sessionDataDir: string, sessionId: string): string {
+  return join(sessionIdentityDataDir(sessionDataDir, sessionId), 'turn.caller');
+}
+
+/**
  * Publish the turn now executing. Called by the worker at the point it hands a
  * queued input to the CLI, which is later than the daemon's acceptance of that
  * message and possibly much later.
@@ -117,11 +131,15 @@ export function publishActiveTurn(
   sessionId: string,
   turnId: string | undefined,
   dispatchAttempt?: number,
+  callerOpenId?: string,
 ): void {
-  const path = sessionActiveTurnPath(sessionDataDir, sessionId);
+  const dir = sessionIdentityDataDir(sessionDataDir, sessionId);
   try {
-    mkdirSync(sessionIdentityDataDir(sessionDataDir, sessionId), { recursive: true, mode: 0o700 });
-    atomicWriteFileSync(path, `${turnId ?? ''}\n`, { mode: 0o600 });
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    atomicWriteFileSync(sessionActiveTurnPath(sessionDataDir, sessionId), `${turnId ?? ''}\n`, { mode: 0o600 });
+    // Empty on an unknown/absent principal: the wrapper only relaxes a turn
+    // mismatch when BOTH sides name the same person, so an empty line denies.
+    atomicWriteFileSync(sessionActiveTurnCallerPath(sessionDataDir, sessionId), `${callerOpenId ?? ''}\n`, { mode: 0o600 });
   } catch { /* best-effort: a stale/absent turn file refuses, never misattributes */ }
   try {
     atomicWriteFileSync(
@@ -129,6 +147,7 @@ export function publishActiveTurn(
       `${JSON.stringify({
         turnId: turnId ?? null,
         dispatchAttempt: dispatchAttempt ?? null,
+        ...(callerOpenId ? { callerOpenId } : {}),
       })}\n`,
       { mode: 0o600 },
     );
@@ -177,6 +196,10 @@ export interface LarkCliIdentity extends TurnBound {
   tool: 'lark-cli';
   appId: string;
   userAccessToken: string;
+  /** Open id this token acts for. Lets the wrapper keep a turn-mismatched but
+   *  same-principal credential usable — a person's own follow-up turn must not
+   *  be denied while their previous turn is still draining. */
+  openId?: string;
 }
 
 /**
@@ -193,6 +216,8 @@ export interface LarkCliHomeIdentity extends TurnBound {
   mode: 'user-home';
   /** Absolute per-person HOME the child lark-cli sees. */
   home: string;
+  /** See {@link LarkCliIdentity.openId}. */
+  openId?: string;
 }
 
 export interface BytedCliIdentity extends TurnBound {
@@ -200,6 +225,8 @@ export interface BytedCliIdentity extends TurnBound {
   cloudJwt: string;
   /** Optional: only present once a Codebase JWT has been minted for this person. */
   codeJwt?: string;
+  /** See {@link LarkCliIdentity.openId}. */
+  openId?: string;
 }
 
 /**
@@ -248,6 +275,9 @@ const DENY_MSG_VAR = 'BOTMUX_IDENTITY_DENY_MSG';
 /** The turn these credentials belong to; compared against the worker's live
  *  turn file before they may be used. */
 const TURN_VAR = 'BOTMUX_IDENTITY_TURN';
+/** Open id these credentials act for. Compared with the worker's live-turn
+ *  caller when the turn ids disagree: equal principals keep the credential. */
+const OPEN_ID_VAR = 'BOTMUX_IDENTITY_OPEN_ID';
 /** Per-person HOME for the device-code lark-cli identity. Scoped to the child
  *  exec only — the wrapper sets it inline, never inheriting a parent value. */
 const HOME_VAR = 'BOTMUX_IDENTITY_HOME';
@@ -295,6 +325,7 @@ export function renderIdentityEnv(identity: CliIdentity): string {
     if (identity.codeJwt) pairs.push(['BYTEDCLI_USER_CODE_JWT', identity.codeJwt]);
   }
   if (identity.turnId) pairs.push([TURN_VAR, identity.turnId]);
+  if ('openId' in identity && identity.openId) pairs.push([OPEN_ID_VAR, identity.openId]);
   const header = '# botmux trigger-user identity — rewritten each turn, do not edit\n';
   return header + pairs.map(([k, v]) => `${k}=${quoteFor(k, v)}`).join('\n') + '\n';
 }
@@ -447,21 +478,35 @@ export function renderIdentityWrapper(tool: TriggerUserAuthTool, realBinaryPath:
     // replaced by a newer message's credentials while this turn is still
     // running, so these are somebody else's.
     '__botmux_live=',
+    '__botmux_live_caller=',
     'if [ -n "$SESSION_DATA_DIR" ] && [ -n "$BOTMUX_SESSION_ID" ]; then',
-    '  __botmux_turnf="$SESSION_DATA_DIR/cli-identity/$BOTMUX_SESSION_ID.bin/.data/turn"',
-    '  if [ -f "$__botmux_turnf" ]; then',
-    '    read -r __botmux_live < "$__botmux_turnf" || __botmux_live=',
+    '  __botmux_d="$SESSION_DATA_DIR/cli-identity/$BOTMUX_SESSION_ID.bin/.data"',
+    '  if [ -f "$__botmux_d/turn" ]; then',
+    '    read -r __botmux_live < "$__botmux_d/turn" || __botmux_live=',
     '  fi',
-    '  unset __botmux_turnf',
+    '  if [ -f "$__botmux_d/turn.caller" ]; then',
+    '    read -r __botmux_live_caller < "$__botmux_d/turn.caller" || __botmux_live_caller=',
+    '  fi',
+    '  unset __botmux_d',
     'fi',
     // Only enforced when both sides state a turn. An identity published without
     // one predates turn binding; a session with no live turn file has nothing to
     // contradict. Neither is evidence of a mismatch, so neither refuses here.
     `if [ -n "$${TURN_VAR}" ] && [ -n "$__botmux_live" ] \\`,
     `   && [ "$${TURN_VAR}" != "$__botmux_live" ]; then`,
+    `  __botmux_published_mode=$${MODE_VAR}`,
     `  ${MODE_VAR}=turn-mismatch`,
+    // Same human across consecutive turns (their follow-up was accepted while
+    // the previous turn is still draining): the credential acts for exactly the
+    // person the worker is now executing, so keep it. Only a NAMED match on both
+    // sides relaxes; anything missing stays a refusal. Restore the published
+    // mode (user/user-home/bot) so the case dispatch below runs normally.
+    `  if [ -n "$${OPEN_ID_VAR}" ] && [ -n "$__botmux_live_caller" ] \\`,
+    `     && [ "$${OPEN_ID_VAR}" = "$__botmux_live_caller" ]; then`,
+    `    ${MODE_VAR}=$__botmux_published_mode`,
+    '  fi',
     'fi',
-    'unset __botmux_live',
+    'unset __botmux_live __botmux_live_caller __botmux_published_mode',
     '',
     `case "$${MODE_VAR}" in`,
     '  user|bot)',
@@ -477,7 +522,7 @@ export function renderIdentityWrapper(tool: TriggerUserAuthTool, realBinaryPath:
     `      printf '%s\\n' 'botmux: ${tool} 的按人身份目录缺失，命令未执行。请重新发送 /login 完成授权后重试。' >&2`,
     `      exit ${IDENTITY_DENIED_EXIT_CODE}`,
     '    fi',
-    `    unset ${MODE_VAR} ${DENY_MSG_VAR} ${TURN_VAR}`,
+    `    unset ${MODE_VAR} ${DENY_MSG_VAR} ${TURN_VAR} ${OPEN_ID_VAR}`,
     `    HOME="$${HOME_VAR}" exec ${shellSingleQuote(realBinaryPath)} "$@"`,
     '    ;;',
     '  turn-mismatch)',
@@ -496,7 +541,7 @@ export function renderIdentityWrapper(tool: TriggerUserAuthTool, realBinaryPath:
     `    exit ${IDENTITY_DENIED_EXIT_CODE}`,
     '    ;;',
     'esac',
-    `unset ${MODE_VAR} ${DENY_MSG_VAR} ${TURN_VAR} ${HOME_VAR}`,
+    `unset ${MODE_VAR} ${DENY_MSG_VAR} ${TURN_VAR} ${OPEN_ID_VAR} ${HOME_VAR}`,
     `exec ${shellSingleQuote(realBinaryPath)} "$@"`,
     '',
   ].join('\n');
@@ -528,6 +573,7 @@ export function ensureSessionIdentityPlaceholders(
     // Same existence-filter reason: the wrapper reads the active turn on every
     // invocation, and a path missing at spawn stays unreadable afterwards.
     sessionActiveTurnPath(sessionDataDir, sessionId),
+    sessionActiveTurnCallerPath(sessionDataDir, sessionId),
   ];
   for (const path of paths) {
     if (existsSync(path)) continue;

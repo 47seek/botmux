@@ -550,6 +550,74 @@ describe('renderIdentityWrapper', () => {
     expect(runWrapper(wrapperPath, { SESSION_DATA_DIR: dir, BOTMUX_SESSION_ID: SESSION })).toBe('a|tok-bob|');
   });
 
+  // The user-reported false positive: the SAME human keeps talking — their
+  // follow-up opens turn-B while turn-A's tail command is still draining.
+  // Denying that tail serves nobody (no second principal is protected) and made
+  // every self-continuation look like a permission failure. Equal open ids on
+  // both sides keep the credential usable.
+  it('keeps the credential when turn ids differ but both name the same human', () => {
+    const wrapperPath = join(dir, 'lark-cli');
+    writeFileSync(wrapperPath, renderIdentityWrapper('lark-cli', stubTool()));
+    writeSessionIdentity(dir, SESSION, {
+      tool: 'lark-cli', appId: 'a', userAccessToken: 'tok-alice', turnId: 'turn-A', openId: 'ou-alice',
+    });
+    publishActiveTurn(dir, SESSION, 'turn-B', undefined, 'ou-alice');
+
+    expect(runWrapper(wrapperPath, { SESSION_DATA_DIR: dir, BOTMUX_SESSION_ID: SESSION })).toBe('a|tok-alice|');
+  });
+
+  // user-home (device-code HOME) identity carries the same principal stamp.
+  it('keeps a user-home credential across two of the same person’s turns', () => {
+    const personHome = join(dir, 'ph-same');
+    mkdirSync(personHome, { recursive: true });
+    const homeTool = join(dir, 'real-home-same.sh');
+    writeFileSync(homeTool, '#!/bin/sh\nprintf "%s" "$HOME"\n');
+    chmodSync(homeTool, 0o755);
+    const wrapperPath = join(dir, 'lark-cli-home-same');
+    writeFileSync(wrapperPath, renderIdentityWrapper('lark-cli', homeTool));
+    writeSessionIdentity(dir, SESSION, {
+      tool: 'lark-cli', mode: 'user-home', home: personHome, turnId: 'turn-A', openId: 'ou-alice',
+    });
+    publishActiveTurn(dir, SESSION, 'turn-B', undefined, 'ou-alice');
+
+    expect(runWrapper(wrapperPath, {
+      SESSION_DATA_DIR: dir, BOTMUX_SESSION_ID: SESSION, HOME: '/the/machine/home',
+    })).toBe(personHome);
+  });
+
+  // The cross-principal guard is the entire reason turn binding exists: it must
+  // stay a hard refusal whenever the live turn belongs to a DIFFERENT human.
+  it('still refuses when the live turn belongs to a different human', () => {
+    const wrapperPath = join(dir, 'lark-cli');
+    writeFileSync(wrapperPath, renderIdentityWrapper('lark-cli', stubTool()));
+    writeSessionIdentity(dir, SESSION, {
+      tool: 'lark-cli', appId: 'a', userAccessToken: 'tok-alice', turnId: 'turn-A', openId: 'ou-alice',
+    });
+    publishActiveTurn(dir, SESSION, 'turn-B', undefined, 'ou-bob');
+
+    const { status } = runDenied(wrapperPath, { SESSION_DATA_DIR: dir, BOTMUX_SESSION_ID: SESSION });
+    expect(status).toBe(IDENTITY_DENIED_EXIT_CODE);
+  });
+
+  // Fail closed: a relaxation requires a NAMED equal principal on BOTH sides.
+  // A credential stamped before open-id binding existed, or a live turn whose
+  // caller is unknown (empty caller file), must never silently pass.
+  it.each([
+    ['credential carries no open id', undefined, 'ou-alice'],
+    ['live turn names no caller', 'ou-alice', undefined],
+  ])('refuses same-turn-ids-differ when %s', (_label, credentialOpenId, liveCaller) => {
+    const wrapperPath = join(dir, 'lark-cli');
+    writeFileSync(wrapperPath, renderIdentityWrapper('lark-cli', stubTool()));
+    writeSessionIdentity(dir, SESSION, {
+      tool: 'lark-cli', appId: 'a', userAccessToken: 'tok-alice', turnId: 'turn-A',
+      ...(credentialOpenId ? { openId: credentialOpenId } : {}),
+    });
+    publishActiveTurn(dir, SESSION, 'turn-B', undefined, liveCaller);
+
+    const { status } = runDenied(wrapperPath, { SESSION_DATA_DIR: dir, BOTMUX_SESSION_ID: SESSION });
+    expect(status).toBe(IDENTITY_DENIED_EXIT_CODE);
+  });
+
   // Only a real disagreement refuses. An identity with no turn predates the
   // binding, and a session with no live turn file states nothing to contradict;
   // treating either as a mismatch would refuse every command in those paths.

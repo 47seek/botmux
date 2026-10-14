@@ -450,9 +450,11 @@ describe('V3 setCaptureIdentity (single identity writer)', () => {
       expect(at, name).toBeGreaterThanOrEqual(0);
       return source.slice(at, source.indexOf('\n}\n', at));
     };
-    expect(bodyOf('deliverRawInput')).toContain('setCaptureIdentity(msg.turnId, undefined)');
-    expect(bodyOf('writeAdoptMessage')).toContain('setCaptureIdentity(turnId, dispatchAttempt)');
-    expect(bodyOf('flushPending')).toContain('setCaptureIdentity(item.turnId, item.dispatchAttempt)');
+    expect(bodyOf('deliverRawInput')).toContain('setCaptureIdentity(msg.turnId, undefined, msg.turnCallerOpenId)');
+    expect(bodyOf('writeAdoptMessage')).toContain('setCaptureIdentity(turnId, dispatchAttempt, trustedCaller?.requestUserOpenId)');
+    const flushBody = bodyOf('flushPending');
+    expect(flushBody).toContain('setCaptureIdentity(');
+    expect(flushBody).toContain('item.turnCallerOpenId ?? item.trustedCaller?.requestUserOpenId');
     for (const name of ['adoptInitialActiveTurn', 'adoptDisplacedActiveTurn', 'writeCliPidMarker', 'syncQueuedTurnsFromMarkerDisk', 'advanceQueuedTypeAheadTurn']) {
       const at = source.indexOf(`function ${name}(`);
       expect(at, name).toBeGreaterThanOrEqual(0);
