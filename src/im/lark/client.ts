@@ -2251,6 +2251,11 @@ interface MessagePageScan {
   /** `Failed to <errorAction>: …` text of the thrown {@link LarkApiError}. Differs
    *  per public entry point and is kept verbatim for log/regex compatibility. */
   errorAction: string;
+  /** Per-request HTTP timeout, forwarded to every page request; unset keeps the SDK default. */
+  timeoutMs?: number;
+  /** Cancellation signal: forwarded to every page request and checked before the
+   *  next page is fetched, so an aborted scan stops paging immediately. */
+  signal?: AbortSignal;
 }
 
 /**
@@ -2268,6 +2273,7 @@ interface MessagePageScan {
 async function* iterateMessagePages(c: any, scan: MessagePageScan): AsyncGenerator<any[], void, void> {
   let pageToken: string | undefined;
   do {
+    scan.signal?.throwIfAborted();
     const res = await larkGet(c, '/open-apis/im/v1/messages', {
       container_id_type: scan.containerType,
       container_id: scan.containerId,
@@ -2275,7 +2281,8 @@ async function* iterateMessagePages(c: any, scan: MessagePageScan): AsyncGenerat
       sort_type: 'ByCreateTimeDesc',
       with_sender_name: 'true',
       ...(pageToken ? { page_token: pageToken } : {}),
-    });
+    }, { timeoutMs: scan.timeoutMs, signal: scan.signal });
+    scan.signal?.throwIfAborted();
 
     if (res.code !== 0) {
       throw larkApiError(scan.errorAction, res);
@@ -2341,6 +2348,10 @@ export async function listChatMessages(
 export interface ChatMessageScanOptions {
   /** Lark page size per request. Clamped to the API max of 50. */
   pageSize?: number;
+  /** 每页请求的 HTTP 超时（透传给 Axios）；不设置时保持 SDK 默认行为。 */
+  timeoutMs?: number;
+  /** 取消信号：透传给每页请求，且在翻页前检查——被取消后不再发起下一页。 */
+  signal?: AbortSignal;
   /**
    * Called while scanning newest -> oldest. Returning true stops after the
    * current message has been included in the returned chronological list.
@@ -2362,6 +2373,8 @@ export async function listChatMessagesUntil(
 
   for await (const items of iterateMessagePages(c, {
     containerType: 'chat', containerId: chatId, pageSize, errorAction: 'list chat messages',
+    timeoutMs: options.timeoutMs,
+    signal: options.signal,
   })) {
     for (const item of items) {
       allMessages.push(item);
