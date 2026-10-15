@@ -10077,8 +10077,12 @@ export function sendWorkerSessionInput(
   ds: DaemonSession,
   message: TransferBufferedInput,
 ): boolean {
-  if (sessionCliId(ds, getBot(ds.larkAppId).config) === 'codex'
-    && message.type === 'term_action' && (message.key === 'ctrlc' || message.key === 'esc')) {
+  // Evaluate the cheap message-shape guards FIRST: getBot() THROWS for an
+  // unregistered app (IPC tests / in-flight teardown), and every other input
+  // type (inject_command, set_display_mode, …) must reach worker.send without
+  // this registry lookup at all. Only a Codex Ctrl+C/ESC needs the cancel.
+  if (message.type === 'term_action' && (message.key === 'ctrlc' || message.key === 'esc')
+    && sessionCliId(ds, getBot(ds.larkAppId).config) === 'codex') {
     cancelOrdinaryRecoveryForUserInput(ds.session, ds.session.ordinaryTurnRecovery?.currentTurnId ?? 'stop');
   }
   const annotated = withTurnCaller(ds, message);
