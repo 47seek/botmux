@@ -21140,6 +21140,7 @@ function cloneIndependentLaunchPosture(source: Session, child: Session): void {
     ? { ...source.cliRuntime, update: { ...source.cliRuntime.update } }
     : undefined;
   child.cliPathOverride = source.cliPathOverride;
+  child.cliConfigDir = source.cliConfigDir;
   child.wrapperCli = source.wrapperCli;
   child.cliLaunchMode = source.cliLaunchMode;
   child.agentFrozen = source.agentFrozen;
@@ -28659,7 +28660,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // 关键：adopt 路径会跳过 ensureCliSkills，若重启后第一次就是 adopt 一个外部
   // claude 会话，必须保证此时全局 ~/.claude/settings.json 已带 hook——否则"全局
   // hook 适配 adopt"不成立。这里幂等、best-effort，不阻塞启动。
-  try { ensureCliEnv(cfg.cliId, cfg.cliPathOverride); }
+  try { ensureCliEnv(cfg.cliId, cfg.cliPathOverride, { configDir: cfg.cliConfigDir }); }
   catch (err) { logger.warn(`[hook] startup ensureCliEnv failed for ${cfg.cliId}: ${err instanceof Error ? err.message : String(err)}`); }
   sessionStore.init(cfg.larkAppId, {
     groupDefaultModels: chatId => getBot(cfg.larkAppId).config.groupDefaultModels?.[chatId],
