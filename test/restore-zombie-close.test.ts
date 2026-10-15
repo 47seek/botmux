@@ -339,6 +339,23 @@ function makeActivePersistentSession(rootMessageId: string, backendType: 'tmux' 
   return s; // left active
 }
 
+describe('restoreActiveSessions — recovery persistence isolation', () => {
+  it.each(['ordinary', 'readonly'] as const)('isolates a %s recovery attach failure and restores later sessions', async kind => {
+    const broken = makeActivePersistentSession('om_recovery_broken');
+    const healthy = makeActivePersistentSession('om_recovery_healthy');
+    const map = new Map<string, DaemonSession>();
+    wp.registry = map;
+    const attach = kind === 'ordinary' ? ensureOrdinaryTurnRecoveryAttached : ensureReadonlyTaskContinuationAttached;
+    vi.mocked(attach).mockImplementationOnce(() => { throw new Error('disk full during recovery attach'); });
+    await expect(restoreActiveSessions(map)).resolves.toBeUndefined();
+    expect(map.get(sessionKey('om_recovery_healthy', 'app_test'))?.session.sessionId).toBe(healthy.sessionId);
+    expect(sessionStore.getSession(broken.sessionId)?.status).toBe('active');
+    expect(ensureOrdinaryTurnRecoveryAttached).toHaveBeenCalledWith(expect.objectContaining({ session: expect.objectContaining({ sessionId: healthy.sessionId }) }));
+    expect(ensureReadonlyTaskContinuationAttached).toHaveBeenCalledWith(expect.objectContaining({ session: expect.objectContaining({ sessionId: healthy.sessionId }) }));
+    expect(logger.error).toHaveBeenCalledWith(expect.stringContaining('disk full during recovery attach'));
+  });
+});
+
 describe('restoreActiveSessions — workspace retirement', () => {
   it.each(['tmux', 'zmx'] as const)('skips and explains a corrupt active retired %s row before registration or spawn', async backend => {
     const session = makeActivePersistentSession('retired-root', backend);

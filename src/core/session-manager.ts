@@ -3226,11 +3226,19 @@ export async function restoreActiveSessions(
   // not wake while a later row is still competing for the same route.
   for (const ds of restoredByThisInvocation) {
     if (!stillOwnsRestoreRegistration(ds)) continue;
-    ensureOrdinaryTurnRecoveryAttached(ds);
-    const restoredLeaseId = interruptedReadonlyContinuationLeaseIds.get(ds.session.sessionId);
-    if (!restoredLeaseId
-      || !markReadonlyTaskContinuationInterruptedByRestart(ds, restoredLeaseId)) {
-      ensureReadonlyTaskContinuationAttached(ds);
+    try {
+      ensureOrdinaryTurnRecoveryAttached(ds);
+      const restoredLeaseId = interruptedReadonlyContinuationLeaseIds.get(ds.session.sessionId);
+      if (!restoredLeaseId
+        || !markReadonlyTaskContinuationInterruptedByRestart(ds, restoredLeaseId)) {
+        ensureReadonlyTaskContinuationAttached(ds);
+      }
+    } catch (err) {
+      logger.error(
+        `[${ds.session.sessionId.substring(0, 8)}] Isolated recovery re-arm failure; `
+        + `durable row retained and daemon startup continuing: `
+        + `${err instanceof Error ? err.message : String(err)}`,
+      );
     }
   }
 

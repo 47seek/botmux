@@ -38,7 +38,7 @@ import { createWorkerStderrRing, WORKER_ERROR_MARKER, type WorkerStderrRing } fr
 import * as sessionStore from '../services/session-store.js';
 import * as asyncTriggerStore from '../services/async-trigger-store.js';
 import { recordTurnInputCommit } from '../services/idempotency-store.js';
-import { drainCodexRollout, findCodexRolloutBySessionId } from '../services/codex-transcript.js';
+import { CODEX_CAPACITY_ERROR_CODE, drainCodexRollout, findCodexRolloutBySessionId } from '../services/codex-transcript.js';
 import {
   markMessageListenerRunPreviewFailed,
   markMessageListenerRunPreviewReplied,
@@ -1750,7 +1750,8 @@ function ordinaryTurnRecoveryEligible(
   ds: DaemonSession,
   botCfg = getBot(ds.larkAppId).config,
 ): boolean {
-  return sessionCliId(ds, botCfg) === 'claude-code'
+  const cliId = sessionCliId(ds, botCfg);
+  return (cliId === 'claude-code' || (cliId === 'codex' && botCfg.codexCapacityRecovery === true && !ds.adoptedFrom && !ds.session.adoptedFrom))
     && ds.session.status === 'active'
     && !isSharedAdoptSession(ds)
     && !ds.session.vcMeetingReceiver
@@ -1789,20 +1790,34 @@ function ordinaryTurnRecoveryStillOwnsSession(ds: DaemonSession): boolean {
 function ordinaryTurnRecoveryWarning(
   state: NonNullable<Session['ordinaryTurnRecovery']>,
   locale: ReturnType<typeof localeForBot>,
+  cliName = 'Claude',
+  cliId: CliId = 'claude-code',
 ): string {
+  if (cliId === 'codex' && state.status === 'exhausted') {
+    return tr('worker.codex_capacity_recovery_stopped', { cliName }, locale);
+  }
   if (state.status === 'exhausted' && state.continuationsStarted >= 2) {
-    return tr('worker.ordinary_recovery_exhausted', undefined, locale);
+    return tr('worker.ordinary_recovery_exhausted', { cliName }, locale);
+  }
+  if (state.lastErrorCode === 'recovery_disabled') {
+    return tr('worker.ordinary_recovery_disabled', { cliName }, locale);
   }
   if (state.lastErrorCode === 'recovery_enqueue_failed') {
-    return tr('worker.ordinary_recovery_enqueue_failed', undefined, locale);
+    return tr('worker.ordinary_recovery_enqueue_failed', { cliName }, locale);
   }
   if (state.lastErrorCode === 'recovery_delivery_failed') {
-    return tr('worker.ordinary_recovery_delivery_failed', undefined, locale);
+    return tr('worker.ordinary_recovery_delivery_failed', { cliName }, locale);
   }
   if (state.lastErrorCode === 'recovery_dispatch_interrupted') {
-    return tr('worker.ordinary_recovery_dispatch_interrupted', undefined, locale);
+    return tr('worker.ordinary_recovery_dispatch_interrupted', { cliName }, locale);
   }
-  return tr('worker.ordinary_recovery_non_retryable', undefined, locale);
+  if (state.lastErrorCode === 'recovery_restart_unverified') {
+    return tr('worker.ordinary_recovery_restart_unverified', { cliName }, locale);
+  }
+  if (state.lastErrorCode === 'recovery_persist_failed') {
+    return tr('worker.ordinary_recovery_persist_failed', { cliName }, locale);
+  }
+  return tr('worker.ordinary_recovery_non_retryable', { cliName }, locale);
 }
 
 /** 构造一张通用失败卡。两条通知路径（recovery warn / claude 终态兜底）共用它，
@@ -1853,6 +1868,77 @@ function buildSessionTurnFailedCard(
   });
 }
 
+function notifyOrdinaryTurnRecoveryFailure(
+  ds: DaemonSession,
+  state: NonNullable<Session['ordinaryTurnRecovery']>,
+  botCfg = getBot(ds.larkAppId).config,
+): void {
+  const warning = ordinaryTurnRecoveryWarning(state, localeForBot(ds.larkAppId), sessionCliDisplayName(ds, botCfg), sessionCliId(ds, botCfg));
+  ds.agentAttention = {
+    kind: 'blocked',
+    reason: warning,
+    at: state.alertSentAt ?? Date.now(),
+  };
+  publishAttentionPatch(ds);
+  emitSessionLifecycleHook(ds, 'session.requires_attention', {
+    reason: 'ordinary_turn_recovery_exhausted',
+    errorCode: state.lastErrorCode,
+    logicalTurnId: state.logicalTurnId,
+  });
+  void requireCallbacks().sessionReply(
+    sessionAnchorId(ds),
+    buildSessionTurnFailedCard(ds, {
+      status: 'failed',
+      reason: warning,
+      ...(state.lastErrorCode !== undefined ? { errorCode: state.lastErrorCode } : {}),
+      // Include attempted continuations for both exhausted and opted-out
+      // recovery, so the user can see how far automatic handling got.
+      continuations: state.continuationsStarted,
+      // A recovery failure or opt-out does not prove that no side effects
+      // ran. Leave retry safety to the shared error-code policy.
+    }),
+    'interactive',
+    ds.larkAppId,
+    state.logicalTurnId,
+  ).catch(err => logger.error(
+    `[${tag(ds)}] Failed to deliver ordinary-turn recovery warning: `
+    + `${err instanceof Error ? err.message : String(err)}`,
+  ));
+}
+
+/** Opting out settles a pending failure before removing its runtime owner.
+ * The persisted notice receipt also owns any later capacity diagnostic. */
+function disposeIneligibleOrdinaryTurnRecovery(
+  ds: DaemonSession,
+  botCfg = getBot(ds.larkAppId).config,
+  failedCapacityTurnId?: string,
+): void {
+  try {
+    const current = ds.session.ordinaryTurnRecovery;
+    if (sessionCliId(ds, botCfg) === 'codex' && botCfg.codexCapacityRecovery !== true
+      && ordinaryTurnRecoveryEligible(ds, { ...botCfg, codexCapacityRecovery: true })
+      && ordinaryTurnRecoveryStillOwnsSession(ds)
+      && current && (['backoff', 'dispatching'].includes(current.status)
+        || (current.status === 'running' && current.currentTurnId === failedCapacityTurnId))) {
+      cancelOrdinaryRecoveryForUserInput(ds.session, 'recovery_disabled');
+      const cancelled = {
+        ...current, status: 'cancelled' as const, nextAttemptAt: undefined,
+        cancelledByTurnId: 'recovery_disabled', lastErrorCode: 'recovery_disabled',
+        alertSentAt: current.alertSentAt ?? Date.now(), warningDispatched: true,
+      };
+      // Keep the cancellation/notice fence in memory even if disk is full.
+      ds.session.ordinaryTurnRecovery = cancelled;
+      try { sessionStore.updateSession(ds.session); }
+      catch (error) {
+        logger.error(`[${tag(ds)}] Could not persist disabled capacity recovery: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      if (!current.warningDispatched) notifyOrdinaryTurnRecoveryFailure(ds, cancelled, botCfg);
+    }
+  } finally {
+    disposeOrdinaryTurnRecovery(ds.session);
+  }
+}
+
 /** Attach the crash-safe timer owner for one eligible ordinary Claude/Lark
  * session. Session state is persisted; this runtime registry only owns timers. */
 export function ensureOrdinaryTurnRecoveryAttached(
@@ -1860,7 +1946,7 @@ export function ensureOrdinaryTurnRecoveryAttached(
   botCfg = getBot(ds.larkAppId).config,
 ): boolean {
   if (!ordinaryTurnRecoveryEligible(ds, botCfg)) {
-    disposeOrdinaryTurnRecovery(ds.session);
+    disposeIneligibleOrdinaryTurnRecovery(ds, botCfg);
     return false;
   }
   // Re-arm the runtime silent registry from the persisted recovery state BEFORE
@@ -1870,9 +1956,33 @@ export function ensureOrdinaryTurnRecoveryAttached(
   for (const turnId of ordinaryTurnRecoverySilentTurnIds(ds.session.ordinaryTurnRecovery)) {
     if (!isSilentScheduledTurn(ds, turnId)) armSilentScheduledTurn(ds, turnId);
   }
+  const onRecoveryError = (err: unknown): void => {
+    logger.error(`[${tag(ds)}] Recovery persistence failed: ${err instanceof Error ? err.message : String(err)}`);
+    try {
+      const turnId = ds.session.ordinaryTurnRecovery?.currentTurnId;
+      if (turnId) requireOrdinaryTurnRecoveryAttention(ds.session, turnId, 'recovery_persist_failed');
+    } catch (persistError) {
+      logger.error(`[${tag(ds)}] Could not persist recovery attention: ${persistError instanceof Error ? persistError.message : String(persistError)}`);
+    }
+  };
   attachOrdinaryTurnRecovery(ds.session, {
+    onError: onRecoveryError,
+    ...(sessionCliId(ds, botCfg) === 'codex' ? {
+      recoverableErrorCodes: [CODEX_CAPACITY_ERROR_CODE],
+      supersedeOnUserInput: true,
+      resumeRecoveryOnRestore: false,
+      backoffMs: [15_000, 45_000],
+    } : {}),
     schedule: (delayMs, run) => {
-      const timer = setTimeout(run, delayMs);
+      const timer = setTimeout(() => {
+        try {
+          if (!ordinaryTurnRecoveryEligible(ds)) {
+            disposeIneligibleOrdinaryTurnRecovery(ds);
+            return;
+          }
+          run();
+        } catch (err) { onRecoveryError(err); }
+      }, delayMs);
       timer.unref?.();
       return timer;
     },
@@ -1923,45 +2033,14 @@ export function ensureOrdinaryTurnRecoveryAttached(
       if (!enqueued && silent) disarmSilentScheduledTurn(ds, dispatch.turnId);
       return enqueued;
     },
-    warn: state => {
-      const warning = ordinaryTurnRecoveryWarning(state, localeForBot(ds.larkAppId));
-      ds.agentAttention = {
-        kind: 'blocked',
-        reason: warning,
-        at: state.alertSentAt ?? Date.now(),
-      };
-      publishAttentionPatch(ds);
-      emitSessionLifecycleHook(ds, 'session.requires_attention', {
-        reason: 'ordinary_turn_recovery_exhausted',
-        errorCode: state.lastErrorCode,
-        logicalTurnId: state.logicalTurnId,
-      });
-      void requireCallbacks().sessionReply(
-        sessionAnchorId(ds),
-        buildSessionTurnFailedCard(ds, {
-          status: 'failed',
-          ...(state.lastErrorCode !== undefined ? { errorCode: state.lastErrorCode } : {}),
-          // recovery 走到 warn 一定是「自动续跑救不回来」，把已试次数摊给用户，
-          // 免得他以为系统什么都没做。
-          continuations: state.continuationsStarted,
-          // 这条路径的 retryable 已经在 coordinator 里判过并否掉了（否则不会
-          // warn），所以按钮的安全性交给 errorCode 白名单判断，不再谎称 safe。
-        }),
-        'interactive',
-        ds.larkAppId,
-        state.logicalTurnId,
-      ).catch(err => logger.error(
-        `[${tag(ds)}] Failed to deliver ordinary-turn recovery warning: `
-        + `${err instanceof Error ? err.message : String(err)}`,
-      ));
-    },
+    warn: state => notifyOrdinaryTurnRecoveryFailure(ds, state, botCfg),
   });
   const restored = ds.session.ordinaryTurnRecovery;
   if (restored?.alertSentAt
     && (restored.status === 'exhausted' || restored.status === 'attention_required')) {
     ds.agentAttention = {
       kind: 'blocked',
-      reason: ordinaryTurnRecoveryWarning(restored, localeForBot(ds.larkAppId)),
+      reason: ordinaryTurnRecoveryWarning(restored, localeForBot(ds.larkAppId), sessionCliDisplayName(ds, botCfg), sessionCliId(ds, botCfg)),
       at: restored.alertSentAt,
     };
     publishAttentionPatch(ds);
@@ -9982,6 +10061,10 @@ export function sendWorkerSessionInput(
   ds: DaemonSession,
   message: TransferBufferedInput,
 ): boolean {
+  if (sessionCliId(ds, getBot(ds.larkAppId).config) === 'codex'
+    && message.type === 'term_action' && (message.key === 'ctrlc' || message.key === 'esc')) {
+    cancelOrdinaryRecoveryForUserInput(ds.session, ds.session.ordinaryTurnRecovery?.currentTurnId ?? 'stop');
+  }
   const annotated = withTurnCaller(ds, message);
   if (bufferTransferInput(ds, annotated)) return true;
   const worker = ds.worker;
@@ -16842,7 +16925,18 @@ function setupWorkerHandlers(
           ds.session,
           readonlyTerminal,
         );
-        const recoveryOwnsTerminal = ordinaryTurnRecoveryHandlesTerminal(ds.session, msg)
+        const ordinaryHttpTerminal = sessionCliId(ds, botCfg) === 'codex' && (ds.pendingWaitPromises?.has(msg.turnId)
+          || ds.asyncTriggerResults?.has(msg.turnId)
+          || ds.settledHttpTerminalTurns?.has(msg.turnId));
+        if (ordinaryHttpTerminal && ds.session.ordinaryTurnRecovery?.currentTurnId === msg.turnId) {
+          try { cancelOrdinaryRecoveryForUserInput(ds.session, msg.turnId); }
+          catch (err) { logger.error(`[${t}] Failed to cancel HTTP recovery: ${err instanceof Error ? err.message : String(err)}`); }
+        }
+        if (!ordinaryTurnRecoveryEligible(ds)) {
+          disposeIneligibleOrdinaryTurnRecovery(ds, getBot(ds.larkAppId).config,
+            msg.status === 'failed' && msg.errorCode === CODEX_CAPACITY_ERROR_CODE ? msg.turnId : undefined);
+        }
+        const recoveryOwnsTerminal = (!ordinaryHttpTerminal && ordinaryTurnRecoveryHandlesTerminal(ds.session, msg))
           || readonlyContinuationOwnsTerminal;
         let recoveryHandled = false;
         try {
@@ -16853,7 +16947,7 @@ function setupWorkerHandlers(
           logger.error(`[${t}] Failed to persist turn_terminal for ${msg.turnId.substring(0, 8)}: ${err.message}`);
         }
         try {
-          handleOrdinaryTurnRecoveryTerminal(ds.session, msg);
+          if (!ordinaryHttpTerminal) handleOrdinaryTurnRecoveryTerminal(ds.session, msg);
           recoveryHandled = recoveryOwnsTerminal;
         } catch (err) {
           // Recovery projection is durable fail-closed state, but a temporary
@@ -16959,7 +17053,8 @@ function setupWorkerHandlers(
         // 现在统一走失败卡。仍然刻意**不**碰已经有可见卡片的路径：`failed` 的
         // 结构化终态由 Channel B 的 final_output 卡承载（还带半截答案），在这里
         // 再发一张就是重复通知。
-        const structuredFailedOwnsNotice = !isClaudeProviderFailure && msg.status === 'failed';
+        const structuredFailedOwnsNotice = !isClaudeProviderFailure && msg.status === 'failed'
+          && !(msg.errorCode === CODEX_CAPACITY_ERROR_CODE && recoveryOwnsTerminal && !recoveryHandled);
         const shouldPostFailureCard = shouldNotifyTurnFailure({
           status: msg.status,
           ...(msg.errorCode !== undefined ? { errorCode: msg.errorCode } : {}),
@@ -18652,6 +18747,30 @@ function deliverFinalOutput(
       if (!completedAlready) markFailedTurnIdle(ds, msg.turnId);
       rememberHttpTerminal(ds, msg.turnId);
       ds.idempotentAsyncTurns?.delete(msg.turnId);
+      ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
+      onComplete?.(true);
+      return;
+    }
+    // The ordered terminal IPC owns persistence and the backoff decision. Hide
+    // only the diagnostic for a live, exact capacity-recovery owner; HTTP,
+    // adopted, superseded and unrelated failure paths keep their normal UI.
+    const capacityDiagnostic = sessionCliId(ds, getBot(ds.larkAppId).config) === 'codex'
+      && msg.turnFailureCode === CODEX_CAPACITY_ERROR_CODE;
+    const terminal = { turnId: msg.turnId, status: 'failed' as const, errorCode: msg.turnFailureCode };
+    if (capacityDiagnostic && !ordinaryTurnRecoveryEligible(ds)
+      && ordinaryTurnRecoveryHandlesTerminal(ds.session, terminal)) {
+      // A diagnostic can reach this path before the backoff timer observes
+      // opt-out. Settle through the same one-notice path and cancel that timer.
+      disposeIneligibleOrdinaryTurnRecovery(ds, getBot(ds.larkAppId).config, msg.turnId);
+    }
+    const recovery = ds.session.ordinaryTurnRecovery;
+    const predecessor = recovery && recovery.continuationsStarted > 0 && recovery.logicalTurnId === msg.turnId;
+    const recordedNoticeOwnsTurn = recovery?.warningDispatched === true
+      && (recovery.currentTurnId === msg.turnId || predecessor);
+    const completedPredecessor = recovery?.status === 'completed' && predecessor;
+    if (capacityDiagnostic
+      && (recordedNoticeOwnsTurn || completedPredecessor || (ordinaryTurnRecoveryEligible(ds)
+        && ordinaryTurnRecoveryHandlesTerminal(ds.session, terminal)))) {
       ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
       onComplete?.(true);
       return;

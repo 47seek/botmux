@@ -1582,6 +1582,9 @@ export interface BotConfig {
    * `additionalContext`, so the desktop user bubble stays clean. Missing/false
    * preserves the legacy XML-ish prompt byte-for-byte. Codex App only. */
   codexAppCleanInput?: boolean;
+  /** Opt-in Codex model-capacity continuation. Missing/false is off. Each
+   * admitted task may inject up to two recovery inputs into native history. */
+  codexCapacityRecovery?: boolean;
   /**
    * Codex App only: tune or mute the once-per-turn "no observable progress"
    * nudge (#1162). `enabled: false` silences just the Lark push — the worker
@@ -3902,6 +3905,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
           return undefined;
         }
       })(),
+      codexCapacityRecovery: entry.codexCapacityRecovery === true || undefined,
       noProgressNotify: entry.noProgressNotify === undefined ? undefined : normalizeNoProgressNotifyPolicy(entry.noProgressNotify),
       feedback: entry.feedback === undefined
         ? undefined
