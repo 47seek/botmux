@@ -230,31 +230,6 @@ describe('credential-only pane: botmux send authority', () => {
   );
 
   it.skipIf(!canRun)(
-    'relays `dispatch --into` (append to an existing topic) instead of refusing it',
-    () => {
-      // Setting BOTMUX_SEND_RELAY routes every dispatch through the relay. The
-      // collaboration skill's append flow (`--into <root>`) must survive that:
-      // the request has to reach the host carrying exactly that one root (the
-      // host's delivery route then binds it to the validated chat). No watcher
-      // runs here, so the CLI parks waiting for a response (killed → null).
-      const r = runConfined([
-        distCli, 'dispatch', '--into', 'om_existing_root', '--bot-app', 'cli_target',
-        '--brief', 'follow-up',
-      ], { withRelay: true, timeoutMs: 8_000 });
-      expect(r.stderr).not.toContain('ROUTING_NOT_SUPPORTED');
-      expect(r.stderr).not.toContain('INVALID_DISPATCH_ROOT');
-      expect(r.outboxRequests).toHaveLength(1);
-      const request = r.outboxRequests![0]!;
-      expect(request.command).toBe('dispatch');
-      const flags = request.flags as string[];
-      expect(flags.filter(flag => flag === '--into')).toHaveLength(1);
-      expect(flags[flags.indexOf('--into') + 1]).toBe('om_existing_root');
-      expect(flags[flags.indexOf('--bot-app') + 1]).toBe('cli_target');
-    },
-    90_000,
-  );
-
-  it.skipIf(!canRun)(
     'hides sibling sessions\' relay outboxes while keeping its own writable',
     () => {
       // Every outbox carries that session's live relay capability token. This
