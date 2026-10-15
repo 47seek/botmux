@@ -16,9 +16,13 @@ import { prepareLarkToolEnv } from '../src/core/lark-tool-binding.js';
 
 describe('auth request arguments', () => {
   it('accepts default authorization and preserves requested scope names', () => {
-    expect(parseAuthRequestArgs(['request'])).toEqual({ help: false, command: 'request', scopes: [] });
+    expect(parseAuthRequestArgs(['request'])).toEqual({ help: false, command: 'request', scopes: [], allowUnknown: false });
     expect(parseAuthRequestArgs(['request', '--json', '--scope', 'im:chat:read, docs:document:readonly im:chat:read']))
-      .toEqual({ help: false, command: 'request', scopes: ['im:chat:read', 'docs:document:readonly'] });
+      .toEqual({ help: false, command: 'request', scopes: ['im:chat:read', 'docs:document:readonly'], allowUnknown: false });
+    expect(parseAuthRequestArgs(['request', '--allow-unknown', '--scope', 'custom:scope']))
+      .toEqual({ help: false, command: 'request', scopes: ['custom:scope'], allowUnknown: true });
+    expect(parseAuthRequestArgs(['request', '--force', '--scope', 'custom:scope']))
+      .toEqual({ help: false, command: 'request', scopes: ['custom:scope'], allowUnknown: true });
     expect(parseAuthRequestArgs(['wait', '--request-id', 'request-1']))
       .toEqual({ help: false, command: 'wait', requestId: 'request-1' });
   });
@@ -174,6 +178,30 @@ describe('auth request CLI', () => {
     expect(requests[0].body).not.toHaveProperty('originTurnId');
     expect(requests[0].body).not.toHaveProperty('originDispatchAttempt');
     expect(Boolean(requests[0].headers['x-botmux-cli-auth'])).toBe(true);
+  });
+
+  it('forwards allowUnknown flag to the daemon auth-request endpoint', async () => {
+    writeFileSync(join(root, '.botmux', '.dashboard-secret'), 'test-ipc-secret', { mode: 0o600 });
+    delete env.BOTMUX_ORIGIN_CHANNEL_ID;
+    const result = await run(['request', '--scope', 'future:custom:scope', '--allow-unknown', '--json']);
+    expect(result.code, result.stderr).toBe(0);
+    expect(requests).toHaveLength(1);
+    expect(requests[0]).toMatchObject({
+      method: 'POST', url: '/api/sessions/session/auth-request',
+      body: { sessionId: 'session', scopes: ['future:custom:scope'], allowUnknown: true },
+    });
+  });
+
+  it('forwards --force as allowUnknown to the daemon auth-request endpoint', async () => {
+    writeFileSync(join(root, '.botmux', '.dashboard-secret'), 'test-ipc-secret', { mode: 0o600 });
+    delete env.BOTMUX_ORIGIN_CHANNEL_ID;
+    const result = await run(['request', '--scope', 'future:custom:scope', '--force', '--json']);
+    expect(result.code, result.stderr).toBe(0);
+    expect(requests).toHaveLength(1);
+    expect(requests[0]).toMatchObject({
+      method: 'POST', url: '/api/sessions/session/auth-request',
+      body: { sessionId: 'session', scopes: ['future:custom:scope'], allowUnknown: true },
+    });
   });
 
   it('waits over a managed host session with no origin tuple', async () => {
