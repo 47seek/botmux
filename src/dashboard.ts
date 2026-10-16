@@ -5568,18 +5568,7 @@ const server = createServer(async (req, res) => {
     // ─── Customization center (built-in prompt/skill overrides) ──────────────
     // GET is a public read (overview only, no secrets); all mutations are
     // owner-gated (not on PUBLIC_READ_PATHS → decideDashboardAuth 401s guests).
-    if (await handleCustomizationApi(req, res, url, {
-      getBotNames: () => {
-        const names = readPersistedBotNames();
-        for (const bot of registry.list()) {
-          const name = bot.botName?.trim();
-          // A daemon can publish its App ID while the Feishu probe warms up.
-          // Keep a known cached name until a real live name is available.
-          if (name && name !== bot.larkAppId) names.set(bot.larkAppId, name);
-        }
-        return names;
-      },
-    })) {
+    if (await handleCustomizationApi(req, res, url)) {
       return;
     }
 

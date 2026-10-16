@@ -140,6 +140,50 @@ describe('bot-config store', () => {
     expect(readConfig()).toMatchObject({ promptInjection: 'none', codexRpcInput: true });
   });
 
+  it('judges zero injection on the effective backend (daemon default when not overridden)', async () => {
+    process.env.BACKEND_TYPE = 'zmx';
+    try {
+      // antigravity zero injection cannot run on zmx; with no override the session uses it.
+      const { store } = await loaded({ cliId: 'antigravity' });
+      const zero = store.findConfigField('promptInjection')!;
+      expect(await store.applyConfigField('app_default', zero, 'none'))
+        .toMatchObject({ ok: false, reason: 'zero_prompt_unsupported' });
+      const backend = store.findConfigField('backendType')!;
+      expect((await store.applyConfigField('app_default', backend, 'tmux')).ok).toBe(true);
+      expect((await store.applyConfigField('app_default', zero, 'none')).ok).toBe(true);
+      // Clearing the override falls back to zmx: refused while zero injection is on.
+      expect(await store.applyConfigField('app_default', backend, null))
+        .toMatchObject({ ok: false, reason: 'zero_prompt_unsupported' });
+      expect(readConfig().backendType).toBe('tmux');
+    } finally {
+      delete process.env.BACKEND_TYPE;
+    }
+  });
+
+  it('pairs a remote daemon default back to pty for a local CLI, as spawning does', async () => {
+    process.env.BACKEND_TYPE = 'riff';
+    try {
+      // claude-code never spawns on riff: the pairing resolves it to pty, which supports zero injection.
+      const { store } = await loaded({ cliId: 'claude-code' });
+      expect((await store.applyConfigField('app_default', store.findConfigField('promptInjection')!, 'none')).ok).toBe(true);
+      // Runtime prompt construction agrees with the accepted write.
+      const { zeroPromptInjectionForBot } = await import('../src/core/prompt-injection.js');
+      expect(zeroPromptInjectionForBot('app_default')).toBe(true);
+    } finally {
+      delete process.env.BACKEND_TYPE;
+    }
+  });
+
+  it('treats a stale remote backend override on a local CLI the way spawning does', async () => {
+    // e.g. left over after switching away from a remote CLI: spawn pairs it back to local.
+    const { store } = await loaded({ cliId: 'claude-code', backendType: 'riff', replyDelivery: 'send' });
+    expect((await store.applyConfigField('app_default', store.findConfigField('promptInjection')!, 'none')).ok).toBe(true);
+    const { zeroPromptInjectionForBot } = await import('../src/core/prompt-injection.js');
+    expect(zeroPromptInjectionForBot('app_default')).toBe(true);
+    const { effectiveReplyDelivery } = await import('../src/core/reply-delivery.js');
+    expect(effectiveReplyDelivery('app_default', 'claude-code')).toBe('transcript');
+  });
+
   it('rejects zero injection without automatic reply support', async () => {
     const { store } = await loaded({ cliId: 'gemini' });
     expect(await store.applyConfigField('app_default', store.findConfigField('promptInjection')!, 'none'))
