@@ -25,6 +25,8 @@ on:
       - "scripts/render-midscene-summary.mjs"
       - "scripts/run-e2e.ts"
       - "scripts/check-midscene-model.mjs"
+      - "scripts/feishu-live-queue.mjs"
+      - "scripts/publish-gh-pages.sh"
       - "test/helpers/mock-llm-server/**"
       - "src/dashboard/**"
       - "src/index-dashboard.ts"
@@ -34,9 +36,18 @@ on:
 permissions:
   contents: read
 
-# The Dashboard suite and the Feishu live suite run as parallel jobs; only the
-# Feishu job takes the shared lock, because every run drives the same Feishu
-# bots. Inside that job the Feishu lanes (test/e2e-browser/cases/*.yaml) run
+# A newer push to the same pull request supersedes its older run. Manual runs
+# never cancel each other.
+concurrency:
+  group: midscene-e2e-${{ github.event.pull_request.number && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
+  cancel-in-progress: true
+
+# The Dashboard suite and the Feishu live suite run as parallel jobs. Every run
+# drives the same Feishu bots, so only one Feishu job may run at a time; the
+# feishu-queue job hands out that slot first come first served
+# (scripts/feishu-live-queue.mjs). A GitHub concurrency group cannot do this:
+# it keeps one pending job and cancels it whenever a newer run arrives.
+# Inside the Feishu job the lanes (test/e2e-browser/cases/*.yaml) run
 # concurrently against one daemon fleet. They cannot be split across runners:
 # Feishu delivers each app's events to only one of its WebSocket connections,
 # so per-runner daemons for the same bots would receive each other's messages.
@@ -117,15 +128,36 @@ jobs:
           retention-days: 7
           overwrite: true
 
+  feishu-queue:
+    # The name is matched by scripts/feishu-live-queue.mjs.
+    name: Wait for the Feishu live slot
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    # Waiting has its own budget, so it never eats into the Feishu job's.
+    timeout-minutes: 300
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          sparse-checkout: scripts/feishu-live-queue.mjs
+          sparse-checkout-cone-mode: false
+
+      - name: Wait until no other run holds or is ahead for the slot
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          QUEUE_MAX_WAIT_MINUTES: "290"
+        run: node scripts/feishu-live-queue.mjs
+
   feishu:
+    # The name is matched by scripts/feishu-live-queue.mjs.
     name: Feishu live Midscene (parallel lanes)
+    needs: feishu-queue
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     # The group-mode lane is serial (one shared group) and alone takes ~2h.
     timeout-minutes: 350
-    concurrency:
-      group: feishu-live-e2e-shared-lock
-      cancel-in-progress: false
     outputs:
       ready: ${{ steps.feishu_config.outputs.ready }}
       outcome: ${{ steps.feishu_midscene.outcome }}
@@ -246,7 +278,7 @@ jobs:
 
   midscene-report:
     name: Build Midscene report
-    needs: [dashboard, feishu]
+    needs: [dashboard, feishu-queue, feishu]
     # Failed cases are exactly when the evidence matters, so build the report
     # whenever at least one producer ran.
     if: always() && !cancelled() && (needs.dashboard.result != 'skipped' || needs.feishu.result != 'skipped')
@@ -293,6 +325,7 @@ jobs:
           DASHBOARD_RESULT: ${{ needs.dashboard.result }}
           DASHBOARD_OUTCOME: ${{ needs.dashboard.outputs.outcome }}
           FEISHU_RESULT: ${{ needs.feishu.result }}
+          QUEUE_RESULT: ${{ needs.feishu-queue.result }}
           FEISHU_READY: ${{ needs.feishu.outputs.ready }}
           FEISHU_OUTCOME: ${{ needs.feishu.outputs.outcome }}
           FEISHU_CASES: ${{ needs.feishu.outputs.cases }}
@@ -300,15 +333,18 @@ jobs:
           dashboard="${DASHBOARD_OUTCOME:-not-run}"
           if [[ "$DASHBOARD_RESULT" == "skipped" ]]; then dashboard="not-run"; fi
           feishu="${FEISHU_OUTCOME:-not-run}"
-          # Only missing credentials (ready=false) mean skipped. A job cancelled
-          # before detection (e.g. displaced from the shared lock) is reported
-          # as cancelled, with its cases not run.
+          # Only missing credentials (ready=false) mean skipped. A Feishu job
+          # that never got the slot (the queue timed out or the run was
+          # superseded) or was cancelled before detection is reported as
+          # cancelled, with its cases not run.
           if [[ "$FEISHU_READY" == "false" ]]; then
             feishu="skipped"
           elif [[ "$FEISHU_RESULT" == "cancelled" ]]; then
             feishu="cancelled"
+          elif [[ "$FEISHU_RESULT" == "skipped" && ( "$QUEUE_RESULT" == "failure" || "$QUEUE_RESULT" == "cancelled" ) ]]; then
+            feishu="cancelled"
           fi
-          # A Feishu job displaced from the lock before running has no results;
+          # A Feishu job that never ran has no results;
           # publishing it would replace this PR's last real report with "not
           # run" rows. A job killed by its time limit is also cancelled but
           # keeps per-case results, so only an empty result tree skips publish.
@@ -392,6 +428,11 @@ jobs:
     permissions:
       contents: read
     steps:
+      - uses: actions/checkout@v6
+        with:
+          sparse-checkout: scripts/publish-gh-pages.sh
+          sparse-checkout-cone-mode: false
+
       - name: Download linked evidence site
         uses: actions/download-artifact@v8
         with:
@@ -420,14 +461,9 @@ jobs:
           chmod 600 ~/.ssh/id_ed25519
           ssh-keyscan -t ed25519,rsa github.com >> ~/.ssh/known_hosts 2>/dev/null
           export GIT_SSH_COMMAND="ssh -i ~/.ssh/id_ed25519 -o IdentitiesOnly=yes"
-          git clone --depth 1 --branch gh-pages git@github.com:deepcoldy/deepcoldy.github.io.git pages
-          target="pages/botmux-midscene/$SITE_KEY"
-          rm -rf "$target"
-          mkdir -p "$target"
-          cp -a "$RUNNER_TEMP/midscene-site/." "$target/"
-          cd pages
-          git config user.name "botmux-midscene-bot"
-          git config user.email "midscene-bot@users.noreply.github.com"
-          git add -A
-          git commit -m "test: publish Botmux Midscene report ($SITE_KEY @ ${GITHUB_SHA::7})"
-          git push origin gh-pages
+          export GIT_AUTHOR_NAME="botmux-midscene-bot" GIT_COMMITTER_NAME="botmux-midscene-bot"
+          export GIT_AUTHOR_EMAIL="midscene-bot@users.noreply.github.com" GIT_COMMITTER_EMAIL="midscene-bot@users.noreply.github.com"
+          # Single-commit publish: gh-pages keeps no history (see the script).
+          PAGES_REMOTE=git@github.com:deepcoldy/deepcoldy.github.io.git \
+            bash scripts/publish-gh-pages.sh "$RUNNER_TEMP/midscene-site" "botmux-midscene/$SITE_KEY" \
+            "test: publish Botmux Midscene report ($SITE_KEY @ ${GITHUB_SHA::7})"

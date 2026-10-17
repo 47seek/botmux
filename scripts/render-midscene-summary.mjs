@@ -199,7 +199,7 @@ export function renderSummary({
 
   if (feishuOutcome === 'cancelled') {
     lines.push(
-      '> The Feishu live job was cancelled before it produced results — usually because a newer run took the shared Feishu lock. Its cases are listed as not run; re-run the job to test them.',
+      '> The Feishu live job did not produce results — a newer push to the same pull request superseded this run, or it waited too long for the shared Feishu slot. Its cases are listed as not run; re-run the job to test them.',
       '',
     );
   } else if (feishuOutcome === 'skipped') {

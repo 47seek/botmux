@@ -93,13 +93,27 @@ so each phase keeps its own Midscene snapshots. Other cases use
 
 The `Midscene E2E` workflow runs two jobs in parallel. The Dashboard job needs
 no Feishu login state, but it does need the configured Midscene visual model.
-The Feishu job holds the shared live-test lock and runs the `core` lanes
-concurrently. Manual runs can pick `feishu_cases` (`all` or a lane list) and
-`feishu_concurrency`. A third job merges both uploads
-(`botmux-midscene-dashboard-data`, `botmux-midscene-feishu-data`), publishes the
-HTML report to GitHub Pages, and writes the per-case result to the workflow
-Summary page. Without the live-test secrets, only the Feishu lanes are skipped;
-the Dashboard run and its report are still required.
+The Feishu job runs the `core` lanes concurrently. Manual runs can pick
+`feishu_cases` (`all` or a lane list) and `feishu_concurrency`. A third job
+merges both uploads (`botmux-midscene-dashboard-data`,
+`botmux-midscene-feishu-data`), publishes the HTML report to GitHub Pages, and
+writes the per-case result to the workflow Summary page. Without the live-test
+secrets, only the Feishu lanes are skipped; the Dashboard run and its report
+are still required.
+
+Every run drives the same Feishu bots, so only one Feishu job runs at a time.
+The `Wait for the Feishu live slot` job (`scripts/feishu-live-queue.mjs`) hands
+out the slot first come first served: it waits while another run holds the slot
+or started waiting earlier, then lets this run's Feishu job start. Nothing is
+cancelled across branches — a GitHub `concurrency` group would cancel its
+pending job whenever a newer run arrived. A newer push to the same pull request
+does cancel that pull request's older run. A run that waits longer than the
+queue budget reports its Feishu cases as not run.
+
+Reports are published with `scripts/publish-gh-pages.sh`, shared with the docs
+deploy: each publish replaces its own directory and pushes the branch as a
+single commit (with `--force-with-lease`, retrying if the other publisher moved
+it), so `gh-pages` never accumulates history.
 
 Configure these repository secrets before running the workflow:
 
