@@ -111,6 +111,8 @@ import {
   type CardUsageSnapshot,
   type LocalHomeLinkMode,
 } from '../im/lark/md-card.js';
+import { buildTrustedResultDeliveryCard } from '../im/lark/trusted-result-delivery-card.js';
+import { resolvePluginResultAccessUrl } from './plugin-result-access-url.js';
 import { replyWithImageFallback } from '../im/lark/card-image-fallback.js';
 import { resolveReplyImages, type ReplyImageState } from '../im/lark/reply-images.js';
 import { getSessionUsageSnapshot } from './cost-calculator.js';
@@ -16816,6 +16818,102 @@ function setupWorkerHandlers(
               + `${msg.turnId.substring(0, 8)}: ${err instanceof Error ? err.message : String(err)}`,
             );
           }
+        }
+        break;
+      }
+
+      case 'plugin_result_delivery': {
+        const deliveryUuid = (kind: string) => `prd_${createHash('sha256')
+          .update(`${msg.pluginId}\0${msg.deliveryId}\0${kind}`, 'utf8')
+          .digest('hex')
+          .slice(0, 46)}`;
+        const reply = (value: Extract<DaemonToWorker, { type: 'plugin_result_delivery_result' }>) => {
+          if (worker.connected) worker.send(value);
+        };
+        const reject = (error: string) => reply({
+          type: 'plugin_result_delivery_result',
+          requestId: msg.requestId,
+          ok: false,
+          error,
+        });
+        if (!ownsWorkerSession() || msg.sessionId !== ds.session.sessionId) {
+          logger.warn(`[${t}] Rejected plugin result delivery from stale worker`);
+          reject('stale_worker');
+          break;
+        }
+        if (managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) {
+          reject('delivery_suppressed_for_turn');
+          break;
+        }
+        const expectedCaller = currentGatewayCallerOpenId(ds, msg.turnId);
+        if (!expectedCaller || msg.callerOpenId !== expectedCaller) {
+          logger.warn(`[${t}] Rejected plugin result delivery with mismatched turn caller`);
+          reject('trusted_caller_mismatch');
+          break;
+        }
+        const frozen = frozenReplyContextForTurn(ds, msg.turnId);
+        const resultBinding = msg.responseKind === 'final'
+          ? turnResultBinding(ds, msg.turnId, msg.dispatchAttempt, workerGeneration)
+          : undefined;
+        const resultMessages = (messageIds: string[]): TurnDeliveryReceipt['messages'] => messageIds.map(messageId => ({
+          messageId,
+          kind: 'primary',
+        }));
+        const observeDelivery = (
+          status: TurnDeliveryReceipt['status'],
+          messageIds: string[],
+          reason?: string,
+        ) => observeTurnResultDelivery(
+          resultBinding,
+          { status: 'unavailable', reason: 'trusted_plugin_delivery' },
+          {
+            channel: 'im',
+            status,
+            platform: 'lark',
+            chatId: ds.chatId,
+            ...(frozen.target.mode !== 'plain' ? { parentMessageId: frozen.target.rootMessageId } : {}),
+            messages: resultMessages(messageIds),
+            ...(reason ? { reason } : {}),
+          },
+        );
+        try {
+          if (!/^[A-Za-z0-9_-]{20,256}$/.test(msg.viewToken)
+            || !Number.isFinite(Date.parse(msg.expiresAt))
+            || !Number.isSafeInteger(msg.fileCount)
+            || msg.fileCount < 0) {
+            throw new Error('invalid_plugin_result_entry');
+          }
+          const accessUrl = resolvePluginResultAccessUrl(msg.viewToken);
+          if (!accessUrl) throw new Error('plugin_result_access_url_unavailable');
+          const card = buildTrustedResultDeliveryCard({ accessUrl, expiresAt: msg.expiresAt });
+          const messageId = await scopedReply(card, 'interactive', msg.turnId, {
+            uuid: deliveryUuid('entry'),
+            replyTarget: frozen.target,
+          });
+          const messageIds = [messageId];
+          // Persist the delivery fact before acknowledging the worker. Once
+          // acknowledged it may immediately emit turn_terminal, so reversing
+          // this order creates an empty/not-ready terminal race.
+          observeDelivery('delivered', messageIds);
+          reply({
+            type: 'plugin_result_delivery_result',
+            requestId: msg.requestId,
+            ok: true,
+            messageIds,
+          });
+        } catch (error) {
+          const messageIds: string[] = [];
+          observeDelivery(
+            messageIds.length ? 'partial' : 'failed',
+            messageIds,
+            'trusted_plugin_delivery_failed',
+          );
+          logger.error(
+            `[${t}] Plugin result delivery failed plugin=${msg.pluginId}`,
+          );
+          // Provider errors may contain result text, filenames or paths. Keep
+          // details in host logs and return only a stable non-sensitive code.
+          reject('plugin_result_delivery_failed');
         }
         break;
       }
