@@ -434,7 +434,7 @@ import { authorityForDispatch, dispatchCallerFromReply, deliverDispatchWithUser,
 import { resolveUnionIdFromOpenId } from './im/lark/client.js';
 import { ScheduleAuthorityStore } from './services/schedule-authority-store.js';
 import { computeInputHash } from './utils/canonical-input-hash.js';
-import { authorizeDelegatedScheduleRun, authorizeDelegatedScheduleSelfManage } from './core/schedule-delegated-runtime.js';
+import { authorizeDelegatedScheduleRun, authorizeScheduleSelfManage } from './core/schedule-delegated-runtime.js';
 import { parseScheduledTurnId, trustedCallerForScheduledTask } from './core/scheduled-turn-provenance.js';
 import { TRIGGER_USER_AUTH_TOOLS } from './services/trigger-user-auth.js';
 import { triggerSessionTurn, reconcileIdempotencyLeasesOnBoot, convergeIdempotentAsyncTurnOnWorkerExit, externalEventOpensOwnTopic } from './core/trigger-session.js';
@@ -7736,16 +7736,20 @@ ipcRoute('POST', SCHEDULE_MANAGED_MUTATE_ROUTE, async (req, res) => {
   }
   const authority = scheduleAuthorityStore?.getRecord(appId, id);
   if (!authority) return jsonRes(res, 404, { ok: false, error: 'schedule_not_found' });
+  if (potentialScheduledSelfManager && action === 'remove' && authority.state === 'revoked') {
+    return jsonRes(res, 200, { ok: true, replay: true });
+  }
   const scheduledSelfManager = potentialScheduledSelfManager
-    && authority.kind === 'delegated'
-    && authority.selfManage;
+    && (authority.kind === 'direct'
+      || (authority.kind === 'delegated' && authority.selfManage));
   if (potentialScheduledSelfManager && !scheduledSelfManager) {
-    return jsonRes(res, 403, { ok: false, error: 'delegated_schedule_self_manage_denied' });
+    return jsonRes(res, 403, { ok: false, error: 'schedule_self_manage_denied' });
   }
   if (scheduledSelfManager) {
     try {
-      await authorizeDelegatedScheduleSelfManage(authority, {
+      await authorizeScheduleSelfManage(authority, {
         selfManageEnabled: readGlobalConfig().scheduleDelegation?.selfManageEnabled === true,
+        targetChatId: ds!.chatId,
         adminOpenIds: getDashboardAdminOpenIds(appId),
         resolveTargetOpenId: async unionId => {
           const resolved = await resolveTargetAppOpenId(appId, unionId);
@@ -7756,7 +7760,7 @@ ipcRoute('POST', SCHEDULE_MANAGED_MUTATE_ROUTE, async (req, res) => {
     } catch (error) {
       return jsonRes(res, 403, {
         ok: false,
-        error: 'delegated_schedule_self_manage_denied',
+        error: 'schedule_self_manage_denied',
         detail: error instanceof Error ? error.message : String(error),
       });
     }
