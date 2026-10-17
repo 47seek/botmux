@@ -7747,6 +7747,28 @@ Context flags: --session-id, --lark-app-id, --chat-id, --working-dir/--repo`);
 }
 
 async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
+  const remoteRunnerSessionTool = rest.includes('--remote-runner-session-tool');
+  if (remoteRunnerSessionTool && process.env.BOTMUX_HOST_RELAY_AUTHORIZED !== '1') {
+    console.error('botmux schedule refused: --remote-runner-session-tool requires the owning worker\'s live turn authority');
+    process.exit(1);
+  }
+  const trustedRemoteRunnerRelay = remoteRunnerSessionTool
+    && process.env.BOTMUX_HOST_RELAY_AUTHORIZED === '1'
+    && !!process.env.BOTMUX_SESSION_ID
+    && !!process.env.BOTMUX_TURN_ID;
+  if (remoteRunnerSessionTool && !trustedRemoteRunnerRelay) {
+    console.error('botmux schedule refused: the Remote Runner relay is missing its frozen session/turn');
+    process.exit(1);
+  }
+  const remoteRunnerControllerOpenId = trustedRemoteRunnerRelay
+    ? process.env.BOTMUX_REMOTE_RUNNER_CONTROLLER_OPEN_ID?.trim()
+    : undefined;
+  if (remoteRunnerControllerOpenId
+      && !/^ou_[A-Za-z0-9_-]{1,160}$/.test(remoteRunnerControllerOpenId)) {
+    console.error('botmux schedule refused: Remote Runner controller identity is invalid');
+    process.exit(1);
+  }
+  rest = rest.filter(arg => arg !== '--remote-runner-session-tool');
   if (sub === 'update' && rest.length === 1 && ['--help', '-h'].includes(rest[0])) {
     console.log(SCHEDULE_UPDATE_USAGE);
     return;
@@ -7754,6 +7776,14 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
   // Ensure SESSION_DATA_DIR points at the daemon's data dir so schedule-store
   // writes to the right file even when invoked outside the daemon env.
   process.env.SESSION_DATA_DIR ??= resolveDataDir();
+
+  const frozenRelaySession = trustedRemoteRunnerRelay
+    ? await detectCurrentSession()
+    : undefined;
+  if (trustedRemoteRunnerRelay && !frozenRelaySession) {
+    console.error('botmux schedule refused: the Remote Runner relay session is unavailable');
+    process.exit(1);
+  }
 
   const scheduler = await import('./core/scheduler.js');
   const scheduleStore = await import('./services/schedule-store.js');
@@ -7764,8 +7794,9 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
   // binds to the primary bot (bots.json[0]) so mutations keep the legacy
   // "ownerless task runs on bot-0" semantics; `list` without a bound bot
   // aggregates every readable store instead.
-  const cliScopeAppId = argValue(rest, '--lark-app-id')
-    ?? (await detectCurrentSession())?.larkAppId
+  const cliScopeAppId = frozenRelaySession?.larkAppId
+    ?? (!trustedRemoteRunnerRelay ? argValue(rest, '--lark-app-id') : undefined)
+    ?? (!trustedRemoteRunnerRelay ? (await detectCurrentSession())?.larkAppId : undefined)
     ?? process.env.BOTMUX_LARK_APP_ID;
   // LAZY + sandbox-safe bots.json read: sandboxed sessions always carry a
   // scope (env-injected appId) and must never touch bots.json — it is denied
@@ -7841,7 +7872,17 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
   }
 
   if (sub === 'add') {
-    const [rawSchedule, ...promptParts] = positionals(rest, ['--new-topic', '--top-level', '--topic', '--silent', '--follow-active']);
+    const [positionalSchedule, ...promptParts] = positionals(rest, ['--new-topic', '--top-level', '--topic', '--silent', '--follow-active']);
+    const structuredSchedule = argValue(rest, '--schedule');
+    if (trustedRemoteRunnerRelay && (structuredSchedule === undefined || positionalSchedule !== undefined || promptParts.length > 0)) {
+      console.error('botmux schedule refused: the Remote Runner relay requires structured schedule/prompt values');
+      process.exit(1);
+    }
+    if (!trustedRemoteRunnerRelay && structuredSchedule !== undefined) {
+      console.error('--schedule is reserved for the Remote Runner host relay.');
+      process.exit(1);
+    }
+    const rawSchedule = trustedRemoteRunnerRelay ? structuredSchedule : positionalSchedule;
     if (!rawSchedule) {
       console.error('用法: botmux schedule add <schedule> <prompt> [--id 8位小写十六进制] [--name NAME] [--chat-id CHAT] [--top-level | --topic --root-msg-id ROOT | --new-topic [--topic-title TITLE]] [--follow-active] [--lark-app-id APP] [--workdir DIR] [--silent] [--model ID] [--reasoning-effort LEVEL]');
       process.exit(1);
@@ -7853,10 +7894,12 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
       process.exit(1);
     }
 
-    const cur = await detectCurrentSession();
+    const cur = frozenRelaySession ?? await detectCurrentSession();
     let creatorAuthError: unknown;
-    try { await detectAuthenticatedCurrentSession(); }
-    catch (error) { creatorAuthError = error; }
+    if (!trustedRemoteRunnerRelay) {
+      try { await detectAuthenticatedCurrentSession(); }
+      catch (error) { creatorAuthError = error; }
+    }
     const explicitTaskId = argValue(rest, '--id');
     if (rest.includes('--id') && !explicitTaskId) {
       console.error('--id 需要一个 8 位小写十六进制任务 ID。');
@@ -7866,15 +7909,21 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
       console.error('--id 只接受 8 位小写十六进制任务 ID。');
       process.exit(1);
     }
-    const chatId = argValue(rest, '--chat-id') ?? cur?.chatId;
-    const explicitRootMessageId = argValue(rest, '--root-msg-id');
+    const chatId = trustedRemoteRunnerRelay ? cur?.chatId : argValue(rest, '--chat-id') ?? cur?.chatId;
+    const explicitRootMessageId = trustedRemoteRunnerRelay ? undefined : argValue(rest, '--root-msg-id');
     const rootMessageId = explicitRootMessageId
       ?? (chatId && chatId === cur?.chatId ? cur.rootMessageId : undefined);
     // Resolve the daemon that owns the authoritative task store. A bare host
     // terminal uses the primary bot selected above; managed sessions stay
     // pinned to their own app.
     const larkAppId = cliScopeAppId ?? scheduleStore.getScheduleScope() ?? undefined;
-    const workingDir = argValue(rest, '--workdir') ?? cur?.workingDir ?? process.cwd();
+    const workingDir = trustedRemoteRunnerRelay
+      ? cur?.workingDir
+      : argValue(rest, '--workdir') ?? cur?.workingDir ?? process.cwd();
+    if (!workingDir) {
+      console.error('botmux schedule refused: the Remote Runner relay working directory is unavailable');
+      process.exit(1);
+    }
     const name = argValue(rest, '--name') ?? (promptArg.length > 20 ? promptArg.slice(0, 20) + '…' : promptArg);
     const legacyDeliver = argValue(rest, '--deliver') as 'origin' | 'local' | 'new-topic' | undefined;
     const wantsNewTopic = rest.includes('--new-topic') || legacyDeliver === 'new-topic';
@@ -7978,7 +8027,10 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
             path: SCHEDULE_DELEGATED_ADD_ROUTE,
             sessionId: cur.sessionId,
             larkAppId,
-            body: { task: {
+            body: {
+              ...(trustedRemoteRunnerRelay ? { remoteRunnerSessionTool: true } : {}),
+              ...(remoteRunnerControllerOpenId ? { remoteRunnerControllerOpenId } : {}),
+              task: {
               id: delegatedTaskId,
               name,
               schedule: rawSchedule,
@@ -7996,7 +8048,8 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
               calendarDayType: normalizedDayType,
               ...(wantsFollowActive ? { followActive: true } : {}),
               ...(topicTitle ? { topicTitle } : {}),
-            } },
+              },
+            },
           });
         } catch (error) {
           if (creatorAuthError) throw creatorAuthError;
@@ -8086,7 +8139,8 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
   const scheduledSelfManageCandidate = !!mutationSession?.turnId
     && mutationSession.turnId.startsWith('schedule:')
     && ['remove', 'rm', 'delete', 'del', 'pause', 'disable'].includes(sub);
-  if (sub !== 'update' && mutationSession && !scheduledSelfManageCandidate) {
+  if (!trustedRemoteRunnerRelay
+      && sub !== 'update' && mutationSession && !scheduledSelfManageCandidate) {
     await detectAuthenticatedCurrentSession();
   }
   const managedMutation = async (
@@ -8134,7 +8188,7 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
       // refuses canonical updates for delegated tasks and for tasks bound to a
       // protected precondition (which the CLI cannot rebind).
       const updates = readScheduleUpdate(rest);
-      await detectAuthenticatedCurrentSession();
+      if (!trustedRemoteRunnerRelay) await detectAuthenticatedCurrentSession();
       await managedMutation('update', updates);
       console.log(`✅ 已更新任务 ${id} 的配置；后续执行生效，未触发补跑。`);
       break;

@@ -7452,6 +7452,17 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
   try { body = await readJsonBody(req, 64 * 1024); }
   catch { return jsonRes(res, 400, { ok: false, error: 'invalid_schedule_request' }); }
   const sessionId = typeof body?.sessionId === 'string' ? body.sessionId : '';
+  const remoteRunnerSessionTool = body?.remoteRunnerSessionTool === true;
+  if (body?.remoteRunnerSessionTool !== undefined && !remoteRunnerSessionTool) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_schedule_request' });
+  }
+  const remoteRunnerControllerOpenId = body?.remoteRunnerControllerOpenId;
+  if (remoteRunnerControllerOpenId !== undefined
+      && (!remoteRunnerSessionTool
+        || typeof remoteRunnerControllerOpenId !== 'string'
+        || !/^ou_[A-Za-z0-9_-]{1,160}$/.test(remoteRunnerControllerOpenId))) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_schedule_request' });
+  }
   const ds = sessionId ? findActiveBySessionId(sessionId) : undefined;
   const trustedHost = isTrustedHostIpcRequest(req);
   const verified = authorizeSessionScopedIpc({
@@ -7505,6 +7516,22 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
   const reply = pickTurnReplyTarget(ds.session, ds.managedTurnOrigin.turnId);
   const expectedRoot = reply?.rootMessageId
     ?? ((ds.scope ?? ds.session.scope) === 'thread' ? ds.session.rootMessageId : undefined);
+  if (remoteRunnerSessionTool) {
+    const expectedWorkingDir = ds.workingDir ?? ds.session.workingDir;
+    if (!expectedWorkingDir
+      || task.chatId !== ds.chatId
+      || task.workingDir !== expectedWorkingDir
+      || task.deliver === 'local') {
+      return jsonRes(res, 403, { ok: false, error: 'schedule_session_tool_scope_invalid' });
+    }
+    if (task.executionPosition === 'topic'
+      && (!expectedRoot || task.rootMessageId !== expectedRoot)) {
+      return jsonRes(res, 403, { ok: false, error: 'schedule_session_tool_root_mismatch' });
+    }
+    if (task.executionPosition !== 'topic' && task.rootMessageId !== undefined) {
+      return jsonRes(res, 400, { ok: false, error: 'schedule_session_tool_root_forbidden' });
+    }
+  }
   const turnId = ds.managedTurnOrigin.turnId;
   const generation = ds.workerGeneration;
   let controlOpenId: string | undefined;
@@ -7516,15 +7543,26 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
   let persistentRunScopes: Array<'bytedcli'> = [];
   let selfManage = false;
   const caller = scheduleCallerForTurn(ds, turnId);
-  const direct = caller?.senderType === 'user'
+  const directHuman = caller?.senderType === 'user'
     && !caller.source && caller.requestLarkAppId === ds.larkAppId;
+  const providerActor = caller?.senderType === 'bot'
+    && caller.requestLarkAppId === ds.larkAppId
+    && typeof remoteRunnerControllerOpenId === 'string';
+  if (remoteRunnerControllerOpenId && !providerActor) {
+    return jsonRes(res, 403, { ok: false, error: 'schedule_session_tool_controller_forbidden' });
+  }
+  const direct = directHuman || providerActor;
   const capability = ds.managedTurnOrigin.capability;
   try {
-    if (direct) {
-      controlOpenId = caller.requestUserOpenId;
-      controlUnionId = caller.requestUserUnionId
+    if (directHuman) {
+      controlOpenId = caller!.requestUserOpenId;
+      controlUnionId = caller!.requestUserUnionId
         ?? (controlOpenId ? await resolveUnionIdFromOpenId(ds.larkAppId, controlOpenId) ?? undefined : undefined);
       grantId = `direct:${sessionId}:${turnId}`;
+    } else if (providerActor) {
+      controlOpenId = remoteRunnerControllerOpenId;
+      controlUnionId = await resolveUnionIdFromOpenId(ds.larkAppId, controlOpenId) ?? undefined;
+      grantId = `provider-actor:${sessionId}:${turnId}`;
     } else {
       if (readGlobalConfig().scheduleDelegation?.createEnabled !== true) {
         return jsonRes(res, 403, { ok: false, error: 'schedule_delegation_disabled' });
