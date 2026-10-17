@@ -123,7 +123,10 @@ import {
   type DurableLarkOutboxTarget,
 } from './services/durable-lark-outbox.js';
 import { enqueueDurableLarkFinalOutput } from './services/durable-lark-final-output.js';
-import { parseDurablePrimarySessionRecord } from './services/durable-session-primary.js';
+import {
+  claimDurableLarkActiveSession,
+  parseDurablePrimarySessionRecord,
+} from './services/durable-session-primary.js';
 import { createDurableLarkSessionControlRuntime } from './services/durable-lark-session-control-runtime.js';
 import { closeResidualIsLocal, describeCloseResidual } from './core/close-residual.js';
 import { durableLarkSessionControlPartitionPrefix } from './services/durable-lark-session-control.js';
@@ -427,6 +430,7 @@ import {
   ensureTerminalWorkerPort,
   ensureSessionWhiteboard,
   resumeSession,
+  takeOverDurableActiveRemoteSession,
   closeCliMismatchedSessionsForBot,
 } from './core/session-manager.js';
 import { publishTurnCliIdentity, type DelegatedCliIdentity } from './core/turn-cli-identity.js';
@@ -30175,6 +30179,43 @@ export async function startDaemon(botIndex?: number): Promise<void> {
               const current = await durableCoordinationRuntime.store.readSession(stableKey);
               return current ? parseDurablePrimarySessionRecord(current).session : undefined;
             },
+            takeOverPrimarySession: async (stableKey, canonical) => {
+              if (!primaryRuntime) throw new Error('durable primary runtime is not ready');
+              try {
+                const claimed = await claimDurableLarkActiveSession({
+                  facade: primaryRuntime.session,
+                  sessionKey: stableKey,
+                  expectedSessionId: canonical.sessionId,
+                  expectedLarkAppId: cfg.larkAppId,
+                });
+                if (claimed.kind !== 'claimed') {
+                  throw new Error(
+                    claimed.kind === 'occupied'
+                      ? `durable active takeover Session is occupied by ${claimed.ownerId}`
+                      : `durable active takeover claim failed: ${claimed.kind}`,
+                  );
+                }
+                const local = activeSessions.get(stableKey);
+                if (local?.session.sessionId === claimed.session.sessionId
+                    && local.session.status === 'active') {
+                  return local.session;
+                }
+                const takeover = await takeOverDurableActiveRemoteSession(
+                  claimed.session,
+                  activeSessions,
+                );
+                if (!takeover.ok) {
+                  throw new Error(
+                    `durable active takeover failed: ${takeover.error}`
+                    + (takeover.detail ? ` (${takeover.detail})` : ''),
+                  );
+                }
+                return takeover.ds.session;
+              } catch (error) {
+                await primaryRuntime.session.releaseLease(stableKey);
+                throw error;
+              }
+            },
           },
         );
         startEventDispatchers.push(() => {
@@ -30283,8 +30324,30 @@ export async function startDaemon(botIndex?: number): Promise<void> {
               partitionKeyPrefix: durableLarkSessionControlPartitionPrefix(cfg.larkAppId),
               resolve: primaryControlRuntime.resolve,
             },
-            onLeadershipAcquired: () => { eventRuntime.connect(); },
+            onLeadershipAcquired: leadership => {
+              const recovery = eventRuntime.connectPrimary({ signal: leadership.signal });
+              void recovery.ready.catch(error => {
+                if (leadership.signal.aborted) return;
+                logger.warn(
+                  `[durable-primary:${cfg.larkAppId}] ingress recovery stopped unexpectedly: `
+                  + `${error instanceof Error ? error.message : String(error)}`,
+                );
+              });
+            },
             onLeadershipLost: () => { eventRuntime.close(); },
+            onSessionLeaseLost: stableKey => {
+              const ds = activeSessions.get(stableKey);
+              if (!ds || ds.larkAppId !== cfg.larkAppId) return;
+              retireWorkerProcessOnly(ds, 'durable_session_lease_lost');
+              if (activeSessions.get(stableKey) === ds) activeSessions.delete(stableKey);
+              try { sessionStore.closeSession(ds.session.sessionId); } catch (error) {
+                logger.error(
+                  `[durable-primary:${cfg.larkAppId}] failed to quarantine local Session `
+                  + `${ds.session.sessionId} after lease loss: `
+                  + `${error instanceof Error ? error.message : String(error)}`,
+                );
+              }
+            },
             onError: error => logger.warn(
               `[durable-primary:${cfg.larkAppId}] `
               + `${error instanceof Error ? error.message : String(error)}`,
