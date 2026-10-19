@@ -802,7 +802,7 @@ export const messages: Record<string, string> = {
   'card.config.text_note': 'Edit then tap Save (one write); leaving a field blank clears it. For long/multi-line roles use `/role team set`.',
   'card.config.lbl_brand': 'Card signature (brandLabel)',
   'card.config.lbl_prompt': 'On-join first prompt',
-  'card.config.lbl_passthrough': 'Extra passthrough slash commands (comma/space separated, e.g. /goal /export)',
+  'card.config.lbl_passthrough': 'Extra passthrough slash commands (separate with comma/newline or a space before /, e.g. /goal /export; spaces inside a name become hyphens, e.g. /Ultra Goal → /ultra-goal)',
   'card.config.lbl_startup': 'Startup commands (auto-sent after launch, before the first message; comma/newline separated, args allowed, e.g. /effort ultracode)',
   'card.config.lbl_role': 'Default role (team, cross-chat)',
   'card.config.save': '💾 Save',
