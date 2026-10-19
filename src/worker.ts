@@ -119,6 +119,7 @@ import {
   type WebTerminalInputMode,
 } from './services/web-terminal-settings-store.js';
 import { aidenCodexResumeNeedsRedraw, CodexUpdateDialogGuard, codexUpdateDialogSafeKeys } from './utils/codex-update-dialog.js';
+import { CodexModelMigrationDialogGuard, codexModelMigrationSafeKeys, isCodexModelMigrationScreen } from './utils/codex-model-migration-dialog.js';
 import { EffortConfirmDialogGuard, isEffortLevelCommand } from './utils/effort-confirm-dialog.js';
 import { installStdioEpipeGuard, isIgnorableStreamError } from './utils/stdio-epipe-guard.js';
 import { resolveDarwinCodexCaBundle } from './utils/darwin-ca-bundle.js';
@@ -11321,6 +11322,7 @@ let injectionFlushing = false;
 
 /** 排队注入一行 TUI 命令：idle（isPromptReady）时经串行恢复事务敲入。 */
 async function flushPendingInjections(): Promise<void> {
+  if (codexModelMigrationCheckNeeded() && await codexModelMigrationAdmit('write') !== 'proceed') return;
   if (idleDetector?.isStartupPending()) return;
   // 不跨 restart 边界写入（与 flushPending 同款守卫）：destroySession 异步期间
   // backend 可能仍指向旧 CLI。
@@ -11719,6 +11721,373 @@ function inspectAidenCodexUpdateDialogOnScreen(): boolean {
   return screen.length > 0 && dismissAidenCodexUpdateDialog(screen, 'screen');
 }
 
+// ─── Codex model-migration picker ────────────────────────────────────────────
+
+// Codex 0.162 paints a skeleton composer before initialization and then, once
+// per CODEX_HOME whenever the configured model has an unacknowledged upgrade,
+// replaces it with a modal "Meet <model>: 1. Try new model / 2. Use existing
+// model" picker. The idle detector had already latched ready evidence from the
+// skeleton, so two quiet seconds on the picker flushed the first queued message
+// into it: the paste was dropped and its submit Enter confirmed "Try new model"
+// (silently switching the user's global model), leaving the turn
+// submit_unconfirmed. There is no process-level opt-out (see
+// codex-model-migration-dialog.ts), so resolve it on screen with "Use existing
+// model" and keep every input path held until the normal composer returns.
+const codexModelMigrationGuard = new CodexModelMigrationDialogGuard();
+// The picker's key handler is not ready the instant it paints — the same
+// warm-up race as the trust dialog (openai/codex#39487).
+const CODEX_MODEL_MIGRATION_SETTLE_MS = 400;
+const CODEX_MODEL_MIGRATION_RETRY_MS = 1_000;
+const CODEX_MODEL_MIGRATION_POLL_MS = 2_000;
+const CODEX_MODEL_MIGRATION_MAX_ATTEMPTS = 3;
+/** Input is held for the picker (seen, or an unreadable capture while held). */
+let codexModelMigrationPending = false;
+/** The authoritative screen was verified picker-free after startup. The picker
+ *  only precedes the first prompt of a CLI process, so later input skips the
+ *  screen capture until the next spawn. */
+let codexModelMigrationCleared = false;
+/** PTY output generation at the latest rejected ready edge (screen idle or
+ *  first-prompt timeout). If nothing was output since, that edge cannot recur
+ *  on its own and the release must re-drive it. */
+let codexModelMigrationHeldReadyGeneration: number | undefined;
+/** A queued writer (flush, injection, raw passthrough) returned early. */
+let codexModelMigrationHeldWrite = false;
+/** Own retry loop, independent of the chat screen-update timer (which v3
+ *  workflow workers never start). */
+let codexModelMigrationRecheckTimer: ReturnType<typeof setTimeout> | null = null;
+let codexModelMigrationUnreadableLogged = false;
+let codexModelMigrationLastActionAt = 0;
+let codexModelMigrationAttempts = 0;
+let codexModelMigrationLimitNotified = false;
+/** Startup readiness re-seed after a release (see the release function). */
+let codexModelMigrationReseedTimer: ReturnType<typeof setTimeout> | null = null;
+const CODEX_MODEL_MIGRATION_RESEED_QUIET_MS = 2_000;
+const CODEX_MODEL_MIGRATION_RESEED_MAX_TRIES = 15;
+
+/** All picker state is per CLI process: called on every spawn and kill. */
+function resetCodexModelMigrationState(): void {
+  codexModelMigrationGuard.reset();
+  if (codexModelMigrationRecheckTimer) {
+    clearTimeout(codexModelMigrationRecheckTimer);
+    codexModelMigrationRecheckTimer = null;
+  }
+  if (codexModelMigrationReseedTimer) {
+    clearTimeout(codexModelMigrationReseedTimer);
+    codexModelMigrationReseedTimer = null;
+  }
+  codexModelMigrationPending = false;
+  codexModelMigrationCleared = false;
+  codexModelMigrationHeldReadyGeneration = undefined;
+  codexModelMigrationHeldWrite = false;
+  codexModelMigrationUnreadableLogged = false;
+  codexModelMigrationLastActionAt = 0;
+  codexModelMigrationAttempts = 0;
+  codexModelMigrationLimitNotified = false;
+}
+
+/** Owned Codex TUI whose screen may drive synthesized keys. ZMX snapshots are
+ *  not authoritative for that (see onBackendScreenResync). */
+function codexModelMigrationInScope(): boolean {
+  return lastInitConfig?.cliId === 'codex'
+    && !lastInitConfig.adoptMode
+    && !lastInitConfig.existingAppServerEndpoint
+    && backendScreenEvidenceIsAuthoritativeForMutation();
+}
+
+function codexModelMigrationCheckNeeded(): boolean {
+  return codexModelMigrationInScope() && !!backend && !codexModelMigrationCleared;
+}
+
+/** Drain the PTY renderer before the screen is judged. On the renderer
+ *  screen path (PTY: no native capture) xterm parses renderer.write()
+ *  asynchronously, so a picker repaint that has just arrived can still be
+ *  invisible to a synchronous capture. Returns false when output kept
+ *  arriving through every round: the frame is then UNVERIFIED and callers
+ *  must hold, never proceed. tmux/herdr captures come from the multiplexer
+ *  and need no drain. */
+async function settleCodexModelMigrationRenderer(): Promise<boolean> {
+  if (!renderer || !backend || backend.captureViewport || backend.captureCurrentScreen) return true;
+  for (let round = 0; round < 3; round++) {
+    const target: TerminalRenderer | null = renderer;
+    if (!target) return true;
+    const revision = backendScreenRevision;
+    try { await target.writeAndFlush(''); } catch { return false; }
+    if (renderer !== target) return false;
+    if (backendScreenRevision === revision) return true;
+  }
+  return false;
+}
+
+type CodexModelMigrationObservation =
+  | { state: 'picker'; screen: string }
+  | { state: 'clear' }
+  /** The capture threw or came back blank (TmuxPipeBackend returns '' on a
+   *  capture timeout): proves nothing about the picker. */
+  | { state: 'unreadable' }
+  /** No screen source at all (e.g. a PTY backend in a workflow worker, which
+   *  has no renderer): nothing can be resolved, keep the previous behaviour. */
+  | { state: 'unobservable' };
+
+function observeCodexModelMigrationScreen(): CodexModelMigrationObservation {
+  if (!backend || !canCaptureBusyPatternScreen(backend)) return { state: 'unobservable' };
+  let screen = '';
+  try {
+    screen = captureBackendScreen(backend);
+  } catch { return { state: 'unreadable' }; }
+  if (!stripAnsiScreenText(screen).trim()) return { state: 'unreadable' };
+  return isCodexModelMigrationScreen(screen) ? { state: 'picker', screen } : { state: 'clear' };
+}
+
+/** Stream side: chunks place the picker's words with cursor addressing, so the
+ *  selected row is only knowable from the rendered screen. Schedule a screen
+ *  check once the picker's key handler is live; do NOT consume the chunk. One
+ *  coalesced read can carry the picker repaint AND the composer that replaced
+ *  it, and that composer evidence must still reach the idle detector. Holding
+ *  input is decided only by the authoritative screen, so a stream match alone
+ *  can never strand startup. */
+function noticeCodexModelMigrationDialog(data: string): void {
+  if (!awaitingFirstPrompt || !codexModelMigrationCheckNeeded() || !codexModelMigrationGuard.inspect(data)) return;
+  scheduleCodexModelMigrationRecheck(CODEX_MODEL_MIGRATION_SETTLE_MS);
+}
+
+function scheduleCodexModelMigrationRecheck(delayMs: number): void {
+  if (codexModelMigrationRecheckTimer) return;
+  const backendAtSchedule = backend;
+  const generationAtSchedule = cliSpawnGeneration;
+  codexModelMigrationRecheckTimer = setTimeout(() => {
+    codexModelMigrationRecheckTimer = null;
+    if (backend !== backendAtSchedule || cliSpawnGeneration !== generationAtSchedule) return;
+    void recheckCodexModelMigration(backendAtSchedule, generationAtSchedule);
+  }, delayMs);
+}
+
+/** Timer-driven re-check: retries the picker while it stays open and releases
+ *  held input once a readable screen shows it gone. */
+async function recheckCodexModelMigration(expectedBackend: typeof backend, expectedGeneration: number): Promise<void> {
+  if (backend !== expectedBackend || cliSpawnGeneration !== expectedGeneration) return;
+  // Still open (or unverified): the gate re-armed this loop. Gone: it
+  // scheduled the release.
+  await codexModelMigrationAdmit('recheck');
+}
+
+function holdCodexModelMigrationInput(): void {
+  codexModelMigrationPending = true;
+  scheduleCodexModelMigrationRecheck(codexModelMigrationAttempts >= CODEX_MODEL_MIGRATION_MAX_ATTEMPTS
+    ? CODEX_MODEL_MIGRATION_POLL_MS
+    : CODEX_MODEL_MIGRATION_RETRY_MS);
+}
+
+/** Runs the release outside the observing caller: a writer that just saw the
+ *  picker gone must not re-enter flushPending from inside itself. */
+function scheduleCodexModelMigrationRelease(): void {
+  const backendAtSchedule = backend;
+  const generationAtSchedule = cliSpawnGeneration;
+  setTimeout(() => {
+    if (backend !== backendAtSchedule || cliSpawnGeneration !== generationAtSchedule) return;
+    releaseCodexModelMigrationHold();
+  }, 0);
+}
+
+/** The picker is gone: re-drive whatever it held. Checks never reset idle
+ *  evidence, so a composer redraw fed after a rejected ready edge already runs
+ *  its own quiescence cycle; only a rejected edge with no output since needs
+ *  re-firing (same rule as the structured pre-start gate). */
+function releaseCodexModelMigrationHold(): void {
+  const heldReady = codexModelMigrationHeldReadyGeneration;
+  const heldWrite = codexModelMigrationHeldWrite;
+  codexModelMigrationHeldReadyGeneration = undefined;
+  codexModelMigrationHeldWrite = false;
+  log('Codex model-migration picker cleared; releasing held input');
+  if (heldReady !== undefined && ptyOutputGeneration.isCurrent(heldReady)) {
+    idleDetector?.reset();
+    idleDetector?.fireIdle();
+  }
+  // Newer output does not guarantee another idle edge: after the rejected
+  // idle, feed() dropped readySeen, and cursor/footer-only redraws carry no
+  // prompt marker to re-arm quiescence. Once the PTY is quiet, verify the
+  // prompt on screen and re-seed it (a no-op if the detector re-armed).
+  if (awaitingFirstPrompt) scheduleCodexModelMigrationReseed(CODEX_MODEL_MIGRATION_RESEED_QUIET_MS, CODEX_MODEL_MIGRATION_RESEED_MAX_TRIES);
+  // During startup the idle path (re-driven above, or the composer redraw's
+  // own cycle) owns the first flush: kicking flushPending here would bypass the
+  // startup readiness gate that sendToPty applies (shouldWriteNow).
+  if (!heldWrite || awaitingFirstPrompt) return;
+  if (pendingInjections.length > 0) void flushPendingInjections();
+  if (hasPendingInputForFlush()) void flushPending();
+}
+
+function scheduleCodexModelMigrationReseed(delayMs: number, triesLeft: number): void {
+  if (codexModelMigrationReseedTimer) clearTimeout(codexModelMigrationReseedTimer);
+  const backendAtSchedule = backend;
+  const generationAtSchedule = cliSpawnGeneration;
+  codexModelMigrationReseedTimer = setTimeout(() => {
+    codexModelMigrationReseedTimer = null;
+    if (backend !== backendAtSchedule || cliSpawnGeneration !== generationAtSchedule) return;
+    void reseedCodexModelMigrationReadiness(backendAtSchedule, generationAtSchedule, triesLeft);
+  }, Math.max(0, delayMs));
+}
+
+/** Same rule as the post-SessionStart evidence fallback: a quiet PTY plus a
+ *  prompt on the authoritative screen re-seeds readySeen; IdleDetector still
+ *  runs its full quiescence check, and the screen-idle gate still applies. */
+async function reseedCodexModelMigrationReadiness(
+  expectedBackend: typeof backend,
+  expectedGeneration: number,
+  triesLeft: number,
+): Promise<void> {
+  // Ready already published, or the picker is back (its gate owns startup).
+  if (!awaitingFirstPrompt || codexModelMigrationPending || !expectedBackend) return;
+  const retry = (delayMs: number) => {
+    if (triesLeft > 1) scheduleCodexModelMigrationReseed(delayMs, triesLeft - 1);
+  };
+  const quietMs = Date.now() - lastPtyOutputAtMs;
+  if (quietMs < CODEX_MODEL_MIGRATION_RESEED_QUIET_MS) {
+    retry(CODEX_MODEL_MIGRATION_RESEED_QUIET_MS - quietMs);
+    return;
+  }
+  const settled = await settleCodexModelMigrationRenderer();
+  if (backend !== expectedBackend || cliSpawnGeneration !== expectedGeneration) return;
+  if (!awaitingFirstPrompt || codexModelMigrationPending) return;
+  if (!settled) { retry(CODEX_MODEL_MIGRATION_RESEED_QUIET_MS); return; }
+  let screen = '';
+  try {
+    screen = captureBackendScreen(expectedBackend);
+  } catch { retry(CODEX_MODEL_MIGRATION_RESEED_QUIET_MS); return; }
+  const text = stripAnsiScreenText(screen);
+  if (!text.trim()) { retry(CODEX_MODEL_MIGRATION_RESEED_QUIET_MS); return; }
+  if (isCodexModelMigrationScreen(screen) || !cliAdapter?.readyPattern?.test(text)) return;
+  if (idleDetector?.seedReadyEvidence()) {
+    log(`Codex model-migration picker cleared: screen quiet ${quietMs}ms with a prompt; re-seeding readiness`);
+  }
+}
+
+/**
+ * Synchronous picker gate on the current screen; reached only through
+ * codexModelMigrationAdmit(), which drains the renderer first. Returns true
+ * while input must stay queued: the authoritative screen shows the picker as
+ * the active input surface, or the frame is unreadable/unverified while a hold
+ * is in force (or during startup). It then selects "Use existing model"
+ * (bounded retries, then one user notice). It never resets idle evidence: a
+ * stale observation must not erase a composer redraw.
+ */
+function codexModelMigrationBlocksInput(override?: CodexModelMigrationObservation): boolean {
+  if (!codexModelMigrationCheckNeeded()) return false;
+  const observed = override ?? observeCodexModelMigrationScreen();
+  if (observed.state === 'unobservable') return false;
+  if (observed.state === 'unreadable') {
+    // Not evidence that the picker closed: keep an existing hold (and stay
+    // held during startup), never cache it as cleared. A readable recheck
+    // decides.
+    if (!codexModelMigrationPending && !awaitingFirstPrompt) return false;
+    if (!codexModelMigrationUnreadableLogged) {
+      codexModelMigrationUnreadableLogged = true;
+      log('Codex screen capture unreadable while checking the model-migration picker; holding input until a readable capture');
+    }
+    holdCodexModelMigrationInput();
+    return true;
+  }
+  codexModelMigrationUnreadableLogged = false;
+  if (observed.state === 'clear') {
+    const wasPending = codexModelMigrationPending;
+    codexModelMigrationPending = false;
+    if (!awaitingFirstPrompt) codexModelMigrationCleared = true;
+    if (wasPending) scheduleCodexModelMigrationRelease();
+    return false;
+  }
+  holdCodexModelMigrationInput();
+  if (codexModelMigrationAttempts >= CODEX_MODEL_MIGRATION_MAX_ATTEMPTS) {
+    if (!codexModelMigrationLimitNotified) {
+      codexModelMigrationLimitNotified = true;
+      log(`Codex model-migration picker remained after ${codexModelMigrationAttempts} automatic attempts; input stays held`);
+      send({
+        type: 'user_notify',
+        message: t('worker.codex_model_migration_unresolved', { cliName: cliName(), attempts: codexModelMigrationAttempts }),
+        turnId: currentBotmuxTurnId,
+      });
+    }
+    return true;
+  }
+  if (Date.now() - codexModelMigrationLastActionAt < CODEX_MODEL_MIGRATION_RETRY_MS) return true;
+  codexModelMigrationLastActionAt = Date.now();
+  // Every throttled attempt spends the bounded budget, including one where the
+  // highlighted row is unreadable or the keys were refused: a persistent
+  // failure must surface to the user instead of holding the turn silently.
+  codexModelMigrationAttempts += 1;
+  const attempt = `attempt ${codexModelMigrationAttempts}/${CODEX_MODEL_MIGRATION_MAX_ATTEMPTS}`;
+  const keys = codexModelMigrationSafeKeys(observed.screen);
+  if (!keys) {
+    log(`Codex model-migration picker visible but its selected row is unreadable; holding input (${attempt})`);
+    return true;
+  }
+  let delivered = false;
+  try {
+    if ('sendSpecialKeys' in backend!) {
+      delivered = (backend as any).sendSpecialKeys(...keys) !== false;
+    } else {
+      const input = keys.map(key => key === 'Down' ? '\x1b[B' : key === 'Up' ? '\x1b[A' : '\r').join('');
+      delivered = backend!.write(input) === true;
+    }
+  } catch (error) {
+    log(`Codex model-migration picker navigation failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  log(delivered
+    ? `Codex model-migration picker detected, keeping the configured model (${keys.join('+')}, ${attempt})`
+    : `Codex model-migration picker keys were not delivered (${attempt})`);
+  return true;
+}
+
+/**
+ * THE admission point for the picker guard. Every Codex PTY writer
+ * (flushPending — queued and type-ahead messages, raw passthrough deferred by
+ * codexModelMigrationHoldsRawInput, startup commands, rename — and
+ * flushPendingInjections), every startup ready edge (screen idle, first-prompt
+ * timeout) and the retry timer pass through here, and only here:
+ * renderer drain first, then the synchronous gate on a verified frame. An
+ * unverified frame takes the same hold + retry path as an unreadable capture.
+ * `superseded` means the CLI generation changed during the drain.
+ */
+async function codexModelMigrationAdmit(
+  kind: 'write' | 'ready' | 'recheck',
+  readyGeneration?: number,
+): Promise<'proceed' | 'held' | 'superseded'> {
+  if (!codexModelMigrationCheckNeeded()) return 'proceed';
+  const expectedBackend = backend;
+  const expectedGeneration = cliSpawnGeneration;
+  const settled = await settleCodexModelMigrationRenderer();
+  if (backend !== expectedBackend || cliSpawnGeneration !== expectedGeneration) return 'superseded';
+  if (!codexModelMigrationBlocksInput(settled ? undefined : { state: 'unreadable' })) return 'proceed';
+  // Remember what was held so the release can re-drive it.
+  if (kind === 'write') codexModelMigrationHeldWrite = true;
+  if (kind === 'ready' && readyGeneration !== undefined) codexModelMigrationHeldReadyGeneration = readyGeneration;
+  return 'held';
+}
+
+/** Raw passthrough normally writes literally, even while busy. While the
+ *  picker guard is live (startup, or a hold in force) it is queued instead —
+ *  synchronously, in arrival order — so flushPending, the single admission
+ *  point serialized by isFlushing, delivers it after the gate and never
+ *  interleaved with a normal message's paste/Enter. The picker only precedes
+ *  a CLI process's first prompt, so afterwards raw keeps its legacy path. */
+function codexModelMigrationHoldsRawInput(): boolean {
+  if (!codexModelMigrationCheckNeeded()) return false;
+  if (!awaitingFirstPrompt && !codexModelMigrationPending) return false;
+  codexModelMigrationHeldWrite = true;
+  return true;
+}
+
+/** Screen-idle gate: a picker that replaced Codex's composer is not a prompt,
+ *  even when the stream chunk that painted it was missed. */
+async function codexModelMigrationHoldsIdleInput(idleBackend: typeof backend): Promise<boolean> {
+  if (!codexModelMigrationCheckNeeded()) return false;
+  // Evidence generation of THIS idle edge, before any await.
+  const readyGeneration = ptyOutputGeneration.snapshot();
+  const admission = await codexModelMigrationAdmit('ready', readyGeneration);
+  // Superseded generation: never mark ready from it.
+  if (admission === 'superseded' || backend !== idleBackend) return true;
+  if (admission === 'proceed') return false;
+  log('Codex model-migration picker owns the input surface; holding queued input');
+  return true;
+}
+
 /**
  * Handle startup-only interactions discovered in visible terminal text.
  * Both incremental PTY chunks and authoritative observer snapshots pass
@@ -11737,6 +12106,10 @@ function handleVisibleStartupInteraction(data: string): boolean {
   // "Continue without trusting" through the Web Terminal when Codex presents
   // its Hooks review menu.
   if (lastInitConfig?.existingAppServerEndpoint) return false;
+
+  // Checked before the trust latch: the migration picker follows the trust
+  // dialog on a first launch. Observation only — the chunk is not consumed.
+  noticeCodexModelMigrationDialog(data);
 
   if (trustHandled) return false;
   const stripped = data.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '');
@@ -14205,6 +14578,11 @@ function directRpcTurnBlocksTypeAhead(): boolean {
 }
 
 async function flushPending(): Promise<void> {
+  // Codex model-migration picker guard (startup only): the single admission
+  // point runs before every other guard, so they are all evaluated after its
+  // renderer drain; concurrent calls still serialize on isFlushing (no other
+  // await before it is set). Nothing below re-reads the screen for the picker.
+  if (codexModelMigrationCheckNeeded() && await codexModelMigrationAdmit('write') !== 'proceed') return;
   if (idleDetector?.isStartupPending()) return;
   // destroySession() may be asynchronous while `backend` still references the
   // old CLI. Never let a new flush (including one triggered by the old
@@ -16043,6 +16421,10 @@ async function spawnCli(
   const proxyError = networkProxyError(cfg.sandboxNetworkPolicy, { ...process.env, ...cfg.env });
   if (proxyError) throw new Error(proxyError);
   const spawnGeneration = ++cliSpawnGeneration;
+  // Every spawn is a new CLI process that can show the picker again. Not all
+  // respawns pass through killCli() (e.g. the retry after a crash-loop park),
+  // so the per-process picker state must be reset here too.
+  resetCodexModelMigrationState();
   const isolationRuntimeDataDir = process.env.SESSION_DATA_DIR
     ?? join(homedir(), '.botmux', 'data');
   const sessionScratchDir = ensureSessionTempDir(isolationRuntimeDataDir, cfg.sessionId);
@@ -20606,6 +20988,8 @@ async function spawnCli(
           log('Screen settle barrier degraded after bounded retries; finalizing from the last successful snapshot');
         }
       }
+      // A Codex model-migration picker is not a prompt (see the helper).
+      if (evidenceSource === 'screen' && await codexModelMigrationHoldsIdleInput(idleBackend)) return;
       // xterm-headless parses renderer.write() asynchronously. A transcript
       // terminal can arrive in the same tick as the TUI's busy redraw; drain
       // queued render bytes before the post-terminal composer fence inspects
@@ -21067,7 +21451,7 @@ async function spawnCli(
   // content written *after* this point appears in the card.
   const firstPromptBackend = backend;
   let requestedAidenResumeRedraw = false;
-  const releaseFirstPromptTimeout = (elapsedMs: number, forced: boolean): void => {
+  const releaseFirstPromptTimeout = (elapsedMs: number, forced: boolean, pickerAdmitted = false): void => {
     if (!awaitingFirstPrompt || backend !== firstPromptBackend) return;
     // A timeout can recover missing prompt evidence, never contradict explicit
     // loading evidence. Keep the queue/startup flag; the loaded frame re-drives
@@ -21129,6 +21513,20 @@ async function spawnCli(
       return;
     }
 
+    // Never clear startup state or force a write while Codex's model-migration
+    // picker owns the input surface: the forced flush below would paste into
+    // it and its Enter would accept the new model. Its resolution (automatic,
+    // or by the user in the Web terminal) redraws the composer and re-drives
+    // the normal idle path, which still sees awaitingFirstPrompt.
+    if (!pickerAdmitted && codexModelMigrationCheckNeeded()) {
+      // Decide through the admission point; the re-entry re-validates
+      // everything above against the post-drain state.
+      void codexModelMigrationAdmit('ready', ptyOutputGeneration.snapshot()).then(admission => {
+        if (admission === 'proceed') releaseFirstPromptTimeout(elapsedMs, forced, true);
+        else if (admission === 'held') log(`First prompt timeout — Codex model-migration picker still open; keeping ${pendingMessages.length} input(s) queued`);
+      });
+      return;
+    }
     const wasAwaitingPostHookPrompt = awaitingPostSessionStartPromptEvidence;
     awaitingFirstPrompt = false;
     awaitingPostSessionStartPromptEvidence = false;
@@ -21396,6 +21794,7 @@ function killCli(opts: {
   aidenCodexUpdateLastActionAt = 0;
   aidenCodexUpdateAttempts = 0;
   aidenCodexUpdateLimitNotified = false;
+  resetCodexModelMigrationState();
   disarmEffortConfirm();
   appRunnerControlDecoder.reset();
 }
@@ -24767,7 +25166,7 @@ process.on('message', async (raw: unknown) => {
         || shouldHoldCodexRunnerInput(codexRunnerFreshness)
         || injectionFlushing || shouldDeferUserFlush(pendingInjections)
         || bareShellCheckInProgress || bareShellLaunchBlocked
-        || hookReviewInputHold) {
+        || hookReviewInputHold || codexModelMigrationHoldsRawInput()) {
         freshnessInputQueue.enqueueRaw(msg);
         if (hookReviewInputHold) {
           notifyHookReviewInputHold();
