@@ -119,31 +119,44 @@ export function cliHasNoRawPassthroughSurface(
  * checked BEFORE DAEMON_COMMANDS in the router). Returns null for anything that
  * doesn't qualify. Does NOT prepend the leading `/` — callers that accept bare
  * user input should add it first (see {@link parseCustomPassthroughInput}).
+ *
+ * Internal whitespace joins with `-`: CLI slash commands are single tokens
+ * (`/ultra-goal`) while users naturally type the name with a space
+ * (`/Ultra Goal`). Collapsing before the shape test keeps the grant gate and
+ * router seeing only one well-formed token.
  */
 export function normalizePassthroughCommand(cmd: unknown): string | null {
   if (typeof cmd !== 'string') return null;
-  const normalized = cmd.trim().toLowerCase();
+  const normalized = cmd.trim().toLowerCase().replace(/\s+/g, '-');
   if (!SLASH_COMMAND_SHAPE.test(normalized)) return null;
   if (DAEMON_COMMANDS.has(normalized)) return null;
   return normalized;
 }
 
 /**
- * Parse free-text dashboard / `/botconfig` input (comma, space or newline
- * separated) into a normalized, deduped custom passthrough command list. The
- * leading `/` is optional per token (so users can type `goal export` or
- * `/goal, /export`); illegal and daemon-shadowing tokens are dropped. Mirrors
- * the normalization {@link ../bot-registry.js}'s parseBotConfigsFromText applies
- * when loading bots.json, so a round-trip through the card is stable.
+ * Parse free-text dashboard / `/botconfig` input into a normalized, deduped
+ * custom passthrough command list. Separators are comma/newline, plus a space
+ * whose next token starts with `/` (`/goal /export`). A space before a bare
+ * word is NOT a separator — the word belongs to the command name and joins
+ * with `-` ({@link normalizePassthroughCommand}), so `/Ultra Goal` parses as
+ * one command `/ultra-goal` instead of `/ultra` + `/goal`. The leading `/` is
+ * optional per entry; illegal and daemon-shadowing entries are dropped.
+ * Mirrors the normalization {@link ../bot-registry.js}'s
+ * parseBotConfigsFromText applies when loading bots.json, so a round-trip
+ * through the card is stable.
  */
 export function parseCustomPassthroughInput(raw: string): string[] {
   const out: string[] = [];
-  for (const tok of String(raw ?? '').split(/[\s,]+/)) {
-    const trimmed = tok.trim();
-    if (!trimmed) continue;
-    const withSlash = trimmed.startsWith('/') ? trimmed : `/${trimmed}`;
-    const norm = normalizePassthroughCommand(withSlash);
-    if (norm) out.push(norm);
+  for (const segment of String(raw ?? '').split(/[,\r\n]+/)) {
+    // 一个 entry = 首个 token（带不带 `/` 都行）+ 后续「空白后不是 `/`」的词；
+    // 空白后的下一个 `/` 另起一条（`/goal /export`）。
+    for (const tok of segment.match(/\/?\S+(?:[^\S\r\n]+(?!\/)\S+)*/g) ?? []) {
+      const trimmed = tok.trim();
+      if (!trimmed) continue;
+      const withSlash = trimmed.startsWith('/') ? trimmed : `/${trimmed}`;
+      const norm = normalizePassthroughCommand(withSlash);
+      if (norm) out.push(norm);
+    }
   }
   return [...new Set(out)];
 }
