@@ -3735,7 +3735,26 @@ describe('handleCommand', () => {
         .map(c => c[1])
         .find((content): content is string => typeof content === 'string' && content.includes('"tag":"table"'));
       expect(confirmCard).toBeTruthy();
-      const confirmTable = JSON.parse(confirmCard as string).body.elements
+      const parsedConfirmCard = JSON.parse(confirmCard as string);
+      expect(parsedConfirmCard.schema).toBe('2.0');
+      expect(parsedConfirmCard.body.elements.some((e: any) => e.tag === 'action')).toBe(false);
+      const confirmButton = parsedConfirmCard.body.elements
+        .find((e: any) => e.tag === 'column_set')?.columns?.[0]?.elements?.[0];
+      expect(confirmButton).toMatchObject({
+        tag: 'button',
+        type: 'danger',
+        behaviors: [{
+          type: 'callback',
+          value: {
+            action: 'close_worktree_confirm',
+            root_id: ROOT_ID,
+            session_id: ds.session.sessionId,
+            invoker_open_id: 'ou_sender',
+          },
+        }],
+      });
+      expect(confirmButton.behaviors[0].value.confirmation_state).toMatch(/^[a-f0-9]{64}$/);
+      const confirmTable = parsedConfirmCard.body.elements
         .find((e: any) => e.tag === 'table');
       expect(confirmTable.row_height).toBe('auto');
       expect(confirmTable.row_max_height).toBe('300px');

@@ -437,18 +437,28 @@ function buildCloseWorktreeConfirmCard(args: {
       content: `<font color='grey'>${t(hasRisk ? 'cmd.close.worktree_confirm_effect' : 'cmd.close.worktree_effect_safe', undefined, loc)}</font>`,
     },
     {
-      tag: 'action',
-      actions: [{
-        tag: 'button',
-        text: { tag: 'plain_text', content: t('cmd.close.worktree_confirm_button', undefined, loc) },
-        type: 'danger',
-        value: {
-          action: 'close_worktree_confirm',
-          root_id: args.rootId,
-          session_id: args.sessionId,
-          invoker_open_id: args.invokerOpenId,
-          confirmation_state: args.confirmationState,
-        },
+      tag: 'column_set',
+      flex_mode: 'none',
+      horizontal_spacing: 'small',
+      columns: [{
+        tag: 'column',
+        width: 'weighted',
+        weight: 1,
+        elements: [{
+          tag: 'button',
+          text: { tag: 'plain_text', content: t('cmd.close.worktree_confirm_button', undefined, loc) },
+          type: 'danger',
+          behaviors: [{
+            type: 'callback',
+            value: {
+              action: 'close_worktree_confirm',
+              root_id: args.rootId,
+              session_id: args.sessionId,
+              invoker_open_id: args.invokerOpenId,
+              confirmation_state: args.confirmationState,
+            },
+          }],
+        }],
       }],
     },
   ];
