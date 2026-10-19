@@ -209,10 +209,12 @@ import { platformMachineBaseUrl, publicReverseProxyBaseUrl } from './platform/bi
 import { isMultiTopicOrchestrationEnabled, isRemoteAccessEnabled } from './global-config.js';
 import {
   DASHBOARD_COMMAND_USAGE,
-  DASHBOARD_LOCAL_TOKEN_FLAG,
+  DASHBOARD_READY_WAIT_MS,
   dashboardComingUpFromState,
+  dashboardExportTimeoutForBudget,
   dashboardFailureIsTerminal,
   executeDashboardCliCommand,
+  exportAfterDashboardAnswer,
   formatDashboardFallbackFailure,
   formatDashboardSuccessLines,
   formatDashboardUnreachable,
@@ -3691,15 +3693,16 @@ async function callDashboardEndpoint(
  * `devboxDashboardBaseUrl()` 读侧用的是同一份判据，避免写 9002、读 9001。
  * 非 Devbox / 已配置中心平台或自建反代 / `merlin-cli` 不可用时全部静默 no-op。
  */
-async function ensureDevboxDashboardExportForCurrentPort(): Promise<void> {
+async function ensureDevboxDashboardExportForCurrentPort(timeoutMs?: number): Promise<string | null> {
   const portFile = join(CONFIG_DIR, '.dashboard-port');
   const port = Number((existsSync(portFile) ? readFileSync(portFile, 'utf8').trim() : '')
     || process.env.BOTMUX_DASHBOARD_PORT || '7891');
-  await ensureDevboxDashboardExport({
+  return ensureDevboxDashboardExport({
     port,
     remoteBaseConfigured: Boolean(
       (isRemoteAccessEnabled() && platformMachineBaseUrl()) || publicReverseProxyBaseUrl(),
     ),
+    timeoutMs,
   });
 }
 
@@ -3763,16 +3766,27 @@ async function printDashboardHintWithRetry(): Promise<void> {
   const stepMs = 500;
   const started = Date.now();
   let last: Awaited<ReturnType<typeof callDashboardEndpoint>> | null = null;
-  // 只在轮询之前做一次：导出结果与「dashboard 起没起来」无关，放在循环体里每轮都会
-  // 重新 spawn 一次 merlin-cli，而失败路径最坏每轮付满 5s 超时——本函数自己的预算
-  // 撑不住，实测会把 start/restart 的这段拖到近两倍。
-  await ensureDevboxDashboardExportForCurrentPort();
   for (;;) {
     // Bounded per request (NOT opted into rescanning): this loop's own budget is
     // only consulted below, after the await returns, so a recorded port that
     // accepts the connection and never answers would hang here forever and never
     // reach that check. See requestTimeoutMs in dashboard-endpoint.ts.
     last = await callDashboardEndpoint('/__cli/current', { requestTimeoutMs: stepMs * 4 });
+    // 导出放在 dashboard 在其端口上应答之后（callDashboard 可能自愈
+    // `.dashboard-port`）。「应答」包含 `no-active-token`：全新 Devbox 上没人跑过
+    // `botmux dashboard` 时就是这个状态，此时也要导出——终端链接（PTY/tmux 共用的
+    // buildTerminalUrl）与 CSRF authority 只读导出缓存、不需要 dashboard token。
+    // 拿到可用链接时再用不轮换的 current 重读一次；no-active-token 不调任何
+    // endpoint，绝不创建/轮换 token。两者都结束本循环，所以只导出一次。导出超时
+    // 按剩余预算钳制，重读与轮询同样带 requestTimeoutMs。
+    const exportTimeoutMs = dashboardExportTimeoutForBudget(
+      DASHBOARD_READY_WAIT_MS - (Date.now() - started),
+    );
+    last = await exportAfterDashboardAnswer(
+      last,
+      exportTimeoutMs === null ? null : () => ensureDevboxDashboardExportForCurrentPort(exportTimeoutMs),
+      path => callDashboardEndpoint(path, { requestTimeoutMs: stepMs * 4 }),
+    );
     if (last.ok) {
       // 与 `botmux dashboard` 同一套收敛：绑定中心化平台 / 自建反代后链接不带
       // token（`localUrl` 有值就是这一位），本地直连那条带 token，默认不打印。
@@ -3810,17 +3824,19 @@ async function printDashboardHintWithRetry(): Promise<void> {
  * `dashboard` is the non-rotating get-or-create form; help and invalid
  * subcommands never call either credential endpoint. */
 async function cmdDashboard(args: string[]): Promise<void> {
-  const positional = args.filter(arg => arg !== DASHBOARD_LOCAL_TOKEN_FLAG);
-  const rawAction = positional[0]?.toLowerCase();
-  const resolvesEndpoint = positional.length <= 1
-    && !args.some(arg => ['--help', '-h', 'help'].includes(arg.toLowerCase()))
-    && (rawAction === undefined || rawAction === 'current' || rawAction === 'rotate');
-  if (resolvesEndpoint) await ensureDevboxDashboardExportForCurrentPort();
   // The opt-in for a dead recorded port lives INSIDE executeDashboardCliCommand
   // so it is directly testable (see its doc comment for why source-regex guards
   // were not). `printDashboardHintWithRetry()` deliberately does not use this
   // wrapper — a 500ms poll must never scan the probe range per tick.
-  const execution = await executeDashboardCliCommand(args, callDashboardEndpoint);
+  //
+  // The Devbox export runs INSIDE the wrapper too, after the first endpoint call
+  // has proven which port the live dashboard owns (see
+  // executeDashboardCommandWithExportRefresh).
+  const execution = await executeDashboardCliCommand(
+    args,
+    callDashboardEndpoint,
+    () => ensureDevboxDashboardExportForCurrentPort(),
+  );
   if (execution.kind === 'help') {
     console.log(DASHBOARD_COMMAND_USAGE);
     return;
