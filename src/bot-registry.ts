@@ -30,6 +30,7 @@ import {
   type CliLaunchMode,
 } from './core/cli-launch-mode.js';
 import { logger } from './utils/logger.js';
+import { createLarkUploadHttpPool } from './utils/lark-http-pool.js';
 import { isLocale, setBotLookup, type Locale } from './i18n/index.js';
 import type { VoiceConfig } from './services/voice/types.js';
 import { normalizeGroupIdleClose, type GroupIdleCloseSettings } from './core/group-idle-close.js';
@@ -193,42 +194,20 @@ export function configureLarkClientHttpTimeout(client: unknown): void {
  * behave identically. Falls back to leaving the client on the shared instance
  * if the SDK ever stops exporting `defaultHttpInstance`, so a future SDK bump
  * degrades to "uploads keep the interactive timeout" rather than breaking.
+ *
+ * The pool additionally carries dedicated short-TTL keep-alive agents (see
+ * utils/lark-http-pool.ts): without them a large upload over a lossy path can
+ * land on a socket an intermediary silently half-closed, write its whole body,
+ * then never receive a response — wedging every later upload on that pool.
  */
-let cachedLarkUploadHttpInstance: unknown;
+let cachedLarkUploadHttpPool: { instance: unknown } | null | undefined;
 export function larkUploadHttpInstance(): unknown {
-  if (cachedLarkUploadHttpInstance !== undefined) return cachedLarkUploadHttpInstance;
-  let base: any;
-  try {
-    base = (Lark as unknown as { defaultHttpInstance?: any }).defaultHttpInstance;
-  } catch {
-    // A stripped/mocked SDK namespace may throw on accessing an absent export.
-    base = undefined;
-  }
-  if (!base || typeof base.create !== 'function') {
-    cachedLarkUploadHttpInstance = null;
-    return cachedLarkUploadHttpInstance;
-  }
-  const instance = base.create({ timeout: LARK_UPLOAD_TIMEOUT_MS });
-  try {
-    for (const handler of base.interceptors?.request?.handlers ?? []) {
-      if (handler) {
-        instance.interceptors.request.use(handler.fulfilled, handler.rejected, {
-          synchronous: handler.synchronous,
-        });
-      }
-    }
-    for (const handler of base.interceptors?.response?.handlers ?? []) {
-      if (handler) instance.interceptors.response.use(handler.fulfilled, handler.rejected);
-    }
-  } catch {
-    // A shape change in the SDK's interceptor registry must not brick uploads;
-    // an instance without the response-unwrap interceptor would misread
-    // responses, so fall back to the shared instance (interactive timeout).
-    cachedLarkUploadHttpInstance = null;
-    return cachedLarkUploadHttpInstance;
-  }
-  cachedLarkUploadHttpInstance = instance;
-  return cachedLarkUploadHttpInstance;
+  if (cachedLarkUploadHttpPool !== undefined) return cachedLarkUploadHttpPool?.instance ?? null;
+  cachedLarkUploadHttpPool = createLarkUploadHttpPool(
+    Lark as unknown as { defaultHttpInstance?: any },
+    { timeoutMs: LARK_UPLOAD_TIMEOUT_MS },
+  );
+  return cachedLarkUploadHttpPool?.instance ?? null;
 }
 
 export type ChatReplyMode = 'chat' | 'new-topic' | 'shared' | 'chat-topic';
@@ -2434,7 +2413,7 @@ export function __testOnly_resetBotRegistry(): void {
   registeredOncallConfigMtimeMs = null;
   oncallChatCache = null;
   brandLabelCache = null;
-  cachedLarkUploadHttpInstance = undefined;
+  cachedLarkUploadHttpPool = undefined;
   usageDisplayCache = null;
   replyStyleCache = null;
 }
