@@ -143,6 +143,8 @@ describe.each([
         expect(run(missing)).toMatchObject({ status: IDENTITY_DENIED_EXIT_CODE, stdout: '' });
       }
       publishActiveTurn(dataDir, 'botmux-session', 'turn-a');
+      expect(run()).toMatchObject({ status: 0, stdout: 'test-alice' });
+      publishActiveTurn(dataDir, 'botmux-session', 'turn-unprepared');
       expect(run()).toMatchObject({ status: IDENTITY_DENIED_EXIT_CODE, stdout: '' });
     } finally {
       rmSync(dataDir, { recursive: true, force: true });
