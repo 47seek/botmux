@@ -774,7 +774,9 @@ export interface DaemonSession {
     /** Unguessable Seatbelt pane/profile authority channel. */
     originChannelId?: string;
     turnId?: string;
+    identityTurnId?: string;
     dispatchAttempt?: number;
+    trustedCaller?: TrustedCaller | null;
     /** Current human caller, carried over private worker IPC from the
      * daemon-authenticated input envelope. Never sourced from CLI env/files. */
     callerOpenId?: string;

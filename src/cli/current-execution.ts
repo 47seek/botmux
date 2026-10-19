@@ -12,6 +12,7 @@ export interface CurrentExecutionDocument {
   turnId: string;
   workerGeneration: number;
   dispatchAttempt?: number;
+  identityTurnId?: string;
 }
 
 const identifier = (value: unknown): value is string => typeof value === 'string'
@@ -26,8 +27,9 @@ export function isCurrentExecutionDocument(value: unknown): value is CurrentExec
     && ['larkAppId', 'sessionId', 'chatId', 'turnId'].every(key => identifier(d[key]))
     && positive(d.workerGeneration)
     && (d.dispatchAttempt === undefined || positive(d.dispatchAttempt))
+    && (d.identityTurnId === undefined || identifier(d.identityTurnId))
     && Object.keys(d).every(key => ['schema', 'status', 'larkAppId', 'sessionId', 'chatId',
-      'turnId', 'workerGeneration', 'dispatchAttempt'].includes(key));
+      'turnId', 'workerGeneration', 'dispatchAttempt', 'identityTurnId'].includes(key));
 }
 
 export function parseCurrentExecutionArgs(args: string[]): boolean {

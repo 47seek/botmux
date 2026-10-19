@@ -2,15 +2,13 @@
  * Per-turn publication of the acting CLI identity.
  *
  * This is where the three pieces meet: the bot's {@link TriggerUserAuthConfig}
- * policy, the per-person token store, and the session identity file a wrapper
- * sources. It runs once per turn, just before the turn reaches the CLI.
+ * policy, the per-person token store, and the per-turn identity snapshot a
+ * wrapper sources when that turn executes.
  *
  * The single rule it enforces: **the credentials published for a turn belong to
  * the person who sent that turn, or nothing is published.** There is no path
  * here that reads another person's token — the sender's open_id is the only key
- * ever used, and when it yields nothing the previous file is DELETED rather than
- * left in place. A stale file would mean the next command silently runs as the
- * previous person, which is the exact failure the feature exists to remove.
+ * ever used. Missing credentials produce a denial in that turn's snapshot.
  */
 import { logger } from '../utils/logger.js';
 import { resolveUserToken, lookupAuthorizedUserName } from '../utils/user-token.js';
@@ -113,9 +111,7 @@ export async function publishTurnCliIdentity(
     } catch (e) {
       // Fail closed through the SAME policy as an ordinary missing token, so a
       // credential-store outage and "this person never authorized" cannot end
-      // up with different identities in force. Overwriting matters as much as
-      // the policy: leaving the previous person's file would keep running as
-      // them with no signal at all.
+      // up with different identities in force.
       logger.warn(
         `[trigger-user-auth] withheld ${tool} identity for session ${sessionId}: `
         + `${e instanceof Error ? e.message : String(e)}`,
@@ -128,7 +124,7 @@ export async function publishTurnCliIdentity(
               ? 'botmux: bytedcli authorization service is unavailable. Stop automatic retries and repeated login requests; retry after the service recovers. Existing authorization is retained.'
               : 'botmux: bytedcli 授权服务暂时不可用。请停止自动重试和重复要求用户登录；服务恢复后再重试，已有授权会保留。',
           });
-        } catch { clearSessionIdentity(sessionDataDir, sessionId, tool); }
+        } catch { clearSessionIdentity(sessionDataDir, sessionId, tool, turnId); }
         outcomes.push({ tool, state: 'unavailable' });
         continue;
       }
@@ -154,7 +150,7 @@ function denyDelegated(tool: TriggerUserAuthTool, args: PublishTurnIdentityArgs,
         + reason + ' Do not ask a bot to log in or use another identity.',
     });
   } catch {
-    clearSessionIdentity(args.sessionDataDir, args.sessionId, tool);
+    clearSessionIdentity(args.sessionDataDir, args.sessionId, tool, args.turnId);
   }
   return { tool, state: 'needs-authorization' };
 }
@@ -191,7 +187,11 @@ async function publishDelegated(tool: TriggerUserAuthTool, args: PublishTurnIden
     }
   }
   if (!identity) return denyDelegated(tool, args, user);
-  writeSessionIdentity(args.sessionDataDir, args.sessionId, { ...identity, ...(args.turnId ? { turnId: args.turnId } : {}) });
+  writeSessionIdentity(args.sessionDataDir, args.sessionId, {
+    ...identity,
+    ...(args.turnId ? { turnId: args.turnId } : {}),
+    ...(user.targetOpenId ? { openId: user.targetOpenId } : {}),
+  });
   return { tool, state: 'user' };
 }
 
@@ -411,7 +411,7 @@ function writeDenial(
       ].join('\n'),
     });
   } catch (e) {
-    clearSessionIdentity(sessionDataDir, sessionId, tool);
+    clearSessionIdentity(sessionDataDir, sessionId, tool, turnId);
     logger.debug(
       `[trigger-user-auth] could not publish the ${tool} denial (absent file denies too): `
       + `${e instanceof Error ? e.message : String(e)}`,

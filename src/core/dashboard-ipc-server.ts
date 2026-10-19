@@ -102,7 +102,8 @@ import {
 import { CURRENT_EXECUTION_ROUTE, CURRENT_EXECUTION_SCHEMA } from '../cli/current-execution.js';
 import { resolveDaemonCurrentExecution } from './current-execution.js';
 import {
-  attestCurrentTurnLoopbackPeer,
+  attestCurrentExecutionLoopbackPeer,
+  currentTurnPeerAttestationStable,
   resolveDaemonCurrentActor,
   resolveLoopbackPeerProcesses,
 } from './current-actor-attestation.js';
@@ -2863,7 +2864,17 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
   const originSender = origin?.callerOpenId;
   const turnId = origin?.turnId;
   if (!turnId) return jsonRes(res, 403, { ok: false, error: 'No current requesting user; --as user requires their authorization' });
-  const delegated = getLarkToolDelegation(config.session.dataDir, params.sessionId, turnId);
+  const identityTurnId = origin?.identityTurnId;
+  const peer = process.platform === 'linux' ? resolveLoopbackPeerProcesses({
+    remoteAddress: req.socket.remoteAddress, remotePort: req.socket.remotePort, localPort: req.socket.localPort,
+  }) : undefined;
+  const executionInput = peer?.ok
+    ? { sessionId: params.sessionId, peer: peer.peer, findSession: findActiveBySessionId } : undefined;
+  const execution = executionInput ? attestCurrentExecutionLoopbackPeer(executionInput) : undefined;
+  if (process.platform === 'linux' && !execution) {
+    return jsonRes(res, 403, { ok: false, error: 'current_execution_unverified' });
+  }
+  const delegated = getLarkToolDelegation(config.session.dataDir, params.sessionId, identityTurnId ?? turnId);
   const delegatedError = (reason: string) => `Delegated lark-cli execution refused: ${reason}. Report with botmux report --dispatch-root ${delegated!.dispatchRoot}; do not ask a bot to log in.`;
   if (delegated && (delegated.denialReason || !delegated.targetOpenId || !delegated.tools.includes('lark-cli')
     || !triggerUserAuthApplies(bot.triggerUserAuth, 'lark-cli'))) {
@@ -2879,8 +2890,12 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
     return jsonRes(res, 403, { ok: false, error: 'The current requesting user could not be verified' });
   }
   const token = await resolveUserToken(bot.larkAppId, bot.larkAppSecret, normalizeBrand(bot.brand), sender);
-  if (ds.managedTurnOrigin?.turnId !== turnId || ds.managedTurnOrigin?.callerOpenId !== originSender
-    || delegated && JSON.stringify(getLarkToolDelegation(config.session.dataDir, params.sessionId, turnId)) !== JSON.stringify(delegated)) {
+  if (findActiveBySessionId(params.sessionId) !== ds || ds.session.status !== 'active'
+    || !boundLarkToolRequest(req, params.sessionId, bot.larkAppId)
+    || execution && !currentTurnPeerAttestationStable(execution, executionInput!)
+    || ds.managedTurnOrigin?.turnId !== turnId || ds.managedTurnOrigin?.callerOpenId !== originSender
+    || ds.managedTurnOrigin?.identityTurnId !== identityTurnId
+    || JSON.stringify(getLarkToolDelegation(config.session.dataDir, params.sessionId, identityTurnId ?? turnId)) !== JSON.stringify(delegated)) {
     return jsonRes(res, 409, { ok: false, error: 'The current requesting user changed; retry the command' });
   }
   if (!token) return jsonRes(res, 403, { ok: false, error: delegated
@@ -2919,7 +2934,7 @@ for (const action of ['auth-request', 'auth-status']) {
     const origin = ds?.managedTurnOrigin;
     if (!ds || ds.session.status !== 'active' || sessionTransportDisabled(ds)
       || ds.session.vcMeetingReceiver || !ds.worker || ds.worker.killed
-      || !origin?.callerOpenId || !origin.turnId || !origin.capability) {
+      || !origin?.turnId || !origin.capability) {
       return jsonRes(res, 403, { ok: false, error: 'current_actor_unverified' });
     }
     // Two proof modes for "this request belongs to the current turn":
@@ -2942,7 +2957,7 @@ for (const action of ['auth-request', 'auth-status']) {
         remotePort: req.socket.remotePort,
         localPort: req.socket.localPort,
       });
-      if (!peer.ok || !attestCurrentTurnLoopbackPeer({
+      if (!peer.ok || !attestCurrentExecutionLoopbackPeer({
         sessionId: params.sessionId, peer: peer.peer, findSession: findActiveBySessionId,
       })) {
         return jsonRes(res, 403, { ok: false, error: 'current_actor_unverified' });
@@ -2954,13 +2969,14 @@ for (const action of ['auth-request', 'auth-status']) {
     const requestingUser = (): string | undefined => {
       const liveOrigin = ds.managedTurnOrigin;
       if (!liveOrigin?.turnId) return undefined;
-      const grant = getLarkToolDelegation(config.session.dataDir, params.sessionId, liveOrigin.turnId);
+      const grant = getLarkToolDelegation(config.session.dataDir, params.sessionId, liveOrigin.identityTurnId ?? liveOrigin.turnId);
       if (!grant) return liveOrigin.callerOpenId;
       if (grant.denialReason || !grant.targetOpenId || !grant.tools.includes('lark-cli')
         || !triggerUserAuthApplies(getBot(ds.larkAppId).config.triggerUserAuth, 'lark-cli')) return undefined;
       return grant.targetOpenId;
     };
-    const delegated = getLarkToolDelegation(config.session.dataDir, params.sessionId, origin.turnId);
+    const identityTurnId = origin.identityTurnId ?? origin.turnId;
+    const delegated = getLarkToolDelegation(config.session.dataDir, params.sessionId, identityTurnId);
     const callerOpenId = requestingUser();
     if (!callerOpenId) return jsonRes(res, 403, { ok: false, error: 'current_actor_unverified' });
     const originCallerOpenId = origin.callerOpenId;
@@ -2973,8 +2989,9 @@ for (const action of ['auth-request', 'auth-status']) {
       && ds.session.status === 'active' && ds.worker === worker && !worker.killed
       && ds.workerGeneration === generation && ds.managedTurnOrigin?.callerOpenId === originCallerOpenId
       && ds.managedTurnOrigin?.turnId === turnId && ds.managedTurnOrigin?.capability === capability
+      && (ds.managedTurnOrigin.identityTurnId ?? ds.managedTurnOrigin.turnId) === identityTurnId
       && ds.managedTurnOrigin?.dispatchAttempt === attempt && requestingUser() === callerOpenId
-      && JSON.stringify(getLarkToolDelegation(config.session.dataDir, params.sessionId, turnId)) === JSON.stringify(delegated);
+      && JSON.stringify(getLarkToolDelegation(config.session.dataDir, params.sessionId, identityTurnId)) === JSON.stringify(delegated);
     // The authorization may outlive the turn that started it: the same human's
     // follow-up message rotates the turn while they are tapping the approval
     // link. Keep polling (and accept the granted token) as long as the session's
@@ -3006,10 +3023,10 @@ for (const action of ['auth-request', 'auth-status']) {
       }
       if (isCurrent() && request.isCurrent()) {
         if (!boundTool && !refreshSessionIdentity(config.session.dataDir, params.sessionId, {
-          tool: 'lark-cli', appId: cfg.larkAppId, userAccessToken: result.token, turnId,
+          tool: 'lark-cli', appId: cfg.larkAppId, userAccessToken: result.token, turnId: identityTurnId,
           openId: callerOpenId,
         })) {
-          return jsonRes(res, 409, { ok: false, error: 'auth_turn_changed' });
+          return jsonRes(res, 200, { ok: true, status: 'pending' });
         }
         return jsonRes(res, 200, { ok: true, status: 'ready' });
       }
@@ -3035,13 +3052,13 @@ for (const action of ['auth-request', 'auth-status']) {
         tool: 'lark-cli',
         appId: cfg.larkAppId,
         userAccessToken: result.token,
-        turnId: liveOrigin!.turnId!,
+        turnId: liveOrigin!.identityTurnId ?? liveOrigin!.turnId!,
         openId: request.callerOpenId,
       })) {
         // The worker has not started executing the live turn yet; the request
         // stays registered until TTL, so the waiting CLI polls again and the
         // same-principal mapping is retried once the live turn marker flips.
-        return jsonRes(res, 409, { ok: false, error: 'auth_turn_changed' });
+        return jsonRes(res, 200, { ok: true, status: 'pending' });
       }
       return jsonRes(res, 200, { ok: true, status: 'ready' });
     }

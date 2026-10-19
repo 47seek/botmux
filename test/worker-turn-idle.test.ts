@@ -21,6 +21,7 @@ import { chmodSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSyn
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
+import { sessionActiveTurnPath } from '../src/core/cli-identity.js';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
 import { spawnNodeTsScript } from './helpers/ts-runner.js';
 
@@ -80,6 +81,8 @@ function readyCount(harness: Harness): number {
 interface CliPidMarker {
   sessionId?: string;
   turnId?: string;
+  identityTurnId?: string;
+  callerOpenId?: string;
   dispatchAttempt?: number | null;
   queuedTurnId?: string;
   queuedTurns?: Array<{ turnId?: string }>;
@@ -106,6 +109,15 @@ function readCliPidMarker(harness: Harness): CliPidMarker | undefined {
  *  exactly `currentBotmuxTurnId` into this file. */
 function activeTurnId(harness: Harness): string | undefined {
   return readCliPidMarker(harness)?.turnId;
+}
+
+function publishedIdentity(harness: Harness) {
+  const sessionId = readCliPidMarker(harness)?.sessionId;
+  if (!sessionId) throw new Error('worker PID marker has no session identity');
+  const [turnId, callerOpenId, , identityTurnId] = readFileSync(
+    sessionActiveTurnPath(harness.root, sessionId), 'utf-8',
+  ).split('\n');
+  return { turnId, callerOpenId, identityTurnId };
 }
 
 /** Turn ids the worker still holds as un-promoted type-ahead attributions (the
@@ -316,6 +328,48 @@ describe('worker turn-idle channel', () => {
     expect(harness.logs.join('')).toContain('Ignoring turn-idle report (missing-attempt)');
   }, 60_000);
 
+  it('publishes the adopted disk turn with its original identity snapshot', async () => {
+    const harness = await startWorkerWaitingOnTurn();
+    const before = readyCount(harness);
+    const markersDir = join(harness.root, '.botmux-cli-pids');
+    const markerName = readdirSync(markersDir).find(name => /^\d+$/.test(name));
+    expect(markerName).toBeDefined();
+    const markerPath = join(markersDir, markerName!);
+    const identityTurnId = 'turn-idle-original-authorization';
+    const trustedCaller = {
+      requestUserOpenId: 'ou_turn_idle_original',
+      requestLarkAppId: 'app_turn_idle',
+      senderType: 'user' as const,
+    };
+    writeFileSync(markerPath, JSON.stringify({
+      ...JSON.parse(readFileSync(markerPath, 'utf-8')),
+      turnId: NEXT_TURN_ID,
+      identityTurnId,
+      callerOpenId: trustedCaller.requestUserOpenId,
+      trustedCaller,
+    }));
+
+    harness.child.send({ type: 'turn_idle', turnId: TURN_ID, seq: 1 } satisfies DaemonToWorker);
+    await waitFor(harness, () => readyCount(harness) > before, 'worker to adopt the promoted disk turn');
+
+    expect(readCliPidMarker(harness)).toMatchObject({
+      turnId: NEXT_TURN_ID,
+      identityTurnId,
+      callerOpenId: trustedCaller.requestUserOpenId,
+    });
+    expect(publishedIdentity(harness)).toEqual({
+      turnId: NEXT_TURN_ID,
+      identityTurnId,
+      callerOpenId: trustedCaller.requestUserOpenId,
+    });
+    const origins = harness.messages.filter(message => message.type === 'managed_turn_origin');
+    expect(origins.at(-1)).toMatchObject({
+      turnId: NEXT_TURN_ID,
+      identityTurnId,
+      trustedCaller,
+    });
+  }, 60_000);
+
   /**
    * The blocker this channel shipped with, restated for the post-#1781 worker.
    *
@@ -356,6 +410,7 @@ describe('worker turn-idle channel', () => {
     // type-ahead queue all agree.
     expect(activeTurnId(harness)).toBe(TURN_ID);
     expect(lastManagedOriginTurnId(harness)).toBe(TURN_ID);
+    expect(publishedIdentity(harness)).toMatchObject({ turnId: TURN_ID, identityTurnId: TURN_ID });
     expect(queuedTurnIds(harness)).toEqual([]);
 
     // Steer turn B while A is in flight. The write is type-ahead: B must NOT be
@@ -376,6 +431,7 @@ describe('worker turn-idle channel', () => {
     await delay(1500);
     expect(activeTurnId(harness)).toBe(TURN_ID);
     expect(lastManagedOriginTurnId(harness)).toBe(TURN_ID);
+    expect(publishedIdentity(harness)).toMatchObject({ turnId: TURN_ID, identityTurnId: TURN_ID });
     expect(queuedTurnIds(harness)).toEqual([NEXT_TURN_ID]);
     expect(readyCount(harness)).toBe(before);
 
@@ -394,6 +450,7 @@ describe('worker turn-idle channel', () => {
     );
     expect(activeTurnId(harness)).toBe(NEXT_TURN_ID);
     expect(lastManagedOriginTurnId(harness)).toBe(NEXT_TURN_ID);
+    expect(publishedIdentity(harness)).toMatchObject({ turnId: NEXT_TURN_ID, identityTurnId: NEXT_TURN_ID });
     expect(queuedTurnIds(harness)).toEqual([]);
 
     // B was retired by that same edge, so B's own end-of-turn report is a no-op:
