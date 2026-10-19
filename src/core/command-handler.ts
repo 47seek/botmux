@@ -380,8 +380,10 @@ function buildCloseWorktreeConfirmCard(args: {
   worktreeDir: string;
   sessions: import('../types.js').Session[];
   dirty: boolean;
-  dirtyCount: number;
-  dirtyFiles: string[];
+  uncommittedCount: number;
+  uncommittedFiles: string[];
+  ignoredCount: number;
+  ignoredFiles: string[];
   ahead: number;
   unpushedCommits: string[];
   invokerOpenId: string;
@@ -396,11 +398,17 @@ function buildCloseWorktreeConfirmCard(args: {
   // Safety checks: one compact line each; a detail line follows only when the
   // corresponding list is non-empty, so a clean worktree never prints "none\nnone".
   const checkLines: string[] = [
-    args.dirty
-      ? t('cmd.close.worktree_check_dirty_warn', { n: String(args.dirtyCount) }, loc)
-      : t('cmd.close.worktree_check_dirty_ok', undefined, loc),
+    args.uncommittedCount > 0
+      ? t('cmd.close.worktree_check_uncommitted_warn', { n: String(args.uncommittedCount) }, loc)
+      : t('cmd.close.worktree_check_uncommitted_ok', undefined, loc),
   ];
-  if (args.dirty && args.dirtyFiles.length) checkLines.push(closeWorktreeInlineDetail(args.dirtyFiles));
+  if (args.uncommittedFiles.length) checkLines.push(closeWorktreeInlineDetail(args.uncommittedFiles));
+  checkLines.push(
+    args.ignoredCount > 0
+      ? t('cmd.close.worktree_check_ignored_warn', { n: String(args.ignoredCount) }, loc)
+      : t('cmd.close.worktree_check_ignored_ok', undefined, loc),
+  );
+  if (args.ignoredFiles.length) checkLines.push(closeWorktreeInlineDetail(args.ignoredFiles));
   checkLines.push(
     args.ahead > 0
       ? t('cmd.close.worktree_check_ahead_warn', { n: String(args.ahead) }, loc)
@@ -2393,8 +2401,10 @@ export async function handleCommand(
                 worktreeDir,
                 sessions: [ds.session, ...siblingSessions],
                 dirty: safety.dirty,
-                dirtyCount: safety.dirtyCount,
-                dirtyFiles: safety.dirtyFiles,
+                uncommittedCount: safety.uncommittedCount,
+                uncommittedFiles: safety.uncommittedFiles,
+                ignoredCount: safety.ignoredCount,
+                ignoredFiles: safety.ignoredFiles,
                 ahead: safety.ahead,
                 unpushedCommits: safety.unpushedCommits,
                 invokerOpenId: message.senderId,

@@ -242,7 +242,18 @@ vi.mock('../src/services/git-worktree.js', () => ({
   worktreeRootFor: vi.fn(async (dir: string) => dir),
   withWorktreeTargetLock: vi.fn(async (_path: string, fn: () => Promise<unknown>) => fn()),
   removeRepoWorktree: vi.fn(async () => {}),
-  worktreeSafetyStatus: vi.fn(async () => ({ dirty: false, dirtyCount: 0, dirtyFiles: [], ahead: 0, unpushedCommits: [], fingerprint: 'clean-state' })),
+  worktreeSafetyStatus: vi.fn(async () => ({
+    dirty: false,
+    dirtyCount: 0,
+    dirtyFiles: [],
+    uncommittedCount: 0,
+    uncommittedFiles: [],
+    ignoredCount: 0,
+    ignoredFiles: [],
+    ahead: 0,
+    unpushedCommits: [],
+    fingerprint: 'clean-state',
+  })),
 }));
 
 vi.mock('../src/services/worktree-slug-ai.js', () => ({
@@ -3185,6 +3196,7 @@ describe('handleCommand', () => {
       mockShadowLane();
       vi.mocked(worktreeSafetyStatus).mockResolvedValueOnce({
         dirty: false, dirtyCount: 0, dirtyFiles: [], ahead: 2,
+        uncommittedCount: 0, uncommittedFiles: [], ignoredCount: 0, ignoredFiles: [],
         unpushedCommits: ['abc change'], fingerprint: 'lane-clean',
       });
       const deps = makeDeps(makeDaemonSession());
@@ -3201,6 +3213,7 @@ describe('handleCommand', () => {
       mockShadowLane();
       vi.mocked(worktreeSafetyStatus).mockResolvedValueOnce({
         dirty: true, dirtyCount: 1, dirtyFiles: ['src/dirty.ts'], ahead: 0,
+        uncommittedCount: 1, uncommittedFiles: ['src/dirty.ts'], ignoredCount: 0, ignoredFiles: [],
         unpushedCommits: [], fingerprint: 'lane-dirty',
       });
       const deps = makeDeps(makeDaemonSession());
@@ -3218,10 +3231,12 @@ describe('handleCommand', () => {
       const { laneSession } = mockShadowLane();
       const beforePush = {
         dirty: false, dirtyCount: 0, dirtyFiles: [], ahead: 1,
+        uncommittedCount: 0, uncommittedFiles: [], ignoredCount: 0, ignoredFiles: [],
         unpushedCommits: ['abc change'], fingerprint: 'lane-before-push',
       };
       const published = {
         dirty: false, dirtyCount: 0, dirtyFiles: [], ahead: 0,
+        uncommittedCount: 0, uncommittedFiles: [], ignoredCount: 0, ignoredFiles: [],
         unpushedCommits: [], fingerprint: 'lane-published',
       };
       vi.mocked(worktreeSafetyStatus)
@@ -3268,6 +3283,7 @@ describe('handleCommand', () => {
       const { laneSession } = mockShadowLane();
       const clean = {
         dirty: false, dirtyCount: 0, dirtyFiles: [], ahead: 0,
+        uncommittedCount: 0, uncommittedFiles: [], ignoredCount: 0, ignoredFiles: [],
         unpushedCommits: [], fingerprint: 'lane-clean',
       };
       vi.mocked(worktreeSafetyStatus)
@@ -3301,14 +3317,17 @@ describe('handleCommand', () => {
       const { laneSession } = mockShadowLane();
       const beforePush = {
         dirty: false, dirtyCount: 0, dirtyFiles: [], ahead: 1,
+        uncommittedCount: 0, uncommittedFiles: [], ignoredCount: 0, ignoredFiles: [],
         unpushedCommits: ['abc change'], fingerprint: 'lane-before-push',
       };
       const published = {
         dirty: false, dirtyCount: 0, dirtyFiles: [], ahead: 0,
+        uncommittedCount: 0, uncommittedFiles: [], ignoredCount: 0, ignoredFiles: [],
         unpushedCommits: [], fingerprint: 'lane-published',
       };
       const committedDuringClose = {
         dirty: false, dirtyCount: 0, dirtyFiles: [], ahead: 1,
+        uncommittedCount: 0, uncommittedFiles: [], ignoredCount: 0, ignoredFiles: [],
         unpushedCommits: ['def late change'], fingerprint: 'lane-late-commit',
       };
       vi.mocked(worktreeSafetyStatus)
@@ -3856,7 +3875,12 @@ describe('handleCommand', () => {
       vi.mocked(mainWorktreeFor).mockResolvedValueOnce('/home/testuser/project');
       vi.mocked(worktreeSafetyStatus).mockResolvedValueOnce({
         dirty: true,
+        dirtyCount: 1,
         dirtyFiles: ['src/new-change.ts'],
+        uncommittedCount: 1,
+        uncommittedFiles: ['src/new-change.ts'],
+        ignoredCount: 0,
+        ignoredFiles: [],
         ahead: 0,
         unpushedCommits: [],
         fingerprint: 'new-state',
@@ -3879,8 +3903,16 @@ describe('handleCommand', () => {
       vi.mocked(isLinkedWorktree).mockResolvedValueOnce(true);
       vi.mocked(mainWorktreeFor).mockResolvedValueOnce('/home/testuser/project');
       vi.mocked(worktreeSafetyStatus)
-        .mockResolvedValueOnce({ dirty: false, dirtyCount: 0, dirtyFiles: [], ahead: 0, unpushedCommits: [], fingerprint: 'clean-state' })
-        .mockResolvedValueOnce({ dirty: true, dirtyCount: 1, dirtyFiles: ['src/late.ts'], ahead: 0, unpushedCommits: [], fingerprint: 'changed-state' });
+        .mockResolvedValueOnce({
+          dirty: false, dirtyCount: 0, dirtyFiles: [],
+          uncommittedCount: 0, uncommittedFiles: [], ignoredCount: 0, ignoredFiles: [],
+          ahead: 0, unpushedCommits: [], fingerprint: 'clean-state',
+        })
+        .mockResolvedValueOnce({
+          dirty: true, dirtyCount: 1, dirtyFiles: ['src/late.ts'],
+          uncommittedCount: 1, uncommittedFiles: ['src/late.ts'], ignoredCount: 0, ignoredFiles: [],
+          ahead: 0, unpushedCommits: [], fingerprint: 'changed-state',
+        });
 
       await handleCommand('/close', ROOT_ID, makeLarkMessage(`/close wt --yes --state=${closeWorktreeState(ds.session.sessionId, [], 'clean-state')}`), deps, LARK_APP_ID);
 
@@ -3954,13 +3986,24 @@ describe('handleCommand', () => {
 
 
 
-    it('`/close wt` asks for confirmation when the worktree has dirty or unpushed changes', async () => {
+    it('`/close wt` displays uncommitted and ignored content separately', async () => {
       const ds = makeDaemonSession({ scope: 'thread', workingDir: '/home/testuser/project-wt-task' });
       ds.session.workingDir = '/home/testuser/project-wt-task';
       const deps = makeDeps(ds);
       vi.mocked(isLinkedWorktree).mockResolvedValueOnce(true);
       vi.mocked(mainWorktreeFor).mockResolvedValueOnce('/home/testuser/project');
-      vi.mocked(worktreeSafetyStatus).mockResolvedValueOnce({ dirty: true, dirtyCount: 2, dirtyFiles: ['src/a.ts', 'README.md'], ahead: 2, unpushedCommits: ['abc123 fix close wt', 'def456 add tests'], fingerprint: 'risky-state' });
+      vi.mocked(worktreeSafetyStatus).mockResolvedValueOnce({
+        dirty: true,
+        dirtyCount: 3,
+        dirtyFiles: ['src/a.ts', 'dist/', 'node_modules'],
+        uncommittedCount: 1,
+        uncommittedFiles: ['src/a.ts'],
+        ignoredCount: 2,
+        ignoredFiles: ['dist/', 'node_modules'],
+        ahead: 2,
+        unpushedCommits: ['abc123 fix close wt', 'def456 add tests'],
+        fingerprint: 'risky-state',
+      });
 
       await handleCommand('/close', ROOT_ID, makeLarkMessage('/close wt'), deps, LARK_APP_ID);
 
@@ -3969,15 +4012,18 @@ describe('handleCommand', () => {
       const replies = vi.mocked(deps.sessionReply).mock.calls.map(c => c[1]).join('\n');
       expect(deps.sessionReply).toHaveBeenCalledWith(
         ROOT_ID,
-        expect.stringContaining('⚠️ 未提交改动：2 个文件'),
+        expect.stringContaining('⚠️ 未提交改动：1 项'),
         'interactive',
         LARK_APP_ID,
         'msg_001',
       );
+      expect(replies).toContain('⚠️ Git 已忽略的本地内容：2 项');
       expect(replies).toContain('⚠️ 未 push 提交：2 个');
       expect(replies).toContain('src/a.ts');
+      expect(replies).toContain('dist/');
+      expect(replies).toContain('node_modules');
       expect(replies).toContain('abc123 fix close wt');
-      expect(replies).toContain('删除后：');
+      expect(replies).toContain('未提交改动和 Git 已忽略的本地内容会丢失');
     });
 
     it('`/close wt` refuses in a top-level chat-scope session', async () => {
