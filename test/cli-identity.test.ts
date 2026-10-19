@@ -176,6 +176,19 @@ describe('clearSessionIdentity', () => {
     expect(existsSync(sessionIdentityPath(dir, SESSION, 'bytedcli'))).toBe(false);
   });
 
+  it('clears a failed preparation without deleting the active or queued snapshots', () => {
+    const a = writeSessionIdentity(dir, SESSION, { tool: 'bytedcli', cloudJwt: 'a', turnId: 'turn-A' });
+    const b = writeSessionIdentity(dir, SESSION, { tool: 'bytedcli', cloudJwt: 'b', turnId: 'turn-B' });
+    const c = writeSessionIdentity(dir, SESSION, { tool: 'bytedcli', cloudJwt: 'c', turnId: 'turn-C' });
+    clearSessionIdentity(dir, SESSION, 'bytedcli', 'turn-B');
+    expect(existsSync(a)).toBe(true);
+    expect(existsSync(b)).toBe(false);
+    expect(existsSync(c)).toBe(true);
+    clearAllSessionIdentities(dir, SESSION);
+    expect(existsSync(a)).toBe(false);
+    expect(existsSync(c)).toBe(false);
+  });
+
   it('clears every pre-#1543 identity and turn marker on teardown', () => {
     const identityDir = join(dir, 'cli-identity');
     mkdirSync(identityDir, { recursive: true });
@@ -507,6 +520,21 @@ describe('renderIdentityWrapper', () => {
     expect(runWrapper(wrapperPath, { SESSION_DATA_DIR: dir, BOTMUX_SESSION_ID: SESSION })).toBe('a|tok-alice|');
   });
 
+  it.each(['lark-cli', 'bytedcli'] as const)('executes the selected human %s identity for a bot-origin turn', tool => {
+    const wrapperPath = join(dir, tool);
+    writeFileSync(wrapperPath, renderIdentityWrapper(tool, '/usr/bin/printenv'));
+    writeSessionIdentity(dir, SESSION, tool === 'lark-cli' ? {
+      tool, appId: 'a', userAccessToken: 'authorized-human', turnId: 'turn-A', openId: 'ou_alice_target',
+    } : {
+      tool, cloudJwt: 'authorized-human', turnId: 'turn-A', openId: 'ou_alice_target',
+    });
+    publishActiveTurn(dir, SESSION, 'turn-A', undefined, 'ou_peer_bot');
+    const output = runWrapper(wrapperPath, { SESSION_DATA_DIR: dir, BOTMUX_SESSION_ID: SESSION }, [
+      tool === 'lark-cli' ? 'LARKSUITE_CLI_USER_ACCESS_TOKEN' : 'BYTEDCLI_USER_CLOUD_JWT',
+    ]);
+    expect(output.trim()).toBe('authorized-human');
+  });
+
   it('uses refreshed credentials on the next invocation in the same turn', () => {
     const wrapperPath = join(dir, 'lark-cli');
     writeFileSync(wrapperPath, renderIdentityWrapper('lark-cli', stubTool()));
@@ -520,6 +548,25 @@ describe('renderIdentityWrapper', () => {
     expect(runWrapper(wrapperPath, env)).toBe('a|new-token|');
   });
 
+  it('uses the verified resolver snapshot without rereading the active selection', () => {
+    const selected = writeSessionIdentity(dir, SESSION, {
+      tool: 'lark-cli', appId: 'a', userAccessToken: 'tok-alice', turnId: 'turn-A', openId: 'ou-alice',
+    });
+    writeSessionIdentity(dir, SESSION, {
+      tool: 'lark-cli', appId: 'a', userAccessToken: 'tok-bob', turnId: 'turn-B', openId: 'ou-bob',
+    });
+    publishActiveTurn(dir, SESSION, 'turn-B', undefined, 'ou-bob');
+    const resolver = join(dir, 'identity-resolver');
+    writeFileSync(resolver, '#!/bin/sh\nprintf "%s" "$SELECTED_IDENTITY"\n');
+    chmodSync(resolver, 0o755);
+    const wrapperPath = join(dir, 'lark-cli');
+    writeFileSync(wrapperPath, renderIdentityWrapper('lark-cli', stubTool(), [resolver]));
+    const env = { SESSION_DATA_DIR: dir, BOTMUX_SESSION_ID: SESSION, SELECTED_IDENTITY: selected };
+    expect(runWrapper(wrapperPath, env)).toBe('a|tok-alice|');
+    writeFileSync(resolver, '#!/bin/sh\nexit 77\n');
+    expect(runDenied(wrapperPath, env).status).toBe(77);
+  });
+
   it.each([
     ['turn-B', 'turn-A'],
     ['turn-A', 'turn-B'],
@@ -527,7 +574,7 @@ describe('renderIdentityWrapper', () => {
     ['turn-A', undefined],
   ])('preserves identity when published turn is %s and active turn is %s', (publishedTurn, activeTurn) => {
     const identity = { tool: 'lark-cli' as const, appId: 'a', userAccessToken: 'old-token', turnId: 'turn-A' };
-    const path = sessionIdentityPath(dir, SESSION, identity.tool);
+    const path = sessionIdentityPath(dir, SESSION, identity.tool, publishedTurn);
     if (publishedTurn) writeSessionIdentity(dir, SESSION, { ...identity, turnId: publishedTurn });
     if (activeTurn) publishActiveTurn(dir, SESSION, activeTurn);
     const before = existsSync(path) ? readFileSync(path) : undefined;
@@ -537,7 +584,7 @@ describe('renderIdentityWrapper', () => {
   });
 
   // The regression itself: Alice's turn is mid-flight when Bob's message lands.
-  it('refuses the older turn once a newer sender has overwritten the identity', () => {
+  it('refuses a missing selected snapshot even when another turn is prepared', () => {
     const wrapperPath = join(dir, 'lark-cli');
     writeFileSync(wrapperPath, renderIdentityWrapper('lark-cli', stubTool()));
     publishActiveTurn(dir, SESSION, 'turn-A');
@@ -545,7 +592,7 @@ describe('renderIdentityWrapper', () => {
 
     const { status, stderr } = runDenied(wrapperPath, { SESSION_DATA_DIR: dir, BOTMUX_SESSION_ID: SESSION });
     expect(status).toBe(IDENTITY_DENIED_EXIT_CODE);
-    expect(stderr).toContain('上一轮');
+    expect(stderr).toContain('身份材料');
     // And Bob's turn works the moment the CLI actually reaches it.
     publishActiveTurn(dir, SESSION, 'turn-B');
     expect(runWrapper(wrapperPath, { SESSION_DATA_DIR: dir, BOTMUX_SESSION_ID: SESSION })).toBe('a|tok-bob|');
@@ -562,7 +609,7 @@ describe('renderIdentityWrapper', () => {
     writeSessionIdentity(dir, SESSION, {
       tool: 'lark-cli', appId: 'a', userAccessToken: 'tok-alice', turnId: 'turn-A', openId: 'ou-alice',
     });
-    publishActiveTurn(dir, SESSION, 'turn-B', undefined, 'ou-alice');
+    publishActiveTurn(dir, SESSION, 'turn-B', undefined, 'ou-alice', 'turn-A');
 
     expect(runWrapper(wrapperPath, { SESSION_DATA_DIR: dir, BOTMUX_SESSION_ID: SESSION })).toBe('a|tok-alice|');
   });
@@ -579,7 +626,7 @@ describe('renderIdentityWrapper', () => {
     writeSessionIdentity(dir, SESSION, {
       tool: 'lark-cli', mode: 'user-home', home: personHome, turnId: 'turn-A', openId: 'ou-alice',
     });
-    publishActiveTurn(dir, SESSION, 'turn-B', undefined, 'ou-alice');
+    publishActiveTurn(dir, SESSION, 'turn-B', undefined, 'ou-alice', 'turn-A');
 
     expect(runWrapper(wrapperPath, {
       SESSION_DATA_DIR: dir, BOTMUX_SESSION_ID: SESSION, HOME: '/the/machine/home',
@@ -619,21 +666,18 @@ describe('renderIdentityWrapper', () => {
     expect(status).toBe(IDENTITY_DENIED_EXIT_CODE);
   });
 
-  // Only a real disagreement refuses. An identity with no turn predates the
-  // binding, and a session with no live turn file states nothing to contradict;
-  // treating either as a mismatch would refuse every command in those paths.
-  it.each([
-    ['the identity carries no turn', undefined, 'turn-A'],
-    ['no live turn has been published', 'turn-A', undefined],
-  ])('still runs when %s', (_label, identityTurn, liveTurn) => {
+  it('supports an identity published without turn binding', () => {
     const wrapperPath = join(dir, 'lark-cli');
     writeFileSync(wrapperPath, renderIdentityWrapper('lark-cli', stubTool()));
-    writeSessionIdentity(dir, SESSION, {
-      tool: 'lark-cli', appId: 'a', userAccessToken: 'tok', ...(identityTurn ? { turnId: identityTurn } : {}),
-    });
-    if (liveTurn) publishActiveTurn(dir, SESSION, liveTurn);
-
+    writeSessionIdentity(dir, SESSION, { tool: 'lark-cli', appId: 'a', userAccessToken: 'tok' });
     expect(runWrapper(wrapperPath, { SESSION_DATA_DIR: dir, BOTMUX_SESSION_ID: SESSION })).toBe('a|tok|');
+  });
+
+  it('refuses an unselected turn snapshot', () => {
+    const wrapperPath = join(dir, 'lark-cli');
+    writeFileSync(wrapperPath, renderIdentityWrapper('lark-cli', stubTool()));
+    writeSessionIdentity(dir, SESSION, { tool: 'lark-cli', appId: 'a', userAccessToken: 'tok', turnId: 'turn-A' });
+    expect(runDenied(wrapperPath, { SESSION_DATA_DIR: dir, BOTMUX_SESSION_ID: SESSION }).status).toBe(77);
   });
 
   // The turn marker is bookkeeping between daemon and wrapper; leaking it into
@@ -753,7 +797,7 @@ describe('refreshSessionIdentity (real files, no mock)', () => {
     expect(refreshSessionIdentity(dir, SESSION, {
       ...identity, userAccessToken: 'fresh', turnId: 'turn-A', openId: 'ou-alice',
     })).toBe(true);
-    expect(readFileSync(sessionIdentityPath(dir, SESSION, 'lark-cli'), 'utf8'))
+    expect(readFileSync(sessionIdentityPath(dir, SESSION, 'lark-cli', 'turn-A'), 'utf8'))
       .toContain("'fresh'");
   });
 
@@ -769,7 +813,7 @@ describe('refreshSessionIdentity (real files, no mock)', () => {
     expect(refreshSessionIdentity(dir, SESSION, {
       ...identity, userAccessToken: 'fresh', turnId: 'turn-B', openId: 'ou-alice',
     })).toBe(true);
-    const body = readFileSync(sessionIdentityPath(dir, SESSION, 'lark-cli'), 'utf8');
+    const body = readFileSync(sessionIdentityPath(dir, SESSION, 'lark-cli', 'turn-B'), 'utf8');
     expect(body).toContain("BOTMUX_IDENTITY_OPEN_ID='ou-alice'");
     expect(body).toContain("BOTMUX_IDENTITY_TURN='turn-B'");
   });
@@ -782,7 +826,7 @@ describe('refreshSessionIdentity (real files, no mock)', () => {
     expect(refreshSessionIdentity(dir, SESSION, {
       ...identity, userAccessToken: 'fresh', turnId: 'turn-A', openId: 'ou-bob',
     })).toBe(false);
-    expect(readFileSync(sessionIdentityPath(dir, SESSION, 'lark-cli'), 'utf8'))
+    expect(readFileSync(sessionIdentityPath(dir, SESSION, 'lark-cli', 'turn-A'), 'utf8'))
       .toContain("'old-token'");
   });
 
@@ -800,6 +844,31 @@ describe('refreshSessionIdentity (real files, no mock)', () => {
     })).toBe(true);
   });
 
+  it('refreshes the retained identity when the executing envelope belongs to another turn', () => {
+    const path = writeSessionIdentity(dir, SESSION, { ...identity, turnId: 'turn-A', openId: 'ou-alice' });
+    publishActiveTurn(dir, SESSION, 'turn-B', undefined, 'ou-alice', 'turn-A');
+    expect(refreshSessionIdentity(dir, SESSION, {
+      ...identity, userAccessToken: 'fresh', turnId: 'turn-A', openId: 'ou-alice',
+    })).toBe(true);
+    expect(readFileSync(path, 'utf8')).toContain("'fresh'");
+  });
+
+  it.each([
+    ['stamped', 'ou_peer_bot'], ['denied', 'ou_peer_bot'],
+    ['stamped', undefined], ['denied', undefined],
+  ] as const)('refreshes an authorized human identity from %s while execution caller is %s', (mode, caller) => {
+    const path = writeSessionIdentity(dir, SESSION, mode === 'denied' ? {
+      tool: 'lark-cli', mode: 'denied', turnId: 'turn-A', message: 'authorize first',
+    } : { ...identity, turnId: 'turn-A', openId: 'ou_alice_target' });
+    publishActiveTurn(dir, SESSION, 'turn-A', undefined, caller);
+    expect(refreshSessionIdentity(dir, SESSION, {
+      ...identity, userAccessToken: 'fresh', turnId: 'turn-A', openId: 'ou_alice_target',
+    })).toBe(true);
+    const body = readFileSync(path, 'utf8');
+    expect(body).toContain("LARKSUITE_CLI_USER_ACCESS_TOKEN='fresh'");
+    expect(body).toContain("BOTMUX_IDENTITY_OPEN_ID='ou_alice_target'");
+  });
+
   it('refuses when the live turn has moved on to a different id', () => {
     writeSessionIdentity(dir, SESSION, { ...identity, turnId: 'turn-A', openId: 'ou-alice' });
     publishActiveTurn(dir, SESSION, 'turn-B', undefined, 'ou-alice');
@@ -815,7 +884,7 @@ describe('refreshSessionIdentity (real files, no mock)', () => {
   it('reads only the first line of the two-line active-turn file', () => {
     writeSessionIdentity(dir, SESSION, { ...identity, turnId: 'turn-A', openId: 'ou-alice' });
     publishActiveTurn(dir, SESSION, 'turn-A', undefined, 'ou-alice');
-    expect(readFileSync(sessionActiveTurnPath(dir, SESSION), 'utf8')).toBe('turn-A\nou-alice\n');
+    expect(readFileSync(sessionActiveTurnPath(dir, SESSION), 'utf8').split('\n').slice(0, 2)).toEqual(['turn-A', 'ou-alice']);
 
     expect(refreshSessionIdentity(dir, SESSION, {
       ...identity, userAccessToken: 'fresh', turnId: 'turn-A', openId: 'ou-alice',
@@ -826,12 +895,12 @@ describe('refreshSessionIdentity (real files, no mock)', () => {
 describe('active-turn file is one atomic (turn, caller) pair', () => {
   it('publishes both values in a single file, with the caller as line 2', () => {
     publishActiveTurn(dir, SESSION, 'turn-A', 3, 'ou-alice');
-    expect(readFileSync(sessionActiveTurnPath(dir, SESSION), 'utf8')).toBe('turn-A\nou-alice\n');
+    expect(readFileSync(sessionActiveTurnPath(dir, SESSION), 'utf8').split('\n').slice(0, 2)).toEqual(['turn-A', 'ou-alice']);
   });
 
   it('writes an empty caller line when the principal is unknown', () => {
     publishActiveTurn(dir, SESSION, 'turn-A');
-    expect(readFileSync(sessionActiveTurnPath(dir, SESSION), 'utf8')).toBe('turn-A\n\n');
+    expect(readFileSync(sessionActiveTurnPath(dir, SESSION), 'utf8').split('\n').slice(0, 2)).toEqual(['turn-A', '']);
   });
 });
 
@@ -1000,7 +1069,7 @@ describe('tool-owning process identity environment', () => {
     // rejects absent identity rather than reaching the unwrapped binary.
     expect(run).toThrow();
     for (const [turnId, jwt] of [['turn-a', 'user-a-jwt'], ['turn-b', 'user-b-jwt']]) {
-      writeSessionIdentity(dir, SESSION, { tool: 'bytedcli', cloudJwt: jwt }, turnId);
+      writeSessionIdentity(dir, SESSION, { tool: 'bytedcli', cloudJwt: jwt, turnId });
       publishActiveTurn(dir, SESSION, turnId);
       expect(run()).toBe(jwt);
       expect(env.BYTEDCLI_USER_CLOUD_JWT).toBeUndefined();

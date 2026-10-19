@@ -81,6 +81,21 @@ describe('agent authorization', () => {
     });
   });
 
+  it('authorizes an actorless scheduled delegation through its execution identity', async () => {
+    delegate();
+    delete session.managedTurnOrigin.callerOpenId;
+    session.managedTurnOrigin.identityTurnId = 'om_turn';
+    session.managedTurnOrigin.turnId = 'om_envelope';
+    const request = await (await post('auth-request', { originTurnId: 'om_envelope' })).json();
+    expect(request).toMatchObject({ ok: true, authUrl: AUTH_URL });
+    poll.mockResolvedValue({ status: 'ready', token: 'target-app-grant' });
+    expect(await (await post('auth-status', { requestId: request.requestId, originTurnId: 'om_envelope' })).json())
+      .toEqual({ ok: true, status: 'ready' });
+    expect(cliIdentity.refreshSessionIdentity).toHaveBeenCalledWith(expect.any(String), 'auth-session', {
+      tool: 'lark-cli', appId: 'cli_test', userAccessToken: 'target-app-grant', turnId: 'om_turn', openId: 'ou_target_human',
+    });
+  });
+
   it.each([
     { tools: ['bytedcli'] }, { denialReason: 'target_access_denied' },
     { denialReason: 'target_validation_unavailable' }, { targetOpenId: undefined },
@@ -281,18 +296,18 @@ describe('agent authorization', () => {
     });
   });
 
-  it('preserves newer queued credentials and refuses a rotated worker', async () => {
+  it('waits for the matching identity marker and completes after a same-person worker restart', async () => {
     requestId = (await (await post()).json()).requestId;
     poll.mockResolvedValue({ status: 'ready', token: 'test-user-token' });
     vi.mocked(cliIdentity.refreshSessionIdentity).mockReturnValue(false);
-    expect((await post('auth-status', { requestId })).status).toBe(409);
+    expect(await (await post('auth-status', { requestId })).json()).toEqual({ ok: true, status: 'pending' });
     vi.mocked(cliIdentity.refreshSessionIdentity).mockClear();
     session.workerGeneration++;
     const response = await post('auth-status', { requestId });
-    // Still refused: the live turn file does not line up, so refresh fails
-    // closed and the fresh token is never published to a queued identity.
-    expect(response.status).toBe(409);
-    expect(await response.json()).toEqual({ ok: false, error: 'auth_turn_changed' });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ ok: true, status: 'pending' });
+    vi.mocked(cliIdentity.refreshSessionIdentity).mockReturnValue(true);
+    expect(await (await post('auth-status', { requestId })).json()).toEqual({ ok: true, status: 'ready' });
   });
 });
 

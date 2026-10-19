@@ -789,7 +789,7 @@ describe('/rename production routing — must not pre-create a session (review P
     mkdirSync(`${mocks.dataDir}/fixture-lark-home`, { recursive: true });
     const send = vi.fn((message: any) => {
       if (message.type === 'message') {
-        const env = readFileSync(sessionIdentityPath(mocks.dataDir, ds.session.sessionId, 'lark-cli'), 'utf8');
+        const env = readFileSync(sessionIdentityPath(mocks.dataDir, ds.session.sessionId, 'lark-cli', 'om_queue_identity_reply'), 'utf8');
         expect(env).toContain("BOTMUX_IDENTITY_TURN='om_queue_identity_reply'");
         expect(env).toContain('fixture-lark-home');
       }

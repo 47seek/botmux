@@ -79,7 +79,7 @@ describe('CLI-adapter runners — compiled binary form', () => {
     // broken. RUNNER_ENTRIES is the single source of truth, so
     // iterate it and require each one to appear in cli.ts's dispatch.
     const cliSource = readFileSync(resolve(REPO_ROOT, 'src', 'cli.ts'), 'utf-8');
-    expect(RUNNER_ENTRIES.length).toBe(6);
+    expect(RUNNER_ENTRIES.length).toBe(7);
     for (const entry of RUNNER_ENTRIES) {
       asCompiledBinary();
       expect(runnerArgv0(entry, '/ignored')).toBe(`__${entry}`);
@@ -96,7 +96,7 @@ describe('CLI-adapter runners — compiled binary form', () => {
     // fleet entries, whose launch path is resolveEntrySpawn, not this one.
     expect([...RUNNER_ENTRIES]).toEqual([
       'codex-app-runner', 'dsh-runner', 'mira-runner', 'mir-runner',
-      'minimax-runner', 'lark-tool-runner',
+      'minimax-runner', 'lark-tool-runner', 'cli-identity-runner',
     ]);
   });
 });

@@ -1,4 +1,4 @@
-import { EventEmitter } from 'node:events';
+import { EventEmitter, once } from 'node:events';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { applyQueuedCodexAppLegacyFallback } from '../src/core/session-create.js';
 
@@ -238,7 +238,12 @@ import {
   readManagedOriginCapability,
 } from '../src/core/managed-origin-capability.js';
 import type { DaemonSession } from '../src/core/types.js';
+import type { TrustedCaller, WorkerToDaemon } from '../src/types.js';
 import { activeSessionKey } from '../src/core/types.js';
+import { resolveDaemonCurrentActor } from '../src/core/current-actor-attestation.js';
+import { resolveDaemonCurrentExecution } from '../src/core/current-execution.js';
+import { readProcessStartIdentity } from '../src/utils/process-identity.js';
+import { spawnTsEval } from './helpers/ts-runner.js';
 import * as sessionStore from '../src/services/session-store.js';
 import { getBot } from '../src/bot-registry.js';
 import { dashboardEventBus } from '../src/core/dashboard-events.js';
@@ -6308,6 +6313,129 @@ describe('managed turn authority worker generations', () => {
 
   afterEach(() => {
     scheduledTasksForProvenance.delete('feedbeef');
+  });
+
+  function startAttestedWorker(caller: TrustedCaller | null = scheduledCaller) {
+    const ds = makeDs();
+    ds.session.replyTargets = {
+      [scheduledTurnId]: {
+        rootMessageId: 'om_root', senderOpenId: 'ou_latest_sender',
+        updatedAt: new Date().toISOString(),
+      },
+    };
+    const start = () => {
+      forkWorker(ds, { content: 'scheduled', trustedCaller: scheduledCaller }, scheduledTurnId);
+      const worker = forkMock.mock.results.at(-1)!.value;
+      worker.pid = process.pid;
+      worker.connected = true;
+      worker.emit('message', {
+        type: 'local_process_attestation', backendType: 'pty', credentialIsolated: false,
+        cliPid: process.pid, cliProcStart: readProcessStartIdentity(process.pid),
+      });
+      return worker;
+    };
+    let worker = start();
+    const publish = (changes: Partial<Extract<WorkerToDaemon, { type: 'managed_turn_origin' }>> = {}) => {
+      worker.emit('message', {
+        type: 'managed_turn_origin', sessionId: ds.session.sessionId,
+        capability: 'scheduled-capability', turnId: scheduledTurnId,
+        identityTurnId: scheduledTurnId, dispatchAttempt: 1, trustedCaller: caller,
+        ...changes,
+      });
+    };
+    publish();
+    return { ds, worker, publish, restart: () => { worker = start(); } };
+  }
+
+  async function startToolPeer() {
+    const child = spawnTsEval("process.stdout.write('ready'); process.stdin.resume();", {
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    await once(child.stdout!, 'data');
+    return {
+      peer: { pid: child.pid!, procStart: readProcessStartIdentity(child.pid!)! },
+      close: async () => {
+        const exited = once(child, 'exit');
+        child.kill();
+        await exited;
+      },
+    };
+  }
+
+  it.skipIf(process.platform !== 'linux').each([
+    ['direct', scheduledCaller],
+    ['delegated', null],
+  ] as const)('keeps a running %s tool attested across repeated origin publication', async (_mode, caller) => {
+    const { ds, publish } = startAttestedWorker(caller);
+    const tool = await startToolPeer();
+    const input = { sessionId: ds.session.sessionId, peer: tool.peer, findSession: () => ds };
+    const actor = () => resolveDaemonCurrentActor({
+      ...input,
+      resolveIdentity: async (_appId, openId) => ({ openId, type: 'user', email: 'scheduler@example.test' }),
+    });
+    try {
+      expect(resolveDaemonCurrentExecution(input)).toMatchObject({ status: 'verified', turnId: scheduledTurnId });
+      expect((await actor()).ok).toBe(caller !== null);
+      publish({ capability: 'republished-capability' });
+      expect(resolveDaemonCurrentExecution(input)).toMatchObject({ status: 'verified', turnId: scheduledTurnId });
+      expect((await actor()).ok).toBe(caller !== null);
+      expect(ds.managedTurnOrigin?.callerOpenId).toBe(caller?.requestUserOpenId);
+
+      publish({ turnId: 'om_steered_envelope', capability: 'steered-capability', dispatchAttempt: undefined });
+      expect(resolveDaemonCurrentExecution(input)).toMatchObject({ status: 'verified', turnId: 'om_steered_envelope' });
+      expect(resolveDaemonCurrentExecution(input)?.dispatchAttempt).toBeUndefined();
+      expect((await actor()).ok).toBe(caller !== null);
+    } finally {
+      await tool.close();
+    }
+  });
+
+  it.skipIf(process.platform !== 'linux').each([
+    'caller', 'turn', 'attempt', 'worker generation', 'revocation',
+  ] as const)('rejects an old tool after %s changes the execution boundary', async change => {
+    const { ds, worker, publish, restart } = startAttestedWorker();
+    const oldTool = await startToolPeer();
+    const input = (peer: typeof oldTool.peer) => ({ sessionId: ds.session.sessionId, peer, findSession: () => ds });
+    try {
+      expect(resolveDaemonCurrentExecution(input(oldTool.peer))?.status).toBe('verified');
+      if (change === 'worker generation') restart();
+      if (change === 'revocation') worker.emit('message', {
+        type: 'managed_turn_origin_revoked', sessionId: ds.session.sessionId,
+        capability: 'scheduled-capability', turnId: scheduledTurnId,
+      });
+      publish({
+        capability: 'next-capability',
+        ...(change === 'caller' ? { trustedCaller: { ...scheduledCaller, requestUserOpenId: 'ou_next' } } : {}),
+        ...(change === 'turn' ? { turnId: 'om_next', identityTurnId: 'om_next' } : {}),
+        ...(change === 'attempt' ? { dispatchAttempt: 2 } : {}),
+      });
+      expect(resolveDaemonCurrentExecution(input(oldTool.peer))).toBeNull();
+      const nextTool = await startToolPeer();
+      try {
+        expect(resolveDaemonCurrentExecution(input(nextTool.peer))?.status).toBe('verified');
+      } finally {
+        await nextTool.close();
+      }
+    } finally {
+      await oldTool.close();
+    }
+  });
+
+  it.each([
+    [scheduledCaller, 'ou_latest_sender', 'trusted_caller_mismatch'],
+    [scheduledCaller, scheduledCaller.requestUserOpenId, 'plugin_result_delivery_failed'],
+    [null, 'ou_latest_sender', 'trusted_caller_mismatch'],
+  ] as const)('binds plugin delivery to the published authority %j for %s', (caller, deliveryCaller, expectedError) => {
+    const { ds, worker } = startAttestedWorker(caller);
+    worker.emit('message', {
+      type: 'plugin_result_delivery', requestId: 'authority-test', sessionId: ds.session.sessionId,
+      turnId: scheduledTurnId, dispatchAttempt: 1, callerOpenId: deliveryCaller,
+      pluginId: 'test', deliveryId: 'test', viewToken: 'invalid',
+      expiresAt: '2099-01-01T00:00:00.000Z', fileCount: 0, responseKind: 'final',
+    });
+    expect(worker.send).toHaveBeenCalledWith({
+      type: 'plugin_result_delivery_result', requestId: 'authority-test', ok: false, error: expectedError,
+    });
   });
 
   it('keeps a fresh scheduled turn bound across repeated managed-origin publications', async () => {

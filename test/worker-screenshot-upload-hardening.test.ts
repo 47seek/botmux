@@ -753,12 +753,6 @@ describe('R2 turn-only capture acceptance', () => {
 });
 
 describe('turn caller persistence across crash recovery', () => {
-  it('persists the live caller in the PID marker JSON', () => {
-    const at = source.indexOf('function writeCliPidMarker(');
-    const body = source.slice(at, source.indexOf('\n}\n', at));
-    expect(body).toContain('...(currentBotmuxCallerOpenId ? { callerOpenId: currentBotmuxCallerOpenId } : {})');
-  });
-
   it('persists the queued type-ahead caller so a marker replay does not drop it', () => {
     const at = source.indexOf('function writeCliPidMarker(');
     const body = source.slice(at, source.indexOf('\n}\n', at));

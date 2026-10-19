@@ -686,6 +686,7 @@ import { DONE_REACTION_EMOJI_TYPE } from './pending-response.js';
 import { buildTerminalUrl } from './terminal-url.js';
 import { prependBotmuxBin, resolveBotmuxWrapperBinDir } from './botmux-wrapper.js';
 import { snapshotProcessIdentities } from './current-actor-attestation.js';
+import { sameTrustedPrincipal } from './active-turn-authority.js';
 import { usageLimitStateKey, isActiveWorkRuntimeStatus, type CliUsageLimitState } from '../utils/cli-usage-limit.js';
 import {
   evaluateVcMeetingManagedSend,
@@ -14065,8 +14066,10 @@ function isMeetingDrivenTurn(
 }
 
 function currentGatewayCallerOpenId(ds: DaemonSession, turnId: string): string | undefined {
-  // The daemon owns this per-turn sender map. The worker contributes only the
-  // turn id over private IPC; it can never choose which human that id denotes.
+  const origin = ds.managedTurnOrigin;
+  if (origin?.turnId === turnId && origin.trustedCaller !== undefined) {
+    return origin.callerOpenId;
+  }
   const replyTargetCaller = pickTurnReplyTarget(ds.session, turnId)?.senderOpenId;
   if (replyTargetCaller) return replyTargetCaller;
   const recovered = ds.session.failedTurnRecovery;
@@ -17526,19 +17529,30 @@ function setupWorkerHandlers(
             break;
           }
         }
-        const callerOpenId = msg.turnId
-          ? currentGatewayCallerOpenId(ds, msg.turnId)
-          : undefined;
-        const preexistingProcessIdentities = currentTurnProcessIdentities(ds, msg.turnId);
+        const callerOpenId = msg.trustedCaller !== undefined
+          ? msg.trustedCaller?.requestUserOpenId
+          : msg.turnId ? currentGatewayCallerOpenId(ds, msg.turnId) : undefined;
+        const identityTurnId = msg.identityTurnId ?? msg.turnId;
+        const previousOrigin = ds.managedTurnOrigin;
+        const sameExecution = previousOrigin?.capability && identityTurnId
+          && (previousOrigin.identityTurnId ?? previousOrigin.turnId) === identityTurnId
+          && (previousOrigin.turnId !== msg.turnId || previousOrigin.dispatchAttempt === msg.dispatchAttempt)
+          && previousOrigin.callerOpenId === callerOpenId
+          && (previousOrigin.trustedCaller === msg.trustedCaller
+            || sameTrustedPrincipal(previousOrigin.trustedCaller ?? undefined, msg.trustedCaller ?? undefined));
+        const preexistingProcessIdentities = (sameExecution ? previousOrigin.preexistingProcessIdentities : undefined)
+          ?? currentTurnProcessIdentities(ds, msg.turnId);
         noteTurnDispatchAttempt(ds, msg.turnId, msg.dispatchAttempt);
         ds.managedTurnOrigin = {
           capability: msg.capability,
           ...(msg.policyCapability ? { policyCapability: msg.policyCapability } : {}),
           ...(msg.originChannelId ? { originChannelId: msg.originChannelId } : {}),
           ...(msg.turnId ? { turnId: msg.turnId } : {}),
+          ...(msg.identityTurnId ? { identityTurnId: msg.identityTurnId } : {}),
           ...(msg.dispatchAttempt !== undefined
             ? { dispatchAttempt: msg.dispatchAttempt }
             : {}),
+          ...(msg.trustedCaller !== undefined ? { trustedCaller: msg.trustedCaller } : {}),
           ...(callerOpenId ? { callerOpenId } : {}),
           ...(preexistingProcessIdentities
             ? { preexistingProcessIdentities }

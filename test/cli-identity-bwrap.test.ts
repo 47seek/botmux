@@ -86,7 +86,7 @@ function compileIdentityPolicy(): IdentityPolicyHarness {
   const sessionId = 'sess-live';
   ensureSessionIdentityPlaceholders(dataDir, sessionId, ['lark-cli', 'bytedcli']);
   const identityPath = writeSessionIdentity(dataDir, sessionId, {
-    tool: 'lark-cli', appId: 'cli_app', userAccessToken: 'token-first',
+    tool: 'lark-cli', appId: 'cli_app', userAccessToken: 'token-first', turnId: 'turn-A',
   });
   const sessionDir = sessionIdentityBinDir(dataDir, sessionId);
   const policy = buildFsPolicy({
@@ -190,9 +190,9 @@ describe.skipIf(!bwrapUsable())('bwrap persistent pane × trigger-user identity'
     try {
       await pollFor(() => existsSync(join(harness.ctlDir, 'ready')), 'sandbox reader ready');
       writeSessionIdentity(harness.dataDir, harness.sessionId, {
-        tool: 'lark-cli', appId: 'cli_app', userAccessToken: 'token-second',
+        tool: 'lark-cli', appId: 'cli_app', userAccessToken: 'token-second', turnId: 'turn-A',
       });
-      expect(statSync(sessionIdentityPath(harness.dataDir, harness.sessionId, 'lark-cli')).ino)
+      expect(statSync(sessionIdentityPath(harness.dataDir, harness.sessionId, 'lark-cli', 'turn-A')).ino)
         .not.toBe(firstInode);
       writeFileSync(join(harness.ctlDir, 'go'), '1');
       // Wait for the REFRESHED CONTENT, not merely for the file's existence:

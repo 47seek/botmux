@@ -14,10 +14,9 @@
  * whoever started the session — every later turn, by anyone, would keep running
  * as that first person.
  *
- * A file is re-read on every single CLI invocation, so the identity in force is
- * always the one the daemon wrote for the current turn. Switching people costs
- * nothing and never restarts the session (a restart would drop the CLI's whole
- * context, which in practice is unacceptable).
+ * Identity snapshots are prepared per turn. Each invocation reads the worker's
+ * active-turn record and selects that turn's snapshot, so queued messages keep
+ * their credentials separate from the executing task.
  *
  * ## Trust direction
  *
@@ -32,11 +31,15 @@
  * call for zero benefit, since these files hold exactly a couple of opaque
  * values.
  */
-import { accessSync, constants, existsSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
-import { delimiter, join } from 'node:path';
+import { accessSync, constants, existsSync, mkdirSync, readFileSync, readdirSync, rmSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { delimiter, dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { createRequire } from 'node:module';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { clearLarkToolDelegations } from './lark-tool-delegation.js';
 import { isCliIdentityPath } from '../utils/child-env.js';
+import { resolveEntrySpawn } from './self-spawn.js';
 import type { TriggerUserAuthConfig, TriggerUserAuthTool } from '../services/trigger-user-auth.js';
 
 /** Where a session's identity files live, under its own data dir. */
@@ -59,17 +62,22 @@ export function sessionIdentityDataDir(sessionDataDir: string, sessionId: string
 }
 
 /**
- * Identity file for one tool in one session.
- *
- * Named by session id so concurrent sessions of the same bot — different people
- * in different chats — never read each other's credentials.
+ * Identity file for one tool and optional prepared turn in a session.
  */
 export function sessionIdentityPath(
   sessionDataDir: string,
   sessionId: string,
   tool: TriggerUserAuthTool,
+  turnId?: string,
 ): string {
-  return join(sessionIdentityDataDir(sessionDataDir, sessionId), `${tool}.env`);
+  const dir = sessionIdentityDataDir(sessionDataDir, sessionId);
+  return turnId
+    ? join(dir, 'turns', identityTurnKey(turnId), `${tool}.env`)
+    : join(dir, `${tool}.env`);
+}
+
+function identityTurnKey(turnId: string): string {
+  return createHash('sha256').update(turnId).digest('hex');
 }
 
 /**
@@ -80,8 +88,8 @@ export function sessionIdentityPath(
  * *accepted*, the worker writes this when a turn actually *starts*. The gap
  * between those is the whole problem — see {@link renderIdentityWrapper}.
  *
- * Plain text, one line, no JSON: the wrapper reads it in `/bin/sh` on every
- * invocation, and parsing JSON there would mean spawning `jq`.
+ * Plain text: turn, caller, identity snapshot key, identity turn. The wrapper
+ * reads the record once in `/bin/sh` on every invocation.
  */
 export function sessionActiveTurnPath(sessionDataDir: string, sessionId: string): string {
   return join(sessionIdentityDataDir(sessionDataDir, sessionId), 'turn');
@@ -89,8 +97,7 @@ export function sessionActiveTurnPath(sessionDataDir: string, sessionId: string)
 
 /**
  * The live turn id (first line) from the active-turn file, or undefined when
- * absent/empty. Shared by every TS consumer so the file's two-line layout
- * (turn, then caller) is parsed in exactly one place.
+ * absent/empty.
  */
 export function readActiveTurnLine(sessionDataDir: string, sessionId: string): string | undefined {
   try {
@@ -132,6 +139,7 @@ export function publishActiveTurn(
   turnId: string | undefined,
   dispatchAttempt?: number,
   callerOpenId?: string,
+  identityTurnId: string | undefined = turnId,
 ): void {
   const dir = sessionIdentityDataDir(sessionDataDir, sessionId);
   try {
@@ -140,12 +148,9 @@ export function publishActiveTurn(
     // open: two separate files cannot be updated atomically together, and a
     // reader landing between the two writes would see a turn from one
     // generation with a caller from another (a cross-principal misattribution).
-    // Line 1 = the turn the CLI is executing now; line 2 = the open id of the
-    // human whose turn it is. Both may be empty (unknown turn / absent
-    // principal), which the wrapper treats as a refusal, never an allowance.
     atomicWriteFileSync(
       sessionActiveTurnPath(sessionDataDir, sessionId),
-      `${turnId ?? ''}\n${callerOpenId ?? ''}\n`,
+      `${turnId ?? ''}\n${callerOpenId ?? ''}\n${identityTurnId ? identityTurnKey(identityTurnId) : ''}\n${identityTurnId ?? ''}\n`,
       { mode: 0o600 },
     );
   } catch { /* best-effort: a stale/absent turn file refuses, never misattributes */ }
@@ -156,6 +161,7 @@ export function publishActiveTurn(
         turnId: turnId ?? null,
         dispatchAttempt: dispatchAttempt ?? null,
         ...(callerOpenId ? { callerOpenId } : {}),
+        identityTurnId: identityTurnId ?? null,
       })}\n`,
       { mode: 0o600 },
     );
@@ -362,8 +368,8 @@ export function writeSessionIdentity(
   sessionId: string,
   identity: CliIdentity,
 ): string {
-  const path = sessionIdentityPath(sessionDataDir, sessionId, identity.tool);
-  mkdirSync(sessionIdentityDataDir(sessionDataDir, sessionId), { recursive: true, mode: 0o700 });
+  const path = sessionIdentityPath(sessionDataDir, sessionId, identity.tool, identity.turnId);
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   atomicWriteFileSync(path, renderIdentityEnv(identity), { mode: 0o600 });
   return path;
 }
@@ -373,7 +379,7 @@ export function refreshSessionIdentity(
   sessionId: string,
   identity: CliIdentity & { turnId: string },
 ): boolean {
-  const path = sessionIdentityPath(sessionDataDir, sessionId, identity.tool);
+  const path = sessionIdentityPath(sessionDataDir, sessionId, identity.tool, identity.turnId);
   const turnLine = `${TURN_VAR}=${quoteFor(TURN_VAR, identity.turnId)}`;
   const openId = 'openId' in identity ? identity.openId : undefined;
   try {
@@ -389,8 +395,8 @@ export function refreshSessionIdentity(
     // completed the device grant.
     const stamped = lines.find(line => line.startsWith(`${OPEN_ID_VAR}=`));
     if (stamped && stamped !== `${OPEN_ID_VAR}=${quoteFor(OPEN_ID_VAR, openId ?? '')}`) return false;
-    // The active-turn file is two lines (turn, caller); compare only the turn.
-    if (readActiveTurnLine(sessionDataDir, sessionId) !== identity.turnId) return false;
+    const active = readFileSync(sessionActiveTurnPath(sessionDataDir, sessionId), 'utf8').split('\n');
+    if ((active[3] ?? active[0]) !== identity.turnId) return false;
   } catch {
     return false;
   }
@@ -399,20 +405,23 @@ export function refreshSessionIdentity(
 }
 
 /**
- * Remove the identity for one tool.
- *
- * Called when the current sender has no credentials: the file must GO, not go
- * stale. Leaving the previous person's token in place is precisely the failure
- * this feature exists to prevent — the next command would run as them, silently
- * and with the wrong name in the audit trail.
+ * Remove one turn's tool identity, or every snapshot for that tool at teardown.
  */
 export function clearSessionIdentity(
   sessionDataDir: string,
   sessionId: string,
   tool: TriggerUserAuthTool,
+  turnId?: string,
 ): void {
-  try { rmSync(sessionIdentityPath(sessionDataDir, sessionId, tool), { force: true }); }
+  try { rmSync(sessionIdentityPath(sessionDataDir, sessionId, tool, turnId), { force: true }); }
   catch { /* best-effort: absence is the desired state */ }
+  if (turnId) return;
+  const turnsDir = join(sessionIdentityDataDir(sessionDataDir, sessionId), 'turns');
+  try {
+    for (const entry of readdirSync(turnsDir)) {
+      rmSync(join(turnsDir, entry, `${tool}.env`), { force: true });
+    }
+  } catch { /* best-effort: absence is the desired state */ }
   // Before #1543 identities lived directly under cli-identity/. Upgraded
   // sessions no longer read or overwrite those files, so remove the exact
   // legacy path as well instead of leaving a live token behind indefinitely.
@@ -430,6 +439,8 @@ export function clearAllSessionIdentities(sessionDataDir: string, sessionId: str
   for (const tool of Object.keys(IDENTITY_ENV_KEYS) as TriggerUserAuthTool[]) {
     clearSessionIdentity(sessionDataDir, sessionId, tool);
   }
+  try { rmSync(join(sessionIdentityDataDir(sessionDataDir, sessionId), 'turns'), { recursive: true, force: true }); }
+  catch { /* best-effort: absence is the desired state */ }
   try {
     rmSync(
       join(sessionIdentityDir(sessionDataDir), `${assertSafeSegment(sessionId)}.turn`),
@@ -462,17 +473,14 @@ export function clearAllSessionIdentities(sessionDataDir: string, sessionId: str
  *
  *  - **The identity must belong to the turn now running.** The daemon publishes
  *    when a message is ACCEPTED; the CLI runs turns from its own queue, so
- *    while A's turn is still executing, B's message can arrive and overwrite the
- *    file — and A's remaining tool calls would then run with B's permissions.
- *    The daemon cannot close that gap alone (the worker does not wait for it),
- *    so each identity carries the turn it was published for, the worker
- *    publishes the turn it is actually executing, and a mismatch refuses.
- *
- *    The cost is real and deliberate: tool calls in the tail of A's turn fail
- *    once B has spoken. That is the trade this feature is for — a failed command
- *    is recoverable, a command that silently ran as the wrong person is not.
+ *    while A's turn is executing, B's message prepares its own snapshot. The
+ *    worker selects the snapshot when the corresponding execution starts.
  */
-export function renderIdentityWrapper(tool: TriggerUserAuthTool, realBinaryPath: string): string {
+export function renderIdentityWrapper(
+  tool: TriggerUserAuthTool,
+  realBinaryPath: string,
+  identityResolver?: readonly string[],
+): string {
   const exportKeys = IDENTITY_ENV_KEYS[tool].join(' ');
   return [
     '#!/bin/sh',
@@ -491,35 +499,42 @@ export function renderIdentityWrapper(tool: TriggerUserAuthTool, realBinaryPath:
     // re-set from the credential file below when it carries them.
     `${TURN_VAR}=`,
     `${OPEN_ID_VAR}=`,
-    'if [ -n "$SESSION_DATA_DIR" ] && [ -n "$BOTMUX_SESSION_ID" ]; then',
-    `  __botmux_cred="$SESSION_DATA_DIR/cli-identity/$BOTMUX_SESSION_ID.bin/.data/${tool}.env"`,
-    '  if [ -f "$__botmux_cred" ]; then',
-    '    . "$__botmux_cred"',
-    '  fi',
-    '  unset __botmux_cred',
-    'fi',
-    '',
-    // Turn binding. `__botmux_live` is the turn the CLI is executing now; the
-    // identity names the turn it was published for. Unequal ⇒ the file has been
-    // replaced by a newer message's credentials while this turn is still
-    // running, so these are somebody else's.
     '__botmux_live=',
     '__botmux_live_caller=',
+    '__botmux_identity_key=',
+    '__botmux_identity_turn=',
+    ...(identityResolver ? [
+      `__botmux_cred=$(${[...identityResolver, tool].map(shellSingleQuote).join(' ')}) || exit ${IDENTITY_DENIED_EXIT_CODE}`,
+      'if [ -n "$__botmux_cred" ] && [ -f "$__botmux_cred" ]; then',
+      '  . "$__botmux_cred"',
+      'else',
+      `  ${MODE_VAR}=turn-mismatch`,
+      'fi',
+      'unset __botmux_cred',
+    ] : [
     'if [ -n "$SESSION_DATA_DIR" ] && [ -n "$BOTMUX_SESSION_ID" ]; then',
     '  __botmux_d="$SESSION_DATA_DIR/cli-identity/$BOTMUX_SESSION_ID.bin/.data"',
-    // ONE open, two reads: the file is (turn, caller) written by a single
-    // atomic rename, so this pair is always from one generation. Two separate
-    // reads could interleave with a rewrite and mix generations.
     '  if [ -f "$__botmux_d/turn" ]; then',
-    '    { read -r __botmux_live; read -r __botmux_live_caller; } < "$__botmux_d/turn" || true',
+    '    { read -r __botmux_live; read -r __botmux_live_caller; read -r __botmux_identity_key; read -r __botmux_identity_turn; } < "$__botmux_d/turn" || true',
     '  fi',
-    '  unset __botmux_d',
+    `  __botmux_cred="$__botmux_d/${tool}.env"`,
+    '  if [ -n "$__botmux_identity_key" ]; then',
+    `    __botmux_cred="$__botmux_d/turns/$__botmux_identity_key/${tool}.env"`,
+    '  fi',
+    '  if [ -f "$__botmux_cred" ]; then',
+    '    . "$__botmux_cred"',
+    '  elif [ -n "$__botmux_live" ]; then',
+    `    ${MODE_VAR}=turn-mismatch`,
+    '  fi',
+    '  unset __botmux_d __botmux_cred',
     'fi',
+    ]),
+    '__botmux_identity_turn=${__botmux_identity_turn:-$__botmux_live}',
     // Only enforced when both sides state a turn. An identity published without
     // one predates turn binding; a session with no live turn file has nothing to
     // contradict. Neither is evidence of a mismatch, so neither refuses here.
     `if [ -n "$${TURN_VAR}" ] && [ -n "$__botmux_live" ] \\`,
-    `   && [ "$${TURN_VAR}" != "$__botmux_live" ]; then`,
+    `   && [ "$${TURN_VAR}" != "$__botmux_identity_turn" ]; then`,
     `  __botmux_published_mode=$${MODE_VAR}`,
     `  ${MODE_VAR}=turn-mismatch`,
     // Same human across consecutive turns (their follow-up was accepted while
@@ -527,12 +542,12 @@ export function renderIdentityWrapper(tool: TriggerUserAuthTool, realBinaryPath:
     // person the worker is now executing, so keep it. Only a NAMED match on both
     // sides relaxes; anything missing stays a refusal. Restore the published
     // mode (user/user-home/bot) so the case dispatch below runs normally.
-    `  if [ -n "$${OPEN_ID_VAR}" ] && [ -n "$__botmux_live_caller" ] \\`,
+    `  if [ -z "$__botmux_identity_key" ] && [ -n "$${OPEN_ID_VAR}" ] && [ -n "$__botmux_live_caller" ] \\`,
     `     && [ "$${OPEN_ID_VAR}" = "$__botmux_live_caller" ]; then`,
     `    ${MODE_VAR}=$__botmux_published_mode`,
     '  fi',
     'fi',
-    'unset __botmux_live __botmux_live_caller __botmux_published_mode',
+    'unset __botmux_live __botmux_live_caller __botmux_published_mode __botmux_identity_key __botmux_identity_turn',
     '',
     `case "$${MODE_VAR}" in`,
     '  user|bot)',
@@ -552,8 +567,7 @@ export function renderIdentityWrapper(tool: TriggerUserAuthTool, realBinaryPath:
     `    HOME="$${HOME_VAR}" exec ${shellSingleQuote(realBinaryPath)} "$@"`,
     '    ;;',
     '  turn-mismatch)',
-    `    printf '%s\\n' 'botmux: 这条命令属于上一轮对话，而凭证已经切换到新消息的发起人；为避免用错人的权限，命令未执行。' >&2`,
-    `    printf '%s\\n' 'botmux: 请等当前这轮结束后重试，或由本轮发起人重新发起该操作。' >&2`,
+    `    printf '%s\\n' 'botmux: 当前执行的身份材料缺失或与执行主体不匹配，命令未执行。请检查任务执行状态后重试。' >&2`,
     `    exit ${IDENTITY_DENIED_EXIT_CODE}`,
     '    ;;',
     '  *)',
@@ -693,11 +707,12 @@ export function installIdentityWrapper(
   binDir: string,
   tool: TriggerUserAuthTool,
   realBinaryPath: string | null | undefined,
+  identityResolver?: readonly string[],
 ): string | null {
   if (!realBinaryPath) return null;
   mkdirSync(binDir, { recursive: true });
   const path = join(binDir, tool);
-  atomicWriteFileSync(path, renderIdentityWrapper(tool, realBinaryPath), { mode: 0o755 });
+  atomicWriteFileSync(path, renderIdentityWrapper(tool, realBinaryPath, identityResolver), { mode: 0o755 });
   return path;
 }
 
@@ -863,11 +878,24 @@ export function findRealToolBinary(
 export function prepareTriggerUserCliEnv(
   childEnv: NodeJS.ProcessEnv, sessionDataDir: string | undefined, sessionId: string,
   policy: TriggerUserAuthConfig | undefined, log: (message: string) => void,
+  execution?: { appId: string; ipcPort?: number },
 ): void {
   if (!policy?.enabled || !policy.tools.length || !sessionDataDir) return;
   childEnv.SESSION_DATA_DIR = sessionDataDir;
   childEnv.BOTMUX_SESSION_ID = sessionId;
   const wrapperDir = sessionIdentityBinDir(sessionDataDir, sessionId);
+  let identityResolver: string[] | undefined;
+  if (process.platform === 'linux' && execution) {
+    const moduleDir = dirname(fileURLToPath(import.meta.url));
+    const sourceExecArgs = process.execArgv.map((arg, index, args) =>
+      args[index - 1] === '--import' && arg === 'tsx' ? createRequire(import.meta.url).resolve('tsx') : arg);
+    const runner = moduleDir.endsWith('/src/core')
+      ? { command: process.execPath, args: [...sourceExecArgs, resolve(moduleDir, '../cli-identity-runner.ts')] }
+      : resolveEntrySpawn('cli-identity-runner', resolve(moduleDir, '..'));
+    identityResolver = [runner.command, ...runner.args,
+      '--data-dir', sessionDataDir, '--session-id', sessionId, '--app-id', execution.appId,
+      '--ipc-port', String(execution.ipcPort), '--tool'];
+  }
   // Pre-create the identity files so they survive the sandbox's
   // existence-filter (it drops allow paths that do not exist at spawn, and a
   // dropped path would leave the wrapper unable to read what the daemon later
@@ -892,7 +920,7 @@ export function prepareTriggerUserCliEnv(
         log(`[trigger-user-auth] ${tool} is not installed; no wrapper written`);
         continue;
       }
-      installIdentityWrapper(wrapperDir, tool, real);
+      installIdentityWrapper(wrapperDir, tool, real, identityResolver);
       installedAny = true;
       log(`[trigger-user-auth] wrapping ${tool} -> ${real}`);
     } catch (e) {

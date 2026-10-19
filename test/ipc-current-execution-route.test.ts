@@ -4,6 +4,10 @@ import { readProcessStartIdentity } from '../src/utils/process-identity.js';
 import * as workerPool from '../src/core/worker-pool.js';
 import { spawnTsEvalWithRepoImports, spawnTsScript } from './helpers/ts-runner.js';
 import { fetchDaemonIpc } from '../src/core/daemon-ipc-auth.js';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { publishActiveTurn, sessionIdentityPath } from '../src/core/cli-identity.js';
 
 let ipc: IpcServerHandle | null = null;
 afterEach(async () => { if (ipc) await ipc.close(); ipc = null; setIpcAuthSecret(null); vi.restoreAllMocks(); });
@@ -27,15 +31,15 @@ async function cli(withAncestor: boolean) {
     BOTMUX_LARK_APP_ID: 'cli_execution', BOTMUX_DAEMON_IPC_PORT: String(ipc!.port),
     BOTMUX_TURN_ID: 'stale-spawn-turn', BOTMUX_DISPATCH_ATTEMPT: '999', BOTMUX_NO_CLAIM: '1' };
   const options = { env, stdio: ['ignore', 'pipe', 'pipe'] as ['ignore', 'pipe', 'pipe'] };
-  // A real ancestor must carry kernel-held routing; the current CLI's own env
-  // alone is intentionally not an attestation. Both spawns use the repo helper.
-  const child = withAncestor ? spawnTsEvalWithRepoImports(`
+  const child = spawnTsEvalWithRepoImports(`
     import { spawnTsScript } from './test/helpers/ts-runner.js';
-    const child = spawnTsScript('src/cli.ts', ['execution', 'current', '--json'], { stdio: 'inherit' });
+    const child = spawnTsScript('src/cli.ts', ['execution', 'current', '--json'], {
+      env: { ...process.env, BOTMUX_SESSION_ID: 's-execution' }, stdio: 'inherit',
+    });
     process.once('SIGTERM', () => child.kill('SIGTERM'));
     child.once('error', () => { process.exitCode = 1; });
     child.once('close', code => { process.exitCode = code ?? 1; });
-  `, options) : spawnTsScript('src/cli.ts', ['execution', 'current', '--json'], options);
+  `, { ...options, env: { ...env, BOTMUX_SESSION_ID: withAncestor ? 's-execution' : 'foreign-ancestor' } });
   return await new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve, reject) => {
     let stdout = '', stderr = '';
     const timer = setTimeout(() => { child.kill('SIGTERM'); reject(new Error('execution CLI timed out')); }, 20000);
@@ -46,6 +50,34 @@ async function cli(withAncestor: boolean) {
 }
 
 describe('POST /api/current-execution', () => {
+  it.skipIf(process.platform !== 'linux')('binds the identity runner to the proven identity reference', async () => {
+    const ds = session();
+    ds.managedTurnOrigin.identityTurnId = 'identity-original';
+    vi.spyOn(workerPool, 'findActiveBySessionId').mockImplementation(id => id === 's-execution' ? ds : undefined);
+    ipc = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+    const dir = mkdtempSync(join(tmpdir(), 'cli identity runner-'));
+    const run = () => new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve, reject) => {
+      const child = spawnTsScript('src/cli-identity-runner.ts', [
+        '--data-dir', dir, '--session-id', 's-execution', '--app-id', 'cli_execution',
+        '--ipc-port', String(ipc!.port), '--tool', 'bytedcli',
+      ], { stdio: ['ignore', 'pipe', 'pipe'] });
+      let stdout = '', stderr = '';
+      child.stdout!.on('data', data => { stdout += data; }); child.stderr!.on('data', data => { stderr += data; });
+      child.once('error', reject); child.once('close', code => resolve({ code, stdout, stderr }));
+    });
+    try {
+      publishActiveTurn(dir, 's-execution', 'newer-envelope', 'ou_newer');
+      const accepted = await run();
+      expect(accepted.code, accepted.stderr).toBe(0);
+      expect(accepted.stdout).toBe(`${sessionIdentityPath(dir, 's-execution', 'bytedcli', 'identity-original')}\n`);
+      delete ds.managedTurnOrigin.identityTurnId;
+      const missing = await run();
+      expect(missing.code).toBe(77); expect(missing.stdout).toBe('');
+      ds.workerGeneration++;
+      const stale = await run();
+      expect(stale.code).toBe(77); expect(stale.stdout).toBe('');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
   it('does not let a valid host HMAC bypass current process attestation', async () => {
     const secret = 'current-execution-test-secret'; setIpcAuthSecret(secret);
     const ds = session(); ds.localProcessAttestation.cliProcStart = 'stale';
