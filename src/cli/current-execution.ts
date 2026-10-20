@@ -66,8 +66,9 @@ export async function resolveCurrentExecution(options: {
 export const CURRENT_EXECUTION_IDENTITY_SCHEMA = 'botmux.current-execution-identity.v1' as const;
 export const CURRENT_EXECUTION_IDENTITY_ROUTE = '/api/current-execution-identity';
 
-const IDENTITY_TOOLS = ['lark-cli', 'bytedcli'] as const;
-const identityTool = (value: unknown): value is typeof IDENTITY_TOOLS[number] =>
+const IDENTITY_TOOLS = ['lark-cli', 'bytedcli', 'codebase'] as const;
+type IdentityToolName = typeof IDENTITY_TOOLS[number];
+const identityTool = (value: unknown): value is IdentityToolName =>
   typeof value === 'string' && (IDENTITY_TOOLS as readonly string[]).includes(value);
 
 export interface CurrentExecutionIdentityDocument {

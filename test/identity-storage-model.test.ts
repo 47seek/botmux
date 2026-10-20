@@ -26,7 +26,13 @@ import {
 import { resolveIdentityStorageModel } from '../src/core/lark-tool-binding.js';
 import { rememberLarkToolDelegation, clearLarkToolDelegations, larkToolDelegationTurnIds } from '../src/core/lark-tool-delegation.js';
 import { sessionAuthRequests } from '../src/core/session-auth-requests.js';
-import { registerActiveIdentityTurn, releaseActiveIdentityTurn, clearActiveIdentityTurns } from '../src/core/active-identity-turns.js';
+import {
+  registerActiveIdentityTurn,
+  releaseActiveIdentityTurn,
+  clearActiveIdentityTurns,
+  activeIdentityTurns,
+  activeIdentityTurnsSaturated,
+} from '../src/core/active-identity-turns.js';
 import { collectSessionTurnGarbage } from '../src/core/worker-pool.js';
 import { config } from '../src/config.js';
 
@@ -313,5 +319,22 @@ describe('daemon terminal GC retention set (mutation matrix)', () => {
     publish('turn-A');
     forgetProvenIdentityContent(dir, SESSION, 'turn-A', 'bytedcli');
     expect(recallProvenIdentityContent(dir, SESSION, 'turn-A', 'bytedcli')).toBeUndefined();
+  });
+
+  it('a saturated accept ledger retains EVERYTHING (never clears into over-collection)', () => {
+    // 257 turns that never terminal: past the defensive cap.
+    for (let i = 0; i < 257; i++) {
+      writeSessionIdentity(dir, SESSION, aliceBy(`saturated-${i}`), 'proven');
+      registerActiveIdentityTurn(dir, SESSION, `saturated-${i}`);
+    }
+    expect(activeIdentityTurnsSaturated(dir, SESSION)).toBe(true);
+    // Direct collection with an empty retention set would remove all, but the
+    // daemon GC must skip a saturated session entirely (retain-all).
+    const ds = dsWith({});
+    expect(collectSessionTurnGarbage(ds)).toEqual([]);
+    expect(recallProvenIdentityContent(dir, SESSION, 'saturated-0', 'bytedcli')).toBeDefined();
+    expect(recallProvenIdentityContent(dir, SESSION, 'saturated-256', 'bytedcli')).toBeDefined();
+    // The low-level helper signals retain-all with null.
+    expect(activeIdentityTurns(dir, SESSION)).toBeNull();
   });
 });

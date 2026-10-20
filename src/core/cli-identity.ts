@@ -774,7 +774,14 @@ export function renderIdentityWrapper(
     // body straight from the pipe: nothing in the session directory can select
     // or alter the identity, and no token rests on disk to be read.
     `__botmux_cred_body=$(${[...identityResolver!, tool].map(shellSingleQuote).join(' ')}) || exit ${IDENTITY_DENIED_EXIT_CODE}`,
+    // An empty body is a missing/empty response (no mode assignment below),
+    // never silent permission to run: deny it like a failed proof.
+    `[ -n "$__botmux_cred_body" ] || exit ${IDENTITY_DENIED_EXIT_CODE}`,
     `eval "$__botmux_cred_body" || exit ${IDENTITY_DENIED_EXIT_CODE}`,
+    // Defense in depth: the served body must name the mode we know how to
+    // dispatch. The daemon already whitelists these keys, but a wrapper must
+    // not eval a body that hands it an unrecognized mode either.
+    `case "$BOTMUX_IDENTITY_MODE" in user|bot|user-home|turn-mismatch|denied) ;; *) exit ${IDENTITY_DENIED_EXIT_CODE} ;; esac`,
     'unset __botmux_cred_body',
   ] : [
     'if [ -n "$SESSION_DATA_DIR" ] && [ -n "$BOTMUX_SESSION_ID" ]; then',

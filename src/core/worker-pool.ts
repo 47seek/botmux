@@ -1101,7 +1101,12 @@ export function identityStorageModelForDaemonSession(ds: DaemonSession): Identit
     adoptMode: !!ds.session.adoptedFrom,
     existingAppServerEndpoint: ds.session.existingAppServerEndpoint,
     backendType: ds.session.backendType ?? bot.backendType ?? config.daemon.backendType,
-    larkToolBinding: bot.larkToolBinding,
+    // This model question is only reached for a governed tool under an enabled
+    // triggerUserAuth policy; bytedcli (and the Codebase companion) is managed
+    // regardless of the separate lark-cli app binding. The worker passes the
+    // same effective value (usesLarkToolBinding(..., {larkToolBinding: true})),
+    // so the two sides never disagree when larkToolBinding is explicitly off.
+    larkToolBinding: true,
     sandbox: ds.session.sandbox === true
       || ds.session.sandbox === 'oncall'
       || ds.session.sandbox === 'scratch',
@@ -1125,7 +1130,7 @@ export function identityStorageModelForDaemonSession(ds: DaemonSession): Identit
  * plus every accepted turn that has not produced an exact terminal/rejection
  * (covers the worker's type-ahead queue, which is otherwise daemon-invisible).
  */
-function retainedIdentityTurns(ds: DaemonSession): Set<string> {
+function retainedIdentityTurns(ds: DaemonSession): Set<string> | 'all' {
   const retain = new Set<string>();
   const add = (turnId?: string | null): void => { if (turnId) retain.add(turnId); };
   add(ds.managedTurnOrigin?.identityTurnId ?? ds.managedTurnOrigin?.turnId);
@@ -1141,7 +1146,11 @@ function retainedIdentityTurns(ds: DaemonSession): Set<string> {
   }
   for (const turnId of sessionAuthRequests.identityTurnsFor(ds.session.sessionId)) add(turnId);
   for (const turnId of larkToolDelegationTurnIds(config.session.dataDir, ds.session.sessionId)) add(turnId);
-  for (const turnId of activeIdentityTurns(config.session.dataDir, ds.session.sessionId)) add(turnId);
+  // A saturated accept ledger cannot distinguish queued from dead: retain
+  // every proven turn for the session rather than risk collecting in-flight.
+  const acceptedTurns = activeIdentityTurns(config.session.dataDir, ds.session.sessionId);
+  if (acceptedTurns === null) return 'all';
+  for (const turnId of acceptedTurns) add(turnId);
   return retain;
 }
 
@@ -1149,9 +1158,9 @@ function retainedIdentityTurns(ds: DaemonSession): Set<string> {
  *  session state. No-op for single-model sessions (they keep no in-memory
  *  contents). Returns the removed turn ids. */
 export function collectSessionTurnGarbage(ds: DaemonSession): string[] {
-  return collectProvenIdentityContents(
-    config.session.dataDir, ds.session.sessionId, retainedIdentityTurns(ds),
-  );
+  const retained = retainedIdentityTurns(ds);
+  if (retained === 'all') return [];
+  return collectProvenIdentityContents(config.session.dataDir, ds.session.sessionId, retained);
 }
 
 /** Direct access to the active-sessions Map. Reserved for callers that need
@@ -14812,9 +14821,14 @@ function setupWorkerHandlers(
         }
         discardTriggerStreamingCard(ds, msg.turnId);
         await rejectOrdinaryImDelivery(ds, msg.turnId, workerGeneration, msg);
-        // The turn never started and will never terminal; drop its publication
-        // anchor so its material can be collected.
-        releaseActiveIdentityTurn(config.session.dataDir, ds.session.sessionId, msg.turnId);
+        // The turn never started and will never terminal. Run GC, but do NOT
+        // release this turn's own ledger anchor here: a same-turnId redelivery
+        // to a new dispatch attempts re-registers on accept, and the rejected
+        // message carries no dispatchAttempt to prove it is not stale. Dropping
+        // the anchor before that re-register lands could let a periodic sweep
+        // collect the re-accepted material. The rejected turn is collected on
+        // a later terminal GC once no live structure names it (and always on
+        // teardown); a small retention lag beats a fail-closed 77 window.
         collectSessionTurnGarbage(ds);
         break;
       }
@@ -17854,8 +17868,15 @@ function setupWorkerHandlers(
         // The turn reached a terminal boundary; release its publication anchor
         // and forget proven material for every turn no live state still names
         // (queued turns and continuations stay retained). No-op for sessions on
-        // the single-snapshot model.
+        // the single-snapshot model. When cross-principal isolation is off, an
+        // adoption chain keeps the OPENING turn's identity for the whole chain
+        // (envelope=B executes as A); release that retained anchor here too —
+        // GC re-pins it if any still-live origin references the same id.
         releaseActiveIdentityTurn(config.session.dataDir, msg.sessionId, msg.turnId);
+        const terminalIdentityTurn = ds.managedTurnOrigin?.identityTurnId;
+        if (terminalIdentityTurn && terminalIdentityTurn !== msg.turnId) {
+          releaseActiveIdentityTurn(config.session.dataDir, msg.sessionId, terminalIdentityTurn);
+        }
         collectSessionTurnGarbage(ds);
         break;
       }

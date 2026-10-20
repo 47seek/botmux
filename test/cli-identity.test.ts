@@ -581,6 +581,14 @@ describe('renderIdentityWrapper', () => {
     // A channel refusal (proof failed / no material) denies outright.
     writeFileSync(resolver, '#!/bin/sh\nexit 77\n');
     expect(runDenied(wrapperPath, env).status).toBe(77);
+    // A successful channel call that returns an EMPTY body denies too: an
+    // empty eval must never read as permission to run as the machine.
+    writeFileSync(resolver, '#!/bin/sh\nexit 0\n');
+    expect(runDenied(wrapperPath, env).status).toBe(77);
+    // A body carrying an unrecognized mode is rejected even though the call
+    // succeeded (the daemon whitelists keys; the wrapper re-checks).
+    writeFileSync(resolver, `#!/bin/sh\nprintf '%s\\n' "BOTMUX_IDENTITY_MODE='user'" "LARKSUITE_CLI_APP_ID='a'" "LARKSUITE_CLI_USER_ACCESS_TOKEN='tok'\n" "BOTMUX_IDENTITY_MODE='bogus'"\n`);
+    expect(runDenied(wrapperPath, env).status).toBe(77);
   });
 
   it.each([
