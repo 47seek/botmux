@@ -226,6 +226,97 @@ describe('bot-config store', () => {
     expect(keys).toContain('feedback');
     expect(keys).toContain('showReplyTiming');
     expect(keys).toContain('cardActionAckTimeoutMs');
+    expect(keys).toContain('herdr');
+  });
+
+  it('strictly normalizes the herdr JSON field and clears an empty block', async () => {
+    const { registry, store } = await loaded();
+    const spec = store.findConfigField('herdr')!;
+    expect(spec).toMatchObject({ kind: 'json', effect: 'next-session', clearable: true });
+    // 合法块：trim 文本、保留枚举与 chatTypes。
+    const ok = store.coerceConfigValue(spec, JSON.stringify({
+      sessionName: ' default ',
+      placement: 'split',
+      workspace: '  ',
+      tab: '3',
+      splitDirection: 'right',
+      chatTypes: ['group'],
+    }));
+    expect(ok).toEqual({
+      ok: true,
+      value: { sessionName: 'default', placement: 'split', tab: '3', splitDirection: 'right', chatTypes: ['group'] },
+    });
+    expect((await store.applyConfigField('app_default', spec, (ok as any).value)).ok).toBe(true);
+    expect(readConfig().herdr).toEqual({ sessionName: 'default', placement: 'split', tab: '3', splitDirection: 'right', chatTypes: ['group'] });
+    expect(registry.getBot('app_default').config.herdr).toEqual(readConfig().herdr);
+    // 非法 placement / 未知字段 / 错误类型显式拒绝（不静默剔除），且不动已落盘配置。
+    for (const bad of [
+      { placement: 'nope' },
+      { session: 'default' },
+      { sessionName: 3 },
+      { chatTypes: ['group', 'x'] },
+      [1, 2],
+    ]) {
+      const rejected = store.coerceConfigValue(spec, JSON.stringify(bad));
+      expect(rejected.ok, JSON.stringify(bad)).toBe(false);
+      expect((rejected as any).reason).toContain('invalid_herdr_config');
+    }
+    expect(readConfig().herdr).toBeDefined();
+    // chatTypes 重复值与 bots.json/env 门一致：去重接受，不报错。
+    const dup = store.coerceConfigValue(spec, JSON.stringify({
+      sessionName: 'default', chatTypes: ['group', 'group', 'p2p'],
+    }));
+    expect(dup).toEqual({ ok: true, value: { sessionName: 'default', chatTypes: ['group', 'p2p'] } });
+    // 空对象归一为 null：applyConfigField 删除整个 herdr 键。
+    const empty = store.coerceConfigValue(spec, '{}');
+    expect(empty).toEqual({ ok: true, value: null });
+    expect((await store.applyConfigField('app_default', spec, null)).ok).toBe(true);
+    expect(readConfig()).not.toHaveProperty('herdr');
+    expect(registry.getBot('app_default').config.herdr).toBeUndefined();
+  });
+
+  it('rejects an inert herdr block through the shared /config coerce path too', async () => {
+    const { store } = await loaded();
+    const spec = store.findConfigField('herdr')!;
+    // IM /config set 与 Dashboard 共用 coerceConfigValue：无 sessionName/placement
+    // 时只填子字段必须拒绝，不能存出「零效果」块。
+    for (const raw of [{ tab: '3' }, { workspace: 'w' }, { splitDirection: 'down' }, { chatTypes: ['group'] }]) {
+      const r = store.coerceConfigValue(spec, JSON.stringify(raw));
+      expect(r.ok, JSON.stringify(raw)).toBe(false);
+      expect((r as any).reason).toContain('invalid_herdr_config');
+    }
+    // env 已提供 placement 时，只覆盖 tab 的部分块合法（字段级叠加）。
+    const cfg = (await import('../src/config.js')).config.daemon as { herdr?: unknown };
+    const prev = cfg.herdr;
+    cfg.herdr = { placement: 'split' };
+    try {
+      expect(store.coerceConfigValue(spec, JSON.stringify({ tab: '3' }))).toEqual({ ok: true, value: { tab: '3' } });
+    } finally {
+      if (prev === undefined) delete cfg.herdr; else cfg.herdr = prev;
+    }
+  });
+
+  it('keeps the strict herdr field list in parity with the normalizer', async () => {
+    const { store } = await loaded();
+    const types = await import('../src/adapters/backend/types.js');
+    const spec = store.findConfigField('herdr')!;
+    const allFields = types.normalizeHerdrBackendConfig({
+      sessionName: 'default', placement: 'split', workspace: 'w', tab: 't',
+      splitDirection: 'right', chatTypes: ['group', 'p2p'],
+    });
+    // 严格门字段表必须与归一器实际接受的键完全一致：漏一个就会把新字段当
+    // 未知字段拒绝（或两边语义分叉）。
+    expect([...store.HERDR_FIELD_NAMES].sort()).toEqual(Object.keys(allFields).sort());
+    // 每个字段单独传入都能被严格门识别为已知字段（不报「不是可识别字段」）。
+    for (const key of store.HERDR_FIELD_NAMES) {
+      const value = key === 'placement' ? 'workspace'
+        : key === 'splitDirection' ? 'right'
+        : key === 'chatTypes' ? ['group']
+        : key === 'sessionName' ? 's' : 'x';
+      const r = store.coerceConfigValue(spec, JSON.stringify({ [key]: value }));
+      if (r.ok === false) expect(r.reason).not.toContain('不是可识别字段');
+    }
+    void spec;
   });
 
   it('strictly normalizes feedback JSON through the shared config field', async () => {
