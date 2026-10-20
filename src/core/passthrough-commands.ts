@@ -144,18 +144,42 @@ export function normalizePassthroughCommand(cmd: unknown): string | null {
  * Mirrors the normalization {@link ../bot-registry.js}'s
  * parseBotConfigsFromText applies when loading bots.json, so a round-trip
  * through the card is stable.
+ *
+ * A greedy entry can glue neighboring words onto punctuation that is not a
+ * separator (`/goal ; /export` → token `/goal ;`). When the whole entry fails
+ * normalization, it is retried word-by-word on whitespace — but only when its
+ * first word is itself a valid command. That guard keeps malformed leaders
+ * (`/ Ultra Goal`, whose joined shape starts with `-`) dropped as a whole,
+ * while legal commands glued onto trailing punctuation (`/goal (note)`) are
+ * rescued. A spaced name that normalizes fine (`/Ultra Goal`) never reaches
+ * the fallback, so mixed input like `/Ultra Goal /bad (note)` keeps both
+ * entries.
  */
 export function parseCustomPassthroughInput(raw: string): string[] {
   const out: string[] = [];
+  const normalize = (token: string) =>
+    normalizePassthroughCommand(token.startsWith('/') ? token : `/${token}`);
+  const add = (token: string) => {
+    const norm = normalize(token);
+    if (norm) {
+      out.push(norm);
+      return;
+    }
+    const parts = token.split(/\s+/).filter(Boolean);
+    const first = parts.length ? normalize(parts[0]) : null;
+    if (!first) return;
+    out.push(first);
+    for (const part of parts.slice(1)) {
+      const fallback = normalize(part);
+      if (fallback) out.push(fallback);
+    }
+  };
   for (const segment of String(raw ?? '').split(/[,\r\n]+/)) {
     // 一个 entry = 首个 token（带不带 `/` 都行）+ 后续「空白后不是 `/`」的词；
     // 空白后的下一个 `/` 另起一条（`/goal /export`）。
     for (const tok of segment.match(/\/?\S+(?:[^\S\r\n]+(?!\/)\S+)*/g) ?? []) {
       const trimmed = tok.trim();
-      if (!trimmed) continue;
-      const withSlash = trimmed.startsWith('/') ? trimmed : `/${trimmed}`;
-      const norm = normalizePassthroughCommand(withSlash);
-      if (norm) out.push(norm);
+      if (trimmed) add(trimmed);
     }
   }
   return [...new Set(out)];

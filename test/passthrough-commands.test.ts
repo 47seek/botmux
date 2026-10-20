@@ -39,6 +39,21 @@ describe('parseCustomPassthroughInput', () => {
     expect(parseCustomPassthroughInput('/Ultra Goal /export x')).toEqual(['/ultra-goal', '/export-x']);
   });
 
+  it('falls back to per-word parsing of an entry glued by non-separator punctuation', () => {
+    expect(parseCustomPassthroughInput('/goal ; /export')).toEqual(['/goal', '/export']);
+    expect(parseCustomPassthroughInput('/goal (note)')).toEqual(['/goal']);
+    expect(parseCustomPassthroughInput('/a b! c')).toEqual(['/a', '/c']);
+  });
+
+  it('fallback runs per greedy token, keeping an already-normalized spaced name', () => {
+    expect(parseCustomPassthroughInput('/Ultra Goal /bad (note)')).toEqual(['/ultra-goal', '/bad']);
+  });
+
+  it('does not launder an entry with a malformed leader: fallback needs a valid first word', () => {
+    expect(parseCustomPassthroughInput('/ Ultra Goal')).toEqual([]);
+    expect(parseCustomPassthroughInput('/ goal')).toEqual([]);
+  });
+
   it('dedupes after normalization', () => {
     expect(parseCustomPassthroughInput('/Ultra Goal, /ultra-goal')).toEqual(['/ultra-goal']);
   });
