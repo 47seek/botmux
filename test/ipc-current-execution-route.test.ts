@@ -7,10 +7,15 @@ import { fetchDaemonIpc } from '../src/core/daemon-ipc-auth.js';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { publishActiveTurn, sessionIdentityPath } from '../src/core/cli-identity.js';
+import { publishActiveTurn, writeSessionIdentity, recallProvenIdentityContent } from '../src/core/cli-identity.js';
+import { config } from '../src/config.js';
 
 let ipc: IpcServerHandle | null = null;
-afterEach(async () => { if (ipc) await ipc.close(); ipc = null; setIpcAuthSecret(null); vi.restoreAllMocks(); });
+let previousDataDir = '';
+afterEach(async () => {
+  if (ipc) await ipc.close(); ipc = null; setIpcAuthSecret(null); vi.restoreAllMocks();
+  if (previousDataDir) { config.session.dataDir = previousDataDir; previousDataDir = ''; }
+});
 function session(): any {
   return { session: { sessionId: 's-execution', status: 'active' },
     larkAppId: 'cli_execution', chatId: 'oc_execution', workerGeneration: 7,
@@ -50,15 +55,24 @@ async function cli(withAncestor: boolean) {
 }
 
 describe('POST /api/current-execution', () => {
-  it.skipIf(process.platform !== 'linux')('binds the identity runner to the proven identity reference', async () => {
+  it.skipIf(process.platform !== 'linux')('serves the proven identity content bound to the execution turn', async () => {
     const ds = session();
     ds.managedTurnOrigin.identityTurnId = 'identity-original';
     vi.spyOn(workerPool, 'findActiveBySessionId').mockImplementation(id => id === 's-execution' ? ds : undefined);
+    vi.spyOn(await import('../src/bot-registry.js'), 'getBot').mockReturnValue({ config: {
+      larkAppId: 'cli_execution', larkToolBinding: true, backendType: 'pty',
+    } } as any);
     ipc = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
-    const dir = mkdtempSync(join(tmpdir(), 'cli identity runner-'));
+    const dataDir = mkdtempSync(join(tmpdir(), 'cli identity runner-'));
+    previousDataDir = config.session.dataDir;
+    config.session.dataDir = dataDir;
+    writeSessionIdentity(dataDir, 's-execution', {
+      tool: 'bytedcli', cloudJwt: 'jwt-original', turnId: 'identity-original', openId: 'ou-original',
+    }, 'proven');
+    const expected = recallProvenIdentityContent(dataDir, 's-execution', 'identity-original', 'bytedcli')!;
     const run = () => new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve, reject) => {
       const child = spawnTsScript('src/cli-identity-runner.ts', [
-        '--data-dir', dir, '--session-id', 's-execution', '--app-id', 'cli_execution',
+        '--data-dir', dataDir, '--session-id', 's-execution', '--app-id', 'cli_execution',
         '--ipc-port', String(ipc!.port), '--tool', 'bytedcli',
       ], { stdio: ['ignore', 'pipe', 'pipe'] });
       let stdout = '', stderr = '';
@@ -66,18 +80,54 @@ describe('POST /api/current-execution', () => {
       child.once('error', reject); child.once('close', code => resolve({ code, stdout, stderr }));
     });
     try {
-      publishActiveTurn(dir, 's-execution', 'newer-envelope', 'ou_newer');
+      publishActiveTurn(dataDir, 's-execution', 'newer-envelope', 'ou_newer');
       const accepted = await run();
       expect(accepted.code, accepted.stderr).toBe(0);
-      expect(accepted.stdout).toBe(`${sessionIdentityPath(dir, 's-execution', 'bytedcli', 'identity-original')}\n`);
+      expect(accepted.stdout).toBe(expected);
+      expect(accepted.stdout).toContain('jwt-original');
       delete ds.managedTurnOrigin.identityTurnId;
       const missing = await run();
       expect(missing.code).toBe(77); expect(missing.stdout).toBe('');
       ds.workerGeneration++;
       const stale = await run();
       expect(stale.code).toBe(77); expect(stale.stdout).toBe('');
-    } finally { rmSync(dir, { recursive: true, force: true }); }
+    } finally { rmSync(dataDir, { recursive: true, force: true }); }
   });
+  it('returns a distinct terminal error when the proven material is gone', async () => {
+    const ds = session();
+    vi.spyOn(workerPool, 'findActiveBySessionId').mockImplementation(id => id === 's-execution' ? ds : undefined);
+    vi.spyOn(await import('../src/bot-registry.js'), 'getBot').mockReturnValue({ config: {
+      larkAppId: 'cli_execution', larkToolBinding: true, backendType: 'pty',
+    } } as any);
+    ipc = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+    // Lineage proves (the session/worker fixtures pass attestation) but nothing
+    // was ever published for this turn: 404 identity_material_unavailable, not
+    // the 403 proof failure.
+    const response = await fetch(`http://127.0.0.1:${ipc.port}/api/current-execution-identity`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ sessionId: 's-execution', tool: 'bytedcli' }),
+    });
+    expect(response.status).toBe(404);
+    expect(await response.json()).toMatchObject({ error: 'identity_material_unavailable' });
+  });
+
+  it('refuses identity content for a session on the single model', async () => {
+    const ds = session();
+    vi.spyOn(workerPool, 'findActiveBySessionId').mockImplementation(id => id === 's-execution' ? ds : undefined);
+    // adoptMode forces single even on Linux
+    vi.spyOn(await import('../src/bot-registry.js'), 'getBot').mockReturnValue({ config: {
+      larkAppId: 'cli_execution', larkToolBinding: true, backendType: 'pty',
+    } } as any);
+    ds.session.adoptedFrom = 'tmux-session-1';
+    ipc = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+    const response = await fetch(`http://127.0.0.1:${ipc.port}/api/current-execution-identity`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ sessionId: 's-execution', tool: 'bytedcli' }),
+    });
+    expect(response.status).toBe(403);
+    expect(await response.json()).toMatchObject({ error: 'current_execution_unverified' });
+  });
+
   it('does not let a valid host HMAC bypass current process attestation', async () => {
     const secret = 'current-execution-test-secret'; setIpcAuthSecret(secret);
     const ds = session(); ds.localProcessAttestation.cliProcStart = 'stale';

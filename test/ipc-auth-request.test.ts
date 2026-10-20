@@ -35,6 +35,7 @@ beforeEach(async () => {
     authUrl: AUTH_URL, scopes: ['offline_access', 'im:chat:read'], expiresIn: 600, poll,
   });
   vi.spyOn(cliIdentity, 'refreshSessionIdentity').mockReturnValue(true);
+  vi.spyOn(cliIdentity, 'sessionIdentityMaterialPresent').mockReturnValue(true);
   setIpcAuthSecret(SECRET);
   ipc = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
 });
@@ -78,7 +79,9 @@ describe('agent authorization', () => {
     expect(await (await post('auth-status', { requestId: request.requestId })).json()).toEqual({ ok: true, status: 'ready' });
     expect(cliIdentity.refreshSessionIdentity).toHaveBeenCalledWith(expect.any(String), 'auth-session', {
       tool: 'lark-cli', appId: 'cli_test', userAccessToken: 'target-app-grant', turnId: 'om_turn', openId: 'ou_target_human',
-    });
+    },
+    process.platform === 'linux' ? 'proven' : 'single',
+  );
   });
 
   it('authorizes an actorless scheduled delegation through its execution identity', async () => {
@@ -93,7 +96,9 @@ describe('agent authorization', () => {
       .toEqual({ ok: true, status: 'ready' });
     expect(cliIdentity.refreshSessionIdentity).toHaveBeenCalledWith(expect.any(String), 'auth-session', {
       tool: 'lark-cli', appId: 'cli_test', userAccessToken: 'target-app-grant', turnId: 'om_turn', openId: 'ou_target_human',
-    });
+    },
+    process.platform === 'linux' ? 'proven' : 'single',
+  );
   });
 
   it.each([
@@ -140,7 +145,9 @@ describe('agent authorization', () => {
     expect((await post('auth-status', { requestId: request.requestId, originTurnId: 'om_next' })).status).toBe(200);
     expect(cliIdentity.refreshSessionIdentity).toHaveBeenCalledWith(expect.any(String), 'auth-session', {
       tool: 'lark-cli', appId: 'cli_test', userAccessToken: 'target-app-grant', turnId: 'om_next', openId: 'ou_target_human',
-    });
+    },
+    process.platform === 'linux' ? 'proven' : 'single',
+  );
   });
 
   it('rejects another human behind the same dispatch bot before polling', async () => {
@@ -258,7 +265,9 @@ describe('agent authorization', () => {
     expect(cliIdentity.refreshSessionIdentity).toHaveBeenCalledWith(expect.any(String), 'auth-session', {
       tool: 'lark-cli', appId: 'cli_test', userAccessToken: 'test-user-token',
       turnId: 'om_next', openId: 'ou_sender',
-    });
+    },
+    process.platform === 'linux' ? 'proven' : 'single',
+  );
   });
 
   it('refuses to hand the token to a different human’s live turn', async () => {
@@ -293,7 +302,9 @@ describe('agent authorization', () => {
     expect(cliIdentity.refreshSessionIdentity).toHaveBeenCalledWith(expect.any(String), 'auth-session', {
       tool: 'lark-cli', appId: 'cli_test', userAccessToken: 'test-user-token', turnId: 'om_turn',
       openId: 'ou_sender',
-    });
+    },
+    process.platform === 'linux' ? 'proven' : 'single',
+  );
   });
 
   it('waits for the matching identity marker and completes after a same-person worker restart', async () => {
@@ -399,7 +410,9 @@ describe.skipIf(process.platform !== 'linux')('agent authorization over a manage
     expect(await (await hostPost('auth-status', { requestId: request.requestId })).json()).toEqual({ ok: true, status: 'ready' });
     expect(cliIdentity.refreshSessionIdentity).toHaveBeenCalledWith(expect.any(String), 'host-session', {
       tool: 'lark-cli', appId: 'cli_test', userAccessToken: 'target-app-grant', turnId: 'om_host', openId: 'ou_target_human',
-    });
+    },
+    process.platform === 'linux' ? 'proven' : 'single',
+  );
   });
 
   it('authorizes an RPC client through the independently attested engine root', async () => {
@@ -450,6 +463,8 @@ describe.skipIf(process.platform !== 'linux')('agent authorization over a manage
     expect(cliIdentity.refreshSessionIdentity).toHaveBeenCalledWith(expect.any(String), 'host-session', {
       tool: 'lark-cli', appId: 'cli_test', userAccessToken: 'host-user-token', turnId: 'om_host',
       openId: 'ou_host',
-    });
+    },
+    process.platform === 'linux' ? 'proven' : 'single',
+  );
   });
 });

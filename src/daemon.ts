@@ -371,6 +371,8 @@ import {
   setDurableBridgeFinalOutputHandler,
   buildStreamingCardJson,
   isResumeRecoveryPlaceholder,
+  identityStorageModelForDaemonSession,
+  collectSessionTurnGarbage,
 } from './core/worker-pool.js';
 import { buildClosedSessionCard } from './core/closed-session-card.js';
 import { waitAllWithin, trackProducerQuiet, trackProcessExited } from './core/producer-quiescence.js';
@@ -4070,6 +4072,7 @@ async function prepareScheduledTurnCliIdentity(ds: DaemonSession, turnId: string
     senderOpenId,
     locale: localeForBot(ds.larkAppId),
     turnId,
+    storageModel: identityStorageModelForDaemonSession(ds),
   });
 }
 
@@ -4095,6 +4098,7 @@ async function prepareDelegatedScheduledTurnIdentity(
     delegatedIdentity: delegatedScheduleCliIdentity(authority, authorized.targetOpenId),
     locale: localeForBot(ds.larkAppId),
     turnId,
+    storageModel: identityStorageModelForDaemonSession(ds),
   });
   return true;
 }
@@ -4138,6 +4142,7 @@ async function refreshTurnCliIdentity(ds: DaemonSession, turnId: string): Promis
     ...(delegatedIdentity ? { delegatedIdentity } : {}),
     locale: localeForBot(ds.larkAppId),
     turnId,
+    storageModel: identityStorageModelForDaemonSession(ds),
   });
 
   // NO chat notice here.
@@ -31496,6 +31501,13 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       sweepOrphanSandboxes(config.session.dataDir, new Set([...activeSessions.values()].map(ds => ds.session.sessionId)));
     sweepOrphanScratchSandboxes(config.session.dataDir, new Set([...activeSessions.values()].map(ds => ds.session.sessionId)));
     sweepOrphanMacScratchSandboxes(config.session.dataDir, new Set([...activeSessions.values()].map(ds => ds.session.sessionId)));
+    // Periodic terminal GC for proven identity contents: covers rejection and
+    // worker-exit paths that do not emit a terminal, and any missed edge.
+    // Retention is computed from live state, so live/queued turns survive.
+    for (const ds of activeSessions.values()) {
+      try { collectSessionTurnGarbage(ds); }
+      catch (err: any) { logger.warn(`[trigger-user-auth] identity GC failed: ${err?.message ?? err}`); }
+    }
     } catch (err: any) {
       logger.warn(`[sandbox-reconcile] failed: ${err?.message ?? err}`);
     }

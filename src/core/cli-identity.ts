@@ -31,7 +31,7 @@
  * call for zero benefit, since these files hold exactly a couple of opaque
  * values.
  */
-import { accessSync, constants, existsSync, mkdirSync, readFileSync, readdirSync, rmSync } from 'node:fs';
+import { accessSync, constants, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { delimiter, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -40,11 +40,110 @@ import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { clearLarkToolDelegations } from './lark-tool-delegation.js';
 import { isCliIdentityPath } from '../utils/child-env.js';
 import { resolveEntrySpawn } from './self-spawn.js';
+import type { IdentityStorageModel } from './lark-tool-binding.js';
 import type { TriggerUserAuthConfig, TriggerUserAuthTool } from '../services/trigger-user-auth.js';
+
+export type { IdentityStorageModel };
 
 /** Where a session's identity files live, under its own data dir. */
 export function sessionIdentityDir(sessionDataDir: string): string {
   return join(sessionDataDir, 'cli-identity');
+}
+
+/**
+ * Proven-model identity contents live ONLY here, in daemon memory, keyed by
+ * session then turn then tool. The current-execution proof route serves these
+ * contents to a wrapper whose process lineage it has verified; nothing holding
+ * a token is ever written to disk in that model, so the same-uid CLI process
+ * can neither enumerate queued people's credentials nor redirect its own
+ * selection at them. Keyed on realpath so data-dir aliases cannot split the
+ * store for one session.
+ */
+const provenIdentityContents = new Map<
+  string,
+  Map<string, Partial<Record<IdentityTool, string>>>
+>();
+
+function provenSessionKey(sessionDataDir: string, sessionId: string): string {
+  let canonical: string;
+  try { canonical = realpathSync(sessionDataDir); } catch { canonical = resolve(sessionDataDir); }
+  return JSON.stringify([canonical, assertSafeSegment(sessionId)]);
+}
+
+function provenSessionMap(key: string, create: boolean) {
+  let turns = provenIdentityContents.get(key);
+  if (!turns && create) {
+    turns = new Map();
+    provenIdentityContents.set(key, turns);
+  }
+  return turns;
+}
+
+/** Store one proven identity env body. Called at the same publication points
+ *  that used to write a per-turn snapshot file. */
+export function rememberProvenIdentityContent(
+  sessionDataDir: string,
+  sessionId: string,
+  turnId: string,
+  tool: IdentityTool,
+  body: string,
+): void {
+  const key = provenSessionKey(sessionDataDir, sessionId);
+  const turns = provenSessionMap(key, true)!;
+  const tools = turns.get(turnId) ?? {};
+  tools[tool] = body;
+  turns.set(turnId, tools);
+}
+
+/** Recall one proven identity env body, or undefined when that turn/tool was
+ *  never published or has since been collected. */
+export function recallProvenIdentityContent(
+  sessionDataDir: string,
+  sessionId: string,
+  turnId: string,
+  tool: IdentityTool,
+): string | undefined {
+  return provenSessionMap(provenSessionKey(sessionDataDir, sessionId), false)?.get(turnId)?.[tool];
+}
+
+/** Forget one turn/tool, one whole turn, or everything the session holds. */
+export function forgetProvenIdentityContent(
+  sessionDataDir: string,
+  sessionId: string,
+  turnId?: string,
+  tool?: IdentityTool,
+): void {
+  const turns = provenSessionMap(provenSessionKey(sessionDataDir, sessionId), false);
+  if (!turns) return;
+  if (!turnId) { turns.clear(); return; }
+  if (!tool) { turns.delete(turnId); return; }
+  const tools = turns.get(turnId);
+  if (tools) {
+    delete tools[tool];
+    if (Object.keys(tools).length === 0) turns.delete(turnId);
+  }
+}
+
+/**
+ * Terminal GC for proven contents: forget every turn outside `retainTurnIds`.
+ * The retention set is computed by the daemon from live state (current
+ * execution, dispatched queue, schedule/recovery continuations, pending auth
+ * requests, delegations), never from CLI-writable files. Returns the removed
+ * turn ids. Failures bias toward retention.
+ */
+export function collectProvenIdentityContents(
+  sessionDataDir: string,
+  sessionId: string,
+  retainTurnIds: Iterable<string>,
+): string[] {
+  const turns = provenSessionMap(provenSessionKey(sessionDataDir, sessionId), false);
+  if (!turns) return [];
+  const retain = new Set(retainTurnIds);
+  const removed: string[] = [];
+  for (const turnId of turns.keys()) {
+    if (!retain.has(turnId)) { turns.delete(turnId); removed.push(turnId); }
+  }
+  return removed;
 }
 
 /**
@@ -59,6 +158,49 @@ export function sessionIdentityDir(sessionDataDir: string): string {
  */
 export function sessionIdentityDataDir(sessionDataDir: string, sessionId: string): string {
   return join(sessionIdentityBinDir(sessionDataDir, sessionId), '.data');
+}
+
+/**
+ * Records which identity publication model a session's on-disk directory was
+ * initialized for. The proven model keeps no token files; the single model
+ * keeps one per-tool file. A session must never reuse the other model's
+ * leftovers: when the marker is absent or names a different model, identity
+ * artifacts are cleared once and the directory recreated for the current one.
+ */
+const IDENTITY_LAYOUT_FILE = 'identity-layout';
+
+function identityLayoutMarkerPath(sessionDataDir: string, sessionId: string): string {
+  return join(sessionIdentityDataDir(sessionDataDir, sessionId), IDENTITY_LAYOUT_FILE);
+}
+
+function readIdentityLayout(sessionDataDir: string, sessionId: string): IdentityStorageModel | undefined {
+  try {
+    const value = readFileSync(identityLayoutMarkerPath(sessionDataDir, sessionId), 'utf8').trim();
+    return value === 'proven-v1' || value === 'single-v1'
+      ? (value.slice(0, -3) as IdentityStorageModel)
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Remove every identity artifact (files and per-turn dirs), keeping the
+ *  wrapper binaries, login-shell shims and the lark-tool binding config. Also
+ *  forgets proven in-memory contents for the session: the other model must not
+ *  reuse them. */
+function resetIdentityArtifacts(sessionDataDir: string, sessionId: string): void {
+  forgetProvenIdentityContent(sessionDataDir, sessionId);
+  const dir = sessionIdentityDataDir(sessionDataDir, sessionId);
+  for (const tool of Object.keys(IDENTITY_ENV_KEYS) as TriggerUserAuthTool[]) {
+    try { rmSync(join(dir, `${tool}.env`), { force: true }); }
+    catch { /* best-effort: absence is the desired state */ }
+  }
+  try { rmSync(join(dir, 'turns'), { recursive: true, force: true }); }
+  catch { /* best-effort: absence is the desired state */ }
+  for (const name of ['turn', 'turn.json']) {
+    try { rmSync(join(dir, name), { force: true }); }
+    catch { /* best-effort: absence is the desired state */ }
+  }
 }
 
 /**
@@ -88,38 +230,29 @@ function identityTurnKey(turnId: string): string {
  * *accepted*, the worker writes this when a turn actually *starts*. The gap
  * between those is the whole problem — see {@link renderIdentityWrapper}.
  *
- * Plain text: turn, caller, identity snapshot key, identity turn. The wrapper
- * reads the record once in `/bin/sh` on every invocation.
+ * Plain text, four lines: turn, caller, sha256(identity turn), identity turn.
+ * The single-model wrapper reads the record once in `/bin/sh` on every
+ * invocation (the first two lines plus the file); the proven-model wrapper
+ * selects no identity from disk and does not read it. Daemon refresh checks
+ * use line 4 as a liveness gate.
  */
 export function sessionActiveTurnPath(sessionDataDir: string, sessionId: string): string {
   return join(sessionIdentityDataDir(sessionDataDir, sessionId), 'turn');
 }
 
 /**
- * The live turn id (first line) from the active-turn file, or undefined when
- * absent/empty.
- */
-export function readActiveTurnLine(sessionDataDir: string, sessionId: string): string | undefined {
-  try {
-    const first = readFileSync(sessionActiveTurnPath(sessionDataDir, sessionId), 'utf8').split('\n', 1)[0]!;
-    return first.trim() || undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-/**
  * Machine-readable companion to {@link sessionActiveTurnPath}:
  * `{"turnId":…,"dispatchAttempt":…}` (one JSON object, 0600).
  *
- * The shell file stays a bare line because the `/bin/sh` identity wrapper
- * sources it per tool call; this one exists for a JSON consumer that must
- * freeze the (turn, dispatch generation) pair it is reporting on. The dsh-tui
- * wrapper plugin reads it synchronously inside the `agent/status` callback
- * (BOTMUX_TURN_IDLE_COMMAND) and carries the pair end-to-end, because a later
- * read can already name the NEXT dispatch — see src/utils/turn-idle-report.ts.
- * Its path layout is therefore mirrored in the generated snippet
- * (src/adapters/dsh-question-bridge.ts): keep the two in sync.
+ * The shell file stays a bare record because a `/bin/sh` identity wrapper in
+ * the single-snapshot model sources it per tool call; this one exists for a
+ * JSON consumer that must freeze the (turn, dispatch generation) pair it is
+ * reporting on. The dsh-tui wrapper plugin reads it synchronously inside the
+ * `agent/status` callback (BOTMUX_TURN_IDLE_COMMAND) and carries the pair
+ * end-to-end, because a later read can already name the NEXT dispatch — see
+ * src/utils/turn-idle-report.ts. Its path layout is therefore mirrored in the
+ * generated snippet (src/adapters/dsh-question-bridge.ts): keep the two in
+ * sync.
  */
 export function sessionActiveTurnIdentityPath(sessionDataDir: string, sessionId: string): string {
   return join(sessionIdentityDataDir(sessionDataDir, sessionId), 'turn.json');
@@ -144,10 +277,11 @@ export function publishActiveTurn(
   const dir = sessionIdentityDataDir(sessionDataDir, sessionId);
   try {
     mkdirSync(dir, { recursive: true, mode: 0o700 });
-    // turn + caller live in ONE file so the wrapper reads them in a single
-    // open: two separate files cannot be updated atomically together, and a
-    // reader landing between the two writes would see a turn from one
-    // generation with a caller from another (a cross-principal misattribution).
+    // turn, caller, identity key and identity turn live in ONE file so readers
+    // get all four in a single open: separate files cannot be updated
+    // atomically together, and a reader landing between writes would see a
+    // turn from one generation with a caller from another (a cross-principal
+    // misattribution).
     atomicWriteFileSync(
       sessionActiveTurnPath(sessionDataDir, sessionId),
       `${turnId ?? ''}\n${callerOpenId ?? ''}\n${identityTurnId ? identityTurnKey(identityTurnId) : ''}\n${identityTurnId ?? ''}\n`,
@@ -391,7 +525,12 @@ function shellSingleQuoteMultiline(value: string): string {
 }
 
 /**
- * Publish the identity in force for this turn.
+ * Publish the identity in force for a turn.
+ *
+ * In the proven model the rendered env body stays in daemon memory (see
+ * {@link rememberProvenIdentityContent}); no token touches disk. In the
+ * single-snapshot model it is written to the one per-tool file and atomically
+ * replaces whatever the previous turn left there.
  *
  * 0600 because the file holds a live token, and the containing dir is 0700.
  * Written atomically: a CLI invocation that lands mid-write must read either the
@@ -402,10 +541,25 @@ export function writeSessionIdentity(
   sessionDataDir: string,
   sessionId: string,
   identity: CliIdentity,
+  model: IdentityStorageModel,
 ): string {
+  const body = renderIdentityEnv(identity);
   const path = sessionIdentityPath(sessionDataDir, sessionId, identity.tool, identity.turnId);
-  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-  atomicWriteFileSync(path, renderIdentityEnv(identity), { mode: 0o600 });
+  if (model === 'proven') {
+    if (!identity.turnId) throw new Error('[cli-identity] proven identity requires a turn id');
+    rememberProvenIdentityContent(sessionDataDir, sessionId, identity.turnId, identity.tool, body);
+    // Companion mirror for the Codebase CLI: keep memory and disk branches in
+    // agreement whenever bytedcli publishes, so the two never disagree.
+    if (identity.tool === 'bytedcli') {
+      const companion = codebaseCompanionOf(identity);
+      rememberProvenIdentityContent(sessionDataDir, sessionId, identity.turnId, companion.tool,
+        renderIdentityEnv(companion));
+    }
+    return path;
+  }
+  const singlePath = join(sessionIdentityDataDir(sessionDataDir, sessionId), `${identity.tool}.env`);
+  mkdirSync(dirname(singlePath), { recursive: true, mode: 0o700 });
+  atomicWriteFileSync(singlePath, body, { mode: 0o600 });
   // Companion: every bytedcli publication (grant OR refusal) is mirrored for
   // the Codebase CLI, so the two can never disagree about whose turn it is.
   // Two files cannot be committed atomically; if the mirror fails, take the
@@ -420,11 +574,25 @@ export function writeSessionIdentity(
         { mode: 0o600 },
       );
     } catch (e) {
-      try { rmSync(path, { force: true }); } catch { /* best-effort */ }
+      try { rmSync(singlePath, { force: true }); } catch { /* best-effort */ }
       throw e;
     }
   }
-  return path;
+  return singlePath;
+}
+
+/** Whether a published identity for the turn/tool still exists, in the model's
+ *  store. Distinguishes "material missing" (a terminal condition for an auth
+ *  poll) from "live turn not active yet" (which keeps the poll pending). */
+export function sessionIdentityMaterialPresent(
+  sessionDataDir: string,
+  sessionId: string,
+  tool: IdentityTool,
+  turnId: string,
+  model: IdentityStorageModel,
+): boolean {
+  if (model === 'proven') return recallProvenIdentityContent(sessionDataDir, sessionId, turnId, tool) !== undefined;
+  return existsSync(join(sessionIdentityDataDir(sessionDataDir, sessionId), `${tool}.env`));
 }
 
 function isDeniedIdentity(identity: CliIdentity): identity is DeniedIdentity {
@@ -459,15 +627,19 @@ export function refreshSessionIdentity(
   sessionDataDir: string,
   sessionId: string,
   identity: CliIdentity & { turnId: string },
+  model: IdentityStorageModel,
 ): boolean {
-  const path = sessionIdentityPath(sessionDataDir, sessionId, identity.tool, identity.turnId);
   const turnLine = `${TURN_VAR}=${quoteFor(TURN_VAR, identity.turnId)}`;
   const openId = 'openId' in identity ? identity.openId : undefined;
   try {
     // Match the TURN line by line, not by suffix: renderIdentityEnv appends the
     // OPEN_ID line after TURN for every principal-stamped identity, so
     // `endsWith(TURN=…)` is false for exactly the files this feature produces.
-    const lines = readFileSync(path, 'utf8').split('\n');
+    const previous = model === 'proven'
+      ? recallProvenIdentityContent(sessionDataDir, sessionId, identity.turnId, identity.tool)
+      : readFileSync(join(sessionIdentityDataDir(sessionDataDir, sessionId), `${identity.tool}.env`), 'utf8');
+    if (previous === undefined) return false;
+    const lines = previous.split('\n');
     if (!lines.includes(turnLine)) return false;
     // Incidental consistency: a file already stamped for one principal must not
     // be refreshed into another principal's token. An UNSTAMPED file (the
@@ -476,12 +648,19 @@ export function refreshSessionIdentity(
     // completed the device grant.
     const stamped = lines.find(line => line.startsWith(`${OPEN_ID_VAR}=`));
     if (stamped && stamped !== `${OPEN_ID_VAR}=${quoteFor(OPEN_ID_VAR, openId ?? '')}`) return false;
+    // Proven content is addressed by execution proof, so the live turn marker
+    // only has to still name this identity turn. The single-snapshot model
+    // compares its first line (envelope turn), as before.
     const active = readFileSync(sessionActiveTurnPath(sessionDataDir, sessionId), 'utf8').split('\n');
-    if ((active[3] ?? active[0]) !== identity.turnId) return false;
+    if (model === 'proven') {
+      if ((active[3] ?? active[0]) !== identity.turnId) return false;
+    } else if ((active[0] ?? '').trim() !== identity.turnId) {
+      return false;
+    }
   } catch {
     return false;
   }
-  writeSessionIdentity(sessionDataDir, sessionId, identity);
+  writeSessionIdentity(sessionDataDir, sessionId, identity, model);
   return true;
 }
 
@@ -492,12 +671,19 @@ export function clearSessionIdentity(
   sessionDataDir: string,
   sessionId: string,
   tool: IdentityTool,
-  turnId?: string,
+  turnId: string | undefined,
+  model: IdentityStorageModel,
 ): void {
-  try { rmSync(sessionIdentityPath(sessionDataDir, sessionId, tool, turnId), { force: true }); }
+  if (model === 'proven') {
+    forgetProvenIdentityContent(sessionDataDir, sessionId, turnId, tool);
+    // The companion lives and dies with bytedcli's in-memory identity.
+    if (tool === 'bytedcli') forgetProvenIdentityContent(sessionDataDir, sessionId, turnId, CODEBASE_COMPANION_TOOL);
+    return;
+  }
+  try { rmSync(join(sessionIdentityDataDir(sessionDataDir, sessionId), `${tool}.env`), { force: true }); }
   catch { /* best-effort: absence is the desired state */ }
-  // The companion lives and dies with bytedcli's identity.
-  if (tool === 'bytedcli') clearSessionIdentity(sessionDataDir, sessionId, CODEBASE_COMPANION_TOOL, turnId);
+  // The companion lives and dies with bytedcli's on-disk identity.
+  if (tool === 'bytedcli') clearSessionIdentity(sessionDataDir, sessionId, CODEBASE_COMPANION_TOOL, turnId, model);
   if (turnId) return;
   const turnsDir = join(sessionIdentityDataDir(sessionDataDir, sessionId), 'turns');
   try {
@@ -516,14 +702,28 @@ export function clearSessionIdentity(
   } catch { /* best-effort: absence is the desired state */ }
 }
 
-/** Drop every identity for a session (teardown). */
+/** Drop every identity for a session (teardown). Proven contents are memory
+ *  only; single-snapshot files and any on-disk leftovers from an older layout
+ *  are removed as well. */
 export function clearAllSessionIdentities(sessionDataDir: string, sessionId: string): void {
   clearLarkToolDelegations(sessionDataDir, sessionId);
+  forgetProvenIdentityContent(sessionDataDir, sessionId);
   for (const tool of Object.keys(IDENTITY_ENV_KEYS) as TriggerUserAuthTool[]) {
-    clearSessionIdentity(sessionDataDir, sessionId, tool);
+    try { rmSync(join(sessionIdentityDataDir(sessionDataDir, sessionId), `${tool}.env`), { force: true }); }
+    catch { /* best-effort: absence is the desired state */ }
+    try {
+      rmSync(
+        join(sessionIdentityDir(sessionDataDir), `${assertSafeSegment(sessionId)}.${tool}.env`),
+        { force: true },
+      );
+    } catch { /* best-effort: absence is the desired state */ }
   }
   try { rmSync(join(sessionIdentityDataDir(sessionDataDir, sessionId), 'turns'), { recursive: true, force: true }); }
   catch { /* best-effort: absence is the desired state */ }
+  for (const name of ['turn', 'turn.json', IDENTITY_LAYOUT_FILE]) {
+    try { rmSync(join(sessionIdentityDataDir(sessionDataDir, sessionId), name), { force: true }); }
+    catch { /* best-effort: absence is the desired state */ }
+  }
   try {
     rmSync(
       join(sessionIdentityDir(sessionDataDir), `${assertSafeSegment(sessionId)}.turn`),
@@ -543,81 +743,56 @@ export function clearAllSessionIdentities(sessionDataDir: string, sessionId: str
  *  - `BOTMUX_SESSION_ID` / `SESSION_DATA_DIR` come from the session env the
  *    worker already injects; the wrapper is identical for every session, so
  *    nothing needs rewriting when sessions come and go.
- *  - **A missing or unrecognized identity file denies the command.** The
- *    earlier version exec'd the tool anyway, on the belief that no env means
- *    "run as the bot". It does not: lark-cli then resolves the operator's
- *    on-disk login and acts as *that person* — the machine account this whole
- *    feature exists to stop. So absence is refusal, and running as the bot is
+ *  - **A missing or unrecognized identity denies the command.** The earlier
+ *    version exec'd the tool anyway, on the belief that no env means "run as
+ *    the bot". It does not: lark-cli then resolves the operator's on-disk
+ *    login and acts as *that person* — the machine account this whole feature
+ *    exists to stop. So absence is refusal, and running as the bot is
  *    something the daemon must ask for explicitly (`mode=bot`).
  *
- *    Failing this way is safe to default to: the only thing an unwritten file
- *    can mean is that the daemon has not yet decided, and borrowing a stranger's
- *    credentials while it decides is worse than not running.
+ * Two identity models (see {@link IdentityStorageModel}):
  *
- *  - **The identity must belong to the turn now running.** The daemon publishes
- *    when a message is ACCEPTED; the CLI runs turns from its own queue, so
- *    while A's turn is executing, B's message prepares its own snapshot. The
- *    worker selects the snapshot when the corresponding execution starts.
+ *  - `proven`: a helper process proves THIS process tree belongs to the turn
+ *    now executing over the daemon loopback channel, and prints the identity
+ *    env assignments themselves. The wrapper `eval`s them directly — no
+ *    identity file is read or selected, so a same-uid agent cannot redirect
+ *    the choice at another queued turn and no token rests on disk to read.
+ *  - `single` (paths without that channel): the legacy layout — one per-tool
+ *    file the daemon overwrites (or removes) on every turn, plus the live
+ *    turn marker used for the tail-of-turn mismatch refusal.
  */
 export function renderIdentityWrapper(
   tool: IdentityTool,
   realBinaryPath: string,
+  model: IdentityStorageModel,
   identityResolver?: readonly string[],
 ): string {
   const exportKeys = IDENTITY_ENV_KEYS[tool].join(' ');
-  return [
-    '#!/bin/sh',
-    '# botmux trigger-user identity wrapper — generated, do not edit.',
-    '# Sources the identity the daemon published for the CURRENT turn, then execs',
-    '# the real tool. Re-read on every invocation, which is what lets the acting',
-    '# identity change without restarting the session.',
-    '#',
-    '# No usable identity => the command does not run. Exec\'ing the tool bare',
-    '# would hand it the machine account\'s login, not the bot\'s.',
-    `${MODE_VAR}=`,
-    `${DENY_MSG_VAR}=`,
-    // Clear inherited copies before sourcing: a parent process that exports a
-    // forged OPEN_ID/TURN could otherwise flip a cross-principal refusal into
-    // the same-principal allowance. Depths of defence only — the values are
-    // re-set from the credential file below when it carries them.
-    `${TURN_VAR}=`,
-    `${OPEN_ID_VAR}=`,
-    '__botmux_live=',
-    '__botmux_live_caller=',
-    '__botmux_identity_key=',
-    '__botmux_identity_turn=',
-    ...(identityResolver ? [
-      `__botmux_cred=$(${[...identityResolver, tool].map(shellSingleQuote).join(' ')}) || exit ${IDENTITY_DENIED_EXIT_CODE}`,
-      'if [ -n "$__botmux_cred" ] && [ -f "$__botmux_cred" ]; then',
-      '  . "$__botmux_cred"',
-      'else',
-      `  ${MODE_VAR}=turn-mismatch`,
-      'fi',
-      'unset __botmux_cred',
-    ] : [
+  const resolveBlock = model === 'proven' ? [
+    // The runner proves this process tree over the daemon loopback channel and
+    // prints the identity env ASSIGNMENTS, never a path. eval consumes that
+    // body straight from the pipe: nothing in the session directory can select
+    // or alter the identity, and no token rests on disk to be read.
+    `__botmux_cred_body=$(${[...identityResolver!, tool].map(shellSingleQuote).join(' ')}) || exit ${IDENTITY_DENIED_EXIT_CODE}`,
+    `eval "$__botmux_cred_body" || exit ${IDENTITY_DENIED_EXIT_CODE}`,
+    'unset __botmux_cred_body',
+  ] : [
     'if [ -n "$SESSION_DATA_DIR" ] && [ -n "$BOTMUX_SESSION_ID" ]; then',
     '  __botmux_d="$SESSION_DATA_DIR/cli-identity/$BOTMUX_SESSION_ID.bin/.data"',
-    '  if [ -f "$__botmux_d/turn" ]; then',
-    '    { read -r __botmux_live; read -r __botmux_live_caller; read -r __botmux_identity_key; read -r __botmux_identity_turn; } < "$__botmux_d/turn" || true',
-    '  fi',
     `  __botmux_cred="$__botmux_d/${tool}.env"`,
-    '  if [ -n "$__botmux_identity_key" ]; then',
-    `    __botmux_cred="$__botmux_d/turns/$__botmux_identity_key/${tool}.env"`,
-    '  fi',
     '  if [ -f "$__botmux_cred" ]; then',
     '    . "$__botmux_cred"',
-    '  elif [ -n "$__botmux_live" ]; then',
-    `    ${MODE_VAR}=turn-mismatch`,
+    '  fi',
+    '  if [ -f "$__botmux_d/turn" ]; then',
+    '    { read -r __botmux_live; read -r __botmux_live_caller; } < "$__botmux_d/turn" || true',
     '  fi',
     '  unset __botmux_d __botmux_cred',
     'fi',
-    ]),
-    '__botmux_identity_turn=${__botmux_identity_turn:-$__botmux_live}',
     // Only enforced when both sides state a turn. An identity published without
     // one predates turn binding; a session with no live turn file has nothing to
     // contradict. Neither is evidence of a mismatch, so neither refuses here.
     `if [ -n "$${TURN_VAR}" ] && [ -n "$__botmux_live" ] \\`,
-    `   && [ "$${TURN_VAR}" != "$__botmux_identity_turn" ]; then`,
+    `   && [ "$${TURN_VAR}" != "$__botmux_live" ]; then`,
     `  __botmux_published_mode=$${MODE_VAR}`,
     `  ${MODE_VAR}=turn-mismatch`,
     // Same human across consecutive turns (their follow-up was accepted while
@@ -625,12 +800,33 @@ export function renderIdentityWrapper(
     // person the worker is now executing, so keep it. Only a NAMED match on both
     // sides relaxes; anything missing stays a refusal. Restore the published
     // mode (user/user-home/bot) so the case dispatch below runs normally.
-    `  if [ -z "$__botmux_identity_key" ] && [ -n "$${OPEN_ID_VAR}" ] && [ -n "$__botmux_live_caller" ] \\`,
+    `  if [ -n "$${OPEN_ID_VAR}" ] && [ -n "$__botmux_live_caller" ] \\`,
     `     && [ "$${OPEN_ID_VAR}" = "$__botmux_live_caller" ]; then`,
     `    ${MODE_VAR}=$__botmux_published_mode`,
     '  fi',
     'fi',
-    'unset __botmux_live __botmux_live_caller __botmux_published_mode __botmux_identity_key __botmux_identity_turn',
+    'unset __botmux_live __botmux_live_caller __botmux_published_mode',
+  ];
+  return [
+    '#!/bin/sh',
+    '# botmux trigger-user identity wrapper — generated, do not edit.',
+    '# Loads the identity the daemon holds for the CURRENT turn, then execs the',
+    '# real tool. Re-resolved on every invocation, which is what lets the acting',
+    '# identity change without restarting the session.',
+    '#',
+    '# No usable identity => the command does not run. Exec\'ing the tool bare',
+    '# would hand it the machine account\'s login, not the bot\'s.',
+    `${MODE_VAR}=`,
+    `${DENY_MSG_VAR}=`,
+    // Clear inherited copies before loading: a parent process that exports a
+    // forged OPEN_ID/TURN could otherwise flip a cross-principal refusal into
+    // the same-principal allowance. The values are re-set below from the
+    // daemon-provided identity when it carries them.
+    `${TURN_VAR}=`,
+    `${OPEN_ID_VAR}=`,
+    '__botmux_live=',
+    '__botmux_live_caller=',
+    ...resolveBlock,
     '',
     `case "$${MODE_VAR}" in`,
     '  user|bot)',
@@ -671,31 +867,50 @@ export function renderIdentityWrapper(
 }
 
 /**
- * Create the per-session identity directory and empty files before sandbox
- * spawn so a sandboxed session can read them later.
+ * Initialize the per-session identity directory for one storage model before
+ * sandbox spawn so a sandboxed session can read the bound directory later.
  *
- * The file sandbox existence-filters its allow list: a directory that does not
- * exist at spawn is dropped. Binding the directory (rather than its files) is
- * also what makes later atomic rename updates visible to a persistent sandbox.
+ * The file sandbox existence-filters its allow list: a path that does not exist
+ * at spawn is dropped. Binding the directory (rather than its files) is also
+ * what makes later atomic rename updates visible to a persistent sandbox.
  *
  * Empty is the right initial content. No identity exists until the first turn
  * resolves one, and both the wrapper and a `.`-source treat an empty file the
  * same as an absent one.
  *
- * Never truncates an existing file: a restart mid-session must not discard the
- * identity already in force.
+ * When the directory was initialized for the OTHER model (or predates this
+ * layout), identity artifacts are reset once first: a session must not reuse
+ * the other model's snapshots. Never truncates an existing file of the current
+ * model: a restart mid-session must not discard the identity already in force.
  */
-export function ensureSessionIdentityPlaceholders(
+export function ensureSessionIdentityStorage(
   sessionDataDir: string,
   sessionId: string,
   tools: readonly IdentityTool[],
+  model: IdentityStorageModel,
 ): void {
-  mkdirSync(sessionIdentityDataDir(sessionDataDir, sessionId), { recursive: true, mode: 0o700 });
+  const dir = sessionIdentityDataDir(sessionDataDir, sessionId);
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const current = readIdentityLayout(sessionDataDir, sessionId);
+  if (current !== model) {
+    // An explicit switch wipes everything. A missing marker on a SINGLE init is
+    // the first worker spawn for a session whose identity the daemon may have
+    // already published into the root file during accept→fork: leave it in
+    // place. A missing marker on a PROVEN init still wipes — proven sessions
+    // must have no token file on disk, including leftovers from an older build.
+    if (current !== undefined || model === 'proven') {
+      resetIdentityArtifacts(sessionDataDir, sessionId);
+      mkdirSync(dir, { recursive: true, mode: 0o700 });
+    }
+    atomicWriteFileSync(identityLayoutMarkerPath(sessionDataDir, sessionId), `${model}-v1\n`, { mode: 0o600 });
+  }
   const paths = [
-    ...tools.map(tool => sessionIdentityPath(sessionDataDir, sessionId, tool)),
-    // Same existence-filter reason: the wrapper reads the active turn on every
-    // invocation, and a path missing at spawn stays unreadable afterwards.
     sessionActiveTurnPath(sessionDataDir, sessionId),
+    // The single model sources these root files on every invocation; the
+    // proven model keeps no token files, so only the turn marker is needed.
+    ...(model === 'single'
+      ? tools.map(tool => join(dir, `${tool}.env`))
+      : []),
   ];
   for (const path of paths) {
     if (existsSync(path)) continue;
@@ -790,12 +1005,13 @@ export function installIdentityWrapper(
   binDir: string,
   tool: IdentityTool,
   realBinaryPath: string | null | undefined,
+  model: IdentityStorageModel,
   identityResolver?: readonly string[],
 ): string | null {
   if (!realBinaryPath) return null;
   mkdirSync(binDir, { recursive: true });
   const path = join(binDir, tool);
-  atomicWriteFileSync(path, renderIdentityWrapper(tool, realBinaryPath, identityResolver), { mode: 0o755 });
+  atomicWriteFileSync(path, renderIdentityWrapper(tool, realBinaryPath, model, identityResolver), { mode: 0o755 });
   return path;
 }
 
@@ -956,11 +1172,14 @@ export function findRealToolBinary(
 }
 
 /** Install identity interception on the process that actually executes tools.
- * Used before both native CLI and RPC app-server startup. No token is copied
- * into the process environment: wrappers read the current turn on each call. */
+ * Used before both native CLI and RPC app-server startup. In the proven model
+ * no token is copied into the process environment or disk: the wrapper fetches
+ * the current turn's identity from the daemon over the proven loopback channel
+ * on each call; the single model keeps one daemon-written, turn-checked file. */
 export function prepareTriggerUserCliEnv(
   childEnv: NodeJS.ProcessEnv, sessionDataDir: string | undefined, sessionId: string,
   policy: TriggerUserAuthConfig | undefined, log: (message: string) => void,
+  model: IdentityStorageModel,
   execution?: { appId: string; ipcPort?: number },
 ): void {
   if (!policy?.enabled || !policy.tools.length || !sessionDataDir) return;
@@ -968,7 +1187,7 @@ export function prepareTriggerUserCliEnv(
   childEnv.BOTMUX_SESSION_ID = sessionId;
   const wrapperDir = sessionIdentityBinDir(sessionDataDir, sessionId);
   let identityResolver: string[] | undefined;
-  if (process.platform === 'linux' && execution) {
+  if (model === 'proven' && process.platform === 'linux' && execution) {
     const moduleDir = dirname(fileURLToPath(import.meta.url));
     const sourceExecArgs = process.execArgv.map((arg, index, args) =>
       args[index - 1] === '--import' && arg === 'tsx' ? createRequire(import.meta.url).resolve('tsx') : arg);
@@ -979,22 +1198,20 @@ export function prepareTriggerUserCliEnv(
       '--data-dir', sessionDataDir, '--session-id', sessionId, '--app-id', execution.appId,
       '--ipc-port', String(execution.ipcPort), '--tool'];
   }
-  // Pre-create the identity files so they survive the sandbox's
-  // existence-filter (it drops allow paths that do not exist at spawn, and a
-  // dropped path would leave the wrapper unable to read what the daemon later
-  // publishes — the session would silently run without the sender's identity).
-  // Empty is the correct initial content: no identity is published until the
-  // first turn resolves one, and the wrapper treats an empty file as "no
-  // identity", the same as absent.
+  // Initialize the directory for THIS model before sandbox spawn so its bound
+  // directory survives the existence-filter and leftovers from the other model
+  // (or an older layout) are cleared rather than reused. Expand the governed
+  // tool list to include the Codebase companion exactly as publication does.
   const identityTools = identityToolsFor(policy.tools);
   try {
-    ensureSessionIdentityPlaceholders(
+    ensureSessionIdentityStorage(
       sessionDataDir,
       sessionId,
       identityTools,
+      model,
     );
   } catch (e) {
-    log(`[trigger-user-auth] WARN could not pre-create identity files: ${(e as Error).message}`);
+    log(`[trigger-user-auth] WARN could not initialize identity storage: ${(e as Error).message}`);
   }
   let installedAny = false;
   for (const tool of identityTools) {
@@ -1004,7 +1221,7 @@ export function prepareTriggerUserCliEnv(
         log(`[trigger-user-auth] ${tool} is not installed; no wrapper written`);
         continue;
       }
-      installIdentityWrapper(wrapperDir, tool, real, identityResolver);
+      installIdentityWrapper(wrapperDir, tool, real, model, identityResolver);
       installedAny = true;
       log(`[trigger-user-auth] wrapping ${tool} -> ${real}`);
     } catch (e) {

@@ -370,6 +370,25 @@ describe('worker turn-idle channel', () => {
     });
   }, 60_000);
 
+  it('drops a malformed marker identityTurnId and falls back to the envelope turn', async () => {
+    const harness = await startWorkerWaitingOnTurn();
+    const before = readyCount(harness);
+    const markersDir = join(harness.root, '.botmux-cli-pids');
+    const markerName = readdirSync(markersDir).find(name => /^\d+$/.test(name));
+    expect(markerName).toBeDefined();
+    const markerPath = join(markersDir, markerName!);
+    for (const malformed of [12345, 'bad\nturn', 'x'.repeat(257), 'bad turn']) {
+      writeFileSync(markerPath, JSON.stringify({
+        ...JSON.parse(readFileSync(markerPath, 'utf-8')),
+        turnId: NEXT_TURN_ID,
+        identityTurnId: malformed,
+      }));
+      harness.child.send({ type: 'turn_idle', turnId: TURN_ID, seq: 1 } satisfies DaemonToWorker);
+      await waitFor(harness, () => readyCount(harness) > before, `worker to adopt (${String(malformed)})`);
+      expect(publishedIdentity(harness)).toMatchObject({ turnId: NEXT_TURN_ID, identityTurnId: NEXT_TURN_ID });
+    }
+  }, 60_000);
+
   /**
    * The blocker this channel shipped with, restated for the post-#1781 worker.
    *

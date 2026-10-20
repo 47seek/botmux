@@ -244,6 +244,7 @@ import type { DaemonSession } from '../src/core/types.js';
 import { getDocSubscription, putDocSubscription, removeDocSubscription } from '../src/services/doc-subs-store.js';
 import { config } from '../src/config.js';
 
+import { recallProvenIdentityContent } from '../src/core/cli-identity.js';
 import { startIpcServer, setIpcAuthSecret } from '../src/core/dashboard-ipc-server.js';
 import { fetchDaemonIpc } from '../src/core/daemon-ipc-auth.js';
 import { setActiveSessionsRegistry } from '../src/core/worker-pool.js';
@@ -1104,7 +1105,7 @@ describe('/rename production routing — must not pre-create a session (review P
     mkdirSync(`${mocks.dataDir}/fixture-lark-home`, { recursive: true });
     const send = vi.fn((message: any) => {
       if (message.type === 'message') {
-        const env = readFileSync(sessionIdentityPath(mocks.dataDir, ds.session.sessionId, 'lark-cli', 'om_queue_identity_reply'), 'utf8');
+        const env = recallProvenIdentityContent(mocks.dataDir, ds.session.sessionId, 'om_queue_identity_reply', 'lark-cli');
         expect(env).toContain("BOTMUX_IDENTITY_TURN='om_queue_identity_reply'");
         expect(env).toContain('fixture-lark-home');
       }

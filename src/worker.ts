@@ -25,7 +25,7 @@ import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { join, basename, dirname, delimiter, relative, extname } from 'node:path';
 import { resolveBotmuxWrapperBinDir, prependBotmuxBin } from './core/botmux-wrapper.js';
 import { sessionIdentityBinDir, prepareTriggerUserCliEnv, publishActiveTurn, GIT_ASKPASS_BASENAME } from './core/cli-identity.js';
-import { prepareLarkToolEnv, usesLarkToolBinding, cleanupLarkToolBinding, larkToolBindingPath, resolveLarkToolDataDir } from './core/lark-tool-binding.js';
+import { prepareLarkToolEnv, usesLarkToolBinding, cleanupLarkToolBinding, larkToolBindingPath, resolveLarkToolDataDir, resolveIdentityStorageModel } from './core/lark-tool-binding.js';
 import { tokenStoreProtection } from './services/trigger-user-auth.js';
 import { installAidenCodexShim, writeAidenCodexShellConfigs } from './services/aiden-codex-shim.js';
 import { scanCredentialBearingMcpServers, credentialBearingMcpAdvisory } from './services/credential-bearing-mcp.js';
@@ -1372,8 +1372,17 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
     const identityPolicy = boundLark && cfg.triggerUserAuth
       ? { ...cfg.triggerUserAuth, tools: cfg.triggerUserAuth.tools.filter(tool => tool !== 'lark-cli') }
       : cfg.triggerUserAuth;
+    // RPC engines are host-side processes (codexRpcEligible forbids sandboxes),
+    // so the loopback proof channel is reachable whenever the binding applies.
+    const engineIdentityBinding = !!process.env.SESSION_DATA_DIR
+      && usesLarkToolBinding({ ...cfg, larkToolBinding: true }, process.env.SESSION_DATA_DIR, isWorkflowWorker());
+    const engineIdentityModel = resolveIdentityStorageModel({
+      platform: process.platform, binding: engineIdentityBinding, sandboxRequested: false,
+      sandboxNetwork: cfg.sandboxNetwork !== false, sandboxNetworkPolicy: cfg.sandboxNetworkPolicy,
+    });
     prepareTriggerUserCliEnv(engineEnv, process.env.SESSION_DATA_DIR, cfg.sessionId, identityPolicy, log,
-      usesLarkToolBinding({ ...cfg, larkToolBinding: true }, process.env.SESSION_DATA_DIR, isWorkflowWorker())
+      engineIdentityModel,
+      engineIdentityModel === 'proven'
         ? { appId: cfg.larkAppId, ipcPort: parseDaemonIpcPort(process.env.BOTMUX_DAEMON_IPC_PORT) }
         : undefined);
     if (boundLark) prepareLarkToolEnv({ env: engineEnv, dataDir: process.env.SESSION_DATA_DIR!,
@@ -4107,6 +4116,16 @@ function registerRpcEnginePidMarker(pid: number | undefined): string | null {
   }
 }
 
+/** Validate an identityTurnId read back from the CLI-writable PID marker, the
+ *  same shape the current-execution document enforces: non-empty, at most 256
+ *  chars, no controls/whitespace. A malformed marker value is dropped (the turn
+ *  then falls back to its own turnId) rather than published into the active
+ *  turn record. Depth defence — selection authority does not trust this file. */
+function markerIdentityTurnId(value: unknown): string | undefined {
+  return typeof value === 'string' && value.length > 0 && value.length <= 256
+    && !/[\x00-\x20\x7f]/.test(value) ? value : undefined;
+}
+
 function adoptInitialActiveTurn(parsed: {
   turnId: string;
   identityTurnId?: string;
@@ -4128,7 +4147,7 @@ function adoptInitialActiveTurn(parsed: {
   activeTurnAuthority.clear();
   activeTurnAuthority.reserve({
     turnId: parsed.turnId,
-    identityTurnId: parsed.identityTurnId,
+    identityTurnId: markerIdentityTurnId(parsed.identityTurnId),
     dispatchAttempt: currentBotmuxDispatchAttempt,
     caller: parsed.trustedCaller,
     controller: parsed.trustedController,
@@ -4176,7 +4195,7 @@ function adoptDisplacedActiveTurn(parsed: {
   activeTurnAuthority.clear();
   activeTurnAuthority.reserve({
     turnId: parsed.turnId,
-    identityTurnId: parsed.identityTurnId,
+    identityTurnId: markerIdentityTurnId(parsed.identityTurnId),
     dispatchAttempt: currentBotmuxDispatchAttempt,
     caller: parsed.trustedCaller,
     controller: parsed.trustedController,
@@ -4239,7 +4258,7 @@ function writeCliPidMarker(): void {
                 if (qt?.turnId && qt.turnId !== currentBotmuxTurnId && !retiredTurnIds.has(qt.turnId) && !queuedTypeAheadTurns.some(t => t.turnId === qt.turnId)) {
                   queuedTypeAheadTurns.push({
                     turnId: qt.turnId,
-                    ...(qt.identityTurnId ? { identityTurnId: qt.identityTurnId } : {}),
+                    ...(markerIdentityTurnId(qt.identityTurnId) ? { identityTurnId: markerIdentityTurnId(qt.identityTurnId)! } : {}),
                     ...(typeof qt.dispatchAttempt === 'number' ? { dispatchAttempt: qt.dispatchAttempt } : {}),
                     ...(qt.trustedCaller && typeof qt.trustedCaller === 'object' ? { trustedCaller: qt.trustedCaller } : {}),
                     ...(qt.trustedController && typeof qt.trustedController === 'object' ? { trustedController: qt.trustedController } : {}),
@@ -4258,7 +4277,7 @@ function writeCliPidMarker(): void {
           : undefined;
         const queuedTurns = queuedTypeAheadTurns.map(t => ({
           turnId: t.turnId,
-          ...(t.identityTurnId ? { identityTurnId: t.identityTurnId } : {}),
+          ...(markerIdentityTurnId(t.identityTurnId) ? { identityTurnId: markerIdentityTurnId(t.identityTurnId)! } : {}),
           ...(t.dispatchAttempt !== undefined ? { dispatchAttempt: t.dispatchAttempt } : {}),
           ...(t.trustedCaller ? { trustedCaller: t.trustedCaller } : {}),
           ...(t.trustedController ? { trustedController: t.trustedController } : {}),
@@ -4317,7 +4336,7 @@ function restoreQueuedTurnsFromMarkerDisk(markerPath: string): void {
           if (t && typeof t.turnId === 'string' && t.turnId !== currentBotmuxTurnId && !retiredTurnIds.has(t.turnId) && !queuedTypeAheadTurns.some(q => q.turnId === t.turnId)) {
             queuedTypeAheadTurns.push({
               turnId: t.turnId,
-              ...(t.identityTurnId ? { identityTurnId: t.identityTurnId } : {}),
+              ...(markerIdentityTurnId(t.identityTurnId) ? { identityTurnId: markerIdentityTurnId(t.identityTurnId)! } : {}),
               ...(typeof t.dispatchAttempt === 'number' ? { dispatchAttempt: t.dispatchAttempt } : {}),
               ...(t.trustedCaller && typeof t.trustedCaller === 'object' ? { trustedCaller: t.trustedCaller } : {}),
               ...(t.trustedController && typeof t.trustedController === 'object' ? { trustedController: t.trustedController } : {}),
@@ -4385,7 +4404,7 @@ function syncQueuedTurnsFromMarkerDisk(): boolean {
             if (qt?.turnId && qt.turnId !== currentBotmuxTurnId && !retiredTurnIds.has(qt.turnId) && !queuedTypeAheadTurns.some(t => t.turnId === qt.turnId)) {
               queuedTypeAheadTurns.push({
                 turnId: qt.turnId,
-                ...(qt.identityTurnId ? { identityTurnId: qt.identityTurnId } : {}),
+                ...(markerIdentityTurnId(qt.identityTurnId) ? { identityTurnId: markerIdentityTurnId(qt.identityTurnId)! } : {}),
                 ...(typeof qt.dispatchAttempt === 'number' ? { dispatchAttempt: qt.dispatchAttempt } : {}),
                 ...(qt.trustedCaller && typeof qt.trustedCaller === 'object' ? { trustedCaller: qt.trustedCaller } : {}),
                 ...(qt.trustedController && typeof qt.trustedController === 'object' ? { trustedController: qt.trustedController } : {}),
@@ -19029,8 +19048,19 @@ async function spawnCli(
   const identityPolicy = boundLark && cfg.triggerUserAuth
     ? { ...cfg.triggerUserAuth, tools: cfg.triggerUserAuth.tools.filter(tool => tool !== 'lark-cli') }
     : cfg.triggerUserAuth;
+  // Match the daemon's publication model exactly: proven only when the binding
+  // applies AND the sandbox (if any) leaves the daemon loopback reachable;
+  // network-isolated sandboxes and all non-managed paths keep the legacy
+  // single-snapshot wrapper.
+  const childIdentityBinding = !!process.env.SESSION_DATA_DIR
+    && usesLarkToolBinding({ ...cfg, larkToolBinding: true }, process.env.SESSION_DATA_DIR, isWorkflowWorker());
+  const childIdentityModel = resolveIdentityStorageModel({
+    platform: process.platform, binding: childIdentityBinding, sandboxRequested,
+    sandboxNetwork: cfg.sandboxNetwork !== false, sandboxNetworkPolicy: cfg.sandboxNetworkPolicy,
+  });
   prepareTriggerUserCliEnv(childEnv, process.env.SESSION_DATA_DIR, cfg.sessionId, identityPolicy, log,
-    usesLarkToolBinding({ ...cfg, larkToolBinding: true }, process.env.SESSION_DATA_DIR, isWorkflowWorker())
+    childIdentityModel,
+    childIdentityModel === 'proven'
       ? { appId: cfg.larkAppId, ipcPort: parseDaemonIpcPort(process.env.BOTMUX_DAEMON_IPC_PORT) }
       : undefined);
   if (boundLark) prepareLarkToolEnv({ env: childEnv, effectivePath: perBotInjectEnv.PATH ?? childEnv.PATH, dataDir: process.env.SESSION_DATA_DIR!,

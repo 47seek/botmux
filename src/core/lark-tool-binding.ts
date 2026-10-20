@@ -67,6 +67,64 @@ export function usesLarkToolBinding(config: {
   return config.larkToolBinding !== false;
 }
 
+/**
+ * Which identity publication model a session runs.
+ *
+ * - `proven`: the Linux managed entry proves its execution over the loopback
+ *   current-execution channel and receives the identity CONTENT in memory; no
+ *   token is written to disk. Requires the daemon loopback to be reachable
+ *   inside the sandbox, so network-isolated sandboxes (`--unshare-net`, or a
+ *   slirp policy launched with `--disable-host-loopback`) are excluded.
+ * - `single`: every other path (adopt / remote / external app-server /
+ *   workflow / non-Lark transport / non-Linux / loopback-isolated sandbox)
+ *   keeps the legacy single-snapshot file that is overwritten or removed on
+ *   every turn.
+ *
+ * The worker (wrapper rendering) and the daemon (publication) MUST derive this
+ * from identical inputs; a session never mixes the two.
+ */
+export type IdentityStorageModel = 'single' | 'proven';
+
+export function resolveIdentityStorageModel(input: {
+  platform: NodeJS.Platform;
+  binding: boolean;
+  sandboxRequested: boolean;
+  sandboxNetwork?: boolean;
+  sandboxNetworkPolicy?: unknown;
+}): IdentityStorageModel {
+  if (input.platform !== 'linux' || !input.binding) return 'single';
+  if (input.sandboxRequested
+    && (input.sandboxNetwork === false || input.sandboxNetworkPolicy !== undefined)) {
+    return 'single';
+  }
+  return 'proven';
+}
+
+/** Daemon-side model resolution from the fields frozen on a managed session.
+ *  MUST use the same inputs as the worker's wrapper-rendering decision. */
+export function identityStorageModelForManagedSession(input: {
+  platform: NodeJS.Platform;
+  sessionId: string;
+  larkAppId: string;
+  chatId: string;
+  apiOnly?: boolean;
+  adoptMode?: boolean;
+  existingAppServerEndpoint?: string;
+  backendType: import('../adapters/backend/types.js').BackendType;
+  larkToolBinding?: boolean;
+  sandbox: boolean;
+  sandboxNetwork?: boolean;
+  sandboxNetworkPolicy?: unknown;
+}): IdentityStorageModel {
+  return resolveIdentityStorageModel({
+    platform: input.platform,
+    binding: usesLarkToolBinding(input),
+    sandboxRequested: input.sandbox,
+    sandboxNetwork: input.sandboxNetwork,
+    sandboxNetworkPolicy: input.sandboxNetworkPolicy,
+  });
+}
+
 /** Clean up managed lark-cli binding files and wrappers when binding is disabled. */
 export function cleanupLarkToolBinding(dataDir: string, sessionId: string): void {
   try {

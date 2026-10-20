@@ -132,7 +132,9 @@ describe('companion wrapper', () => {
     expect(identityWrapperInstalled(binDir, 'bytedcli')).toBe(true);
     expect(identityWrapperInstalled(binDir, 'codebase')).toBe(true);
     expect(identityWrapperInstalled(binDir, 'lark-cli')).toBe(false);
-    expect(existsSync(sessionIdentityPath(dir, SESSION, 'codebase'))).toBe(true);
+    // The companion gets no pre-created placeholder; it materializes when the
+    // first bytedcli publication mirrors onto it (storage-model split).
+    expect(existsSync(sessionIdentityPath(dir, SESSION, 'codebase'))).toBe(false);
     expect(logs.some(l => l.includes('wrapping codebase'))).toBe(true);
     expect(env.PATH!.startsWith(binDir)).toBe(true);
   });

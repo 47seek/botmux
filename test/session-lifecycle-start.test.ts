@@ -222,6 +222,7 @@ import {
   sendWorkerInput,
   setActiveSessionsRegistry,
   suspendWorker,
+  currentGatewayCallerOpenId,
 } from '../src/core/worker-pool.js';
 import {
   awaitReadonlyTaskContinuationUser,
@@ -6513,6 +6514,27 @@ describe('managed turn authority worker generations', () => {
       },
     };
   }
+
+  // Callerless delegated execution publishes trustedCaller:null on EVERY
+  // republication. A republication that omits the field (older worker) must
+  // keep the explicit null and must NOT let the reply-target sender become the
+  // callerOpenId — otherwise plugin_result_delivery authenticates a human reply
+  // as the callerless turn (the review's mixed-tuple bug).
+  it('keeps an explicit callerless (trustedCaller:null) republication from borrowing a reply-target caller', () => {
+    const { ds, publish } = startAttestedWorker(null);
+    expect(ds.managedTurnOrigin?.trustedCaller).toBeNull();
+    expect(ds.managedTurnOrigin?.callerOpenId).toBeUndefined();
+
+    // New worker republishes identically but leaves the field out (as an older
+    // worker in a mixed fleet would).
+    publish({ capability: 'republished-capability', trustedCaller: undefined });
+    expect(ds.managedTurnOrigin?.trustedCaller).toBeNull();
+    expect(ds.managedTurnOrigin?.callerOpenId).toBeUndefined();
+
+    // Gateway caller resolution for this turn is therefore callerless; the
+    // human reply-target sender never leaks into the tuple.
+    expect(currentGatewayCallerOpenId(ds, scheduledTurnId)).toBeUndefined();
+  });
 
   it.skipIf(process.platform !== 'linux').each([
     ['direct', scheduledCaller],
