@@ -27,6 +27,7 @@ import { shouldInstallGlobalSkills } from '../skills/injection-mode.js';
 import { whiteboardEnabled } from '../services/whiteboard-store.js';
 import { cliSupportsNativeUsage, resolveSessionTranscriptPath } from '../services/transcript-resolver.js';
 import { readStatuslineSnapshot, toCardQuota } from '../services/statusline-snapshot.js';
+import { getCardFooterExtensionSegments } from '../services/card-footer-extension.js';
 import { cleanupTraexAskHooks, installHook } from '../adapters/hook-installer.js';
 import { cursorUsageHookCommand, hookCommandFor } from '../adapters/hook-command.js';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
@@ -409,6 +410,30 @@ function prepareAdoptedReplyImages(
  * remains best-effort even when a CLI has no supported transcript or a usage
  * resolver fails. */
 export function getDaemonSessionUsageSnapshot(
+  ds: DaemonSession,
+  effectiveCliId?: CliId,
+  opts?: { fresh?: boolean },
+): CardUsageSnapshot {
+  const snapshot = readDaemonSessionUsageSnapshot(ds, effectiveCliId, opts);
+  // bots.json `cardFooterExtension`：按 bot 缓存的外部命令输出，追加在用量段末尾。
+  // 只读缓存、不等命令；与 CLI / 后端无关，所以放在所有分支之后统一合并。
+  try {
+    const larkAppId = ds.larkAppId ?? ds.session.larkAppId;
+    if (larkAppId) {
+      const bot = getBot(larkAppId);
+      const extensionSegments = getCardFooterExtensionSegments(
+        // 结果按 bot（larkAppId）共享：环境也必须是 bot 级的，不能取本会话的
+        // effectiveCliId——同一 bot 不同会话用不同 CLI 时，变量会在刷新间跳变。
+        { larkAppId, cliId: bot.config.cliId, botName: bot.config.name },
+        bot.config.cardFooterExtension,
+      );
+      if (extensionSegments) return { ...snapshot, extensionSegments };
+    }
+  } catch { /* best-effort */ }
+  return snapshot;
+}
+
+function readDaemonSessionUsageSnapshot(
   ds: DaemonSession,
   effectiveCliId?: CliId,
   opts?: { fresh?: boolean },
