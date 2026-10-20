@@ -16,8 +16,13 @@ import {
   entryForBot,
   filterRoleGroups,
   filterRoleProfiles,
+  formatListenerPreviewTime,
+  hashBotId,
   hashChatId,
   isValidProfileId,
+  mergeListenerContentPolicy,
+  previewMessageListener,
+  runMessageListenerPreview,
   saveInjectMode,
   type GroupInfo,
 } from '../src/dashboard/web/roles.js';
@@ -87,6 +92,16 @@ describe('team federation helpers', () => {
   });
 });
 
+describe('message listener content policy helpers', () => {
+  it('preserves keywords when the title-resolution checkbox is toggled', () => {
+    const withKeywords = mergeListenerContentPolicy(undefined, { includeKeywords: ['智能纪要'] });
+    expect(mergeListenerContentPolicy(withKeywords, {
+      includeKeywords: [...(withKeywords.includeKeywords ?? [])],
+      resolveDocumentTitles: true,
+    })).toEqual({ includeKeywords: ['智能纪要'], resolveDocumentTitles: true });
+  });
+});
+
 describe('roles helpers', () => {
   const groups: GroupInfo[] = [{
     chatId: 'oc_chat_a',
@@ -105,6 +120,8 @@ describe('roles helpers', () => {
     expect(isValidProfileId('bad space')).toBe(false);
     expect(hashChatId('#/roles/profile?chatId=oc_chat_a')).toBe('oc_chat_a');
     expect(hashChatId('#/roles/profile?chatId=')).toBeNull();
+    expect(hashBotId('#/roles?chatId=oc_chat_a&botId=cli_a')).toBe('cli_a');
+    expect(hashBotId('#/roles?chatId=oc_chat_a')).toBeNull();
   });
 
   it('filters groups/profiles and counts only bots currently in chat', () => {
@@ -126,6 +143,19 @@ describe('roles helpers', () => {
     ], 'cli_a')?.content).toBe('role');
     expect(entryForBot([], 'cli_a')).toBeUndefined();
     expect(entryForBot([], null)).toBeUndefined();
+  });
+
+  it('formats listener preview create times as local timestamps', () => {
+    const expected = (() => {
+      const d = new Date(1785139176792);
+      const pad = (value: number) => String(value).padStart(2, '0');
+      return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+    })();
+
+    expect(formatListenerPreviewTime('1785139176792')).toBe(expected);
+    expect(formatListenerPreviewTime('1785139176')).toBe(formatListenerPreviewTime('1785139176000'));
+    expect(formatListenerPreviewTime(undefined)).toBe('');
+    expect(formatListenerPreviewTime('not-a-time')).toBe('');
   });
 
   it('keeps role write APIs on the existing endpoints and request bodies', async () => {
@@ -150,5 +180,24 @@ describe('roles helpers', () => {
       force: true,
       preview: false,
     });
+  });
+
+  it('uses listener preview and run endpoints with a capped count', async () => {
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({
+      ok: true,
+      requestedLimit: 20,
+      matches: [{ messageId: 'om_1', messageText: 'alert', msgType: 'text' }],
+    }), { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(previewMessageListener('cli_a', 'oc_chat_a', { enabled: true, prompt: 'listener' } as any, 50))
+      .resolves.toMatchObject({ ok: true, requestedLimit: 20, matches: [{ messageId: 'om_1' }] });
+    await expect(runMessageListenerPreview('cli_a', 'oc_chat_a', { enabled: true, prompt: 'listener' } as any, 3))
+      .resolves.toMatchObject({ ok: true });
+
+    expect(fetchMock.mock.calls[0][0]).toBe('/api/message-listeners/cli_a/oc_chat_a/preview');
+    expect(JSON.parse(String((fetchMock.mock.calls[0][1] as RequestInit).body))).toMatchObject({ limit: 20 });
+    expect(fetchMock.mock.calls[1][0]).toBe('/api/message-listeners/cli_a/oc_chat_a/run-preview');
+    expect(JSON.parse(String((fetchMock.mock.calls[1][1] as RequestInit).body))).toMatchObject({ limit: 3 });
   });
 });

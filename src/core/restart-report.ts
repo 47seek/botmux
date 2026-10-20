@@ -6,9 +6,10 @@
  * groups on restart (those stay silent now). See core/maintenance.ts and the
  * daemon startup wiring.
  */
+import { githubAuthHeaders, type GithubAuthResolveOptions } from './github-auth.js';
 import type { RestartKind } from '../services/restart-intent-store.js';
-import { consumeRestartIntent } from '../services/restart-intent-store.js';
-import { countActiveSessionsOnDisk } from '../services/session-store.js';
+import { claimRestartIntentForReport } from '../services/restart-intent-store.js';
+import { countActiveSessionsOnDisk, SessionStoreSqliteUnavailableError } from '../services/session-store.js';
 import { botmuxVersion } from '../utils/install-info.js';
 import { t, localeForBot, type Locale } from '../i18n/index.js';
 
@@ -25,7 +26,7 @@ export interface RestartReportInput {
    *  the central platform, so the owner can still reach the dashboard if the
    *  platform is down. */
   dashboardLocalUrl?: string;
-  /** kind==='update' only: the version delta + changelog body. */
+  /** Version delta for update/rollback; changelog is update-only. */
   oldVersion?: string;
   newVersion?: string;
   changelog?: string;
@@ -40,9 +41,11 @@ export function buildRestartReportText(input: RestartReportInput, locale?: Local
   const lines: string[] = [];
   lines.push(input.kind === 'update'
     ? t('restart.updated_restarted', undefined, locale)
-    : t('restart.restarted', undefined, locale));
+    : input.kind === 'rollback'
+      ? t('restart.rolled_back_restarted', undefined, locale)
+      : t('restart.restarted', undefined, locale));
 
-  if (input.kind === 'update' && input.oldVersion && input.newVersion) {
+  if (input.kind !== 'manual' && input.oldVersion && input.newVersion) {
     lines.push(t('restart.version_delta', { old: vtag(input.oldVersion), new: vtag(input.newVersion) }, locale));
   } else {
     lines.push(t('restart.version', { version: vtag(input.version) }, locale));
@@ -65,7 +68,7 @@ export function buildRestartReportCard(input: RestartReportInput, locale?: Local
   return JSON.stringify({
     config: { wide_screen_mode: true },
     header: {
-      template: input.kind === 'update' ? 'green' : 'blue',
+      template: input.kind === 'update' ? 'green' : input.kind === 'rollback' ? 'orange' : 'blue',
       title: { tag: 'plain_text', content: t('restart.card_title', undefined, locale) },
     },
     elements: [{ tag: 'markdown', content: buildRestartReportText(input, locale) }],
@@ -85,10 +88,18 @@ export interface RestartReportWiring {
   /** Local host:port direct fallback link (set only when dashboardUrl is a
    *  central-platform link). */
   dashboardLocalUrl?: string | undefined;
+  /** Missing preserves the legacy behavior (send intentional-restart DMs). */
+  notifyOnRestart?: boolean;
   /** Send the interactive card as a p2p DM to the owner. */
   sendCard: (openId: string, cardJson: string) => Promise<void>;
-  now?: number;
+  githubAuth?: GithubAuthResolveOptions;
+  /** Injectable clock for deterministic tests. */
+  now?: number | (() => number);
   log?: (msg: string) => void;
+  wait?: (ms: number) => Promise<void>;
+  /** Optional caller/test ceiling. Production leaves this unset so a durable
+   *  prepared intent is followed until it commits, aborts, or becomes stale. */
+  preparedCommitWaitMs?: number;
 }
 
 /**
@@ -99,16 +110,42 @@ export interface RestartReportWiring {
  */
 export async function sendRestartReportIfPending(w: RestartReportWiring): Promise<void> {
   const log = w.log ?? (() => {});
-  const intent = consumeRestartIntent(w.now ?? Date.now());
-  if (!intent) return; // no breadcrumb → crash/reboot → stay silent
+  const now = () => typeof w.now === 'function' ? w.now() : w.now ?? Date.now();
+  const wait = w.wait ?? (ms => new Promise(resolve => setTimeout(resolve, ms)));
+  let claim = claimRestartIntentForReport(now());
+  let remainingPreparedWaitMs = w.preparedCommitWaitMs === undefined
+    ? undefined
+    : Math.max(0, w.preparedCommitWaitMs);
+  const pollMs = 500;
+  while (claim.state === 'prepared') {
+    if (remainingPreparedWaitMs !== undefined && remainingPreparedWaitMs <= 0) return;
+    const delayMs = remainingPreparedWaitMs === undefined
+      ? pollMs
+      : Math.min(pollMs, remainingPreparedWaitMs);
+    await wait(delayMs);
+    if (remainingPreparedWaitMs !== undefined) remainingPreparedWaitMs -= delayMs;
+    claim = claimRestartIntentForReport(now());
+  }
+  if (claim.state !== 'claimed') return;
+  const intent = claim.intent;
+  if (w.notifyOnRestart === false) {
+    log(`restart-report suppressed by maintenance.notifyOnRestart=false (kind=${intent.kind})`);
+    return;
+  }
   if (!w.ownerOpenId) { log('restart-report: no owner configured — skipping DM'); return; }
 
   const locale = localeForBot(w.primaryLarkAppId);
-  const sessionCount = countActiveSessionsOnDisk();
+  let sessionCount = 0;
+  try {
+    sessionCount = countActiveSessionsOnDisk();
+  } catch (err) {
+    if (!(err instanceof SessionStoreSqliteUnavailableError)) throw err;
+    log(`restart-report: session store unreadable — ${err.message}`);
+  }
   const version = botmuxVersion();
   let changelog: string | undefined;
   if (intent.kind === 'update' && intent.newVersion) {
-    changelog = (await fetchChangelog(intent.newVersion))
+    changelog = (await fetchChangelog(intent.newVersion, { auth: w.githubAuth }))
       ?? t('restart.changelog_link_fallback', { url: releasesUrl(intent.newVersion) }, locale);
   }
   const card = buildRestartReportCard({
@@ -131,11 +168,19 @@ export async function sendRestartReportIfPending(w: RestartReportWiring): Promis
 
 /** Best-effort GitHub release notes for a version. null on any failure (offline,
  *  rate-limited, release not yet published) — caller falls back to a link. */
-export async function fetchChangelog(newVersion: string): Promise<string | null> {
+export async function fetchChangelog(
+  newVersion: string,
+  opts?: { auth?: GithubAuthResolveOptions; fetchImpl?: typeof fetch; timeoutMs?: number },
+): Promise<string | null> {
+  const fetchImpl = opts?.fetchImpl ?? fetch;
   try {
-    const res = await fetch(`https://api.github.com/repos/${GITHUB_REPO}/releases/tags/${vtag(newVersion)}`, {
-      headers: { Accept: 'application/vnd.github+json', 'User-Agent': 'botmux' },
-      signal: AbortSignal.timeout(8_000),
+    const res = await fetchImpl(`https://api.github.com/repos/${GITHUB_REPO}/releases/tags/${vtag(newVersion)}`, {
+      headers: {
+        Accept: 'application/vnd.github+json',
+        'User-Agent': 'botmux',
+        ...githubAuthHeaders(opts?.auth),
+      },
+      signal: AbortSignal.timeout(opts?.timeoutMs ?? 8_000),
     });
     if (!res.ok) return null;
     const body = await res.json() as { body?: string };

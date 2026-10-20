@@ -1,9 +1,10 @@
+import type React from 'react';
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { SectionHeader } from './dashboard-components.js';
-import { legacyWorkflowDetailHash } from './legacy-workflow-link.js';
+import { confirm } from './confirm-modal.js';
 import { useT } from './react-hooks.js';
-import { fetchV3RunDetail, fetchV3Runs, probeLegacyV2RunSnapshot, shouldProbeLegacyV2Fallback } from './v3-api.js';
-import { WorkflowVersionSwitch } from './workflow-version-switch.js';
+import { ui } from './ui.js';
+import { cancelV3Run, fetchV3RunDetail, fetchV3Runs } from './v3-api.js';
 import {
   V3_DECISION_LABEL,
   V3_GRAPH,
@@ -73,24 +74,10 @@ function useV3RunDetail(runId: string): DetailPollState {
   useEffect(() => {
     let disposed = false;
     let timer: number | null = null;
-    let triedV2Fallback = false;
 
     const schedule = () => {
       timer = window.setTimeout(() => { void poll(); }, V3_POLL_MS);
     };
-
-    async function maybeRedirectToLegacy(status: number): Promise<boolean> {
-      if (!shouldProbeLegacyV2Fallback(status, triedV2Fallback)) return false;
-      triedV2Fallback = true;
-      try {
-        const exists = await probeLegacyV2RunSnapshot(runId);
-        if (disposed || !exists) return false;
-        window.location.replace(legacyWorkflowDetailHash(runId, location.hash.split('?')[1]));
-        return true;
-      } catch {
-        return false;
-      }
-    }
 
     async function poll(): Promise<void> {
       if (disposed) return;
@@ -100,7 +87,6 @@ function useV3RunDetail(runId: string): DetailPollState {
           const result = await fetchV3RunDetail(runId);
           if (disposed) return;
           if (!result.ok) {
-            if (await maybeRedirectToLegacy(result.status)) return;
             setStatusText(result.status === 404 ? 'not found' : `HTTP ${result.status}`);
           } else {
             setView(result.view);
@@ -124,13 +110,12 @@ function useV3RunDetail(runId: string): DetailPollState {
   return { view, statusText };
 }
 
-function V3ListPage(): JSX.Element {
+function V3ListPage(): React.JSX.Element {
   const tr = useT();
   const runs = useV3RunsList();
   const headingActions = (
     <div className="page-heading-actions v3r-run-toolbar">
       <span className="v3r-run-count">{runs.length}</span>
-      <WorkflowVersionSwitch active="v3" />
     </div>
   );
 
@@ -164,18 +149,36 @@ function V3ListPage(): JSX.Element {
   );
 }
 
-function V3DetailPage(props: { runId: string }): JSX.Element {
+function V3DetailPage(props: { runId: string }): React.JSX.Element {
   const tr = useT();
   const { view, statusText } = useV3RunDetail(props.runId);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [instanceId, setInstanceId] = useState<string | null>(null);
   const [instancePinned, setInstancePinned] = useState(false);
+  const [cancelBusy, setCancelBusy] = useState(false);
+  const [cancelSubmitted, setCancelSubmitted] = useState(false);
+  const [cancelNotice, setCancelNotice] = useState<string | null>(null);
 
   useEffect(() => {
     setSelectedId(null);
     setInstanceId(null);
     setInstancePinned(false);
+    setCancelBusy(false);
+    setCancelSubmitted(false);
+    setCancelNotice(null);
   }, [props.runId]);
+
+  useEffect(() => {
+    if (view?.runStatus === 'cancelling') {
+      setCancelSubmitted(true);
+      setCancelNotice(tr('workflow.v3.cancelPending'));
+    } else if (view?.runStatus === 'cancelled') {
+      setCancelSubmitted(false);
+      setCancelNotice(tr('workflow.v3.cancelled'));
+    } else if (isTerminalRunStatus(view?.runStatus)) {
+      setCancelSubmitted(false);
+    }
+  }, [tr, view?.runStatus]);
 
   useEffect(() => {
     if (!view) return;
@@ -198,6 +201,36 @@ function V3DetailPage(props: { runId: string }): JSX.Element {
 
   const selectedNode = view?.nodes.find((node) => node.id === selectedId) ?? null;
   const statusClass = view ? `v3r-pill rs-${view.runStatus}` : 'v3r-pill';
+  const terminal = isTerminalRunStatus(view?.runStatus);
+  const cancelling = cancelBusy || cancelSubmitted || view?.runStatus === 'cancelling';
+
+  const cancelRun = useCallback(async () => {
+    if (!view || terminal || cancelling) return;
+    if (!await confirm({ title: '取消运行', message: tr('workflow.v3.cancelConfirm', { runId: props.runId }), danger: true })) return;
+    setCancelBusy(true);
+    setCancelNotice(null);
+    try {
+      const result = await cancelV3Run(props.runId);
+      if (!result.ok) {
+        setCancelNotice(result.status === 401
+          ? tr('workflow.v3.cancelAuthRequired')
+          : tr('workflow.v3.cancelFailed', { error: result.error }));
+        return;
+      }
+      setCancelNotice(
+        result.runStatus === 'cancelled'
+          ? tr('workflow.v3.cancelled')
+          : result.alreadyTerminal
+            ? tr('workflow.v3.cancelAlreadyTerminal')
+            : tr('workflow.v3.cancelPending'),
+      );
+      setCancelSubmitted(result.runStatus !== 'cancelled' && result.alreadyTerminal !== true);
+    } catch {
+      setCancelNotice(tr('workflow.v3.cancelFailed', { error: 'network_error' }));
+    } finally {
+      setCancelBusy(false);
+    }
+  }, [cancelling, props.runId, terminal, tr, view]);
 
   return (
     <>
@@ -209,9 +242,18 @@ function V3DetailPage(props: { runId: string }): JSX.Element {
           <span className={`${statusClass} v3r-run-status-pill`}>{statusText}</span>
         </div>
         <div className="page-heading-actions">
-          <WorkflowVersionSwitch active="v3" />
+          <V3CancelButton
+            runStatus={view?.runStatus}
+            busy={cancelBusy || cancelSubmitted}
+            onCancel={() => { void cancelRun(); }}
+          />
         </div>
       </div>
+      {cancelNotice ? (
+        <div className={`v3r-cancel-notice${view?.runStatus === 'cancelled' ? ' done' : ''}`} role="status">
+          {cancelNotice}
+        </div>
+      ) : null}
       <div className="v3r-wrap">
         <section className="overview-block v3r-graph-section">
           <SectionHeader
@@ -247,7 +289,33 @@ function V3DetailPage(props: { runId: string }): JSX.Element {
   );
 }
 
-function V3Legend(): JSX.Element {
+export function V3CancelButton(props: {
+  runStatus: RunView['runStatus'] | undefined;
+  busy: boolean;
+  onCancel: () => void;
+}): React.JSX.Element | null {
+  const tr = useT();
+  if (!ui.authed) return null;
+  const terminal = isTerminalRunStatus(props.runStatus);
+  const cancelling = props.busy || props.runStatus === 'cancelling';
+  return (
+    <button
+      type="button"
+      className="danger v3r-cancel-button"
+      disabled={!props.runStatus || terminal || cancelling}
+      title={terminal ? tr('workflow.v3.cancelTerminal') : tr('workflow.v3.cancelTitle')}
+      onClick={props.onCancel}
+    >
+      {cancelling
+        ? tr('workflow.v3.cancelling')
+        : terminal
+          ? tr('workflow.v3.cancelTerminal')
+          : tr('workflow.v3.cancel')}
+    </button>
+  );
+}
+
+function V3Legend(): React.JSX.Element {
   return (
     <div className="v3r-legend">
       <span className="lg st-pending">待机</span>
@@ -267,7 +335,7 @@ function DagGraph(props: {
   view: RunView | null;
   selectedId: string | null;
   onSelect: (nodeId: string) => void;
-}): JSX.Element {
+}): React.JSX.Element {
   const layout = useMemo(() => props.view ? buildGraphLayout(props.view) : null, [props.view]);
   const topologyKey = layout
     ? `${layout.width}:${layout.height}:${layout.nodes.map(box => box.node.id).join('\u0000')}`
@@ -338,7 +406,7 @@ function DagNode(props: {
   box: ReturnType<typeof buildGraphLayout>['nodes'][number];
   selected: boolean;
   onSelect: (nodeId: string) => void;
-}): JSX.Element {
+}): React.JSX.Element {
   const { box, selected } = props;
   const node = box.node;
   if (node.isLoop) {
@@ -361,7 +429,7 @@ function LoopGraphNode(props: {
   box: ReturnType<typeof buildGraphLayout>['nodes'][number];
   selected: boolean;
   onSelect: (nodeId: string) => void;
-}): JSX.Element {
+}): React.JSX.Element {
   const { box, selected } = props;
   const node = box.node;
   const ls = node.loopState;
@@ -395,7 +463,7 @@ function LoopBudgetDots(props: {
   y: number;
   budget: number;
   maxIterations: number | undefined;
-}): JSX.Element {
+}): React.JSX.Element {
   const ls = props.node.loopState!;
   const cy = props.y + V3_GRAPH.loopHeight - 13;
   const dots = Array.from({ length: props.budget }, (_, idx) => idx + 1);
@@ -428,7 +496,7 @@ function NodePanel(props: {
   instanceId: string | null;
   instancePinned: boolean;
   onInstanceSelect: (nodeId: string) => void;
-}): JSX.Element {
+}): React.JSX.Element {
   const node = props.node;
   const instances = useMemo(
     () => node?.isLoop ? loopInstances(props.view, node.id) : [],
@@ -478,7 +546,7 @@ function NodePanel(props: {
   );
 }
 
-function NodeErrorLine(props: { node: RunNodeView }): JSX.Element {
+function NodeErrorLine(props: { node: RunNodeView }): React.JSX.Element {
   const node = props.node;
   return (
     <p className="v3r-err">
@@ -490,7 +558,7 @@ function NodeErrorLine(props: { node: RunNodeView }): JSX.Element {
   );
 }
 
-function InstanceStrip(props: { node: RunNodeView; auto: boolean }): JSX.Element {
+function InstanceStrip(props: { node: RunNodeView; auto: boolean }): React.JSX.Element {
   const loop = props.node.loop!;
   return (
     <div className="v3r-inst-strip">
@@ -508,7 +576,7 @@ function LoopTimeline(props: {
   instances: RunNodeView[];
   activeInstanceId: string | null;
   onInstanceSelect: (nodeId: string) => void;
-}): JSX.Element {
+}): React.JSX.Element {
   const ls = props.node.loopState;
   if (!ls) return <p className="muted">loop 未开始</p>;
 
@@ -563,7 +631,7 @@ function RoundMiniDag(props: {
   instances: RunNodeView[];
   activeInstanceId: string | null;
   onInstanceSelect: (nodeId: string) => void;
-}): JSX.Element {
+}): React.JSX.Element {
   const instanceByBodyId = useMemo(
     () => new Map(props.instances.map((instance) => [instance.loop!.bodyNodeId, instance])),
     [props.instances],
@@ -614,7 +682,7 @@ function RoundMiniDag(props: {
   );
 }
 
-function TerminalSlot(props: { runId: string; node: RunNodeView | null }): JSX.Element {
+function TerminalSlot(props: { runId: string; node: RunNodeView | null }): React.JSX.Element {
   const ref = useRef<HTMLDivElement | null>(null);
   const renderedSignatureRef = useRef<string | null>(null);
   const signature = props.node ? `${props.runId}|${props.node.id}|${nodeTerminalSignature(props.node)}` : null;
@@ -635,7 +703,7 @@ function TerminalSlot(props: { runId: string; node: RunNodeView | null }): JSX.E
   return <div id="v3-term-slot" className="v3r-term-slot" ref={ref} />;
 }
 
-export function V3RunsPage(): JSX.Element {
+export function V3RunsPage(): React.JSX.Element {
   const runId = v3RunIdFromHash();
   return (
     <section className="page workflows-page v3-page">

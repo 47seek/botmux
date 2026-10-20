@@ -50,13 +50,13 @@
  *
  * Pure I/O. Attribution belongs in CodexBridgeQueue.
  */
-import { existsSync, statSync, openSync, readSync, closeSync, readdirSync, readlinkSync } from 'node:fs';
-import { execSync } from 'node:child_process';
-import { homedir, platform } from 'node:os';
+import { existsSync, readdirSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { join } from 'node:path';
 import type { CodexBridgeEvent } from './codex-transcript.js';
+import { beginJsonlDrain, iterateJsonlLines } from './jsonl-cursor.js';
+import { listProcessOpenFiles } from '../utils/process-open-files.js';
 
-const IS_LINUX = platform() === 'linux';
 
 const CHAT_ID_RE = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}';
 
@@ -87,34 +87,10 @@ export function cursorChatIdFromStoreDbPath(path: string): string | undefined {
  *  Linux: `/proc/<pid>/fd/*` fast path. macOS / BSD: `lsof -p <pid> -Fn`
  *  fallback (same shape as codex-transcript.findCodexRolloutByPid). */
 export function findCursorChatIdByPid(pid: number): string | undefined {
-  if (!Number.isInteger(pid) || pid <= 0) return undefined;
-  if (IS_LINUX) {
-    const fdDir = `/proc/${pid}/fd`;
-    if (existsSync(fdDir)) {
-      let entries: string[];
-      try { entries = readdirSync(fdDir); } catch { return undefined; }
-      for (const fd of entries) {
-        let target: string;
-        try { target = readlinkSync(join(fdDir, fd)); } catch { continue; }
-        const chatId = cursorChatIdFromStoreDbPath(target);
-        if (chatId) return chatId;
-      }
-      return undefined;
-    }
-    // /proc unreadable — fall through to lsof.
-  }
-  let out: string;
-  try {
-    out = execSync(`lsof -p ${pid} -Fn`, {
-      encoding: 'utf-8',
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
-  } catch {
-    return undefined;
-  }
-  for (const line of out.split('\n')) {
-    if (!line.startsWith('n/')) continue;
-    const chatId = cursorChatIdFromStoreDbPath(line.slice(1));
+  const targets = listProcessOpenFiles(pid);
+  if (!targets) return undefined;
+  for (const target of targets) {
+    const chatId = cursorChatIdFromStoreDbPath(target);
     if (chatId) return chatId;
   }
   return undefined;
@@ -242,39 +218,20 @@ function eventFromLine(path: string, lineStart: number, obj: any, timestampMs: n
  *  contract of codex-transcript.drainCodexRollout so the worker can reuse the
  *  same fs.watch / poll wakeup machinery and the shared CodexBridgeQueue. */
 export function drainCursorTranscript(path: string, fromOffset: number): CursorDrainResult {
-  if (!existsSync(path)) return { events: [], newOffset: fromOffset, pendingTail: '' };
-  let size: number;
-  try { size = statSync(path).size; } catch { return { events: [], newOffset: fromOffset, pendingTail: '' }; }
-  let start = fromOffset;
   // Cursor's mirror can briefly disappear / shrink while it rewrites. Do not
   // reset to 0 here: replaying the full history pollutes attribution state and
   // can wedge a live turn behind old events. Wait for the mirror to grow past
   // the last consumed byte instead.
-  if (size < start) return { events: [], newOffset: fromOffset, pendingTail: '' };
-  if (size === start) return { events: [], newOffset: start, pendingTail: '' };
-
-  const len = size - start;
-  const buf = Buffer.alloc(len);
-  const fd = openSync(path, 'r');
-  try { readSync(fd, buf, 0, len, start); } finally { closeSync(fd); }
-  const text = buf.toString('utf8');
-  const lastNl = text.lastIndexOf('\n');
-  const completeText = lastNl >= 0 ? text.slice(0, lastNl + 1) : '';
-  let pendingTail = lastNl >= 0 ? text.slice(lastNl + 1) : text;
-  let newOffset = start + Buffer.byteLength(completeText, 'utf8');
+  const step = beginJsonlDrain(path, fromOffset, { onShrink: 'hold', missingOffset: 'keep' });
+  if (step.kind !== 'read') return { events: [], newOffset: step.newOffset, pendingTail: '' };
+  const { size, completeText } = step.window;
+  let pendingTail = step.window.pendingTail;
+  let newOffset = step.window.newOffset;
 
   const events: CodexBridgeEvent[] = [];
-  // Track byte offset within the file so synthetic uuids are stable across
-  // re-drains (the transcript is append-only).
-  let cursor = start;
-  for (const line of completeText.split('\n')) {
-    if (line.length === 0) {
-      cursor += 1; // the \n after an empty line
-      continue;
-    }
-    const lineByteLen = Buffer.byteLength(line, 'utf8') + 1; // include \n
-    const lineStart = cursor;
-    cursor += lineByteLen;
+  // Line offsets keep synthetic uuids stable across re-drains (the transcript
+  // is append-only).
+  for (const { line, lineStart } of iterateJsonlLines(completeText, step.start)) {
     let obj: any;
     try { obj = JSON.parse(line); } catch { continue; }
     // No per-event timestamp in Cursor's JSONL — stamp with the drain

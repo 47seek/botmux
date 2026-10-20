@@ -2,7 +2,7 @@
  * Schedules dashboard card.
  *
  * The list view is compact, paginated, refreshable, and read-only except for
- * per-row detail entry. The detail view exposes pause/resume, delivery-mode
+ * per-row detail entry. The detail view exposes pause/resume, execution-position
  * switching, and back actions. Run-now remains outside this card because it is
  * a one-shot side effect rather than a reversible state change.
  *
@@ -23,14 +23,14 @@ import { isDashboardAdmin } from '../../dashboard/dashboard-admins.js';
 import type {
   ScheduleCardTaskInput,
   ScheduleDetailDto,
-  ScheduleDelivery,
   ScheduleRowDto,
 } from '../../dashboard/schedule-card-model.js';
 import {
   computeDeliveryButtonAvailability,
   computeButtonAvailability,
-  normalizeScheduleDelivery,
   paginateSchedules,
+  nextScheduleExecutionPosition,
+  resolveScheduleExecutionPlacement,
   toScheduleDetailDto,
   toScheduleRowDto,
 } from '../../dashboard/schedule-card-model.js';
@@ -38,6 +38,7 @@ import type { DaemonClient } from '../../dashboard/daemon-internal-client.js';
 import { type Locale, t } from '../../i18n/index.js';
 
 import type { CardActionData } from './card-handler.js';
+import { BACK_TO_OVERVIEW_ACTION, DASH_PAGE_SIZE, JUMP_PAGE_MAX_OPTIONS, ackToast, errorToast, escapeLarkMd, type DashCardHandlerResult } from './dash-card-common.js';
 
 export const SCHEDULES_ACTION_REFRESH = 'dash_schedules_refresh' as const;
 export const SCHEDULES_ACTION_PAGE = 'dash_schedules_page' as const;
@@ -46,16 +47,6 @@ export const SCHEDULES_ACTION_PAUSE = 'dash_schedules_pause' as const;
 export const SCHEDULES_ACTION_RESUME = 'dash_schedules_resume' as const;
 export const SCHEDULES_ACTION_DELIVERY = 'dash_schedules_delivery' as const;
 export const SCHEDULES_ACTION_BACK_TO_LIST = 'dash_schedules_back_to_list' as const;
-/** Action emitted by "🔙 返回总览" on overview-origin sub-cards. Same string
- *  as overview-card's OVERVIEW_ACTION_REFRESH (kept in sync; we don't import
- *  to avoid a circular dep). */
-const BACK_TO_OVERVIEW_ACTION = 'dash_overview_refresh' as const;
-
-/** Default page size for standalone and overview-drilldown list cards. */
-const PAGE_SIZE = 5;
-
-/** Hard cap on `select_static` jump-page option count. */
-const JUMP_PAGE_MAX_OPTIONS = 50;
 
 function toneIcon(tone: string): string {
   switch (tone) {
@@ -120,7 +111,7 @@ export function buildSchedulesCard(
   const effectivePageSize =
     typeof opts.pageSize === 'number' && Number.isFinite(opts.pageSize) && opts.pageSize > 0
       ? Math.floor(opts.pageSize)
-      : PAGE_SIZE;
+      : DASH_PAGE_SIZE;
   const sorted = sortForList(tasks);
   const { items, total, page, totalPages } = paginateSchedules(sorted, opts.page, effectivePageSize);
 
@@ -128,7 +119,7 @@ export function buildSchedulesCard(
   // page/detail/detail-back rebuilds keep the same drilldown state.
   const navFields: Record<string, string> = {};
   if (opts.origin === 'overview') navFields.origin = 'overview';
-  if (effectivePageSize !== PAGE_SIZE) navFields.page_size = String(effectivePageSize);
+  if (effectivePageSize !== DASH_PAGE_SIZE) navFields.page_size = String(effectivePageSize);
   if (opts.scope === 'global') navFields.dashboard_scope = 'global';
 
   const enabledCount = sorted.filter(t => t.enabled).length;
@@ -357,20 +348,20 @@ function botLabelFromDetail(detail: ScheduleDetailDto): string {
   return '—';
 }
 
-function deliveryLabel(deliver: ScheduleDelivery, locale: Locale): string {
-  switch (deliver) {
-    case 'new-topic':
-      return t('card.dashboard.schedules.delivery.new_topic', undefined, locale);
+function deliveryLabel(detail: ScheduleDetailDto, locale: Locale): string {
+  switch (resolveScheduleExecutionPlacement(detail.raw)) {
+    case 'thread':
+      return t('card.dashboard.schedules.delivery.thread', undefined, locale);
     case 'local':
       return t('card.dashboard.schedules.delivery.local', undefined, locale);
-    case 'origin':
+    case 'new-topic':
+      return t('card.dashboard.schedules.delivery.new_topic', undefined, locale);
+    case 'task':
+      return t('schedulePos.cardDeliveryTask', undefined, locale);
+    case 'chat':
     default:
-      return t('card.dashboard.schedules.delivery.origin', undefined, locale);
+      return t('card.dashboard.schedules.delivery.top_level', undefined, locale);
   }
-}
-
-function nextDeliveryTarget(deliver: ScheduleDelivery): Exclude<ScheduleDelivery, 'local'> {
-  return deliver === 'new-topic' ? 'origin' : 'new-topic';
 }
 
 /** Options for the detail card. `invokerOpenId` plumbs the lock onto every callback button. */
@@ -391,7 +382,7 @@ export interface BuildSchedulesDetailCardOpts {
 
 /**
  * Build the schedule detail card: task metadata, next-run preview, reversible
- * state controls, delivery-mode switch, and back action.
+ * state controls, execution-position switching, and back action.
  *
  * Pause and resume are mutually exclusive per the model matrix:
  *   enabled === true → pause clickable, resume disabled (alreadyEnabled)
@@ -430,6 +421,15 @@ export function buildSchedulesDetailCard(
   infoLines.push(
     t('card.dashboard.schedules.detail.name_label', { name: escapeLarkMd(detail.name) }, opts.locale),
   );
+  if ((detail.executionPlacement === 'new-topic' || detail.executionPlacement === 'task') && detail.raw.topicTitle) {
+    infoLines.push(
+      t(
+        'card.dashboard.schedules.detail.topic_title_label',
+        { title: escapeLarkMd(detail.raw.topicTitle) },
+        opts.locale,
+      ),
+    );
+  }
   infoLines.push(
     t('card.dashboard.schedules.detail.enabled_label', { status: enabledLabel }, opts.locale),
   );
@@ -446,7 +446,7 @@ export function buildSchedulesDetailCard(
   infoLines.push(
     t(
       'card.dashboard.schedules.detail.delivery_label',
-      { delivery: escapeLarkMd(deliveryLabel(detail.deliver, opts.locale)) },
+      { delivery: escapeLarkMd(deliveryLabel(detail, opts.locale)) },
       opts.locale,
     ),
   );
@@ -541,17 +541,18 @@ export function buildSchedulesDetailCard(
     typeof opts.pageSize === 'number'
     && Number.isFinite(opts.pageSize)
     && opts.pageSize > 0
-    && opts.pageSize !== PAGE_SIZE
+    && opts.pageSize !== DASH_PAGE_SIZE
   ) {
     navFields.page_size = String(Math.floor(opts.pageSize));
   }
   if (opts.scope === 'global') navFields.dashboard_scope = 'global';
 
-  // ─── Action row — pause / resume + delivery (mutually exclusive) + back ─
+  // ─── Action row — pause / resume + execution position + back ──────────
   const pauseEnabled = detail.actions.pause.enabled === true;
   const resumeEnabled = detail.actions.resume.enabled === true;
-  const currentDelivery = normalizeScheduleDelivery(detail.raw.deliver);
-  const deliveryTarget = nextDeliveryTarget(currentDelivery);
+  const currentPlacement = resolveScheduleExecutionPlacement(detail.raw);
+  const showDeliveryButton = currentPlacement !== 'local';
+  const deliveryTarget = nextScheduleExecutionPosition(detail.raw);
   const deliveryButtonState = computeDeliveryButtonAvailability(detail.raw, deliveryTarget);
   const deliveryEnabled = deliveryButtonState.enabled === true;
   const pauseButton: Record<string, unknown> = {
@@ -584,8 +585,12 @@ export function buildSchedulesDetailCard(
       tag: 'plain_text',
       content: t(
         deliveryTarget === 'new-topic'
-          ? 'card.dashboard.schedules.btn.use_new_topic'
-          : 'card.dashboard.schedules.btn.use_origin',
+          ? 'card.dashboard.schedules.btn.use_fresh_topic'
+          : deliveryTarget === 'task'
+            ? 'schedulePos.cardBtnUseTaskTopic'
+            : deliveryTarget === 'topic'
+              ? 'card.dashboard.schedules.btn.use_origin'
+              : 'card.dashboard.schedules.btn.use_new_topic',
         undefined,
         opts.locale,
       ),
@@ -595,7 +600,7 @@ export function buildSchedulesDetailCard(
       action: SCHEDULES_ACTION_DELIVERY,
       invoker_open_id: opts.invokerOpenId,
       schedule_id: detail.id,
-      target_delivery: deliveryTarget,
+      target_position: deliveryTarget,
       ...navFields,
     },
   };
@@ -605,7 +610,7 @@ export function buildSchedulesDetailCard(
     actions: [
       pauseButton,
       resumeButton,
-      deliveryButton,
+      ...(showDeliveryButton ? [deliveryButton] : []),
       {
         tag: 'button',
         text: { tag: 'plain_text', content: t('card.dashboard.schedules.btn.back', undefined, opts.locale) },
@@ -644,7 +649,7 @@ export function buildSchedulesDetailCard(
       });
     }
   }
-  if (!deliveryEnabled) {
+  if (showDeliveryButton && !deliveryEnabled) {
     const reasonKey = mapDeliveryDisabledReason(deliveryButtonState.reasonKey);
     if (reasonKey) {
       elements.push({
@@ -655,7 +660,6 @@ export function buildSchedulesDetailCard(
       });
     }
   }
-
   // Footer security note (mirrors list card).
   elements.push({
     tag: 'note',
@@ -698,26 +702,21 @@ function mapDeliveryDisabledReason(reasonKey: string | undefined): string | unde
   switch (reasonKey) {
     case 'schedules.action.delivery.local':
       return 'card.dashboard.schedules.delivery.disabled.local';
+    case 'schedules.action.delivery.topicRootRequired':
+      return 'card.dashboard.schedules.delivery.disabled.topicRootRequired';
     case 'schedules.action.delivery.alreadyOrigin':
       return 'card.dashboard.schedules.delivery.disabled.alreadyOrigin';
+    case 'schedules.action.delivery.alreadyTopLevel':
+      return 'card.dashboard.schedules.delivery.disabled.alreadyTopLevel';
     case 'schedules.action.delivery.alreadyNewTopic':
       return 'card.dashboard.schedules.delivery.disabled.alreadyNewTopic';
+    case 'schedules.action.delivery.alreadyTask':
+      return 'schedulePos.cardAlreadyTask';
+    case 'schedules.action.delivery.taskMultiChat':
+      return 'schedulePos.cardTaskMultiChatUnsupported';
     default:
       return undefined;
   }
-}
-
-/**
- * Sanitize user-/CLI-supplied text for inclusion in lark_md. See
- * `sessions-card.ts:escapeLarkMd` for the order rationale: `&` first to
- * avoid `&` → `&amp;` then `<` → `&lt;` getting re-encoded as `&amp;lt;`.
- */
-function escapeLarkMd(text: string): string {
-  return text
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/([*_~`])/g, '\\$1');
 }
 
 /** ─── Handler ─────────────────────────────────────────────────────────── */
@@ -731,18 +730,7 @@ export interface SchedulesCardHandlerDeps {
   nowMs?: () => number;
 }
 
-export interface SchedulesCardHandlerResult {
-  toast?: { type: 'info' | 'success' | 'error'; content: string };
-  card?: { type: 'raw'; data: Record<string, unknown> };
-}
-
-function ackToast(textKey: string, locale: Locale): SchedulesCardHandlerResult {
-  return { toast: { type: 'info', content: t(textKey, undefined, locale) } };
-}
-
-function errorToast(textKey: string, params: Record<string, string> | undefined, locale: Locale): SchedulesCardHandlerResult {
-  return { toast: { type: 'error', content: t(textKey, params, locale) } };
-}
+export type SchedulesCardHandlerResult = DashCardHandlerResult;
 
 /** Dispatch a `dash_schedules_*` action callback. Mirrors sessions-card. */
 export async function handleSchedulesCardAction(
@@ -937,11 +925,14 @@ export async function handleSchedulesCardAction(
     if (typeof scheduleId !== 'string' || !scheduleId) {
       return errorToast('card.dashboard.schedules.schedule_not_found', undefined, locale);
     }
-    const targetDelivery =
-      value.target_delivery === 'origin' || value.target_delivery === 'new-topic'
-        ? value.target_delivery
-        : undefined;
-    if (!targetDelivery) {
+    const legacyTarget = value.target_delivery === 'origin'
+      ? 'topic'
+      : value.target_delivery === 'new-topic' ? 'top-level' : undefined;
+    const targetPosition =
+      value.target_position === 'top-level' || value.target_position === 'topic' || value.target_position === 'new-topic' || value.target_position === 'task'
+        ? value.target_position
+        : legacyTarget;
+    if (!targetPosition) {
       return ackToast('card.dashboard.settings.invalid_action', locale);
     }
     const failedKey = 'card.dashboard.schedules.delivery_failed';
@@ -956,7 +947,7 @@ export async function handleSchedulesCardAction(
     // Server-side action matrix for delivery mirrors pause/resume: the card
     // paint is UX only. Re-read the latest row and verify this exact target
     // is still a legal transition before calling the owner daemon.
-    const deliveryState = computeDeliveryButtonAvailability(before, targetDelivery);
+    const deliveryState = computeDeliveryButtonAvailability(before, targetPosition);
     if (deliveryState.enabled !== true) {
       const mappedKey = mapDeliveryDisabledReason(deliveryState.reasonKey) ?? failedKey;
       return errorToast(mappedKey, undefined, locale);
@@ -967,6 +958,7 @@ export async function handleSchedulesCardAction(
       resp = await client.request({
         method: 'POST',
         path: `/__daemon/schedules/${encodeURIComponent(scheduleId)}/delivery${writePathSuffix}`,
+        body: { executionPosition: targetPosition },
       });
     } catch (e) {
       return errorToast(failedKey, { reason: (e as Error).message }, locale);
@@ -976,11 +968,14 @@ export async function handleSchedulesCardAction(
       return errorToast(failedKey, { reason: failureReason }, locale);
     }
 
-    const responseDeliver =
-      (resp.body as { deliver?: unknown } | undefined)?.deliver === 'origin' ||
-      (resp.body as { deliver?: unknown } | undefined)?.deliver === 'new-topic'
-        ? (resp.body as { deliver: 'origin' | 'new-topic' }).deliver
-        : targetDelivery;
+    const responsePositionBody = (resp.body as { executionPosition?: unknown } | undefined)?.executionPosition;
+    const responsePosition =
+      responsePositionBody === 'topic' ||
+      responsePositionBody === 'top-level' ||
+      responsePositionBody === 'new-topic' ||
+      responsePositionBody === 'task'
+        ? responsePositionBody as 'topic' | 'top-level' | 'new-topic' | 'task'
+        : targetPosition;
     const postRefetch = await safeGetSchedulesList(client, locale, listPathSuffix);
     let after: ScheduleCardTaskInput | undefined;
     if (!('errorResult' in postRefetch)) {
@@ -989,8 +984,12 @@ export async function handleSchedulesCardAction(
     if (!after) {
       // Delivery toggle succeeded upstream but the refetch was stale/missing.
       // Keep the card interactive by rendering a synth row with the known
-      // target mode; the next refresh converges to the owner daemon snapshot.
-      after = { ...before, deliver: responseDeliver };
+      // target position; the next refresh converges to the owner snapshot.
+      after = {
+        ...before,
+        scope: responsePosition === 'topic' || responsePosition === 'task' ? 'thread' : 'chat',
+        executionPosition: responsePosition,
+      };
     }
     const detail = toScheduleDetailDto(after, { nowMs: now() });
     const cardJson = buildSchedulesDetailCard(detail, {

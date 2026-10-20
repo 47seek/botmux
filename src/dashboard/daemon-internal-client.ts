@@ -21,12 +21,12 @@
  * `randomNonce` / `secret` are all injectable.
  */
 
-import { homedir } from 'node:os';
-import { join } from 'node:path';
 import { randomBytes } from 'node:crypto';
 
+import { dashboardSecretPath } from '../core/dashboard-secret.js';
 import { loadDashboardSecret } from './auth.js';
 import { signDaemonRequest } from './daemon-internal-auth.js';
+import { isLoopbackUrl, loopbackFetchImpl } from '../core/loopback-fetch.js';
 
 const DEFAULT_DASHBOARD_URL = 'http://127.0.0.1:7891';
 const DEFAULT_RETRIES = 3;
@@ -34,7 +34,7 @@ const DEFAULT_TIMEOUT_MS = 5000;
 const DEFAULT_BASE_BACKOFF_MS = 100;
 const DEFAULT_MAX_BACKOFF_MS = 5_000;
 
-const SECRET_PATH_DEFAULT = join(homedir(), '.botmux', '.dashboard-secret');
+const SECRET_PATH_DEFAULT = dashboardSecretPath();
 
 export interface DaemonClientOptions {
   /** Base URL of the dashboard process (default `http://127.0.0.1:7891`). */
@@ -124,7 +124,11 @@ export function createDaemonClient(opts: DaemonClientOptions): DaemonClient {
   const secret = opts.secret?.trim() ?? loadSecretFromFile(opts.secretPath ?? SECRET_PATH_DEFAULT);
   if (!secret) throw new Error('dashboard_secret_missing');
   const appId = opts.appId;
-  const fetchFn = opts.fetch ?? fetch;
+  // Loopback targets must NOT go through the global fetch: under Bun it routes
+  // 127.0.0.1 via $http_proxy unless no_proxy names that literal address, and the
+  // proxy can then both fail the call AND forge a well-formed reply. `dashboardUrl`
+  // is overridable, so dispatch on the resolved host rather than assuming loopback.
+  const fetchFn = opts.fetch ?? (isLoopbackUrl(dashboardUrl) ? loopbackFetchImpl : fetch);
   const now = opts.now ?? Date.now;
   const nonceFn = opts.randomNonce ?? defaultNonce;
   const defaultRetries = opts.retries ?? DEFAULT_RETRIES;

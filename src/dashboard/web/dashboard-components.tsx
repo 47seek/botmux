@@ -1,6 +1,8 @@
+import type React from 'react';
 import {
   useCallback,
   useEffect,
+  useLayoutEffect,
   useRef,
   useState,
   type ButtonHTMLAttributes,
@@ -13,6 +15,12 @@ import { createPortal } from 'react-dom';
 export type DropdownOption<T extends string> = {
   value: T;
   label: ReactNode;
+  /**
+   * Optional second line under the label, shown in the popup only (the
+   * collapsed trigger keeps rendering `label` alone via dropdownLabel).
+   * Lets option lists double as inline help for hard-to-name settings.
+   */
+  hint?: ReactNode;
   /** Non-selectable informational entry (e.g. a mode the current CLI can't use). */
   disabled?: boolean;
 };
@@ -21,7 +29,7 @@ export function dropdownLabel<T extends string>(options: DropdownOption<T>[], va
   return options.find(option => option.value === value)?.label ?? value;
 }
 
-export function Html(props: { html: string; as?: 'span' | 'div' }): JSX.Element {
+export function Html(props: { html: string; as?: 'span' | 'div' }): React.JSX.Element {
   const Tag = props.as ?? 'span';
   return <Tag style={{ display: 'contents' }} dangerouslySetInnerHTML={{ __html: props.html }} />;
 }
@@ -30,7 +38,7 @@ export function LoadingState(props: {
   label: ReactNode;
   className?: string;
   compact?: boolean;
-}): JSX.Element {
+}): React.JSX.Element {
   const className = [
     'page-loading',
     props.compact ? 'page-loading-compact' : '',
@@ -50,7 +58,7 @@ export function SectionHeader(props: {
   count?: ReactNode;
   hint?: ReactNode;
   children?: ReactNode;
-}): JSX.Element {
+}): React.JSX.Element {
   return (
     <div className="sect-head overview-panel-head">
       <h2>{props.title}</h2>
@@ -64,11 +72,11 @@ export function SectionHeader(props: {
 export function HeaderAction(props: {
   href: string;
   children: ReactNode;
-}): JSX.Element {
+}): React.JSX.Element {
   return <a className="sect-head-action" href={props.href}>{props.children}</a>;
 }
 
-export function HeaderControls(props: { children: ReactNode }): JSX.Element {
+export function HeaderControls(props: { children: ReactNode }): React.JSX.Element {
   return <div className="sect-head-controls">{props.children}</div>;
 }
 
@@ -76,7 +84,7 @@ type ActionButtonProps = ButtonHTMLAttributes<HTMLButtonElement> & {
   children: ReactNode;
 };
 
-function ActionGlyph(props: { kind: 'plus' | 'refresh' }): JSX.Element {
+function ActionGlyph(props: { kind: 'plus' | 'refresh' }): React.JSX.Element {
   if (props.kind === 'plus') {
     return (
       <svg className="ui-action-icon" viewBox="0 0 16 16" aria-hidden="true">
@@ -92,7 +100,7 @@ function ActionGlyph(props: { kind: 'plus' | 'refresh' }): JSX.Element {
   );
 }
 
-export function CreateActionButton(props: ActionButtonProps): JSX.Element {
+export function CreateActionButton(props: ActionButtonProps): React.JSX.Element {
   const { children, className, type = 'button', ...buttonProps } = props;
   return (
     <button {...buttonProps} type={type} className={['ui-create-action', className].filter(Boolean).join(' ')}>
@@ -105,7 +113,7 @@ export function CreateActionButton(props: ActionButtonProps): JSX.Element {
 export function RefreshIconButton(props: Omit<ButtonHTMLAttributes<HTMLButtonElement>, 'children'> & {
   label: string;
   busy?: boolean;
-}): JSX.Element {
+}): React.JSX.Element {
   const { label, busy = false, className, type = 'button', ...buttonProps } = props;
   return (
     <button
@@ -121,6 +129,16 @@ export function RefreshIconButton(props: Omit<ButtonHTMLAttributes<HTMLButtonEle
   );
 }
 
+/**
+ * Native modal dialogs live in the browser's top layer. A floating element
+ * portaled to document.body therefore stays behind an open dialog regardless
+ * of its z-index. Keep floating UI in the nearest open dialog when there is
+ * one, while retaining document.body as the normal page-level host.
+ */
+export function floatingPortalHost(anchor: Element | null, fallback: HTMLElement): Element {
+  return anchor?.closest('dialog[open]') ?? fallback;
+}
+
 export function InfoTip(props: {
   children: ReactNode;
   label?: string;
@@ -128,7 +146,7 @@ export function InfoTip(props: {
   trigger?: ReactNode;
   preventClick?: boolean;
   focusable?: boolean;
-}): JSX.Element {
+}): React.JSX.Element {
   const tipRef = useRef<HTMLSpanElement | null>(null);
   const hideTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [open, setOpen] = useState(false);
@@ -189,7 +207,7 @@ export function InfoTip(props: {
       >
         {props.children}
       </span>,
-      document.body,
+      floatingPortalHost(tipRef.current, document.body),
     )
     : null;
 
@@ -219,7 +237,7 @@ export function OverflowText(props: {
   popoverClassName?: string;
   showPopover?: boolean;
   durationMs?: number;
-}): JSX.Element {
+}): React.JSX.Element {
   const anchorRef = useRef<HTMLSpanElement | null>(null);
   const [open, setOpen] = useState(false);
   const [overflowing, setOverflowing] = useState(false);
@@ -306,7 +324,7 @@ export function OverflowText(props: {
       >
         {props.text}
       </span>,
-      document.body,
+      floatingPortalHost(anchorRef.current, document.body),
     )
     : null;
 
@@ -331,7 +349,7 @@ export function FieldTitle(props: {
   help?: ReactNode;
   helpLabel?: string;
   className?: string;
-}): JSX.Element {
+}): React.JSX.Element {
   return (
     <span className={['ui-field-title', props.className].filter(Boolean).join(' ')}>
       <span className="ui-field-title-text">{props.children}</span>
@@ -340,28 +358,70 @@ export function FieldTitle(props: {
   );
 }
 
+/**
+ * 开关行：`<label.toggle-row>` = 复选框 + 滑块 + 「标题（带 ? 提示）+ 可选说明」。
+ * bot-defaults 页与 settings 页共用；两页的差别只在标题用哪一套 FieldTitle
+ * （bot-defaults 的 `bd-*` 页面作用域样式 vs 本文件的 `ui-*`），由 `TitleComponent`
+ * 注入，默认是本文件的 {@link FieldTitle}。
+ */
+export function ToggleRow(props: {
+  checked: boolean;
+  disabled?: boolean;
+  title: ReactNode;
+  help?: ReactNode;
+  description?: ReactNode;
+  className?: string;
+  /** 透传到 `<input data-action>`，供测试/事件委托钉点。 */
+  dataAction?: string;
+  /** 追加到默认 FieldTitle 的 class；使用自定义 `TitleComponent` 时忽略。 */
+  titleClassName?: string;
+  TitleComponent?: (p: { children: ReactNode; help?: ReactNode }) => React.JSX.Element;
+  onChange(checked: boolean): void;
+}): React.JSX.Element {
+  return (
+    <label className={props.className ? `toggle-row ${props.className}` : 'toggle-row'}>
+      <input
+        type="checkbox"
+        data-action={props.dataAction}
+        checked={props.checked}
+        disabled={props.disabled}
+        onChange={event => props.onChange(event.currentTarget.checked)}
+      />
+      <span className="switch" aria-hidden="true" />
+      <span className="toggle-tx">
+        <strong>
+          {props.TitleComponent
+            ? <props.TitleComponent help={props.help}>{props.title}</props.TitleComponent>
+            : <FieldTitle className={props.titleClassName} help={props.help}>{props.title}</FieldTitle>}
+        </strong>
+        {props.description ? <small>{props.description}</small> : null}
+      </span>
+    </label>
+  );
+}
+
 export function OverviewList(props: {
   id?: string;
   className?: string;
   children: ReactNode;
-}): JSX.Element {
+}): React.JSX.Element {
   return <ul className={['overview-list', props.className].filter(Boolean).join(' ')} id={props.id}>{props.children}</ul>;
 }
 
 export function OverviewListItem(props: HTMLAttributes<HTMLLIElement> & {
   kind?: 'session' | 'schedule' | 'group';
   children: ReactNode;
-}): JSX.Element {
+}): React.JSX.Element {
   const { kind, className, children, ...rest } = props;
   const kindClass = kind ? `overview-list-item-${kind}` : '';
   return <li {...rest} className={['overview-list-item', kindClass, className].filter(Boolean).join(' ')}>{children}</li>;
 }
 
-export function OverviewListMain(props: { children: ReactNode }): JSX.Element {
+export function OverviewListMain(props: { children: ReactNode }): React.JSX.Element {
   return <div className="overview-list-main">{props.children}</div>;
 }
 
-export function OverviewListTail(props: { children: ReactNode }): JSX.Element {
+export function OverviewListTail(props: { children: ReactNode }): React.JSX.Element {
   return <div className="overview-list-tail">{props.children}</div>;
 }
 
@@ -376,22 +436,232 @@ type DropdownMenuProps<T extends string> = {
   value: T;
   options: DropdownOption<T>[];
   onChange: (value: T) => void;
+  /** Filter box at the top of the popup, for long option lists (e.g. 20+ CLIs). */
+  searchable?: boolean;
+  searchPlaceholder?: string;
+  /** Shown instead of options when the filter matches nothing. */
+  searchEmptyLabel?: ReactNode;
 };
 
-export function DropdownMenu<T extends string>(props: DropdownMenuProps<T>): JSX.Element {
+/**
+ * The band a popup has to stay inside, in viewport coordinates.
+ *
+ * The screen edge is not the only thing that crops a popup: every ancestor with
+ * a non-`visible` overflow crops it too, and such a box is often far smaller
+ * than the viewport. `.roles-profile-apply` (角色管理 → Profiles → 应用到群组)
+ * is one — `max-height: 34%; overflow: auto` — so a popup budgeted against
+ * `window.innerHeight` believed it had ~635px above the trigger when the panel
+ * only showed ~290px, flipped up, and left a single group row reachable.
+ *
+ * Overshooting the TOP edge of such a box is unrecoverable: an overflow
+ * container scrolls towards its content, never above it, so those options can
+ * be neither seen nor clicked. Intersecting the ancestors' boxes with the
+ * viewport gives the placement maths a frame that reflects what is really on
+ * screen.
+ *
+ * Pure function of the geometry so it can be unit-tested without a DOM.
+ */
+export function popupClipFrame(input: {
+  viewportHeight: number;
+  /** Border boxes of the clipping ancestors; order does not matter. */
+  clippers: { top: number; bottom: number }[];
+}): { top: number; bottom: number } {
+  let top = 0;
+  let bottom = input.viewportHeight;
+  for (const box of input.clippers) {
+    top = Math.max(top, box.top);
+    bottom = Math.min(bottom, box.bottom);
+  }
+  // An ancestor scrolled entirely off screen inverts the band; collapse it
+  // instead of handing negative geometry to the caller (the height floor in
+  // dropdownPlacement then keeps the popup usable).
+  return { top, bottom: Math.max(top, bottom) };
+}
+
+/**
+ * Where a dropdown popup should go, and how tall it may be.
+ *
+ * A dropdown's ancestors are mostly `overflow: hidden` (main / .chrome-body /
+ * .app-shell), so a popup hanging past the edge of the frame is clipped away:
+ * those options cannot be seen, and pointer/wheel events never reach them
+ * either (the popup is not under the cursor down there). Plain CSS cannot know
+ * how much room is left below the trigger, so the component measures it and
+ * hands the budget to style.css as a custom property.
+ *
+ * Pure function of the geometry so it can be unit-tested without a DOM.
+ */
+export function dropdownPlacement(input: {
+  /** Trigger box, viewport-relative (getBoundingClientRect). */
+  triggerTop: number;
+  triggerBottom: number;
+  /** Unconstrained popup height (scrollHeight), i.e. what the content wants. */
+  naturalHeight: number;
+  viewportHeight: number;
+  /**
+   * Visible band from popupClipFrame. Defaults to the whole viewport, which is
+   * the right frame only when nothing between the trigger and the screen edge
+   * clips — pass the measured band whenever a DOM is available.
+   */
+  frameTop?: number;
+  frameBottom?: number;
+  /**
+   * Size for this direction instead of deciding one. Used when a per-page rule
+   * pins the direction with higher specificity than the `.is-drop-up` class, so
+   * the budget must match what actually rendered rather than what we asked for.
+   */
+  forceDropUp?: boolean;
+}): { dropUp: boolean; maxHeight: number } {
+  const margin = 12;
+  const gap = 8;
+  const frameTop = input.frameTop ?? 0;
+  const frameBottom = input.frameBottom ?? input.viewportHeight;
+  const roomBelow = frameBottom - input.triggerBottom - gap - margin;
+  const roomAbove = input.triggerTop - frameTop - gap - margin;
+  // Flip up only when below genuinely cannot fit AND above is roomier;
+  // otherwise stay below (predictable) and just cap the height.
+  const dropUp = input.forceDropUp ?? (input.naturalHeight > roomBelow && roomAbove > roomBelow);
+  // Floor: in a viewport too short for either side, a tiny sliver would be
+  // worse than a popup that slightly overhangs but is still scrollable.
+  const maxHeight = Math.max(140, Math.floor(dropUp ? roomAbove : roomBelow));
+  return { dropUp, maxHeight };
+}
+
+/**
+ * Border boxes of the ancestors that crop `el`, nearest first.
+ *
+ * An `overflow` box does not clip an absolutely positioned descendant whose
+ * containing block sits *above* that box — which is how a popup sometimes
+ * escapes one. Here it never does: the popup's containing block is its own
+ * `.sect-sort-menu` (`position: relative`, style.css), so every non-`visible`
+ * overflow box further up encloses that containing block and genuinely crops
+ * the popup. Should a popup ever be re-parented out of the menu, or the menu
+ * be made `position: static`, this walk would need the containing block
+ * checked per ancestor rather than assumed.
+ *
+ * Two distinct things happen at a `position: fixed` ancestor, and conflating
+ * them drops a real clipper: boxes *above* it stop applying, but the fixed box
+ * *itself* still crops its own descendants — a `<dialog>` opened with
+ * `showModal()` is exactly that (the UA stylesheet makes it fixed, and the
+ * dashboard's modals add their own `overflow`). So record it, then stop.
+ */
+function clippingAncestorBoxes(el: HTMLElement): { top: number; bottom: number }[] {
+  const boxes: { top: number; bottom: number }[] = [];
+  for (let node = el.parentElement; node && node !== document.documentElement; node = node.parentElement) {
+    const style = window.getComputedStyle(node);
+    // `clip`/`hidden`/`auto`/`scroll` all crop; only `visible` lets the popup out.
+    // A single axis is enough: `overflow-x: hidden` forces the other axis to a
+    // scrolling value too, so reading both keeps mixed pairs from slipping past.
+    const crops = !(style.overflowY === 'visible' && style.overflowX === 'visible');
+    if (crops) {
+      const box = node.getBoundingClientRect();
+      boxes.push({ top: box.top, bottom: box.bottom });
+    }
+    // A `fixed` box is positioned against the viewport, so overflow boxes above
+    // it in the tree do not crop it (verified in Chromium: a popup inside a
+    // `position: fixed` panel stays visible and hit-testable well outside an
+    // `overflow: hidden` grandparent). Stop, or a modal would be budgeted
+    // against a container it visibly escapes.
+    //
+    // Its own box is already recorded above. On today's four modal dropdowns
+    // that changes the frame by at most a few pixels — but only because each of
+    // them also has an inner scroll container, clamped to roughly the same
+    // height, that was recorded before we got here. The viewport does not
+    // supply that bound: a fixed box centred in a taller viewport sits strictly
+    // inside it (measured: a 219-380 dialog against a 0-599 viewport), so the
+    // clamp contributes nothing. Drop the inner container from such a modal and
+    // skipping this box would over-budget the popup by ~200px, straight back to
+    // the overshoot this whole walk exists to prevent.
+    if (style.position === 'fixed') break;
+  }
+  return boxes;
+}
+
+export function DropdownMenu<T extends string>(props: DropdownMenuProps<T>): React.JSX.Element {
   const detailsRef = useRef<HTMLDetailsElement | null>(null);
-  const choose = (next: T, button: HTMLButtonElement) => {
-    button.closest('details')?.removeAttribute('open');
+  const searchRef = useRef<HTMLInputElement | null>(null);
+  const popRef = useRef<HTMLDivElement | null>(null);
+  const [query, setQuery] = useState('');
+  const [open, setOpen] = useState(false);
+  const choose = (next: T) => {
+    detailsRef.current?.removeAttribute('open');
+    // Belt-and-braces: `onToggle` normally syncs this, but WebKit before Safari
+    // 15.4 did not fire toggle for programmatic open changes, which would leave
+    // `open` stuck true and the placement effect skipped on the next open (stale
+    // budget / drop-up class). Setting it here closes that loop; on browsers that
+    // do fire toggle React bails out of the identical-state update, so it is free.
+    setOpen(false);
     // Re-selecting the already-active value is a no-op: close the menu but skip
     // onChange, so auto-saving dropdowns don't fire a redundant write + "saved" flash.
     if (next === props.value) return;
     props.onChange(next);
   };
+  const queryNorm = query.trim().toLowerCase();
+  // Match on the visible label when it is plain text, plus the value itself
+  // (users search either "Claude" or "claude-code").
+  const visibleOptions = props.searchable && queryNorm
+    ? props.options.filter(option =>
+      option.value.toLowerCase().includes(queryNorm)
+      || (typeof option.label === 'string' && option.label.toLowerCase().includes(queryNorm)))
+    : props.options;
+
+  // Keep the popup inside the viewport; see dropdownPlacement above.
+  useLayoutEffect(() => {
+    if (!open) return undefined;
+    const place = () => {
+      const details = detailsRef.current;
+      const pop = popRef.current;
+      if (!details || !pop) return;
+      const trigger = details.getBoundingClientRect();
+      // Walk from the popup, so the <details> that wraps it is itself checked:
+      // nothing sets overflow on `.sect-sort-menu` today, but a page-level rule
+      // that did would clip the popup, and starting at the trigger would miss it.
+      const frame = popupClipFrame({
+        viewportHeight: window.innerHeight,
+        clippers: clippingAncestorBoxes(pop),
+      });
+      const geometry = {
+        triggerTop: trigger.top,
+        triggerBottom: trigger.bottom,
+        naturalHeight: pop.scrollHeight,
+        viewportHeight: window.innerHeight,
+        frameTop: frame.top,
+        frameBottom: frame.bottom,
+      };
+      const { dropUp, maxHeight } = dropdownPlacement(geometry);
+      details.classList.toggle('is-drop-up', dropUp);
+      // A per-page rule may pin the direction regardless of the class — e.g.
+      // `.connector-create-modal #cn-verify .sect-sort-pop` sets `bottom` with
+      // ID specificity, so that popup always opens upward. Budgeting for the
+      // side we merely *asked* for would then clip it off the opposite edge, so
+      // detect where it actually landed and size for that side.
+      //
+      // Measure geometry, not `getComputedStyle().top`: for a positioned box the
+      // computed value resolves `auto` to a used pixel value, never the string
+      // 'auto', so a style probe reports "not flipped" for every popup.
+      const popBox = pop.getBoundingClientRect();
+      const renderedUp = popBox.height > 0 && popBox.bottom <= trigger.top + 1;
+      const effective = renderedUp === dropUp
+        ? maxHeight
+        : dropdownPlacement({ ...geometry, forceDropUp: renderedUp }).maxHeight;
+      pop.style.setProperty('--dropdown-popover-space', `${effective}px`);
+    };
+    const frame = window.requestAnimationFrame(place);
+    window.addEventListener('resize', place);
+    // Capture phase: the scroller is an ancestor (main), not window.
+    window.addEventListener('scroll', place, true);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      window.removeEventListener('resize', place);
+      window.removeEventListener('scroll', place, true);
+    };
+  }, [open, visibleOptions.length]);
 
   useEffect(() => {
     if (typeof document === 'undefined') return undefined;
     const close = () => {
       if (detailsRef.current?.open) detailsRef.current.open = false;
+      // Same reason as in choose(): don't rely solely on toggle firing.
+      setOpen(false);
     };
     const onPointerDown = (event: PointerEvent) => {
       const details = detailsRef.current;
@@ -411,13 +681,31 @@ export function DropdownMenu<T extends string>(props: DropdownMenuProps<T>): JSX
     };
   }, []);
   useEffect(() => {
-    if (props.disabled && detailsRef.current?.open) detailsRef.current.open = false;
+    if (props.disabled) return;
+    if (detailsRef.current?.open) detailsRef.current.open = false;
+    // Third programmatic close path — keep it in sync too (see choose()).
+    setOpen(false);
   }, [props.disabled]);
 
   const className = ['sect-sort-menu', props.disabled ? 'is-disabled' : '', props.className].filter(Boolean).join(' ');
 
   return (
-    <details id={props.id} className={className} ref={detailsRef} hidden={props.hidden} style={props.style}>
+    <details
+      id={props.id}
+      className={className}
+      ref={detailsRef}
+      hidden={props.hidden}
+      style={props.style}
+      onToggle={event => {
+        // <details> fires toggle for programmatic `.open = false` too, so this is
+        // the single place that keeps the placement effect in sync with reality.
+        const isOpen = event.currentTarget.open;
+        setOpen(isOpen);
+        if (!props.searchable || !isOpen) return;
+        setQuery('');
+        searchRef.current?.focus();
+      }}
+    >
       <summary
         aria-label={props.ariaLabel}
         aria-disabled={props.disabled ? true : undefined}
@@ -431,23 +719,52 @@ export function DropdownMenu<T extends string>(props: DropdownMenuProps<T>): JSX
       >
         <span className="sect-sort-value">{props.label}</span>
       </summary>
-      <div className="sect-sort-pop">
-        {props.options.map(option => (
+      <div className="sect-sort-pop" ref={popRef}>
+        {props.searchable ? (
+          <input
+            ref={searchRef}
+            className="sect-sort-search"
+            type="search"
+            placeholder={props.searchPlaceholder}
+            aria-label={props.searchPlaceholder}
+            autoComplete="off"
+            spellCheck={false}
+            value={query}
+            onChange={event => setQuery(event.currentTarget.value)}
+            onKeyDown={event => {
+              if (event.key !== 'Enter') return;
+              // The dropdown often sits inside a <form>: never let Enter submit
+              // it. Enter picks the first matching option instead.
+              event.preventDefault();
+              const first = visibleOptions.find(option => !option.disabled);
+              if (first) choose(first.value);
+            }}
+          />
+        ) : null}
+        {visibleOptions.map(option => (
           <button
             key={option.value}
             type="button"
             disabled={option.disabled}
             aria-current={props.value === option.value ? 'true' : undefined}
-            onClick={event => choose(option.value, event.currentTarget)}
+            onClick={() => choose(option.value)}
           >
-            {option.label}
+            {option.hint ? (
+              <span className="sect-sort-option">
+                <span className="sect-sort-option-title">{option.label}</span>
+                <span className="sect-sort-option-hint">{option.hint}</span>
+              </span>
+            ) : option.label}
           </button>
         ))}
+        {props.searchable && visibleOptions.length === 0
+          ? <p className="sect-sort-empty">{props.searchEmptyLabel}</p>
+          : null}
       </div>
     </details>
   );
 }
 
-export function SortMenu<T extends string>(props: DropdownMenuProps<T>): JSX.Element {
+export function SortMenu<T extends string>(props: DropdownMenuProps<T>): React.JSX.Element {
   return <DropdownMenu {...props} />;
 }

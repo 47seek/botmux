@@ -33,7 +33,11 @@ const imOrigin: VcMeetingImTurnOrigin = {
   larkMessageId: 'om_current',
 };
 
-function seed(responseMode: 'silent' | 'listener_thread'): void {
+function seed(
+  responseMode: 'silent' | 'listener_thread',
+  outputPlacement: 'auto' | 'chat' | 'topic' = 'auto',
+  listenerOutputProtocol: 'plain' | 'decision_v1' = 'plain',
+): void {
   applyVcMeetingMemberProjection(dir, {
     ...memberKey,
     ownerBootId: 'owner-boot',
@@ -49,6 +53,7 @@ function seed(responseMode: 'silent' | 'listener_thread'): void {
     joinedAtIngestSeq: 0,
     receiverSessionId: 'receiver-session',
     outputChatId: 'listener-chat',
+    outputPlacement,
   });
   acceptVcMeetingDelivery(dir, {
     ...memberKey,
@@ -60,6 +65,7 @@ function seed(responseMode: 'silent' | 'listener_thread'): void {
     fromSeq: 1,
     toSeq: 1,
     responseMode,
+    listenerOutputProtocol,
     receiverBootId: 'receiver-boot',
   });
   markVcMeetingDeliveryDispatched(dir, { ...memberKey, deliveryKey: 'delivery-key' }, {
@@ -87,6 +93,46 @@ describe('evaluateVcMeetingManagedSend', () => {
     })).toMatchObject({ ok: false, errorCode: 'silent_delivery' });
   });
 
+  it('Plan B: authorizes a silent delivery for the IN-MEETING output channel (silent only gates listener auto-post)', () => {
+    // responseMode:silent means "do not auto-post to the listener group", NOT
+    // "cannot speak in the meeting". The in-meeting managed-output channel
+    // (request-output → hub managed-action) is authorized by capability +
+    // textOutputPolicy/voiceOutputPolicy at the hub, so forInMeetingOutput skips
+    // the silent veto while still proving receipt identity/liveness. A "会议主持"
+    // that is silent in the group must still be able to speak in the meeting.
+    seed('silent');
+    expect(evaluateVcMeetingManagedSend(dir, {
+      receiverSessionId: 'receiver-session', receiverSession: true,
+      turnId: 'delivery-key', dispatchAttempt: 1,
+      forInMeetingOutput: true,
+    })).toMatchObject({ ok: true, kind: 'listener_thread' });
+    // Same delivery, default (listener auto-post) path stays suppressed.
+    expect(evaluateVcMeetingManagedSend(dir, {
+      receiverSessionId: 'receiver-session', receiverSession: true,
+      turnId: 'delivery-key', dispatchAttempt: 1,
+    })).toMatchObject({ ok: false, errorCode: 'silent_delivery' });
+  });
+
+  it('Plan B: forInMeetingOutput still fails closed on a missing/mismatched receipt (no silent bypass of identity checks)', () => {
+    // The flag skips ONLY the silent veto — every identity/liveness check
+    // (receipt exists for this session, attempt matches, active projection,
+    // dispatched/completed) still applies, so it can never authorize output the
+    // receipt itself wouldn't.
+    seed('silent');
+    // Wrong dispatchAttempt → origin_mismatch even with forInMeetingOutput.
+    expect(evaluateVcMeetingManagedSend(dir, {
+      receiverSessionId: 'receiver-session', receiverSession: true,
+      turnId: 'delivery-key', dispatchAttempt: 99,
+      forInMeetingOutput: true,
+    })).toMatchObject({ ok: false, errorCode: 'origin_mismatch' });
+    // Unknown turnId → receipt_not_found even with forInMeetingOutput.
+    expect(evaluateVcMeetingManagedSend(dir, {
+      receiverSessionId: 'receiver-session', receiverSession: true,
+      turnId: 'no-such-delivery', dispatchAttempt: 1,
+      forInMeetingOutput: true,
+    })).toMatchObject({ ok: false, errorCode: 'receipt_not_found' });
+  });
+
   it('allows the exact durable origin for listener_thread mode', () => {
     seed('listener_thread');
     expect(evaluateVcMeetingManagedSend(dir, {
@@ -95,7 +141,9 @@ describe('evaluateVcMeetingManagedSend', () => {
     })).toEqual({
       ok: true,
       kind: 'listener_thread',
-      meetingOwner: { listenerAppId: 'listener', meetingId: 'meeting' },
+      outputPlacement: 'auto',
+      listenerOutputProtocol: 'plain',
+      meetingOwner: { listenerAppId: 'listener', meetingId: 'meeting', memberId: 'member', memberEpoch: 1 },
     });
   });
 
@@ -185,12 +233,31 @@ describe('evaluateVcMeetingManagedSend', () => {
     })).toEqual({
       ok: true,
       kind: 'listener_thread',
-      meetingOwner: { listenerAppId: 'listener', meetingId: 'meeting' },
+      outputPlacement: 'auto',
+      listenerOutputProtocol: 'plain',
+      meetingOwner: { listenerAppId: 'listener', meetingId: 'meeting', memberId: 'member', memberEpoch: 1 },
     });
     expect(evaluateVcMeetingManagedSend(dir, {
       receiverSessionId: 'receiver-session', receiverSession: true,
       turnId: 'om_stale', currentImTurnOrigin: imOrigin,
     })).toMatchObject({ ok: false, errorCode: 'origin_unproven' });
+  });
+
+  it('Plan B: an orphaned-stamp session (no active projection) falls back to ordinary instead of bricking', () => {
+    // Regression: stampVcMeetingBinding marks an ordinary chat-scope session as
+    // a receiver, but when projection registration fails (e.g. Pi has no
+    // reliableTurnTerminal) or the projection is removed, the stamp remains.
+    // The managed-output gate must not brick such a session: with no active
+    // projection it is an ordinary session and may send ordinary IM.
+    expect(evaluateVcMeetingManagedSend(dir, {
+      receiverSessionId: 'receiver-session', receiverSession: true,
+    })).toEqual({ ok: true, kind: 'ordinary' });
+    // A stale IM turn origin does not upgrade it to listener_thread, but the
+    // session still sends as ordinary (not origin_unproven).
+    expect(evaluateVcMeetingManagedSend(dir, {
+      receiverSessionId: 'receiver-session', receiverSession: true,
+      turnId: 'om_current', currentImTurnOrigin: imOrigin,
+    })).toEqual({ ok: true, kind: 'ordinary' });
   });
 
   it('fences an explicit IM send after removal or ownership churn', () => {
@@ -203,10 +270,13 @@ describe('evaluateVcMeetingManagedSend', () => {
       sinkOwnerGeneration: 1, joinedAtIngestSeq: 0,
       receiverSessionId: 'receiver-session', outputChatId: 'listener-chat',
     })).toMatchObject({ ok: true });
+    // Plan B: after removal there is no active projection, so the session is
+    // ordinary again — the stale IM turn origin does not authorize a
+    // listener_thread send, but ordinary sends are allowed (not bricked).
     expect(evaluateVcMeetingManagedSend(dir, {
       receiverSessionId: 'receiver-session', receiverSession: true,
       turnId: 'om_current', currentImTurnOrigin: imOrigin,
-    })).toMatchObject({ ok: false, errorCode: 'origin_unproven' });
+    })).toEqual({ ok: true, kind: 'ordinary' });
 
     const epoch2 = { ...memberKey, memberEpoch: 2 };
     expect(applyVcMeetingMemberProjection(dir, {
@@ -217,6 +287,8 @@ describe('evaluateVcMeetingManagedSend', () => {
       sinkOwnerGeneration: 2, joinedAtIngestSeq: 0,
       receiverSessionId: 'receiver-session', outputChatId: 'listener-chat',
     })).toMatchObject({ ok: true });
+    // Ownership churn: epoch 2 is active, but the IM turn origin is epoch 1
+    // (stale). An active projection keeps the fail-closed gate.
     expect(evaluateVcMeetingManagedSend(dir, {
       receiverSessionId: 'receiver-session', receiverSession: true,
       turnId: 'om_current', currentImTurnOrigin: imOrigin,
@@ -260,6 +332,39 @@ describe('evaluateVcMeetingManagedSend', () => {
     })).toMatchObject({ ok: false, errorCode: 'silent_delivery' });
   });
 
+  it('keeps listener placement frozen on the accepted receipt', () => {
+    seed('listener_thread', 'topic');
+    applyVcMeetingMemberProjection(dir, {
+      ...memberKey,
+      ownerBootId: 'owner-boot', ownerEpoch: 1, agentAppId: 'agent', role: 'minutes',
+      membershipGeneration: 2, status: 'active', responseMode: 'listener_thread',
+      joinedAtIngestSeq: 0, receiverSessionId: 'receiver-session', outputChatId: 'listener-chat',
+      outputPlacement: 'chat',
+    });
+    expect(evaluateVcMeetingManagedSend(dir, {
+      receiverSessionId: 'receiver-session', receiverSession: true,
+      turnId: 'delivery-key', dispatchAttempt: 1,
+    })).toMatchObject({
+      ok: true,
+      kind: 'listener_thread',
+      outputPlacement: 'topic',
+      meetingOwner: { memberId: 'member', memberEpoch: 1 },
+    });
+  });
+
+  it('freezes the controlled-output protocol on the delivery receipt', () => {
+    seed('listener_thread', 'topic', 'decision_v1');
+    expect(evaluateVcMeetingManagedSend(dir, {
+      receiverSessionId: 'receiver-session', receiverSession: true,
+      turnId: 'delivery-key', dispatchAttempt: 1,
+    })).toMatchObject({
+      ok: true,
+      kind: 'listener_thread',
+      outputPlacement: 'topic',
+      listenerOutputProtocol: 'decision_v1',
+    });
+  });
+
   it('keeps ordinary non-receiver sends unchanged', () => {
     expect(evaluateVcMeetingManagedSend(dir, {
       receiverSessionId: 'ordinary-session', receiverSession: false, turnId: 'im-message',
@@ -274,7 +379,9 @@ describe('evaluateVcMeetingManagedSend', () => {
     })).toEqual({
       ok: true,
       kind: 'listener_thread',
-      meetingOwner: { listenerAppId: 'listener', meetingId: 'meeting' },
+      outputPlacement: 'auto',
+      listenerOutputProtocol: 'plain',
+      meetingOwner: { listenerAppId: 'listener', meetingId: 'meeting', memberId: 'member', memberEpoch: 1 },
     });
     expect(evaluateVcMeetingManagedOriginClaim(dir, {
       receiverSessionId: 'receiver-session', liveOrigin, claimedCapability: 'cap-old',

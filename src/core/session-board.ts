@@ -1,6 +1,7 @@
 // 会话看板（kanban）的列定义与输入校验 — daemon 写端点与 dashboard 前端共用，
 // 保证两侧对「合法列 / 合法排序值 / 合法标题」的口径一致。保持零依赖：
 // 该模块会被 esbuild 打进浏览器 bundle。
+import { truncateUtf16WellFormed } from '../utils/unicode.js';
 
 export const KANBAN_COLUMN_IDS = ['backlog', 'todo', 'in_progress', 'in_review', 'done'] as const;
 export type SessionKanbanColumn = (typeof KANBAN_COLUMN_IDS)[number];
@@ -18,11 +19,14 @@ export function normalizeKanbanPosition(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) ? value : null;
 }
 
-/** 重命名标题：单行化、移除会被终端解释的 C0/DEL 控制字符、限长；
- * 空串视为非法。标题会被送进原生 TUI 的 `/rename`，所以这里也是输入边界。 */
+/**
+ * 重命名标题：单行化、移除会被终端解释的 C0/C1/DEL 控制字符、限长；
+ * 空串视为非法。标题既会写到 `botmux list` 的本机 TTY，也会送进原生
+ * TUI 的 `/rename`，所以这里是两条路径共用的输入边界。
+ */
 export function normalizeSessionTitle(value: unknown): string | null {
   if (typeof value !== 'string') return null;
   const title = value.replace(/[\u0000-\u001f\u007f-\u009f]+/g, ' ').replace(/\s+/g, ' ').trim();
   if (!title) return null;
-  return title.slice(0, SESSION_TITLE_MAX);
+  return truncateUtf16WellFormed(title, SESSION_TITLE_MAX);
 }

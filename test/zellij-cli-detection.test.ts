@@ -6,6 +6,7 @@ describe('cliIdFromCommArgv', () => {
     expect(cliIdFromCommArgv('codex', ['/usr/local/bin/codex'])).toBe('codex');
     expect(cliIdFromCommArgv('claude', ['claude'])).toBe('claude-code');
     expect(cliIdFromCommArgv('cursor-agent', ['cursor-agent'])).toBe('cursor');
+    expect(cliIdFromCommArgv('mimo', ['mimo'])).toBe('mimocode');
   });
 
   it('detects a node-wrapped CLI by argv (fnm shim: comm is "node")', () => {
@@ -40,5 +41,57 @@ describe('cliIdFromCommArgv', () => {
     expect(cliIdFromCommArgv('node', ['node', '/x/bin/codex'], 'codex')).toBe('codex');
     expect(cliIdFromCommArgv('cursor-agent', ['cursor-agent'], 'codex')).toBeUndefined();
     expect(cliIdFromCommArgv('cursor-agent', ['cursor-agent'], 'cursor')).toBe('cursor');
+  });
+
+  it('maps only the exact configured executable basename to Codex', () => {
+    const executable = '/opt/Vendor Codex/vendorCodex';
+    expect(cliIdFromCommArgv('vendorCodex', [executable], 'codex', executable)).toBe('codex');
+    expect(cliIdFromCommArgv('codex', ['/usr/local/bin/codex'], 'codex', executable)).toBeUndefined();
+    expect(cliIdFromCommArgv('claude', ['claude'], 'codex', executable)).toBeUndefined();
+  });
+
+  it('finds an exact custom runtime behind a generic launcher without matching official Codex', () => {
+    const executable = '/opt/vendorCodex';
+    expect(cliIdFromCommArgv(
+      'node',
+      ['node', '--enable-source-maps', executable],
+      'codex',
+      executable,
+    )).toBe('codex');
+    expect(cliIdFromCommArgv(
+      'node',
+      ['node', '/usr/local/bin/codex'],
+      'codex',
+      executable,
+    )).toBeUndefined();
+  });
+
+  it('does not scan arbitrary program arguments after the generic launcher script slot', () => {
+    const executable = '/opt/vendorCodex';
+    expect(cliIdFromCommArgv(
+      'node',
+      ['node', '/srv/unrelated.js', executable],
+      'codex',
+      executable,
+    )).toBeUndefined();
+  });
+
+  it('fails closed when an unknown launcher option makes the script slot ambiguous', () => {
+    const executable = '/opt/vendorCodex';
+    expect(cliIdFromCommArgv(
+      'node',
+      ['node', '--require', executable, '/srv/unrelated.js'],
+      'codex',
+      executable,
+    )).toBeUndefined();
+  });
+
+  it('defensively refuses a custom executable that collides with official codex', () => {
+    expect(cliIdFromCommArgv(
+      'codex',
+      ['/usr/local/bin/codex'],
+      'codex',
+      '/opt/vendor/bin/codex',
+    )).toBeUndefined();
   });
 });

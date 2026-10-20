@@ -15,6 +15,7 @@ import {
   orderedFooterRecipients,
   pickBotEntryByName,
   stripCodeSpans,
+  codeSpanRanges,
 } from '../src/utils/bot-routing.js';
 
 type Entry = { larkAppId: string; botName: string | null };
@@ -144,11 +145,32 @@ describe('buildFooterAddressing', () => {
     )).toEqual({ sendTo: 'ou_owner', cc: [] });
   });
 
+  it('uses the current caller for a substitute-triggered reply outside oncall chats', () => {
+    expect(buildFooterAddressing(
+      { ownerOpenId: 'ou_owner', lastCallerOpenId: 'ou_substitute_caller' },
+      { isOncall: false, isSubstitute: true, knownBotOpenIds },
+    )).toEqual({ sendTo: 'ou_substitute_caller', cc: [] });
+  });
+
+  it('lets an explicit human recipient replace the default owner outside oncall chats', () => {
+    expect(buildFooterAddressing(
+      { ownerOpenId: 'ou_owner', lastCallerOpenId: 'ou_caller' },
+      { isOncall: false, hasExplicitMention: true, knownBotOpenIds },
+    )).toEqual({ sendTo: undefined, cc: [] });
+  });
+
   it('uses the last caller in oncall chats when the caller is human', () => {
     expect(buildFooterAddressing(
       { ownerOpenId: 'ou_owner', lastCallerOpenId: 'ou_human_caller' },
       { isOncall: true, knownBotOpenIds },
     )).toEqual({ sendTo: 'ou_human_caller', cc: [] });
+  });
+
+  it('does not append the caller when an explicit human recipient was selected', () => {
+    expect(buildFooterAddressing(
+      { ownerOpenId: 'ou_owner', lastCallerOpenId: 'ou_triggering_bot' },
+      { isOncall: true, hasExplicitMention: true, knownBotOpenIds },
+    )).toEqual({ sendTo: undefined, cc: [] });
   });
 
   it('suppresses owner addressing in oncall when the body explicitly targets a bot', () => {
@@ -177,6 +199,13 @@ describe('buildFooterAddressing', () => {
   it('falls back to the human owner when last caller is a bot', () => {
     expect(buildFooterAddressing(
       { ownerOpenId: 'ou_owner', lastCallerOpenId: 'ou_claude_bot' },
+      { isOncall: true, knownBotOpenIds },
+    )).toEqual({ sendTo: 'ou_owner', cc: [] });
+  });
+
+  it('honors a frozen bot-sender bit even before cross-ref learns that bot id', () => {
+    expect(buildFooterAddressing(
+      { ownerOpenId: 'ou_owner', lastCallerOpenId: 'ou_new_bot', lastCallerIsBot: true },
       { isOncall: true, knownBotOpenIds },
     )).toEqual({ sendTo: 'ou_owner', cc: [] });
   });
@@ -277,5 +306,33 @@ describe('stripCodeSpans', () => {
 
   it('leaves an unbalanced stray backtick harmless (name still in prose)', () => {
     expect(hasAt('这里有个 ` 未闭合，@Codex 仍要 @', 'Codex')).toBe(true);
+  });
+
+  // Previous two-regex form of stripCodeSpans; the range-based one must agree.
+  const legacyStrip = (text: string) => text
+    .replace(/(`{3,}|~{3,})[\s\S]*?\1/g, ' ')
+    .replace(/(`+)[\s\S]*?\1/g, ' ');
+
+  it('keeps stripCodeSpans identical to the previous two-pass regex form', () => {
+    for (const text of [
+      '',
+      'plain @Codex',
+      '`a` b ``c`` d',
+      '```\nx\n``` y `z`',
+      '~~~\n@C\n~~~ ~~strike~~',
+      'stray ` then ```\nfence\n``` and ` again',
+      '`` ` `` and ```js\n`inner`\n```',
+      'open ``` never closed `x`',
+      '```\nx\n```' + '`y`' + '`z`',
+    ]) {
+      expect(stripCodeSpans(text)).toBe(legacyStrip(text));
+    }
+  });
+});
+
+describe('codeSpanRanges', () => {
+  it('returns sorted [start, end) offsets for inline spans and fences', () => {
+    const text = 'a `x` b\n```\ny\n```\nc';
+    expect(codeSpanRanges(text)).toEqual([[2, 5], [8, 17]]);
   });
 });

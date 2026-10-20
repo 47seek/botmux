@@ -1,8 +1,24 @@
+import type React from 'react';
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
 import { DropdownMenu } from './dashboard-components.js';
+import { fetchDetectedModels, mergeModelCandidates, modelSuggestionsForOption } from './bot-defaults.js';
+import { ModelPickerField } from './field-controls.js';
+import { confirm } from './confirm-modal.js';
 import { t } from './ui.js';
 
 export const OPEN_BOT_ONBOARDING_EVENT = 'botmux:open-bot-onboarding';
+
+/** 克隆源 Bot 里会被 cloneBotConfig 带过去、且表单里也有对应项的字段。 */
+export type CloneSourceDefaults = {
+  cliId?: string;
+  cliLaunchMode?: 'forge-traex';
+  workingDir?: string;
+  dirMode?: 'card' | 'fixed';
+  model?: string;
+};
+
+let cloneSourceAppId: string | undefined;
+let cloneSourceDefaults: CloneSourceDefaults | undefined;
 
 type OnboardingStatus =
   | 'starting'
@@ -20,6 +36,9 @@ type OnboardingPermission = {
   skippedScopeCount?: number;
   versionId?: string;
   scopeWarning?: string;
+  /** 与 ok 独立：权限/发版全绿也可能没写上 redirect 白名单（见服务端同名字段注释）。 */
+  redirectConfigured?: boolean;
+  redirectWarning?: string;
   reason?: string;
   message?: string;
 };
@@ -43,6 +62,8 @@ type OnboardingJob = {
   liveStartMessage?: string;
   permission?: OnboardingPermission;
   remainingSteps?: RemainingStep[];
+  /** needs_owner 时的预填建议（创建应用所用账号的邮箱）。 */
+  suggestedOwner?: string;
   error?: string;
   message?: string;
 };
@@ -55,6 +76,9 @@ type CliOption = {
   available?: boolean;
   command?: string;
   availabilityReason?: string;
+  cliLaunchMode?: 'forge-traex';
+  /** 静态模型候选（与 bot-defaults.ts 的 CliOption 对齐）。 */
+  modelChoices?: readonly string[];
 };
 
 type CliOptionsState = {
@@ -161,6 +185,11 @@ function statusText(job: OnboardingJob): string {
 
 async function fetchCliOptions(): Promise<CliOptionsState> {
   try {
+    // 裸端点保留「探测登录态」的旧语义，本弹窗正是要那个 webSession（决定
+    // sessionMode 走 reuse 还是 qr，并展示"将使用 …"的账号），所以不带任何
+    // probe 参数。反过来 Bot 配置页显式带 `?probe=none` 跳过探测。
+    // 为什么是 opt-out 而非 opt-in：见 dashboard.ts /api/cli-options 的注释
+    // （immutable chunk 长缓存 + stale-chunk 自愈只覆盖 import 失败）。
     const res = await fetch('/api/cli-options');
     const body = await res.json();
     if (res.ok && Array.isArray(body?.options)) {
@@ -192,7 +221,13 @@ async function fetchCliOptions(): Promise<CliOptionsState> {
           }
         : { status: 'scan_required', ...(typeof body?.webSession?.reason === 'string' ? { reason: body.webSession.reason } : {}) };
       return {
-        options: body.options as CliOption[],
+        options: (body.options as any[]).map((o: any) => ({
+          ...o,
+          // 容错：缺失/非数组 → []，与 bot-defaults.ts 的 fetchCliOptions 对齐。
+          modelChoices: Array.isArray(o?.modelChoices)
+            ? o.modelChoices.filter((m: unknown): m is string => typeof m === 'string')
+            : [],
+        })) as CliOption[],
         ttadkModelDefault,
         ttadkModelSuggestions,
         suggestedAppName,
@@ -231,11 +266,86 @@ function normalizeFormForOptions(form: OnboardingFormState, cliState: CliOptions
   }, cliId, cliState);
 }
 
-export async function openBotOnboarding(): Promise<void> {
+/**
+ * 从克隆源 Bot 的配置行推出表单预填值。
+ *
+ * 目录必须按**源自己的形态**映射，不能一律 fixed：源只有 workingDir 时若按
+ * fixed 预填，目标会带上 defaultWorkingDir，而后端取目录是
+ * `defaultWorkingDir ?? workingDir` —— 目标那个 '~' 会反过来把源目录遮蔽掉，
+ * 新会话直接在 ~ 起，源的仓库目录静默丢失。
+ */
+export function cloneSourceDefaultsFrom(source: {
+  cliId?: string | null;
+  agentSelectionKey?: string | null;
+  defaultWorkingDir?: string | null;
+  workingDir?: string | null;
+  model?: string | null;
+} | undefined): CloneSourceDefaults | undefined {
+  if (!source) return undefined;
+  return {
+    ...((source.agentSelectionKey || source.cliId) ? { cliId: source.agentSelectionKey || source.cliId! } : {}),
+    ...(source.defaultWorkingDir
+      ? { workingDir: source.defaultWorkingDir, dirMode: 'fixed' as const }
+      : source.workingDir
+        ? { workingDir: source.workingDir, dirMode: 'card' as const }
+        : {}),
+    ...(source.model ? { model: source.model } : {}),
+  };
+}
+
+/**
+ * 把克隆源的配置铺进表单初值。只覆盖源上确实有值的项，其余保持普通新建的默认，
+ * 这样表单展示的就是克隆真正会用的配置（cloneBotConfig 之后仍以源为准）。
+ */
+export function applyCloneDefaults(
+  form: OnboardingFormState,
+  defaults: CloneSourceDefaults | undefined,
+): OnboardingFormState {
+  if (!defaults) return form;
+  return {
+    ...form,
+    ...(defaults.cliId ? { cliId: defaults.cliId } : {}),
+    ...(defaults.workingDir ? { workingDir: defaults.workingDir } : {}),
+    ...(defaults.dirMode ? { dirMode: defaults.dirMode } : {}),
+    ...(defaults.model ? { model: defaults.model } : {}),
+  };
+}
+
+/**
+ * 克隆时用源 Bot 的配置预填表单：后端 cloneBotConfig 会用源 Bot 的
+ * cliId / 目录 / model 覆盖表单值，所以表单必须显示**真正会被使用的**那份，
+ * 否则用户填了却被静默丢弃（看到 claude-code，建出来却是源 Bot 的 codex）。
+ */
+export async function openBotOnboarding(
+  sourceAppId?: string,
+  sourceDefaults?: CloneSourceDefaults,
+): Promise<void> {
+  cloneSourceAppId = sourceAppId;
+  cloneSourceDefaults = sourceAppId ? sourceDefaults : undefined;
   window.dispatchEvent(new Event(OPEN_BOT_ONBOARDING_EVENT));
 }
 
-function PermissionSummary(props: { job: OnboardingJob }): JSX.Element | null {
+/**
+ * redirect 白名单没写上时的一条独立告警。
+ *
+ * 成功时**不加噪音**（回调地址配好本就是默认预期）；失败/未知时必须可见：这一步
+ * 不阻断建 bot，但缺了它，群聊模式 / 会话群标签 / `/login` 一点授权就 20029。
+ * `redirectConfigured === undefined` 走**旧快照兼容**：老 job 没有这个字段，不该
+ * 凭空报警，所以只对显式 false 出提示。
+ */
+function RedirectWarning(props: { permission: OnboardingPermission }): React.JSX.Element | null {
+  const { permission } = props;
+  if (permission.redirectConfigured !== false) return null;
+  return (
+    <p className="hint-warn" data-onboarding-redirect-warn="">
+      {permission.redirectWarning
+        ? t('botOnboarding.permissionRedirectWarn', { reason: permission.redirectWarning })
+        : t('botOnboarding.permissionRedirectWarnNoReason')}
+    </p>
+  );
+}
+
+function PermissionSummary(props: { job: OnboardingJob }): React.JSX.Element | null {
   const { job } = props;
   if ((job.status !== 'completed' && job.status !== 'needs_owner') || !job.permission) return null;
   const permission = job.permission;
@@ -249,6 +359,7 @@ function PermissionSummary(props: { job: OnboardingJob }): JSX.Element | null {
       <>
         <p className="hint-ok">{parts.join(' ')}</p>
         {permission.scopeWarning ? <p className="hint-warn">{permission.scopeWarning}</p> : null}
+        <RedirectWarning permission={permission} />
       </>
     );
   }
@@ -259,6 +370,7 @@ function PermissionSummary(props: { job: OnboardingJob }): JSX.Element | null {
         {t('botOnboarding.permissionManual')}
         {permission.message ? `（${permission.message}）` : ''}
       </p>
+      <RedirectWarning permission={permission} />
       {steps.length ? (
         <ol className="onboarding-steps">
           {steps.map(step => (
@@ -272,7 +384,7 @@ function PermissionSummary(props: { job: OnboardingJob }): JSX.Element | null {
   );
 }
 
-function OnboardingMeta(props: { job: OnboardingJob }): JSX.Element | null {
+function OnboardingMeta(props: { job: OnboardingJob }): React.JSX.Element | null {
   const { job } = props;
   if (!job.appId) return null;
   return (
@@ -285,7 +397,7 @@ function OnboardingMeta(props: { job: OnboardingJob }): JSX.Element | null {
   );
 }
 
-function QrCard(props: { dataUrl: string; alt: string; link?: string }): JSX.Element {
+function QrCard(props: { dataUrl: string; alt: string; link?: string }): React.JSX.Element {
   return (
     <div className="qr-card">
       <img className="qr-image" src={props.dataUrl} alt={props.alt} />
@@ -314,7 +426,7 @@ function OnboardingJobView(props: {
   onSubmitOwner(job: OnboardingJob, owner: string, ownerId: string): void;
   onRetry(mode: 'web' | 'compat'): void;
   onClose(): void;
-}): JSX.Element {
+}): React.JSX.Element {
   const { job, ownerError } = props.view;
   return (
     <>
@@ -336,7 +448,8 @@ function OnboardingJobView(props: {
             <span>{t('botOnboarding.ownerLabel')}</span>
             <input
               id="ob-owner"
-              type="email"
+              type="text"
+              inputMode="email"
               placeholder={t('botOnboarding.ownerPlaceholder')}
               autoComplete="off"
               spellCheck={false}
@@ -418,23 +531,41 @@ function OnboardingForm(props: {
   onSessionModeChange(mode: 'reuse' | 'qr'): void;
   onSubmit(event: FormEvent<HTMLFormElement>): void;
   onClose(): void;
-}): JSX.Element {
+}): React.JSX.Element {
   const selectedCli = props.cliState.options.find(option => option.id === props.form.cliId);
-  const acceptsModel = selectedCli?.gateway === 'ttadk' && selectedCli.acceptsModel !== false;
   const modelDisabled = selectedCli?.gateway === 'ttadk' && selectedCli.acceptsModel === false;
-  const modelPlaceholder = acceptsModel
-      ? t('botOnboarding.modelTtadkPlaceholder').replace('{model}', props.cliState.ttadkModelDefault)
-      : t('botOnboarding.modelPlaceholder');
+  // live 探测当前 CLI 的可用模型（ttadk 网关项保持现状，只用静态建议列表）。
+  const [detectedModels, setDetectedModels] = useState<{ models: string[]; source: 'live' | 'static' } | null>(null);
+  const cliId = props.form.cliId;
+  useEffect(() => {
+    if (selectedCli?.gateway === 'ttadk') {
+      setDetectedModels(null);
+      return;
+    }
+    // stale 标志防卸载/竞态：cliId 快速切换时旧响应不得覆盖新 CLI 的候选。
+    let stale = false;
+    fetchDetectedModels(cliId).then(result => { if (!stale) setDetectedModels(result); });
+    return () => { stale = true; };
+    // 只按 cliId 重新探测；cliState 刷新的静态候选经 modelSuggestionsForOption 合入。
+  }, [cliId]);
+  const modelCandidates = mergeModelCandidates(
+    modelSuggestionsForOption(selectedCli, props.cliState),
+    detectedModels?.models ?? null,
+  );
+  const detectedLiveCount = detectedModels?.source === 'live' ? detectedModels.models.length : 0;
   const dirLabel = props.form.dirMode === 'card' ? t('botOnboarding.dirLabelCard') : t('botOnboarding.dirLabelFixed');
   const dirPlaceholder = props.form.dirMode === 'card'
     ? t('botOnboarding.dirPlaceholderCard')
     : t('botOnboarding.dirPlaceholderFixed');
-  const cliOptions = props.cliState.options.map(option => ({
-    value: option.id,
-    label: option.available === false
-      ? t('botOnboarding.cliMissingOption', { label: option.label, command: option.command ?? option.id })
-      : option.label,
-  }));
+  // 按名称首字母排序，方便在 20+ 个 CLI 里定位；排序用原始 label（缺失告警前缀不参与）。
+  const cliOptions = [...props.cliState.options]
+    .sort((a, b) => a.label.localeCompare(b.label, 'en', { sensitivity: 'base' }))
+    .map(option => ({
+      value: option.id,
+      label: option.available === false
+        ? t('botOnboarding.cliMissingOption', { label: option.label, command: option.command ?? option.id })
+        : option.label,
+    }));
   const dirModeOptions: Array<{ value: OnboardingFormState['dirMode']; label: string }> = [
     { value: 'fixed', label: t('botOnboarding.dirModeFixed') },
     { value: 'card', label: t('botOnboarding.dirModeCard') },
@@ -502,6 +633,9 @@ function OnboardingForm(props: {
           label={onboardingOptionLabel(cliOptions, props.form.cliId)}
           value={props.form.cliId}
           options={cliOptions}
+          searchable
+          searchPlaceholder={t('common.dropdownSearch')}
+          searchEmptyLabel={t('common.dropdownSearchEmpty')}
           onChange={cliId => {
             props.onFormChange(syncModelForCli(props.form, cliId, props.cliState));
           }}
@@ -536,24 +670,26 @@ function OnboardingForm(props: {
           onChange={event => props.onFormChange({ ...props.form, workingDir: event.currentTarget.value })}
         />
       </label>
-      {!modelDisabled ? <label className="onboarding-field">
-        <span>{t('botOnboarding.modelLabel')}</span>
-        <input
-          id="ob-model"
-          type="text"
-          list={acceptsModel ? 'ob-model-suggestions' : undefined}
-          placeholder={modelPlaceholder}
-          autoComplete="off"
-          spellCheck={false}
-          value={props.form.model}
-          onChange={event => props.onFormChange({ ...props.form, model: event.currentTarget.value })}
-        />
-        {acceptsModel ? (
-          <datalist id="ob-model-suggestions">
-            {props.cliState.ttadkModelSuggestions.map(model => <option value={model} key={model} />)}
-          </datalist>
-        ) : null}
-      </label> : null}
+      {!modelDisabled ? (
+        <div className="onboarding-field">
+          <span>{t('botOnboarding.modelLabel')}</span>
+          <ModelPickerField
+            key={props.form.cliId}
+            value={props.form.model}
+            onChange={model => props.onFormChange({ ...props.form, model })}
+            options={modelCandidates}
+            dataInput="ob-model"
+            ariaLabel={t('botOnboarding.modelLabel')}
+            defaultLabel={t('botDefaults.modelPickerDefault')}
+            customLabel={t('botDefaults.modelPickerCustom')}
+            menuClassName="onboarding-menu"
+            detectedCount={detectedLiveCount || undefined}
+            detectedLabel={detectedLiveCount > 0
+              ? t('botDefaults.modelPickerDetected', { count: detectedLiveCount })
+              : undefined}
+          />
+        </div>
+      ) : null}
       {props.error ? <p className="form-error">{props.error}</p> : null}
       <div className="actions onboarding-actions">
         <button type="button" id="ob-cancel" disabled={props.submitting} onClick={props.onClose}>{t('botOnboarding.cancel')}</button>
@@ -577,7 +713,7 @@ function OnboardingForm(props: {
   );
 }
 
-export function BotOnboardingDialog(props: { open: boolean; onClose(): void }): JSX.Element {
+export function BotOnboardingDialog(props: { open: boolean; onClose(): void }): React.JSX.Element {
   const dialogRef = useRef<HTMLDialogElement | null>(null);
   const pollTimerRef = useRef<number | null>(null);
   const loadSeqRef = useRef(0);
@@ -598,13 +734,16 @@ export function BotOnboardingDialog(props: { open: boolean; onClose(): void }): 
 
   const close = useCallback(() => {
     stopPolling();
+    cloneSourceAppId = undefined;
+    cloneSourceDefaults = undefined;
     props.onClose();
   }, [props, stopPolling]);
 
   const applyJob = useCallback((job: OnboardingJob) => {
     setView({ kind: 'job', job });
     if (job.status === 'needs_owner') {
-      setOwnerInput('');
+      // 预填创建账号的邮箱（后端自动确认失败时给出），用户复核/修改后提交。
+      setOwnerInput(job.suggestedOwner ?? '');
       setOwnerIdInput('');
     }
     if (shouldStopPolling(job)) stopPolling();
@@ -633,7 +772,9 @@ export function BotOnboardingDialog(props: { open: boolean; onClose(): void }): 
     loadSeqRef.current = seq;
     const initialCliState = defaultCliOptionsState();
     setCliState(initialCliState);
-    setForm(defaultFormState());
+    // 克隆模式下用源 Bot 的值开局，让表单显示真正会生效的配置（后端克隆会用
+    // 源 Bot 覆盖这几项）；普通新建仍是原来的默认值。
+    setForm(applyCloneDefaults(defaultFormState(), cloneSourceDefaults));
     setSessionMode('checking');
     setView({ kind: 'form' });
     setSubmitting(false);
@@ -696,6 +837,7 @@ export function BotOnboardingDialog(props: { open: boolean; onClose(): void }): 
           workingDir: form.workingDir.trim(),
           dirMode: form.dirMode,
           model: form.model.trim() || undefined,
+          cloneSourceAppId,
         }),
       });
       const body = await res.json();
@@ -719,9 +861,9 @@ export function BotOnboardingDialog(props: { open: boolean; onClose(): void }): 
     void startOnboarding('web');
   }, [startOnboarding]);
 
-  const retry = useCallback((registrationMode: 'web' | 'compat') => {
+  const retry = useCallback(async (registrationMode: 'web' | 'compat') => {
     if (registrationMode === 'compat') {
-      const accepted = window.confirm(t('botOnboarding.compatibilityConfirm'));
+      const accepted = await confirm({ title: '兼容性确认', message: t('botOnboarding.compatibilityConfirm'), danger: false });
       if (!accepted) return;
     }
     const requiresFreshLogin = registrationMode === 'web'

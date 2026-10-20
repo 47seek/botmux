@@ -42,6 +42,16 @@ export interface TeamFilters {
 
 export type TeamApiResult<T = any> = DashboardApiResult<T>;
 
+export interface FeedbackPolicyLayer {
+  enabled?: boolean;
+  audience?: 'requester' | 'reviewers' | 'everyone';
+  reviewers?: unknown[];
+  visibleSemantics?: unknown[];
+  buttons?: unknown[];
+  negativeFollowup?: { reasons?: unknown[]; comment?: { enabled?: boolean; required?: boolean; placeholder?: string; maxLength?: number } };
+  allowReselect?: boolean;
+}
+
 export interface HostedTeamsResponse {
   ok?: boolean;
   deployment?: {
@@ -112,25 +122,16 @@ export async function deleteHostedTeam(teamId: string): Promise<TeamApiResult> {
   return jsend('DELETE', '/api/team/hosted/' + encodeURIComponent(teamId));
 }
 
+export async function updateHostedTeamFeedback(teamId: string, feedback: FeedbackPolicyLayer | null): Promise<TeamApiResult<{ feedback?: FeedbackPolicyLayer | null }>> {
+  return jput(`/api/team/hosted/${encodeURIComponent(teamId)}/feedback`, { feedback });
+}
+
 export async function generateLocalInvite(teamId: string): Promise<TeamApiResult<{ code?: string }>> {
   return jpost<{ code?: string }>('/api/team/local-invite', { teamId });
 }
 
 export async function joinRemoteTeam(hubUrl: string, inviteCode: string): Promise<TeamApiResult> {
   return jpost('/api/team/join-remote', { hubUrl, inviteCode });
-}
-
-export function allTeams(localTeams: Team[], remoteTeams: Team[]): Team[] {
-  return [...localTeams, ...remoteTeams];
-}
-
-export function pickedSet(map: Map<string, Set<string>>, key: string): Set<string> {
-  let s = map.get(key);
-  if (!s) {
-    s = new Set();
-    map.set(key, s);
-  }
-  return s;
 }
 
 export function botMatchesTeamFilters(bot: RosterBot, filters: TeamFilters): boolean {

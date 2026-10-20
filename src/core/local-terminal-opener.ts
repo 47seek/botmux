@@ -2,10 +2,13 @@ import { spawn, spawnSync } from 'node:child_process';
 import { homedir } from 'node:os';
 import { delimiter } from 'node:path';
 import type { DaemonSession } from './types.js';
+import { resolveSessionLaunchModel } from './session-model.js';
 import { getBot } from '../bot-registry.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import type { CliId } from '../adapters/cli/types.js';
 import { buildWrappedLaunch, decorateResumeForWrapper, parseWrapperCli } from '../setup/cli-selection.js';
+import { buildForgeTraexLaunch, decorateResumeForCliLaunchMode, type CliLaunchMode } from './cli-launch-mode.js';
+import { stripPm2GracefulExitMarker } from '../pm2-graceful-exit.js';
 
 type LocalTerminalBackend = 'cli' | 'app';
 
@@ -29,6 +32,7 @@ interface EffectiveCliConfig {
   cliId: CliId;
   cliPathOverride?: string;
   wrapperCli?: string;
+  cliLaunchMode?: CliLaunchMode;
   model?: string;
 }
 
@@ -50,13 +54,17 @@ function onPath(bin: string): boolean {
 }
 
 function effectiveCliConfig(ds: DaemonSession): EffectiveCliConfig {
-  let botCfg: { cliId?: CliId; cliPathOverride?: string; wrapperCli?: string; model?: string } | undefined;
+  let botCfg: { cliId?: CliId; cliPathOverride?: string; wrapperCli?: string; cliLaunchMode?: CliLaunchMode; model?: string } | undefined;
   try { botCfg = getBot(ds.larkAppId).config; } catch { /* tests / deregistered bot */ }
   return {
     cliId: (ds.session.cliId ?? ds.initConfig?.cliId ?? botCfg?.cliId ?? 'claude-code') as CliId,
     cliPathOverride: ds.session.cliPathOverride ?? ds.initConfig?.cliPathOverride ?? botCfg?.cliPathOverride,
     wrapperCli: ds.session.wrapperCli ?? ds.initConfig?.wrapperCli ?? botCfg?.wrapperCli,
-    model: ds.session.model ?? ds.initConfig?.model ?? botCfg?.model,
+    cliLaunchMode: ds.session.cliLaunchMode ?? ds.initConfig?.cliLaunchMode ?? (ds.session.agentFrozen ? undefined : botCfg?.cliLaunchMode),
+    // The model is not frozen onto the session: prefer what this session was
+    // actually spawned with (initConfig), then what botmux would launch next
+    // (live bot config — see resolveSessionLaunchModel).
+    model: ds.initConfig?.model ?? resolveSessionLaunchModel(ds, botCfg),
   };
 }
 
@@ -67,7 +75,7 @@ function isCodexFamily(cliId: string): boolean {
 function defaultLocalExecutable(cliId: CliId, adapterResolvedBin: string, cliPathOverride?: string): string | null {
   if (cliPathOverride?.trim()) return cliPathOverride.trim();
   if (cliId === 'codex-app') return 'codex';
-  if (cliId === 'mira') return null;
+  if (cliId === 'mira' || cliId === 'dsh') return null;
   if (cliId === 'mir') return 'mircli';
   return adapterResolvedBin;
 }
@@ -79,6 +87,11 @@ function replaceFirstToken(command: string, executable: string): string {
 
 function shellJoin(parts: ReadonlyArray<string>): string {
   return parts.map(shellQuote).join(' ');
+}
+
+function commandForForgeLaunch(args: ReadonlyArray<string>): { command: string; executable: string } {
+  const launch = buildForgeTraexLaunch(args);
+  return { command: shellJoin([launch.bin, ...launch.args]), executable: launch.bin };
 }
 
 function commandForWrapperLaunch(wrapperCli: string, args: ReadonlyArray<string>, model?: string): { command: string; executable: string } {
@@ -111,7 +124,15 @@ export function localCliCommandForSession(ds: DaemonSession): LocalCliCommandRes
   }) ?? null;
 
   if (rawResume) {
-    const decorated = decorateResumeForWrapper(rawResume, cfg.wrapperCli, { ttadkModel: cfg.model });
+    const decorated = cfg.cliLaunchMode
+      ? decorateResumeForCliLaunchMode(rawResume, cfg.cliLaunchMode)
+      : decorateResumeForWrapper(rawResume, cfg.wrapperCli, { ttadkModel: cfg.model });
+    if (cfg.cliLaunchMode === 'forge-traex') {
+      if (!onPath('forge')) {
+        return { ok: false, error: 'cli_unavailable', cliId: cfg.cliId, executable: 'forge' };
+      }
+      return { ok: true, mode: 'resume', executable: 'forge', command: `${cd} && exec ${decorated}` };
+    }
     if (cfg.wrapperCli?.trim()) {
       const executable = parseWrapperCli(cfg.wrapperCli)[0];
       if (!executable || !onPath(executable)) {
@@ -124,6 +145,14 @@ export function localCliCommandForSession(ds: DaemonSession): LocalCliCommandRes
       return { ok: false, error: 'cli_unavailable', cliId: cfg.cliId, executable: executable ?? cfg.cliId };
     }
     return { ok: true, mode: 'resume', executable, command: `${cd} && exec ${replaceFirstToken(rawResume, executable)}` };
+  }
+
+  if (cfg.cliLaunchMode === 'forge-traex') {
+    const { command, executable } = commandForForgeLaunch([]);
+    if (!onPath(executable)) {
+      return { ok: false, error: 'cli_unavailable', cliId: cfg.cliId, executable };
+    }
+    return { ok: true, mode: 'launch', executable, command: `${cd} && exec ${command}` };
   }
 
   if (cfg.wrapperCli?.trim()) {
@@ -146,7 +175,15 @@ export function localCliCommandForSession(ds: DaemonSession): LocalCliCommandRes
 
 function spawnDetached(command: string, args: string[]): { ok: true } | { ok: false; error: string } {
   try {
-    const child = spawn(command, args, { detached: true, stdio: 'ignore' });
+    // Strip the daemon's graceful-exit sentinel: the launched terminal runs a
+    // login shell → local AI CLI that could itself start a foreground botmux,
+    // which would then exit 90 on a clean stop (a supervisor reads that as a
+    // crash). Only the PM2-managed cores may carry the marker.
+    const child = spawn(command, args, {
+      detached: true,
+      stdio: 'ignore',
+      env: stripPm2GracefulExitMarker(process.env),
+    });
     child.unref();
     return { ok: true };
   } catch (err) {

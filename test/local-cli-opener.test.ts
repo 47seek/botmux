@@ -3,6 +3,10 @@
  * Run: pnpm vitest run test/local-cli-opener.test.ts
  */
 import { describe, it, expect, vi } from 'vitest';
+import { execFileSync } from 'node:child_process';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
 import {
   appleScriptQuote,
   buildItermAppleScript,
@@ -18,6 +22,17 @@ import {
 } from '../src/services/local-cli-opener.js';
 import { createCliAdapterSync } from '../src/adapters/cli/registry.js';
 import type { DaemonSession } from '../src/core/types.js';
+
+async function withCommandFileTempRoot<T>(run: (root: string) => Promise<T>): Promise<T> {
+  const root = mkdtempSync(join(tmpdir(), 'botmux-local-cli-opener-test-'));
+  vi.stubEnv('TMPDIR', root);
+  try {
+    return await run(root);
+  } finally {
+    vi.unstubAllEnvs();
+    rmSync(root, { recursive: true, force: true });
+  }
+}
 
 function ds(overrides: Partial<DaemonSession> = {}): DaemonSession {
   return {
@@ -65,7 +80,9 @@ describe('local-cli-opener', () => {
         session: { ...ds().session, cliId, cliSessionId: 'ses_nativeid' },
       }), {
         mode: 'resume',
-        adapterFactory: (id) => createCliAdapterSync(id, '/bin/echo'),
+        adapterFactory: (id) => id === 'oh-my-pi'
+          ? ({ buildResumeCommand: () => "omp --resume '/tmp/omp/turn.jsonl' --session-dir '/tmp/omp'" })
+          : createCliAdapterSync(id, '/bin/echo'),
       });
 
       expect(supportsLocalCliOpen(cliId)).toBe(true);
@@ -93,6 +110,123 @@ describe('local-cli-opener', () => {
       ok: true,
       command: "cd '/tmp/project'\\''s dir' && codex resume 'native'\\''id'",
     });
+  });
+
+  it('accepts only the exact shell-quoted OMP resume command shape', () => {
+    const session = ds({
+      session: { ...ds().session, cliId: 'oh-my-pi', cliSessionId: undefined },
+    });
+    const valid = "omp --resume '/tmp/omp/turn'\\''s.jsonl' --session-dir '/tmp/omp/session'\\''s'";
+    const accepted = buildLocalCliOpenCommand(session, {
+      mode: 'resume',
+      adapterFactory: () => ({ buildResumeCommand: () => valid }),
+    });
+    expect(accepted).toEqual({
+      ok: true,
+      command: `cd '/tmp/project'\\''s dir' && ${valid}`,
+    });
+
+    for (const raw of [
+      "omp --resume '/tmp/omp/turn.jsonl' --session-dir '/tmp/omp'; touch /tmp/pwn",
+      "omp --resume '/tmp/omp/turn.jsonl' --session-dir '/tmp/omp'\ntouch /tmp/pwn",
+      "omp --resume '/tmp/omp/turn.jsonl'",
+      "omp --session-dir '/tmp/omp' --resume '/tmp/omp/turn.jsonl'",
+      "omp --resume '/tmp/omp/turn.jsonl' --session-dir '/tmp/omp' --model extra",
+      "omp --resume /tmp/omp/turn.jsonl --session-dir '/tmp/omp'",
+      "omp --resume '/tmp/omp/turn.jsonl' --session-dir /tmp/omp",
+      "omp --resume 'tmp/omp/turn.jsonl' --session-dir '/tmp/omp'",
+      "omp --resume '$HOME/.omp/turn.jsonl' --session-dir '/tmp/omp'",
+    ]) {
+      const rejected = buildLocalCliOpenCommand(session, {
+        mode: 'resume',
+        adapterFactory: () => ({ buildResumeCommand: () => raw }),
+      });
+      expect(rejected).toMatchObject({ ok: false, error: 'missing_resume_id' });
+    }
+  });
+
+  it('uses the frozen configured Codex executable for local resume', () => {
+    const result = buildLocalCliOpenCommand(ds({
+      session: {
+        ...ds().session,
+        cliRuntime: {
+          id: 'vendor-codex',
+          displayName: 'Vendor Codex',
+          executable: "/opt/Vendor Codex/vendor'codex",
+          source: 'configured',
+          update: { provider: 'none' },
+        },
+      },
+    }), { mode: 'resume' });
+
+    expect(result).toEqual({
+      ok: true,
+      command: "cd '/tmp/project'\\''s dir' && '/opt/Vendor Codex/vendor'\\''codex' resume 'native'\\''id'",
+    });
+  });
+
+  it('uses the frozen legacy-path Codex executable instead of the official command', () => {
+    const result = buildLocalCliOpenCommand(ds({
+      session: {
+        ...ds().session,
+        cliPathOverride: '/opt/legacy/vendor-codex',
+        cliRuntime: {
+          id: 'vendor-codex',
+          displayName: 'vendor-codex',
+          executable: '/opt/legacy/vendor-codex',
+          source: 'legacy-path',
+          update: { provider: 'auto' },
+        },
+      },
+    }), { mode: 'resume' });
+
+    expect(result).toEqual({
+      ok: true,
+      command: "cd '/tmp/project'\\''s dir' && '/opt/legacy/vendor-codex' resume 'native'\\''id'",
+    });
+    expect(result.ok && result.command).not.toContain("&& codex resume");
+  });
+
+  it('uses cliPathOverride from a path-only legacy Codex session', () => {
+    const result = buildLocalCliOpenCommand(ds({
+      session: {
+        ...ds().session,
+        agentFrozen: true,
+        // A trailing space is a valid POSIX filename byte. Use trim only to
+        // reject blank values; the frozen executable itself must stay exact.
+        cliPathOverride: '/opt/legacy/path-only-codex ',
+      },
+    }), { mode: 'resume' });
+
+    expect(result).toEqual({
+      ok: true,
+      command: "cd '/tmp/project'\\''s dir' && '/opt/legacy/path-only-codex ' resume 'native'\\''id'",
+    });
+  });
+
+  it('does not apply a legacy runtime executable to another CLI adapter', () => {
+    const adapterFactory = vi.fn(() => ({ buildResumeCommand: () => 'traex resume native-id' }));
+    const result = buildLocalCliOpenCommand(ds({
+      session: {
+        ...ds().session,
+        cliId: 'traex',
+        cliSessionId: 'native-id',
+        cliPathOverride: '/opt/legacy/custom-traex',
+        cliRuntime: {
+          id: 'custom-traex',
+          displayName: 'custom-traex',
+          executable: '/opt/legacy/custom-traex',
+          source: 'legacy-path',
+          update: { provider: 'auto' },
+        },
+      },
+    }), { mode: 'resume', adapterFactory });
+
+    expect(result).toEqual({
+      ok: true,
+      command: "cd '/tmp/project'\\''s dir' && traex resume 'native-id'",
+    });
+    expect(result.ok && result.command).not.toContain('/opt/legacy/custom-traex');
   });
 
   it('attach mode opens a managed tmux session with exact target syntax', () => {
@@ -123,6 +257,78 @@ describe('local-cli-opener', () => {
       command: "herdr session attach 'bmx-abcdef12'",
     });
     expect(adapterFactory).not.toHaveBeenCalled();
+  });
+
+  it('attach mode opens the exact managed agent inside a shared Herdr session', () => {
+    const result = buildLocalCliOpenCommand(ds({
+      session: {
+        ...ds().session,
+        sessionId: 'abcdef123456',
+        backendType: 'herdr',
+        persistentBackendTarget: {
+          backendType: 'herdr',
+          sessionName: 'work',
+          agentName: 'botmux-abcdef12',
+        },
+        cliSessionId: undefined,
+      },
+    }), { mode: 'attach' });
+
+    expect(result).toEqual({
+      ok: true,
+      command: "herdr --session 'work' agent attach 'botmux-abcdef12'",
+    });
+  });
+
+  it('opens the persisted ZMX directory even when the caller selects another namespace', () => {
+    vi.stubEnv('ZMX_DIR', '/tmp/caller-zmx');
+    vi.stubEnv('TMPDIR', '/tmp/caller-tmp');
+    try {
+      const result = buildLocalCliOpenCommand(ds({
+        session: {
+          ...ds().session,
+          sessionId: 'abcdef123456',
+          backendType: 'zmx',
+          persistentBackendTarget: { backendType: 'zmx', sessionName: 'bmx-owned', socketDir: "/tmp/owner's zmx" },
+        },
+      }), { mode: 'attach' });
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.command).toContain("__zmx-attach-managed 'bmx-owned' 'abcdef123456' '/tmp/owner'\\''s zmx'");
+        expect(result.command).not.toContain('/tmp/caller');
+      }
+    } finally { vi.unstubAllEnvs(); }
+  });
+
+  it('attach mode delegates ZMX to the identity-verifying CLI helper with the complete session id', () => {
+    vi.stubEnv('ZMX_DIR', '/tmp/zmx socket');
+    vi.stubEnv('ZMX_SESSION', 'outer');
+    const adapterFactory = vi.fn(() => ({ buildResumeCommand: () => 'codex resume should-not-run' }));
+    const result = buildLocalCliOpenCommand(ds({
+      session: {
+        ...ds().session,
+        sessionId: 'abcdef123456',
+        backendType: 'zmx',
+        persistentBackendTarget: {
+          backendType: 'zmx',
+          sessionName: 'managed-zmx-target',
+        },
+        cliSessionId: undefined,
+      },
+    }), { mode: 'attach', adapterFactory });
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.command).toContain('unset ZMX_SESSION ZMX_SESSION_PREFIX');
+      expect(result.command).toContain("export ZMX_DIR='/tmp/zmx socket'");
+      expect(result.command).toContain('/dist/cli.js');
+      expect(result.command).toContain("__zmx-attach-managed 'managed-zmx-target' 'abcdef123456'");
+      expect(result.command).not.toContain('bmx-abcdef12');
+      expect(result.command).not.toContain('grep ');
+      expect(result.command).not.toContain('exec zmx attach');
+    }
+    expect(adapterFactory).not.toHaveBeenCalled();
+    vi.unstubAllEnvs();
   });
 
   it('attach mode opens adopted Herdr by exact scoped terminal id when available', () => {
@@ -291,7 +497,7 @@ describe('local-cli-opener', () => {
     expect(isLocalCliOpenReady(pending, { mode: 'resume', adapterFactory })).toBe(true);
   });
 
-  it('treats adopted ids and oh-my-pi continue as ready resume targets', () => {
+  it('treats adopted ids and oh-my-pi exact transcript paths as ready resume targets', () => {
     const adopted = ds({
       adoptedFrom: { source: 'tmux', tmuxTarget: 'dev:1.2', cliId: 'traex', cwd: '/repo', sessionId: 'adopt-native' },
       workingDir: undefined,
@@ -307,7 +513,9 @@ describe('local-cli-opener', () => {
     });
     expect(isLocalCliOpenReady(ohMyPi, {
       mode: 'resume',
-      adapterFactory: () => ({ buildResumeCommand: () => 'omp --continue' }),
+      adapterFactory: () => ({
+        buildResumeCommand: () => "omp --resume '/tmp/omp/turn.jsonl' --session-dir '/tmp/omp'",
+      }),
     })).toBe(true);
   });
 
@@ -410,18 +618,126 @@ describe('local-cli-opener', () => {
   });
 
   it('reports a local terminal error when neither iTerm nor Terminal.app can be opened', async () => {
-    const runOsascript = vi.fn(async () => ({ ok: false, stderr: 'automation denied' }));
-    const result = await openLocalCliInIterm(ds(), {
-      platform: 'darwin',
-      mode: 'resume',
-      runOsascript,
-      adapterFactory: () => ({ buildResumeCommand: () => 'codex resume sid' }),
-    });
+    await withCommandFileTempRoot(async () => {
+      const runOsascript = vi.fn(async () => ({ ok: false, stderr: 'automation denied' }));
+      const scriptPaths: string[] = [];
+      const runOpenCommand = vi.fn(async (args: string[]) => {
+        scriptPaths.push(args[2]);
+        return { ok: false, stderr: 'open failed' };
+      });
+      const result = await openLocalCliInIterm(ds(), {
+        platform: 'darwin',
+        mode: 'resume',
+        runOsascript,
+        runOpenCommand,
+        adapterFactory: () => ({ buildResumeCommand: () => 'codex resume sid' }),
+      });
 
-    expect(result.ok).toBe(false);
-    expect(!result.ok && result.error).toBe('terminal_unavailable');
-    expect(!result.ok && result.message).toContain('Terminal.app');
-    expect(runOsascript).toHaveBeenCalledTimes(5);
+      expect(result.ok).toBe(false);
+      expect(!result.ok && result.error).toBe('terminal_unavailable');
+      expect(!result.ok && result.message).toContain('AppleScript or Launch Services');
+      expect(!result.ok && result.message).toContain('iTerm: open failed');
+      expect(!result.ok && result.message).toContain('Terminal.app: open failed');
+      expect(runOsascript).toHaveBeenCalledTimes(5);
+      expect(runOpenCommand).toHaveBeenCalledTimes(2);
+      expect(runOpenCommand.mock.calls.map(([args]) => args.slice(0, 2))).toEqual([
+        ['-b', 'com.googlecode.iterm2'],
+        ['-b', 'com.apple.Terminal'],
+      ]);
+      expect(scriptPaths[0]).toBe(scriptPaths[1]);
+      expect(existsSync(dirname(scriptPaths[0]))).toBe(false);
+    });
+  });
+
+  it('falls back to an async iTerm Launch Services request with a self-cleaning command file', async () => {
+    await withCommandFileTempRoot(async (root) => {
+      const fakeBin = mkdtempSync(join(root, 'bin-'));
+      symlinkSync('/usr/bin/true', join(fakeBin, 'codex'));
+      const runOsascript = vi.fn(async () => ({ ok: false, stderr: 'automation denied (-1743)' }));
+      const runOpenCommand = vi.fn(async () => ({ ok: true }));
+      const result = await openLocalCliInIterm(ds({ workingDir: root }), {
+        platform: 'darwin',
+        mode: 'resume',
+        runOsascript,
+        runOpenCommand,
+        adapterFactory: () => ({ buildResumeCommand: () => 'codex resume sid' }),
+      });
+
+      expect(result.ok).toBe(true);
+      expect(runOsascript).toHaveBeenCalledTimes(5);
+      expect(runOpenCommand).toHaveBeenCalledTimes(1);
+      const args = runOpenCommand.mock.calls[0][0];
+      const scriptPath = args[2];
+      const scriptDir = dirname(scriptPath);
+      expect(args.slice(0, 2)).toEqual(['-b', 'com.googlecode.iterm2']);
+      expect(scriptPath).toMatch(/botmux-open-command-.*open-cli\.command$/);
+      expect(statSync(scriptPath).mode & 0o777).toBe(0o700);
+      const script = readFileSync(scriptPath, 'utf8');
+      const cleanup = `/bin/rm -rf -- '${scriptDir}' >/dev/null 2>&1 || true`;
+      expect(script).toContain('#!/bin/bash\ncd /\n');
+      expect(script).toContain(cleanup);
+      expect(script.indexOf(cleanup)).toBeLessThan(script.indexOf("codex resume 'sid'"));
+      execFileSync(scriptPath, [], { env: { ...process.env, PATH: `${fakeBin}:/usr/bin:/bin` } });
+      expect(existsSync(scriptDir)).toBe(false);
+    });
+  });
+
+  it('falls back to Terminal.app when iTerm is unavailable through Launch Services', async () => {
+    await withCommandFileTempRoot(async () => {
+      const runOsascript = vi.fn(async () => ({ ok: false, stderr: 'automation denied (-1743)' }));
+      const runOpenCommand = vi
+        .fn()
+        .mockResolvedValueOnce({ ok: false, stderr: 'iTerm is not installed' })
+        .mockResolvedValueOnce({ ok: true });
+      const result = await openLocalCliInIterm(ds(), {
+        platform: 'darwin',
+        mode: 'resume',
+        runOsascript,
+        runOpenCommand,
+        adapterFactory: () => ({ buildResumeCommand: () => 'codex resume sid' }),
+      });
+
+      expect(result.ok).toBe(true);
+      expect(runOpenCommand).toHaveBeenCalledTimes(2);
+      expect(runOpenCommand.mock.calls.map(([args]) => args.slice(0, 2))).toEqual([
+        ['-b', 'com.googlecode.iterm2'],
+        ['-b', 'com.apple.Terminal'],
+      ]);
+      expect(runOpenCommand.mock.calls[0][0][2]).toBe(runOpenCommand.mock.calls[1][0][2]);
+    });
+  });
+
+  it('sweeps stale command dirs without touching similarly named botmux temp dirs', async () => {
+    await withCommandFileTempRoot(async (root) => {
+      const stale = mkdtempSync(join(root, 'botmux-open-command-'));
+      const legacyStale = mkdtempSync(join(root, 'botmux-open-'));
+      const recent = mkdtempSync(join(root, 'botmux-open-command-'));
+      const unrelated = mkdtempSync(join(root, 'botmux-open-local-cli-'));
+      const similarlyNamed = join(root, 'botmux-open-command-user-data');
+      mkdirSync(similarlyNamed);
+      const sentinel = join(similarlyNamed, 'keep.txt');
+      writeFileSync(sentinel, 'keep');
+      const old = new Date(Date.now() - 48 * 60 * 60 * 1000);
+      utimesSync(stale, old, old);
+      utimesSync(legacyStale, old, old);
+      utimesSync(unrelated, old, old);
+      utimesSync(similarlyNamed, old, old);
+
+      const result = await openLocalCliInIterm(ds(), {
+        platform: 'darwin',
+        mode: 'resume',
+        runOsascript: vi.fn(async () => ({ ok: false, stderr: 'automation denied' })),
+        runOpenCommand: vi.fn(async () => ({ ok: false, stderr: 'open failed' })),
+        adapterFactory: () => ({ buildResumeCommand: () => 'codex resume sid' }),
+      });
+
+      expect(result.ok).toBe(false);
+      expect(existsSync(stale)).toBe(false);
+      expect(existsSync(legacyStale)).toBe(false);
+      expect(existsSync(recent)).toBe(true);
+      expect(existsSync(unrelated)).toBe(true);
+      expect(existsSync(sentinel)).toBe(true);
+    });
   });
 
   it('launches TRAE in iTerm with traex resume instead of URL schemes', async () => {

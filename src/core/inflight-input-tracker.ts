@@ -24,19 +24,56 @@ import type { CodexAppTurnInput, VcMeetingImTurnOrigin } from '../types.js';
 
 export type InflightItem = {
   content: string;
+  logicalContent?: string;
   turnId?: string;
+  replyTurnId?: string;
   dispatchAttempt?: number;
+  codexAppDispatchId?: string;
+  queuedActivationToken?: string;
   vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin;
   codexAppInput?: CodexAppTurnInput;
+  /** At-most-once turn (idempotency lease): must NEVER be carried over to a
+   *  respawned CLI (codex #776 round-7 finding #1). See PendingCliInput.noReplay. */
+  noReplay?: boolean;
 };
 
 export class InflightInputTracker {
   private unacked: InflightItem[] = [];
   private carryOver: InflightItem[] = [];
 
+  /** Something written to the PTY has not been consumed yet (no idle since). */
+  hasUnacked(): boolean {
+    return this.unacked.length > 0;
+  }
+
   /** An input just went onto the CLI's PTY. */
   onWrite(item: InflightItem): void {
     this.unacked.push(item);
+  }
+
+  /** Remove one exact item after a definitive local write failure before the
+   * caller re-queues it. Covers both the live in-flight set and a synchronous
+   * backend-exit handoff that may already have moved it to carryOver. */
+  forget(item: InflightItem): void {
+    this.unacked = this.unacked.filter(candidate => candidate !== item);
+    this.carryOver = this.carryOver.filter(candidate => candidate !== item);
+  }
+
+  /** Retire one exact write whose transport outcome is ambiguous and must not
+   * be replayed automatically. Other type-ahead items remain tracked. */
+  retire(item: InflightItem): boolean {
+    const index = this.unacked.indexOf(item);
+    if (index < 0) return false;
+    this.unacked.splice(index, 1);
+    return true;
+  }
+
+  /** A caller acknowledged an exact-turn interrupt. Drop that turn from both
+   * replay stages, including an exit that already moved its input to carryOver.
+   * Unrelated type-ahead inputs still belong to the next CLI generation. */
+  retireTurn(turnId: string): void {
+    this.unacked = this.unacked.filter(item => item.turnId !== turnId);
+    this.carryOver = this.carryOver.filter(item => item.turnId !== turnId);
   }
 
   /** CLI is back at its idle prompt — everything written has been consumed

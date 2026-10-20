@@ -3,6 +3,8 @@
 // 单测。daemon 侧 /api/sessions/spawn 与 session-manager 的 spawn/activate 复用。
 import { t, type Locale } from '../i18n/index.js';
 import type { CliTurnPayload } from '../types.js';
+import { truncateUtf16WellFormed } from '../utils/unicode.js';
+import { parseDashboardImageUploads, type DashboardImageUpload } from './dashboard-images.js';
 
 /** 协作模式：
  *  - 'all'  「一起开工」——每个被选 bot 各起一条会话、拿同一份内容。
@@ -53,7 +55,28 @@ function normalizeSpawnRole(value: unknown): SpawnRole | null {
 export function deriveSessionTitleFromContent(content: string): string {
   const firstLine = content.split(/\r?\n/).map(s => s.trim()).find(Boolean) ?? '';
   if (!firstLine) return t('cmd.createSession.untitled');
-  return firstLine.length > TITLE_MAX ? firstLine.slice(0, TITLE_MAX) + '…' : firstLine;
+  const title = truncateUtf16WellFormed(firstLine, TITLE_MAX);
+  return firstLine.length > TITLE_MAX ? title + '…' : title;
+}
+
+/** Dashboard group name follows the same visible first-line rule as the
+ * session title. Keeping it here prevents the browser placeholder and the
+ * actual Lark chat name from drifting apart. */
+export function deriveCreateGroupName(explicitName: unknown, content: string): string {
+  if (typeof explicitName === 'string' && explicitName.trim()) return truncateUtf16WellFormed(explicitName.trim(), 60);
+  return truncateUtf16WellFormed(deriveSessionTitleFromContent(content), 60);
+}
+
+/** Decide which already-joined bots receive the opening turn. The content is
+ * intentionally absent from this decision: an @sub inside Lead instructions
+ * must not wake that sub before the Lead delegates. */
+export function selectCreateSessionTargets(
+  mode: CreateSessionMode,
+  joinedIds: readonly string[],
+  leadLarkAppId?: string,
+): string[] {
+  if (mode === 'lead') return leadLarkAppId && joinedIds.includes(leadLarkAppId) ? [leadLarkAppId] : [];
+  return [...joinedIds];
 }
 
 function coworkerListBlock(coworkers: Coworker[]): string {
@@ -158,6 +181,7 @@ export interface SpawnRequest {
   ownerOpenId?: string;
   ownerUnionId?: string;
   title?: string;
+  images: DashboardImageUpload[];
 }
 
 export type ParseResult<T> = { ok: true; value: T } | { ok: false; error: string };
@@ -192,7 +216,11 @@ export function parseSpawnRequest(body: unknown): ParseResult<SpawnRequest> {
   if (!column) return { ok: false, error: 'bad_column' };
   const role = normalizeSpawnRole(b.role);
   if (!role) return { ok: false, error: 'bad_role' };
-  const title = typeof b.title === 'string' && b.title.trim() ? b.title.trim().slice(0, 200) : undefined;
+  const title = typeof b.title === 'string' && b.title.trim()
+    ? truncateUtf16WellFormed(b.title.trim(), 200)
+    : undefined;
+  const parsedImages = parseDashboardImageUploads(b.images);
+  if (!parsedImages.ok) return { ok: false, error: parsedImages.error };
   return {
     ok: true,
     value: {
@@ -204,6 +232,7 @@ export function parseSpawnRequest(body: unknown): ParseResult<SpawnRequest> {
       ownerOpenId: typeof b.ownerOpenId === 'string' && b.ownerOpenId.trim() ? b.ownerOpenId.trim() : undefined,
       ownerUnionId: typeof b.ownerUnionId === 'string' && b.ownerUnionId.trim() ? b.ownerUnionId.trim() : undefined,
       title,
+      images: parsedImages.images,
     },
   };
 }

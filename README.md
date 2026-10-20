@@ -1,417 +1,201 @@
 # botmux
 
 <p align="center">
-  <img src="cover.svg" alt="botmux cover" width="800">
+  <img src="cover.svg" alt="botmux" width="760">
 </p>
 
 <p align="center">
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License MIT"></a>
-  <img src="https://img.shields.io/badge/node-%3E%3D22-brightgreen.svg" alt="Node.js >= 22">
-  <a href="https://www.npmjs.com/package/botmux"><img src="https://img.shields.io/npm/v/botmux.svg" alt="npm version"></a>
-  <a href="https://github.com/deepcoldy/botmux"><img src="https://img.shields.io/github/stars/deepcoldy/botmux.svg?style=social" alt="GitHub Stars"></a>
+  <a href="https://www.npmjs.com/package/botmux"><img src="https://img.shields.io/npm/v/botmux.svg" alt="npm"></a>
+  <img src="https://img.shields.io/badge/binary-no%20Node%20required-brightgreen.svg" alt="self-contained binary, no Node required">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT"></a>
+  <a href="https://github.com/deepcoldy/botmux"><img src="https://img.shields.io/github/stars/deepcoldy/botmux.svg?style=social" alt="Stars"></a>
 </p>
+
+<p align="center"><b>在飞书里遥控你的 AI 编程 CLI。</b>一条消息启动一个会话，每个会话一个独立 CLI 进程，实时流式回传——手机、电脑、终端三端同步。</p>
 
 <p align="center">
-  <a href="#设计理念">设计理念</a> · <a href="#核心优势">核心优势</a> · <a href="#5-分钟快速接入">快速接入</a> · <a href="https://deepcoldy.github.io/botmux/"><b>📖 文档</b></a> · <a href="https://bytedance.larkoffice.com/wiki/UBOXwH01CixfxfkqxUpcKgvQnsg"><b>✨ 效果展示</b></a>
+  <a href="https://deepcoldy.github.io/botmux/"><b>📖 文档</b></a> ·
+  <a href="#5-分钟接入"><b>🚀 快速接入</b></a> ·
+  <a href="https://bytedance.larkoffice.com/wiki/UBOXwH01CixfxfkqxUpcKgvQnsg"><b>✨ 效果展示</b></a> ·
+  <a href="README.en.md">English</a>
 </p>
 
-<p align="center">
-  中文 | <a href="README.en.md">English</a>
-</p>
+https://github.com/user-attachments/assets/2cd97623-6b92-42ea-a9e9-75c6f5434db6
 
 ---
 
-**飞书 + AI 编程 CLI——私聊 / 群聊 / 话题，每个会话一个独立 CLI 进程，实时流式回传。** Daemon 监听飞书消息，为每个新会话自动启动独立 CLI 进程（Claude Code / Codex / Cursor / Gemini / OpenCode / Antigravity / GitHub Copilot / Kimi Code / Grok Build / Kiro），提供实时流式卡片和可交互 Web 终端。
+Daemon 监听飞书消息，为每个新会话自动 spawn 一个独立的会话进程，把 AI 编程 CLI / Agent 的输出实时流式回传成飞书卡片，并提供可交互的 Web 终端。它**不重造 Agent 能力**，而是直接桥接你已经在用的工具（**20+ CLI / Agent 适配器**，见 [支持的 CLI / Agent](#支持的-cli--agent)）。
 
-> ✨ **先看效果**：[**《5 分钟创建一个真正好用的飞书助理》**](https://bytedance.larkoffice.com/wiki/UBOXwH01CixfxfkqxUpcKgvQnsg) —— 飞书图文 + 视频演示：AI 消息提醒 / 多端同步跨端操作 / 多 Bot 协作 / 多话题并行编排 / 语音总结 + 飞书会议 / Oncall 与个人替身。
+## 它解决什么
 
-> 📖 **完整文档**（命令 / 配置 / 最佳实践 / 排错）：**<https://deepcoldy.github.io/botmux/>** ——本 README 只讲为什么用它和怎么快速上手。
+- **Agent 收不到通知、手机控不了** — CLI 跑在开发机上，人在手机上。botmux 把每轮输出推成飞书卡片，随时随地查看 / 追问 / 打断，还能开可写 Web 终端直接操作。
+- **CLI 不感知飞书上下文** — 把机器人拉进话题群 / oncall 群，@ 一句就在你本机的代码库里开跑；会话可以用 `/relay` 原样搬到另一个群，上下文一点不丢。
+- **单个 Agent 不够用** — 同一个群里放多个不同 CLI 的机器人，@ 谁谁干活，让 Claude Code 和 Codex 一起 review 同一个 MR、各自独立分析、观点不同自动互怼。
 
-## 演示
+## 5 分钟接入
 
-| 飞书流式卡片 | Web 终端 | tmux 会话管理 | 多机器人协作 |
-|:-:|:-:|:-:|:-:|
-| <img src="gif/fold&unfold.gif" width="220" /> | <img src="gif/web_terminal.gif" width="220" /> | <img src="gif/tmux.gif" width="220" /> | <img src="docs/setup/multi-bot-collab.png" width="220" /> |
+> 约 5 分钟：`botmux setup` 一次飞书扫码就连续建好应用、配全权限、发版（加 `--no-open-platform-auto` 则只建应用、跳过权限与发版的自动配置，之后需手动完成；手动创建 / 粘贴凭证是 setup 里的另一个选项）。
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/deepcoldy/botmux/master/install.sh | sh
+botmux setup                 # 一次扫码建应用 → 选 CLI → 选工作目录（自动配权限 + 发版）
+botmux start                 # 启动 daemon（botmux autostart enable 设开机自启）
+```
+
+> botmux 本体是一个**自包含单文件二进制**，运行时已嵌在里面——**装它和跑它都不需要机器上有 Node**（你要接的 AI 编程 CLI 自己需要什么另算）。装到 `~/.botmux/bin/botmux`（`BOTMUX_INSTALL_DIR` 可改），按 OS/arch 自动选对应二进制、校验 SHA-256，并把 `~/.botmux/bin` 写进你当前 shell 的启动文件（zsh / bash / fish 各写对的那个），**开个新终端就能用**。
+>
+> 安装过程**不编译任何原生模块**（不需要 Python / node-gyp / 编译器）：PTY 已经嵌在二进制里。支持 linux / macOS × x64 / arm64（Alpine 等 musl 环境自动选 musl 版）；**Windows 请在 WSL2 里安装**（daemon 依赖 PTY / tmux / Unix 信号，原生 Windows 跑不了；WSL2 报告为 linux，是完整支持的一等环境）。平台不在列表里、或下下来的二进制在本机跑不起来，安装会**明确报错并保留原有版本**，而不是装上一个起不来的命令。
+>
+> 正式版 macOS CLI 使用稳定的 Apple Developer ID 签名。升级替换二进制后，macOS 的文件与 App 数据访问授权仍绑定同一代码身份，不会因为版本哈希变化而把 botmux 当成一个新程序；canary / beta / rc 等预览版仍使用 ad-hoc 签名。
+>
+> 升级：**一律重跑上面那条 curl 命令**（npm / pnpm 全局安装也用它，原地替换、不会重复往启动文件里追加 PATH），装完开个新终端跑 `botmux restart`；≥3.18 的二进制安装上 `botmux upgrade` 与其等价。装指定版本（含回滚）：`curl -fsSL https://raw.githubusercontent.com/deepcoldy/botmux/master/install.sh | BOTMUX_VERSION=v3.18.8 sh`（变量必须在管道右侧的 `sh` 前面）。⚠️ **v3.18.0 之前的老版本不要用 npm 升级**——跨「Node 源码 → 二进制」形态边界会让 daemon 重启失败。
 
 <details>
-<summary>完整演示视频</summary>
-
-[演示视频](https://github.com/user-attachments/assets/3ba4c681-0a7e-4a03-89c8-b8d26b544a65)
-</details>
-
----
-
-## 为什么选择 botmux
-
-### 设计理念
-
-**不做 SDK wrapper，直接桥接 CLI。**
-
-botmux 不重新实现 Agent 能力，而是直接桥接已有的 AI 编程 CLI（Claude Code、Codex、Cursor、Gemini、OpenCode、Antigravity、GitHub Copilot、Kimi Code、Kiro）。记忆、上下文管理、工具调用、权限体系——这些能力 CLI 本身都在快速迭代，botmux 选择站在这个进化之上，而不是平行重造一套。CLI 的每次升级，botmux 零适配自动受益。
-
-### 核心优势
-
-与 OpenClaw 等基于 Agent SDK 构建的方案相比：
-
-| 特性 | botmux | OpenClaw 类方案 |
-|------|--------|----------------|
-| 底层架构 | 直接桥接完整 CLI 进程 | 基于 Agent SDK 重新构建 |
-| CLI 能力 | 完整运行时（hooks、memory、plan mode、Skill、`/` 命令） | SDK API 子集，需手动实现缺失功能 |
-| CLI 升级 | 零适配自动受益 | 需要跟进 SDK 版本变更 |
-| 记忆 / 上下文 | 直接复用 CLI 内建的记忆系统，随 CLI 迭代自动增强 | 需自建记忆系统，与 CLI 原生能力重复 |
-| 多 CLI 支持 | 多种 CLI 一键切换（Claude Code / Codex / Cursor / Gemini / OpenCode / Antigravity / GitHub Copilot / Kimi Code / Grok Build / Kiro 等） | 绑定单一 SDK，无法切换 CLI |
-| Web 终端 | 可交互的完整终端，移动端快捷键工具栏，手机/电脑/飞书三端同步 | 通常仅 Web 聊天界面或只读输出 |
-| 多机器人协作 | 多 bot 同群 @mention 路由，独立进程隔离，不同 CLI 赛博斗蛐蛐 | 通常单机器人 |
-| 多话题协作模式 | 主 bot 自动拆任务、开多话题、派多 bot 并行协作（coder+reviewer），飞书任务清单当共享进度板 | 通常需人工逐个分派、无统一进度板 |
-| 终端直连 | tmux attach 直接进入 CLI 进程，和本地开发体验一致 | 无法直接操作底层终端 |
-| 安装部署 | `npm install -g botmux`，5 分钟飞书配置即可使用 | 安装简单，但配置项较多 |
-
----
-
-## 功能特性
-
-### Skill 管理
-
-botmux 可以管理 CLI 无关的自定义 Skill Registry，并按 bot 配置在会话启动时优先披露指定 skill；未配置时完全保持 Claude / Codex 等 CLI 自己的默认 skill 行为。安装、bot 级策略、Claude scoped plugin 和 Codex prompt delivery 说明见 [Skill 管理](docs/setup/skills.md)。
-
-### 实时流式卡片
-
-每轮对话一张实时更新的飞书卡片，是你在手机/飞书上感知并操控 CLI 的主窗口：
-
-- **终端画面实时截图刷新到卡片**（xterm 无头渲染成图，原样还原 CLI 的 TUI）；可一键「显示 / 隐藏输出」「导出文字」「上下翻屏」
-- **状态实时指示**：启动中 → 正在分析 → 工作中 / 执行中 → 等待输入；额度用满会标「限额已达 · 可重试」
-- **卡片上直接操作**：打开（可写）终端、🔑 取操作链接、重启 / 关闭 / 接管会话、重发上一条任务
-- **每轮一张新卡片**，上一轮冻结存档；会话用 `/relay` 搬到别的群后，原卡片自动冻结为存档
-- **关闭给「可恢复」卡片**（附 CLI 原生 resume 命令），随时点回来继续
-
-### Web 终端（可交互）
-
-每个会话提供一个 Web 终端，地址为 `http://<WEB_EXTERNAL_HOST>:<端口>`。
-
-- **只读链接** — 展示在群话题的流式卡片上，随时查看进度
-- **可操作链接** — 按需获取（点击卡片上的「🔑 获取操作链接」通过私聊发送），可直接在浏览器中操作 CLI
-- 移动端/平板提供悬浮快捷键工具栏（Esc、Ctrl+C、Tab、方向键等），手机上也能流畅操作
-
-### 多机器人协作
-
-同一台机器上可运行多个飞书机器人，每个机器人可对应不同的 CLI。同一群聊中通过 @mention 路由消息，仅有一个机器人时无需 @ 自动响应；多机器人时 `@<bot1> @<bot2> /t xxx` 可让每个被 @ 的机器人在同一条消息上各自独立开新话题。先发一次 `@<bot1> @<bot2> /introduce` 让它们互相登记 open_id，之后各 bot 就能在自己的会话里显式 @mention 对方协作（命令详见 [📖 文档 · 斜杠命令](https://deepcoldy.github.io/botmux/slash-commands)）。
-
-### 多话题协作模式
-
-「多机器人协作」的升级版：主 bot（**编排者**）把一个大任务拆成多个**子项目**，在群里**自动开多条话题**，每条话题派一组 bot 并行推进（常见「一个写代码 + 一个 review」），用一张**飞书任务清单**当所有人共享的进度板，最后由主 bot 收齐汇总。一个普通群就是一个并行工作台，你在飞书任务面板一眼看完成度。
-
-**怎么跑** —— `botmux-orchestrate` skill 教编排者走完整流程：
-
-> 拆子项目 → 提一版「子项目 ↔ bot」分配 → 发给你**一次审批**（可用卡片确认） → 建飞书任务清单 → 逐个开话题派活 → 收齐回报 → 汇总
-
-底层派活靠 `botmux dispatch`：在群里种一条话题、把指定 bot @ 进去各起独立会话。
+<summary>已经在用 Node 生态？也可以走 npm（同一个二进制）</summary>
 
 ```bash
-botmux dispatch --title "实现登录模块" \
-  --bot "ou_xxx:Alice:coder" --bot "ou_yyy:Bob:reviewer" \
-  --repo /path/to/repo --brief-file /tmp/brief.md
+npm install -g botmux        # 需要 Node >= 22 装包本身
 ```
 
-- `--repo <目录>` —— 预设子 bot 的工作目录（绝对路径，需在子 bot 所在机器上存在），起会话直接进去、**免手点「选仓库」卡**。
-- `--standby` —— **必须配 `--repo`**（且不能与 `--into` 同用）：只发一次 `/repo` 把 bot 拉起到指定目录待命、不派简报，之后用 `--into ... --brief(-file)` 激活派活。
-- `--into <话题root>` —— 回到已有话题追加一条（激活待命的 bot / 追加协调）；仍需 `--bot`，且非 standby 时必须带 `--brief` 或 `--brief-file`。
+npm 包内带的是**同一个自包含二进制**（按 os/arch 只装匹配的那一个）。包的 `bin` 指向随包发布的 sh 启动器，由包管理器自己链到 PATH——**npm / pnpm / bun 三种装法都不依赖生命周期脚本**（pnpm 10/11 与 bun 默认不跑依赖的 postinstall，早期版本因此装完没有任何 `botmux` 命令）。postinstall 仍会把 `~/.botmux/bin/botmux` 指向同一个二进制并写 PATH。所以装完始终只有**一个** botmux **版本**（两个入口都 exec 同一个二进制），不再出现「装了两个 Node 版本、各自带一份全局 botmux 互相打架 / 不知道更新了哪个」。
 
-**协作边界**：
-
-- **同部署的「自家」bot 之间互信** —— 编排者能直接对它们跑 `/repo` 等 operate 级命令（与自家 bot 的对话权限一致）。外部 bot 的授权分两层：`/grant @bot` 只给「对话 / 被 chat-scope 拉起」的权限（talk-only，不碰 `allowedUsers`、跑不了 operate 级命令）；要让外部 bot 跑 `/repo` 等 operate 级命令，需把它列进 `allowedUsers`（或后续 operate 级授权）。`/introduce` 只负责发现 / 登记 open_id，**不授予任何权限**。
-- 子 bot 须已在群里、可被 @（具备 `im:message.group_at_msg.include_bot` 权限）。
-- 一条话题可放多个 bot，它们在话题内互相 @ 协作（如 coder 写完 @ reviewer 审）。
-
-### Tmux 会话常驻
-
-安装 tmux 后自动启用。CLI 进程常驻在 tmux session 内，所有功能不受影响。
-
-**核心收益：Daemon 重启不中断 CLI。** `botmux restart` 时 worker 进程退出，但 tmux session（及其中的 CLI 进程）保持运行。下次收到消息时 worker 自动 re-attach，无需 `--resume` 重载上下文。
-
-| 事件 | tmux session | CLI 进程 |
-|------|-------------|---------|
-| `botmux restart` | 存活 | 存活（下次消息 re-attach） |
-| `/close` 或关闭按钮 | 销毁 | 终止（SIGHUP） |
-| CLI 自行退出 / 崩溃 | 随之关闭 | 已退出（自动重启用新 session） |
-
-```bash
-# 交互式会话列表 — 选择后直接 attach 到 tmux（见 § CLI 命令）
-botmux list
-
-# 也可以手动 attach（会话名 = bmx-<sessionId 前 8 位>）
-tmux attach -t bmx-<session-id-前8位>
-# Ctrl+B, D 退出 attach，不影响 CLI 继续运行
-
-# 强制降级到纯 pty 模式（不使用 tmux）
-BACKEND_TYPE=pty botmux start
-```
-
-### 会话接入（Adopt）
-
-将已在 tmux 中运行的 CLI 进程无缝接入 Botmux，在手机上通过飞书查看进度和交互。
-
-```
-/adopt              # 弹出选择卡片：① 接管运行中的会话 ② 从磁盘 resume 导入历史会话
-/adopt 0:2.0        # 直接接入指定 tmux pane（或传历史会话 id 直接 resume 导入）
-```
-
-- **历史会话导入** — 卡片第二栏列出本机该 CLI 的历史会话（claude-code / seed / codex / traex / antigravity / genius），选中即以 `--resume` 在原工作目录重建为标准 Botmux 会话，无需进程仍在运行、也不用先迁进 tmux
-- **共享模式** — Botmux 接入后，iTerm2 和飞书双向同步：流式卡片实时显示终端输出，飞书聊天框输入直接透传到终端
-- **一键接管** — 点击流式卡片上的「🔄 接管」按钮，Botmux 以 `--resume` 重建会话，转为标准 Botmux 会话
-- **安全断开** — 点击「⏏ 断开」，Botmux 退出观察，原 CLI 不受影响
-
-### 定时任务
-
-支持三种调度类型 + 中文自然语言，支持原话题延续（到点在同一话题内继续，不另开 thread）。
-
-**两种创建方式**：
-- **斜杠命令**（快捷）：`/schedule 每日17:50 帮我看看AI圈有什么新闻`
-- **对话触发**（灵活）：直接跟 agent 说「帮我加个每天 18:00 检查部署的定时任务」，自动触发 `botmux-schedule` Skill
-
-支持的调度格式：
-- 中文自然语言：`每日17:50` / `每周一10:00` / `30分钟后` / `明天9:00`
-- 英文 duration/interval：`30m` / `2h` / `every 30m` / `every 2h`
-- Cron 表达式：`0 9 * * *`
-- ISO 时间戳：`2026-05-01T10:00`
-
-### 与飞书话题的交互（Skill + CLI）
-
-CLI 进入 botmux 会话时自动获得 `~/.botmux/bin` 在 PATH 中，以及一组开箱即用的 Skill：
-
-- `botmux send` — 向当前话题发消息（支持文本、图片、文件、interactive 卡片 JSON、@mention）
-- `botmux history` — 读取当前会话历史消息（话题/thread 会话拉话题内，普通群 chat-scope 会话拉整群）
-- `botmux quoted <message_id>` — 用户用引用 UI @ 机器人时，按需读取被引用的那条消息
-- `botmux bots list` — 查询当前群聊的机器人及 open_id
-- `botmux schedule` — 增删改查定时任务
-
-这些能力通过 `--append-system-prompt` 注入和 Skill 描述自动引导 agent 使用。Skill + CLI 的组合相比 Anthropic 官方 Telegram channel 那套 MCP 方案：CLI 启动不用做 MCP 握手、不占用工具列表 token，且对 Claude Code / Codex / Cursor / Gemini / OpenCode / Antigravity / GitHub Copilot 通用 —— 只要 CLI 能读 system prompt 跑 shell 命令就行，不依赖任何 MCP 协议支持。
-
-### Dashboard 管控面
-
-> 命令行 `botmux dashboard` 出一次性 token URL，浏览器里跨所有 daemon/机器人管控
-
-- 一键定位回飞书话题 / 跳 Web 终端 / 多选批量关闭会话
-- 添加机器人对齐 Feishu 单次扫码主路径：名称可选且全程冻结，支持 AI CLI / 工作目录选择、管理员 fail-closed 补填与显式兼容模式
-- 拉新群、自动转让群主、@ 提醒
-- 解散群聊、bot 退群（关联会话自动清理）
-- **会话洞察**（owner-only，只读）：解析各会话 transcript，看动作 span / 工作时序 / 上下文曲线 / 失败聚合 + 诊断建议；聊天里发 `/insight` 可取当前会话摘要卡
-- **Workflows 管控面**：
-  - Run List 5s 轮询；Run Detail 看 summary / dangling 红区 / node-activity 表 / event timeline / **并发执行 timeline**（attempt 级时序），到 terminal 自动停轮询
-  - **Dashboard 内可直接 cancel run**、批准/拒绝 humanGate（approve/reject + 评论）
-  - **Workflow Catalog**：列所有 `~/.botmux/workflows/` 下的 workflow，点进去看 schema / 依赖图，直接在 UI 触发 run（带 params 输入）
-  - IM 卡片（cancel / approve / reject）仍可用；CLI 子命令也保留
-
-<img src="docs/dashboard.png" alt="botmux dashboard" width="800" />
-
----
-
-## 前置要求
-
-- **Node.js** >= 22
-- **AI 编程 CLI / 本地 Agent 应用** 已安装并完成认证（`claude`、`codex`、`coco`、`cursor-agent`、`gemini`、`genius`、`opencode`、`hermes`、`seed`（Seed CLI，Claude Code 衍生）、`relay`（Relay CLI，Seed 新版）、`pi`、`omp`（oh-my-pi，Pi 衍生）、`copilot`（GitHub Copilot CLI）、`traex`（TRAE CLI）、`mircli`（Mir CLI）、`agy`（Antigravity）、`kimi`（Kimi Code）、`grok`（Grok Build）或 `kiro-cli`（Kiro）在 PATH 中）
-  - **CoCo 最低版本 `0.120.32`**：type-ahead（会话忙时即可发新消息，由 CoCo 自己的消息队列接住）依赖 0.120.32+ 的行为；更早版本忙时输入可能丢失或串行，请升级后再用
-- **tmux** >= 3.x（可选，安装后自动启用会话常驻）
-- **CJK 字体**（用于截图渲染中文/emoji）：
-  - macOS 自带 PingFang/Hiragino，无需配置
-  - Debian/Ubuntu：daemon 启动时若检测到缺字体会后台 `apt-get install fonts-noto-cjk fonts-noto-color-emoji`（需免密 sudo 或以 root 运行；装完重启 daemon 生效）
-  - 其他 Linux 发行版请手动安装 Noto CJK + Noto Color Emoji（包名视发行版而定）
-
-## 5 分钟快速接入
-
-> 💡 **TL;DR**：`npm i -g botmux` → `botmux setup`，飞书租户**扫一次码**就能建好一个可用机器人 → `botmux start`。这次扫码拿到的 Web 登录态会连续完成：按 `botmux-N`（可自定义）命名并创建应用、读取 AppID/AppSecret、导入权限、配置重定向 URL、创建并提交发布版本。整个开放平台配置都由 setup 默认完成；加 `--no-open-platform-auto` 可跳过应用创建后的权限/发版自动配置。
-
-### 1. 安装 botmux
-
-```bash
-npm install -g botmux
-# 或：pnpm add -g botmux
-# 或：bun add -g botmux
-```
-
-botmux 的手动/定时更新会识别当前全局安装归属，并继续使用同一个 npm、pnpm 或 Bun 安装位置；无法安全识别的安装方式不会自动回退到 npm。
-
-> 要求 **Node.js ≥ 22**，且本地已装好并登录至少一种 AI 编程 CLI（`claude` / `codex` / `cursor-agent` / `gemini` / `opencode` / `coco` / `agy` / `grok` / `kiro-cli` 等在 PATH 中）。推荐顺手装 **tmux**（装了自动启用会话常驻）。
-
-### 2. 创建应用并配置（`botmux setup`）
-
-跑 `botmux setup`，全程交互式选择（↑/↓ 选择、输入即搜索、⏎ 确认、Esc 取消；非交互终端自动回退为序号输入）：
-
-1. **操作**：首次安装直接进入创建流程；已有配置时先选「添加新机器人 / 重新配置 / 编辑现有机器人 / 删除机器人」。
-2. **飞书应用来源**：三选一——
-   - **一次扫码创建新应用（推荐）**：可填写机器人名称；留空自动使用 `botmux-0`、`botmux-1`……。首次扫码拿到 Web 登录态后，botmux 自动上传默认图标、创建企业自建应用、读取 AppID/AppSecret，并复用同一登录态继续配置权限与发版；后续添加会先显示当前账号与企业供确认，有效期内免扫码。Web 自动创建不可用或使用 Lark 国际版时，可由用户明确选择 `@larksuiteoapi/node-sdk` 兼容模式；兼容模式可能需要额外扫码，且应用名称由平台决定。
-   - **选择已有应用**：复用（或扫码获取）飞书 Web 登录态，列出你在开放平台创建过的应用，选中后**自动读取 AppID/AppSecret**——换机器重配、复用旧应用不用再去后台翻 Secret（仅飞书租户）。
-   - **手动输入 AppID/Secret**：见文末折叠的「手动创建应用」。
-3. **选择 CLI**：选本次要接入的 CLI（可搜索，如输入 `cla` 过滤出 Claude）。
-4. **新话题工作目录**：二选一——
-   - **固定默认目录（推荐）**：新话题直接在指定目录启动、**不弹卡片**（落 `defaultWorkingDir` 字段，之后可用 `/config` 或 `botmux setup edit` 修改）。想让机器人"直接进目录干活"选这个。
-   - **仓库选择卡片**：新话题先弹卡片，从扫描到的 git 仓库里选一个再启动，适合经常在多个仓库间切换。下一问填**仓库扫描根目录**，通常是 git 项目的**父级目录**（如 `~/projects`，支持逗号分隔多个），卡片从该目录**向下**查找 git 仓库（最多 3 层）；尽量别填 `~`（要遍历太多文件夹）。
-
-应用创建后会直接复用同一份 Web 登录态，自动导入权限、配置 `http://127.0.0.1:9768/callback` 重定向 URL、创建并提交发布版本。Feishu 主路径是**首次最多扫码一次、后续有效期内免扫**；缓存账号/企业会在创建前展示并用同一份 cookie 再次比对，登录态失效时先提示，不会静默弹码。只有用户主动「更换账号」或明确选择 SDK 兼容模式时才会重新扫码。
-
-> ✅ **飞书 (feishu.cn) 与 Lark 国际版 (larksuite.com) 均支持**。飞书走单次 Web 扫码；用户明确选择 SDK 兼容模式后，会自动识别并记住 Lark 国际版租户。手动粘 AppID/Secret 时会让你选一次租户类型。每个机器人按所属版本独立连对应域名，同一台机器可同时跑飞书 + Lark 机器人，登录凭证按应用隔离、互不干扰。
-
-setup 末尾会用 `tenant_access_token` 校验凭证（通过才落盘 `bots.json`），并把完整权限 JSON 写到 `~/.botmux/lark-scopes.json` 备查。
-
-<details>
-<summary><b>脚本化（非 TUI）setup</b> —— 给 coding agent / 自动化脚本用的字段级子命令，不依赖交互问答顺序</summary>
-
-```bash
-botmux setup list --json                     # 列出机器人（secret 脱敏）
-botmux setup add --create-app \
-  --app-name 研发助手 \
-  --allowed-users alice@example.com          # 首次扫码；后续有效登录态下免扫
-botmux setup add --create-app --switch-account \
-  --allowed-users alice@example.com          # 明确更换账号并覆盖本机登录态
-botmux setup add \
-  --app-id cli_xxx --app-secret xxx \
-  --allowed-users alice@example.com \
-  --cli codex --working-dir ~/projects       # 添加（写盘前照样校验凭证）
-botmux setup edit botmux-0 --cli claude-code \
-  --default-working-dir /data/proj           # 按字段修改；值传 - 清空
-botmux setup remove botmux-1 --yes           # 非交互删除必须 --yes
-botmux setup help                            # 完整 flag 列表
-```
-
-- `--working-dir` 是仓库选择卡片的扫描根；`--default-working-dir` 是固定默认目录（新话题直接启动、不弹卡），对应 TUI 里工作目录模式的两个选项。
-- `--create-app` 默认先复用并在 stderr 显示已确认的账号/企业；无缓存时首次扫码。`--switch-account` 强制重新扫码并覆盖本机登录态。`--json` 不会在缺少有效缓存时自行弹码，需显式加 `--switch-account`；成功时返回冻结后的 `appName` 与 `appId`，应用已创建但后续失败时返回 `partial`、`appId` 和带 `--open-platform-auto` 的继续命令，不会重复建应用。
-- 已有凭证模式的开放平台自动配置默认跳过，需要时显式加 `--open-platform-auto`。`--compatibility-mode` 必须显式选择，可能需要额外扫码且不支持 `--app-name`。
-- 以前对交互问答「管道喂数字」的脚本请迁移到这些子命令：问答序列一变（本版本就新增了工作目录模式一问），喂数字会静默错位。
+区别只在**谁来装**：npm 路径需要 Node ≥ 22 才能执行安装本身，curl 路径全程不碰 Node；**无论哪种装法，升级都重跑 curl**（v3.18.0 之前的老版本用 npm 跨形态升级会让 daemon 起不回来）。跑起来之后两者完全一致——同样的二进制、同样的命令。
 
 </details>
 
-### 3. 启动
+然后私聊机器人、或 `botmux dashboard` 拉个群，直接开聊。完整步骤（含 Lark 国际版、`--no-open-platform-auto` 后手动配置权限 / 发版、排查）见 **[5 分钟快速接入](https://deepcoldy.github.io/botmux/quickstart)**。
 
-```bash
-botmux start
-```
+## 核心场景
 
-> start 前再校验一次凭证；权限未配齐不会阻塞 daemon，只 WARN。如果之后需要确认事件订阅，飞书后台会要求 daemon 已在跑才能识别长连接。
+- **[实时流式卡片](https://deepcoldy.github.io/botmux/cards)** — 每轮对话一张实时刷新的卡片，终端画面原样截图回传；一键显示/隐藏输出、翻屏、重启/关闭/接管会话。
+- **[多机器人协作](https://deepcoldy.github.io/botmux/multi-bot)** — 同群多 bot @mention 路由，不同 CLI 背后不同模型，天然多样性；方案评审 / 代码 review / 技术选型让它们互相挑刺。
+- **[群内真人独立 lane](docs/principal-lanes.md)** — 可复用 Dashboard 的「跨身份打断隔离（XPI）」开关，让同一群里的真人各用独立 CLI 上下文和 git worktree；消息仍公开可见，引用别人的任务仍可走建议/确认协作。
+- **[多话题并行编排](https://deepcoldy.github.io/botmux/multi-topic)** — 给编排者一个大任务，它自动在群里种话题、拉各 bot 起独立会话跑流水线，飞书任务面板一眼看完所有子任务进度。
+- **[可交互 Web 终端](https://deepcoldy.github.io/botmux/web-terminal)** — 不只是看输出，浏览器 / 手机直接操作 CLI，移动端带悬浮快捷键栏（Esc、Ctrl+C、方向键）。
+- **[会话接入 & 接力](https://deepcoldy.github.io/botmux/adopt)** — 本地 tmux 里跑到一半，手机 `/adopt` 接管；`/relay` 把整个会话（原进程、原记忆）搬进团队群继续。
+- **[定时任务](https://deepcoldy.github.io/botmux/schedule) & [外部触发](https://deepcoldy.github.io/botmux/webhook)** — 自然语言配周期任务（报警分析 / 群总结）；从外部系统编程式触发用 [Webhook](https://deepcoldy.github.io/botmux/webhook) 或 [API 任务触发](https://deepcoldy.github.io/botmux/api-task-trigger)。
+- **[Oncall 模式](https://deepcoldy.github.io/botmux/oncall) & [语音总结](https://deepcoldy.github.io/botmux/voice)** — 拉进 oncall 群，任何成员 @ 即在项目目录排查；配好 TTS 后每张卡片页脚会多一个 🔊 语音总结按钮，让模型「说人话」。
 
-### 4. 建群开聊
+更多：[角色与团队](https://deepcoldy.github.io/botmux/roles) · [文件沙盒](https://deepcoldy.github.io/botmux/sandbox) · [Dashboard 管控面](https://deepcoldy.github.io/botmux/dashboard) · [tmux 会话常驻](https://deepcoldy.github.io/botmux/tmux) · [飞书会议智能体（效果展示）](https://bytedance.larkoffice.com/wiki/UBOXwH01CixfxfkqxUpcKgvQnsg)。
 
-1. 飞书中创建一个**话题群**
-2. 进入群设置 → 群机器人 → 添加刚创建的机器人
-3. 在群里发消息，机器人自动响应
+## 按 Bot 设置零注入
 
-![添加机器人到群](docs/setup/add-bot-to-group.png)
+在 Dashboard →「Bot 配置」→ 选中 Bot →「高级」→「零注入」打开开关；需要统一管理多个 Bot 时，在「Agent 配置」里开启「零注入」分组，关联的 Bot 会随同步一起切换（此时 Bot 配置页的开关锁定）。也可在对应 `bots.json` 条目设置 `"promptInjection": "none"`。适合 lead-bot 派活、sub-bot 专注执行的场景。`default` / 删除字段恢复原行为，既有 prompt、角色和技能配置不会被清空。当前 CLI、终端后端或沙盒组合不支持时开关置灰并说明原因。
 
-### 5. 开机自启（推荐）
+此模式只传任务正文与附件信息，跳过 botmux 的系统提示、逐轮提醒、身份信封、角色、白板、记忆与技能目录；自动从 CLI 转写回传最终回答。使用新会话验证：已经进入历史的提示无法撤回，CLI 原生系统提示、项目 `AGENTS.md` 及用户自行安装的技能仍由 CLI 管理。
 
-确认机器人能正常收发消息之后，跑一次：
+支持范围复用 CLI 的最终回复兜底采集能力：目前包括 Claude Code、Codex、TraeX、CoCo、Hermes、MTR、Pi、Oh My Pi、ebsd、Grok，以及仅在零注入下启用转写采集的 Cursor、Antigravity（这两者常规模式仍通过 `botmux send` 回复，故默认不采集；均限 PTY、tmux 等本地后端，Codex / TraeX 可走 RPC 输入）。暂不支持远端后端和 v3 workflow；Cursor、Antigravity 的转写目录（`~/.cursor`、`~/.gemini`）在 oncall 沙箱（`sandbox: true`/`oncall`、读隔离、`BOTMUX_SANDBOX`）中以目录级 bind 直挂宿主真实路径，零注入可与其同时使用；全根 COW 的 `sandbox: "scratch"` 暂不支持这两者（结构化桥尚未解析 merged 视图，会直接报错而非静默丢回复）。Antigravity 的静默终态需经视口确认，故暂不支持 `zmx` 后端（Cursor 的终态即时采集，不受此限）。CLI 的共享技能目录若存在全局安装的 `botmux-*` 技能，会拒绝启动以免假称零注入；请使用按会话的技能注入方式或独立 home，不会删除其它 bot 共用的文件。
 
-```bash
-botmux autostart enable
-```
+普通协作可直接在群内 @ 执行 bot，最终回答自动回复当前会话，并默认 @ 本轮任务的发起人（真人或 bot）。收件人取自宿主记录的本轮身份，排队和重试不借用后续轮次的发送者；缺少可用身份时不猜测会话 owner，也不注入额外 prompt。已经 @ 发起 bot 的回复本身就是回报，不再额外通过 HTTP 重复追加一轮任务。
 
-<details>
-<summary><b>手动配置开放平台：建应用 / 权限 / 重定向 / 发版（备用）</b> —— 默认由 botmux setup 使用同一次登录态自动完成，仅在自动配置失败、或想手动核对时展开</summary>
+零注入会话也默认回传 Web 终端中的最终回答：`/rewind` 重跑和随后直接输入的多轮对话，都沿用最新飞书发起人的回复位置和 @，以普通回复卡发送，不附加终端来源或复述输入。每个终端回合开始时固定回复对象，新飞书消息只影响之后开始的回合；`/model` 等设置命令、菜单输出和已有历史不回传。该行为复用原生转写监听，不增加开关或 prompt；普通模式和 `/adopt` 保持原行为。
 
-<br>
+没有通过 @ 发起 bot 回报时，已建立签名回报绑定的 `botmux dispatch --bot-app <稳定 App ID>` 派单仍可自动回报原 lead：sub 的 daemon 根据绑定去掉自动附加的 report/send 指令，每轮最终回答回报一次，不自动判定任务完成。回报使用独立重试和持久化去重回执，失败不影响子会话回复；lead 正常在原会话回复，不进入 HTTP 结果轮询。提交结果不明时拒绝自动重放。`dispatch --into` 向此前没有派单记录的普通消息追加任务不会创建该绑定，仍会保留完成指令，不能据此验证零注入。
 
-**手动创建应用**：去 [飞书开放平台](https://open.larkoffice.com/app) 建「企业自建应用」，在「凭证与基础信息」复制 **App ID / App Secret**，在 `botmux setup` 的「飞书应用来源」步骤选「手动输入 AppID/Secret」粘贴回来。
+## 支持的 CLI / Agent
 
-![创建应用](docs/setup/create-app.png)
+`bots.json` 里用 `cliId` 一键切换。**20+ 适配器**，覆盖本地 CLI（进程隔离，`tmux attach` 可直连）和 API / 云 Agent（如 Mira、riff——通过 API / 远端接入，非本地进程；mojo 为 API 驱动、默认在宿主机执行工具，可配 cloud: true 走云沙箱）。代表项：
 
-**添加权限**：按 terminal 提示的一键复制命令把权限 JSON 复制到剪贴板，进入「权限管理」→「批量导入/导出权限」粘贴 → 提交审批。可用性范围选「仅自己可见」会自动通过：
+`claude-code` · `codex` · `gemini` · `cursor` · `opencode` · `opencode2` · `mimocode` · `antigravity` · `copilot` · `grok` · `kimi` · `kiro-cli` · `reasonix` · `dsh` · `aiden` · `coco`(TRAE) · `hermes` · `ebsd` · `mira` · `riff`(云 Agent) … · `mojo`(API 驱动,默认宿主机执行) · `remote-runner`([通用远端 Runner 协议](docs/remote-runner.md)) · `minimax`([MiniMax Code / mcode](docs/minimax-code.md)，支持文件与 Shell 工具、原生 Skills 和精确会话恢复；`mcode login` / `mcode login --region global` 登录，多账号用 `MINIMAX_DATA_DIR` 隔离) …
 
-![权限管理](docs/setup/permissions.png)
+`ebsd` 使用独立的外部服务身份和原生 OMP 会话目录；部署方必须通过受限权限文件配置 Diag Gateway token 与 ByteCloud service account，不能把密钥写入 `bots.json`。
 
-完整 JSON 已经写到 `~/.botmux/lark-scopes.json`，源仓库版本在 [src/setup/lark-scopes.json](src/setup/lark-scopes.json)（与本仓库内部 wiki 文档同步，覆盖 tenant + user 双套域 ≈ 290 项）。
-
-```bash
-# macOS 本地
-cat ~/.botmux/lark-scopes.json | pbcopy
-# Linux 桌面 (本地有 X 服务器)
-cat ~/.botmux/lark-scopes.json | xclip -selection clipboard
-# SSH / 无 DISPLAY：直接 cat, 在本地 terminal 鼠标选中即写本地剪贴板
-cat ~/.botmux/lark-scopes.json
-# SSH 上 OSC 52 直接写本地剪贴板 (iTerm2 / kitty / WezTerm / Alacritty / tmux 1.5+)
-base64 -w0 < ~/.botmux/lark-scopes.json | awk 'BEGIN{printf "\033]52;c;"}{printf "%s",$0}END{printf "\a"}'
-```
-
-**添加重定向 URL（按需）**：如果之后要在飞书里 `/login` 让 botmux 以你的身份调云文档/日历/Wiki 等 API，进入「安全设置」→「重定向 URL」填入 `http://127.0.0.1:9768/callback`。只用 bot 收发消息的话这一步可以跳过。
-
-**发版**：进入「版本管理与发布」，点击「创建版本」并发布。可用性范围选择「仅自己可见」即可自动通过审核。
-
-![发版](docs/setup/publish.png)
-
-</details>
-
-<details>
-<summary><b>机器人收不到消息时的自查</b></summary>
-
-<br>
-
-botmux 会自动开启机器人能力、长连接事件模式并订阅基础事件，正常情况下不用动。如果按上面步骤走完 bot **完全收不到任何消息**（连私聊都不回），分别确认这两项：
-
-- **事件订阅**：开放平台 → 你的应用 → 事件与回调 → 应当订阅 `im.message.receive_v1` + `card.action.trigger`（默认已订阅，如缺失就手动添加）。订阅方式必须是「使用长连接接收事件」(WebSocket)，且 botmux daemon 已经在跑。
-- **机器人能力**：开放平台 → 你的应用 → 应用功能 → 机器人 应当已开通（默认开通），名字/头像可以改。
-
-确认后重启 daemon：`botmux restart`。
-
-</details>
-
----
-
-## 使用指南
-
-### 使用流程
-
-1. 在飞书话题群中发送消息创建新话题；或在普通群中发 `/t <prompt>` 主动开新话题；也可在 Dashboard 为单个 bot 开启普通群回复开话题
-2. 机器人弹出仓库选择卡片 — 选择项目或点击「直接开启会话」（被 `/oncall bind` 绑过的 bot 会跳过此步；绑定按 bot 计）
-3. CLI 在所选目录下启动
-4. 话题中出现实时流式卡片，展示终端输出并支持 Markdown 渲染
-5. 每次回复创建新的流式卡片，上一轮卡片冻结在最后状态
-6. 点击卡片上的「🔑 获取操作链接」通过私聊获取可写终端链接
-7. CLI 通过 `botmux send` 命令在话题中回复（由 `botmux-send` Skill 自动引导）
-
----
-
-### Bot 级环境变量（接入 GLM / 第三方服务商）
-
-每个 `bots.json` 条目都可以配置独立的 `env` 对象，注入到**该 bot 的 CLI 进程**。典型用途：让某个 bot 跑 GLM Coding Plan / 第三方 Anthropic·OpenAI 兼容服务商，另一个 bot 仍跑官方 Claude——只需给前者填上服务商的端点和 key：
+`bots.json` 里只放非敏感元数据和密钥文件路径，例如：
 
 ```json
 {
-  "cliId": "claude-code",
-  "workingDir": "~/projects",
+  "cliId": "ebsd",
+  "workingDir": "/var/lib/botmux/ebsd-work",
+  "sandbox": true,
   "env": {
-    "ANTHROPIC_BASE_URL": "https://api.z.ai/api/anthropic",
-    "ANTHROPIC_AUTH_TOKEN": "你的 GLM Coding Plan key"
+    "EBSD_BOTMUX_DIAG_ENDPOINT": "https://ebsbot.example",
+    "EBSD_BOTMUX_DIAG_TOKEN_FILE": "/run/secrets/ebsd-botmux/diag-token",
+    "EBSD_BOTMUX_BYTECLOUD_ACCESS_KEY_FILE": "/run/secrets/ebsd-botmux/bytecloud-ak",
+    "EBSD_BOTMUX_BYTECLOUD_SECRET_KEY_FILE": "/run/secrets/ebsd-botmux/bytecloud-sk",
+    "EBSD_BOTMUX_SUBJECT": "botmux-ebsd@prod",
+    "EBSD_BOTMUX_REPOSITORY_ROOT": "/srv/repos"
   }
 }
 ```
 
-> GLM 国内站把 `ANTHROPIC_BASE_URL` 换成 `https://open.bigmodel.cn/api/anthropic`。给 Codex 这类 OpenAI 协议 CLI 接入时，填 `OPENAI_BASE_URL` / `OPENAI_API_KEY`（指向服务商的 OpenAI 兼容端点）而非 `ANTHROPIC_*`。也可用于设 `HTTPS_PROXY`、CLI 专属开关等。
+三个密钥文件必须是运行 BotMux 的账号持有的 `0600` 普通文件，不能是符号链接；文件内容、AK/SK 和 Gateway token 都不得写进 `bots.json`。`workingDir` 应是专用空目录，仓库通过只读的 `EBSD_BOTMUX_REPOSITORY_ROOT` 暴露。Linux 开启 `sandbox` 前需安装 bubblewrap，隔离建立失败时会拒绝启动。当前/上一把 Gateway key 可以在服务端并存完成轮换，subject 保持不变。
 
-要点：
+当前完整 `cliId` 以 [`src/adapters/cli/registry.ts`](https://github.com/deepcoldy/botmux/blob/master/src/adapters/cli/registry.ts) 为准；各 CLI 的配置与套 wrapper / 网关方法见 [多 CLI 适配器](https://deepcoldy.github.io/botmux/adapters)。
 
-- `env` 只接受合法环境变量名，值支持字符串、数字、布尔值；`BOTMUX_` / `LARK_APP_` 等 botmux 保留键会被忽略（防止串改会话路由/凭证）。
-- 按**会话**注入到 CLI 进程（下个新会话起效）。tmux/zellij 后端经每个 pane 的 `/usr/bin/env` 注入，**不写入共享 server 全局 env**，所以一个 bot 的服务商配置不会串到别的 bot。
-- 也可在 dashboard 的「机器人默认设置 → 环境变量」里填写（owner 鉴权），或用 `/config set env '{...}'`。
-- 不要把它当成安全密钥库：值以明文存在 `bots.json` 与进程环境中，可能被本机诊断工具看到。
+托管的本地 Codex（tmux，含 `aiden x codex`）会话卡片提供「思考强度」下拉框。仅修改当前会话；空闲时选择后仅保存配置，卡片显示「待生效」；当前 CLI、预览和后台服务保持运行。设置在下一次正常冷恢复、重新创建 Worker/CLI 时生效，下一条消息或连接重附不会强制重启。执行中、等待输入、接管的外部 CLI 和未验证的后端会拒绝切换。下拉框优先显示上一轮实际强度，已保存但尚未应用的配置沿用「待生效」提示；独立 Codex 实例按已绑定的 home 检查历史，Aiden wrapper 继续遵守上游不支持实例池的限制。机器人默认值仍由各机器人配置管理，不修改本机 Codex 默认值。
 
----
+### 会话级 CLI 选择
 
-## 📖 完整文档
+在会话尚未启动前，可以用 `/cli <cliId>` 为当前会话选择已注册的 CLI，例如：
 
-命令、配置、最佳实践、排错的完整内容都在文档站，这里不再重复 ——
+```text
+/cli codex
+```
 
-### 👉 https://deepcoldy.github.io/botmux/
+这个选择只切换裸 CLI 适配器，不继承当前 bot 配置中的 `wrapperCli`、`model` 或 `startupCommands`。因此依赖 `ttadk`、`aiden` 等 wrapper / 网关才能启动的 CLI，不适合用会话级选择切换；应直接把 bot 默认配置设为对应的 wrapper 组合。会话启动后 CLI 选择冻结，后续消息和恢复都会继续使用该 CLI。
 
-| 主题 | 文档 |
-|------|------|
-| 斜杠命令 / CLI 命令 / 会话内子命令 | [命令参考](https://deepcoldy.github.io/botmux/slash-commands) |
-| `bots.json` 字段 / 环境变量 / 文件位置 | [配置参考](https://deepcoldy.github.io/botmux/bots-json) |
-| 多 CLI 适配器（含 wrapper / 网关接入） | [适配器](https://deepcoldy.github.io/botmux/adapters) |
-| 按场景的最佳实践（Oncall / 报警运维 / 个人研发 / 多人协作） | [最佳实践](https://deepcoldy.github.io/botmux/best-practices) |
-| 常见踩坑 / FAQ 排错 | [踩坑](https://deepcoldy.github.io/botmux/pitfalls) · [FAQ](https://deepcoldy.github.io/botmux/faq) |
-| 功能详解：定时任务 / Oncall / Dashboard / 多机器人协作 / 会话接力 | [定时](https://deepcoldy.github.io/botmux/schedule) · [Oncall](https://deepcoldy.github.io/botmux/oncall) · [Dashboard](https://deepcoldy.github.io/botmux/dashboard) · [多 bot](https://deepcoldy.github.io/botmux/multi-bot) · [接力](https://deepcoldy.github.io/botmux/relay) |
+### 会话级 Codex 实例
 
-## 贡献
+同一 Bot 的 Codex 多登录目录可使用 [会话级 Codex 实例](docs/codex-instances.md)：显式 `codexHome` 与默认实例、加权随机新会话分配，以及固定实例的恢复/fork。初始化和登录见该文档；不提供额度不足自动换号。
 
-参见 [CONTRIBUTING.md](CONTRIBUTING.md)。
+### 最终回答反馈（按 bot、默认关闭）
 
-## 许可证
+在单个 `bots.json` 条目中设置 `feedback.enabled: true`，可在最终回答卡片中收集固定三态语义 `positive / progress / negative` 的反馈；默认按钮为“结论可用 / 有效推进 / 结论有误”。按钮文案、样式、顺序、可见语义、负向原因、说明框与是否允许改选均可配置。默认关闭，`apiOnly` bot、进度卡、自定义卡、通知和语音不显示反馈控件。当前仅本次提问者可反馈，提交后原卡片原地更新，自由文本不会回显到群卡。
 
-[MIT](LICENSE)
+```json
+{
+  "feedback": {
+    "enabled": true,
+    "visibleSemantics": ["positive", "progress", "negative"],
+    "buttons": [
+      { "key": "conclusive_usable", "label": "结论可用", "semantic": "positive", "style": "primary" },
+      { "key": "effective_progress", "label": "有效推进", "semantic": "progress", "style": "default" },
+      { "key": "incorrect", "label": "结论有误", "semantic": "negative", "style": "danger" }
+    ],
+    "negativeFollowup": {
+      "reasons": [{ "key": "wrong_result", "label": "结论或结果错误" }],
+      "comment": { "enabled": true, "required": false, "maxLength": 1000 }
+    }
+  }
+}
+```
+
+也可在 Dashboard 的「Bot 配置 → 卡片 → 最终回答反馈」编辑，或用 `/botconfig set feedback '<json>'` 热更新。策略支持本地团队 → bot → bot-scoped chat 分层，优先级为 chat > bot > team；Dashboard 可预览最终生效策略。策略修改只影响之后交付的新卡；已发送卡片继续使用发送时快照。Agent 主动发送可声明 `botmux send --response-kind progress ...` 或 `botmux send --response-kind final ...`；未声明时默认按 progress/非 final 发送，只有显式 final 才挂反馈与页脚品牌签名。数据仅落在本机 `botmux-feedback.sqlite`；可选 webhook 通过 durable outbox 投递 `turn.completed` 与 `feedback.revised` 事件。完整实现和边界见 [`docs/feedback-capability-current-implementation.md`](docs/feedback-capability-current-implementation.md)。
+
+严格兼容 Codex 参数、交互与会话存储的独立发行版无需新增适配器：保留 `cliId: "codex"`，通过 `cliRuntime` 声明自己的 executable、展示名和更新源。BotMux 会按发行版隔离版本与会话身份，未知更新源不会回落到官方 Codex。详见 [Codex 兼容发行版](https://deepcoldy.github.io/botmux/adapters#codex-兼容发行版)。
+
+## 设计理念：直接桥接 CLI，不做 SDK wrapper
+
+botmux 不重新实现记忆、上下文管理、工具调用、权限体系——**多数 CLI 原生能力无需 botmux 重造，CLI 升级通常直接受益**（接口 / 参数 / 输出格式 / resume 语义有变时，adapter 仍可能要跟进）。用户照常发人话，daemon 在后台把上下文封装成结构化 prompt 再喂给 CLI。基于 Agent SDK 的方案则相反：能力取决于 SDK 暴露的接口面与你自己的集成实现。
+
+下表只对比**可核验的集成边界**，不对其它方案下「必然缺失」的结论：
+
+| 集成边界 | botmux | 基于 Agent SDK 的方案 |
+|------|--------|----------------------|
+| 桥接对象 | 完整 CLI 进程（含 hooks / memory / plan mode / MCP / `/` 命令等 CLI 自带运行时） | SDK 暴露的接口面 |
+| CLI 升级 | 多数直接受益；接口 / resume 有变时 adapter 跟进 | 取决于 SDK 版本与集成实现 |
+| 记忆 / 上下文 | 直接复用 CLI 内建 | 取决于 SDK / 自建 |
+| 多 CLI / Agent | 20+ 适配器一键切换 | 取决于 SDK 覆盖面 |
+| 多机器人 | 同群多 bot @mention 路由 | 取决于实现 |
+| 终端直连 | 本地 CLI 可 `tmux attach` 进真进程 | 取决于实现 |
+
+## 可信建群服务的默认免 @
+
+自助建群服务可通过应用与群绑定的签名，为普通群声明默认 `ambient` 模式：无需 @ 即可对话，只 @ 其他成员时保持安静。功能默认关闭，群级显式设置优先，现有对话与操作权限仍然生效。配置、注册表协议和缓存限制见 [可信群默认模式](docs/signed-chat-defaults.md)。
+
+## 接入自带任务流程的专业能力
+
+外部应用可使用实验版[模型透明代理模式](docs/model-proxy.md)：通过有鉴权的本机 Chat Completions 入口复用 CLI 模型能力，调用方继续管理上下文、工具执行和任务流程。[OpenCodeReview（OCR）](https://github.com/alibaba/open-code-review) 等应用可通过模型 SDK 接入；当前兼容字段、原生 CLI 验证范围及专用身份要求见文档。底层[受约束执行接口](docs/constrained-invocations.md)提供任务查询、取消、幂等和进程回收。
+
+## 文档 · 社区 · 贡献
+
+- 📖 **完整文档**（命令 / 配置 / 最佳实践 / 排错）：**<https://deepcoldy.github.io/botmux/>**
+- ✨ **效果展示**（图文 + 视频演示）：[《5 分钟创建一个真正好用的飞书助理》](https://bytedance.larkoffice.com/wiki/UBOXwH01CixfxfkqxUpcKgvQnsg)
+- ❓ **常见问题 / 排错**：[FAQ](https://deepcoldy.github.io/botmux/faq) · [常见踩坑](https://deepcoldy.github.io/botmux/pitfalls)
+- 💬 **交流群**：[关于 & 资源](https://deepcoldy.github.io/botmux/about) 页有内部 / 外部「Botmux 交流群」的扫码入群入口。
+- 🤝 **贡献**：欢迎 issue / PR。新增适配器见 [多 CLI 适配器](https://deepcoldy.github.io/botmux/adapters)。
+- 📄 **License**：[MIT](LICENSE)
+
+<p align="center">好用的话，顺手点个 ⭐ Star 吧 → <a href="https://github.com/deepcoldy/botmux">deepcoldy/botmux</a></p>
+
+[建群参数与默认配置](docs/guide/group-creation.md)

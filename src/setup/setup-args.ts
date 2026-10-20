@@ -1,5 +1,5 @@
 /**
- * `botmux setup <list|add|edit|remove>` 非 TUI（脚本化）模式：argv 解析 + 纯映射。
+ * `botmux setup <list|add|configure|edit|remove>` 非 TUI（脚本化）模式：argv 解析 + 纯映射。
  *
  * 动机：给 coding agent / 脚本一个**字段级**的稳定接口。以前脚本化 setup 只能
  * 对交互问答「管道喂数字」，TUI 问题序列一变（比如新增一问）答案就静默错位；
@@ -14,7 +14,8 @@ import {
   hasOwnerEntry,
   type BotConfigEditInput,
 } from './bot-config-editor.js';
-import { CLI_SELECT_OPTIONS, resolveCliSelection } from './cli-selection.js';
+import { CLI_SELECT_OPTIONS, CLI_SELECTION_ALIASES, resolveCliSelection } from './cli-selection.js';
+import type { CliRuntimeConfig } from '../adapters/cli/runtime.js';
 
 /** add / edit 共用的 bot 字段 flag（原始字符串，'-' 表示清空，语义同 TUI 编辑）。 */
 export interface SetupBotFlags {
@@ -26,6 +27,8 @@ export interface SetupBotFlags {
   /** CLI 选择键：cliId 或网关键（aiden-x-claude / ttadk-x-codex …），见 CLI_SELECT_OPTIONS。 */
   cli?: string;
   cliPath?: string;
+  /** JSON CliRuntimeConfig, or '-' to clear it. */
+  cliRuntime?: string;
   wrapperCli?: string;
   model?: string;
   backend?: string;
@@ -38,12 +41,15 @@ export interface SetupBotFlags {
   showInTeam?: string;
   /** 仅 add：feishu | lark。 */
   brand?: string;
+  /** UI 语言：zh | en。 */
+  lang?: string;
 }
 
 export type SetupCommand =
   | { action: 'help' }
   | { action: 'list'; json: boolean }
   | { action: 'add'; json: boolean; createApp: boolean; compatibilityMode: boolean; switchAccount: boolean; openPlatformAuto: boolean; flags: SetupBotFlags }
+  | { action: 'configure'; json: boolean; selector: string; switchAccount: boolean }
   | { action: 'edit'; json: boolean; selector: string; flags: SetupBotFlags }
   | { action: 'remove'; json: boolean; selector: string; yes: boolean };
 
@@ -66,6 +72,7 @@ const BOT_FIELD_FLAGS: Record<string, keyof SetupBotFlags> = {
   '--app-secret': 'appSecret',
   '--cli': 'cli',
   '--cli-path': 'cliPath',
+  '--cli-runtime': 'cliRuntime',
   '--wrapper-cli': 'wrapperCli',
   '--model': 'model',
   '--backend': 'backend',
@@ -75,6 +82,7 @@ const BOT_FIELD_FLAGS: Record<string, keyof SetupBotFlags> = {
   '--allowed-chat-groups': 'allowedChatGroups',
   '--show-in-team': 'showInTeam',
   '--brand': 'brand',
+  '--lang': 'lang',
 };
 
 export const SETUP_CLI_USAGE = `botmux setup — 脚本化（非 TUI）用法
@@ -85,6 +93,9 @@ export const SETUP_CLI_USAGE = `botmux setup — 脚本化（非 TUI）用法
   botmux setup add --create-app --allowed-users <owner> [--app-name <name>] [选项]
       首次扫码创建飞书应用；后续有效登录态下确认账号/企业后免扫码添加。
       --app-name 留空自动使用 botmux-N；更换账号用 --switch-account。
+      owner 请用完整邮箱、手机号或 union_id on_xxx；新应用尚不存在，不能
+      预先拥有可用的 open_id ou_xxx。managed Agent 若传入 daemon 注入的
+      当前 session owner，会由来源应用转换为 on_。
       默认继续完成权限、长连接事件、redirect 与发版；可用
       --no-open-platform-auto 跳过后半段自动配置。
 
@@ -94,8 +105,13 @@ export const SETUP_CLI_USAGE = `botmux setup — 脚本化（非 TUI）用法
 
   botmux setup add --app-id <cli_xxx> --app-secret <secret> --allowed-users <owner> [选项]
       使用已有凭证添加机器人。必填：--app-id / --app-secret / --allowed-users。
-      两种 add 方式都要求至少一个完整邮箱、union_id on_xxx 或 open_id ou_xxx
-      作为 owner，写盘前会用凭证换 tenant_access_token 校验；失败不写盘。
+      owner 可用完整邮箱、手机号、union_id on_xxx，或该应用自己签发的
+      open_id ou_xxx；写盘前会用凭证校验，失败不写盘。
+
+  botmux setup configure <进程名|AppID> [--switch-account] [--json]
+      对已添加的机器人重跑开放平台权限、长连接事件、redirect 与发版。
+      用于 add 返回 partial 后继续，不会重复创建应用；成功后自动尝试上线。
+      登录账号不对时加 --switch-account 明确重新扫码。
 
   botmux setup edit <进程名|AppID> [字段选项...]
       按字段修改机器人（如 botmux setup edit botmux-0 --cli codex）。
@@ -110,25 +126,30 @@ export const SETUP_CLI_USAGE = `botmux setup — 脚本化（非 TUI）用法
   --app-id <cli_xxx>         飞书应用 App ID（edit 时改绑另一个应用）
   --app-secret <secret>      App Secret
   --cli <key>                CLI 适配器：cliId 或网关键（claude-code / codex /
-                             aiden-x-claude / ttadk-x-codex …）
+                             traecli / forge-x-traex / aiden-x-claude / ttadk-x-codex …；
+                             traecli 映射到 TRAE CLI 2.0（内部 cliId=traex）
   --cli-path <path>          CLI 可执行文件路径覆盖
+  --cli-runtime <JSON|->     Codex-compatible runtime 描述；JSON 含 id、
+                             displayName、executable、update，传 - 清空
   --wrapper-cli <prefix>     通用启动前缀（如 "aiden x claude"），覆盖 --cli 推导值
   --model <m>                CLI 模型名
-  --backend <b>              会话后端 pty | tmux | herdr | zellij
+  --backend <b>              会话后端 pty | tmux | herdr | zellij | zmx
                              traex + herdr 插件安装需在 Dashboard Settings 中显式开启并填写可信 source/ref
   --working-dir <dirs>       仓库选择卡片的扫描根目录（逗号分隔多个）
   --default-working-dir <d>  固定默认目录：新话题直接在此目录启动、不弹仓库
                              选择卡片；传 - 清空、回到弹卡模式
-  --allowed-users <a,b>      管理员名单（完整邮箱 / on_xxx / ou_xxx，逗号分隔）
+  --allowed-users <a,b>      管理员名单（推荐完整邮箱 / 手机号 / on_xxx；
+                             ou_xxx 仅限已有目标应用自身，勿跨 Bot 复制）
   --allowed-chat-groups <g>  可对话群 chat_id（oc_xxx，逗号分隔）
   --show-in-team <bool>      平台团队页是否展示（默认 true）
   --brand <feishu|lark>      租户类型（仅 add）
+  --lang <zh|en>             Bot 语言（zh | en；edit 传 - 清空以继承全局语言）
 
 通用选项：
   --json                     输出机器可读 JSON（含 ok / error 字段）
   --create-app               add 时扫码创建应用，不再要求 --app-id/--app-secret
   --compatibility-mode       显式使用 SDK 兼容模式（可能需要额外扫码）
-  --switch-account           不复用缓存，重新扫码并覆盖本机飞书登录态
+  --switch-account           add --create-app / configure 时重新扫码并覆盖登录态
   --open-platform-auto       add 成功后执行开放平台自动配置（默认跳过；
                              --create-app 时默认开启）
   --no-open-platform-auto    跳过开放平台权限/发版自动配置
@@ -188,6 +209,28 @@ function parseBotFieldFlags(
   return { flags, json, yes, createApp, compatibilityMode, switchAccount, openPlatformAuto, openPlatformAutoSpecified, positional };
 }
 
+/** Parse only the JSON envelope here; structural validation remains centralized
+ * in applyBotConfigEdits -> normalizeCliRuntimeConfig so add/edit/TUI callers
+ * cannot drift onto different runtime rules. */
+function parseCliRuntimeFlag(raw: string | undefined): CliRuntimeConfig | null | undefined {
+  if (raw === undefined) return undefined;
+  const value = raw.trim();
+  if (value === '-') return null;
+  if (!value) throw new Error('--cli-runtime 必须是 JSON 对象或 -');
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch (err) {
+    throw new Error(`--cli-runtime 不是合法 JSON: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  return parsed as CliRuntimeConfig;
+}
+
+function isSettingWrapperCli(raw: string | undefined): boolean {
+  const value = raw?.trim();
+  return !!value && value !== '-';
+}
+
 /** 解析 `botmux setup` 的脚本化子命令 argv。非法输入抛 Error（message 面向用户）。 */
 export function parseSetupCommand(argv: string[]): SetupCommand {
   const [action, ...rest] = argv;
@@ -195,7 +238,7 @@ export function parseSetupCommand(argv: string[]): SetupCommand {
 
   if (action === 'list') {
     const { json, switchAccount, positional } = parseBotFieldFlags(rest, { allowFields: false, action: 'list' });
-    if (switchAccount) throw new Error('--switch-account 仅适用于 add --create-app。');
+    if (switchAccount) throw new Error('--switch-account 仅适用于 add --create-app 或 configure。');
     if (positional.length > 0) throw new Error(`list 不接受多余参数: ${positional.join(' ')}`);
     return { action: 'list', json };
   }
@@ -232,9 +275,27 @@ export function parseSetupCommand(argv: string[]): SetupCommand {
     };
   }
 
+  if (action === 'configure') {
+    const {
+      json,
+      yes,
+      createApp,
+      compatibilityMode,
+      switchAccount,
+      openPlatformAutoSpecified,
+      positional,
+    } = parseBotFieldFlags(rest, { allowFields: false, action: 'configure' });
+    if (yes || createApp || compatibilityMode || openPlatformAutoSpecified) {
+      throw new Error('configure 只接受机器人标识、--switch-account 和 --json。查看用法：botmux setup help');
+    }
+    if (positional.length === 0) throw new Error('configure 需要指定机器人（进程名 botmux-N 或 AppID）。');
+    if (positional.length > 1) throw new Error(`configure 只接受一个机器人标识: ${positional.join(' ')}`);
+    return { action: 'configure', json, selector: positional[0], switchAccount };
+  }
+
   if (action === 'edit') {
     const { flags, json, switchAccount, positional } = parseBotFieldFlags(rest, { allowFields: true, action: 'edit' });
-    if (switchAccount) throw new Error('--switch-account 仅适用于 add --create-app。');
+    if (switchAccount) throw new Error('--switch-account 仅适用于 add --create-app 或 configure。');
     if (positional.length === 0) throw new Error('edit 需要指定机器人（进程名 botmux-N 或 AppID）。');
     if (positional.length > 1) throw new Error(`edit 只接受一个机器人标识: ${positional.join(' ')}`);
     return { action: 'edit', json, selector: positional[0], flags };
@@ -242,7 +303,7 @@ export function parseSetupCommand(argv: string[]): SetupCommand {
 
   if (action === 'remove') {
     const { json, yes, switchAccount, positional } = parseBotFieldFlags(rest, { allowFields: false, action: 'remove' });
-    if (switchAccount) throw new Error('--switch-account 仅适用于 add --create-app。');
+    if (switchAccount) throw new Error('--switch-account 仅适用于 add --create-app 或 configure。');
     if (positional.length === 0) throw new Error('remove 需要指定机器人（进程名 botmux-N 或 AppID）。');
     if (positional.length > 1) throw new Error(`remove 只接受一个机器人标识: ${positional.join(' ')}`);
     return { action: 'remove', json, selector: positional[0], yes };
@@ -268,17 +329,22 @@ export function buildBotFromAddFlags(flags: SetupBotFlags): Record<string, any> 
   }
 
   const sel = resolveCliSelection((flags.cli ?? 'claude-code').trim());
+  if (sel.cliLaunchMode && isSettingWrapperCli(flags.wrapperCli)) {
+    throw new Error('Forge x TraeX 不能与 --wrapper-cli 同时使用。');
+  }
   const base: Record<string, any> = {
     larkAppId: flags.appId!.trim(),
     larkAppSecret: flags.appSecret!.trim(),
     cliId: sel.cliId,
     ...(sel.wrapperCli ? { wrapperCli: sel.wrapperCli } : {}),
+    ...(sel.cliLaunchMode ? { cliLaunchMode: sel.cliLaunchMode } : {}),
     // 与 TUI 同口径：feishu 不落 brand 字段，bots.json 保持干净。
     ...(brand === 'lark' ? { brand: 'lark' } : {}),
   };
 
   const input: BotConfigEditInput = {
     name: flags.name,
+    cliRuntime: parseCliRuntimeFlag(flags.cliRuntime),
     cliPathOverride: flags.cliPath,
     model: flags.model,
     backendType: flags.backend,
@@ -291,10 +357,11 @@ export function buildBotFromAddFlags(flags: SetupBotFlags): Record<string, any> 
     showInTeam: flags.showInTeam,
     // 显式 --wrapper-cli 覆盖 --cli 推导出的前缀（undefined 时不动 base 里的值）。
     wrapperCli: flags.wrapperCli,
+    lang: flags.lang,
   };
   const bot = applyBotConfigEdits(base, input);
   if (!hasOwnerEntry(bot.allowedUsers)) {
-    throw new Error('--allowed-users 至少需要一个完整邮箱、union_id（on_xxx）或 open_id（ou_xxx）作为 owner。');
+    throw new Error('--allowed-users 至少需要一个完整邮箱、手机号（大陆号直填，海外带 + 区号）、union_id（on_xxx）或 open_id（ou_xxx）作为 owner。');
   }
   assertOwnerWhenChatGroups(bot);
   return bot;
@@ -317,10 +384,21 @@ export function editInputFromFlags(flags: SetupBotFlags): BotConfigEditInput {
   if (flags.appSecret !== undefined) input.larkAppSecret = flags.appSecret;
   if (flags.cli !== undefined) {
     const sel = resolveCliSelection(flags.cli.trim());
+    if (sel.cliLaunchMode && isSettingWrapperCli(flags.wrapperCli)) {
+      throw new Error('Forge x TraeX 不能与 --wrapper-cli 同时使用。');
+    }
     input.cliChoice = sel.cliId;
     input.wrapperCli = sel.wrapperCli ?? null;
+    input.cliLaunchMode = sel.cliLaunchMode ?? null;
+    // An explicit CLI selection means its built-in/wrapper distribution.
+    // `--cli-runtime` below can replace this null with a custom descriptor.
+    input.cliRuntime = null;
   }
-  if (flags.wrapperCli !== undefined) input.wrapperCli = flags.wrapperCli;
+  if (flags.wrapperCli !== undefined) {
+    input.wrapperCli = flags.wrapperCli;
+    if (flags.wrapperCli.trim() && flags.wrapperCli.trim() !== '-') input.cliLaunchMode = null;
+  }
+  if (flags.cliRuntime !== undefined) input.cliRuntime = parseCliRuntimeFlag(flags.cliRuntime);
   if (flags.cliPath !== undefined) input.cliPathOverride = flags.cliPath;
   if (flags.model !== undefined) input.model = flags.model;
   if (flags.backend !== undefined) input.backendType = flags.backend;
@@ -329,12 +407,13 @@ export function editInputFromFlags(flags: SetupBotFlags): BotConfigEditInput {
   if (flags.allowedUsers !== undefined) input.allowedUsers = flags.allowedUsers;
   if (flags.allowedChatGroups !== undefined) input.allowedChatGroups = flags.allowedChatGroups;
   if (flags.showInTeam !== undefined) input.showInTeam = flags.showInTeam;
+  if (flags.lang !== undefined) input.lang = flags.lang;
   return input;
 }
 
 /** 合法 --cli 取值（报错提示用）。 */
 export function cliSelectionKeys(): string[] {
-  return CLI_SELECT_OPTIONS.map(o => o.key);
+  return [...CLI_SELECT_OPTIONS.map(o => o.key), ...Object.keys(CLI_SELECTION_ALIASES)];
 }
 
 /** list --json 输出前的 secret 脱敏（CLI 输出可能被贴进聊天/日志）。 */

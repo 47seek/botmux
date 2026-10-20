@@ -1,14 +1,15 @@
+import * as React from 'react';
 import {
   useCallback,
   useEffect,
   useMemo,
-  useRef,
   useState,
   type ComponentType,
   type ReactNode,
 } from 'react';
 import { PLUGIN_PINS_CHANGED_EVENT } from './plugin-events.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
+import { ModalDialog } from './modal-dialog.js';
 
 interface DashboardPluginEntry {
   pluginId: string;
@@ -43,10 +44,7 @@ interface PluginSkillContribution {
 interface PluginMcpContribution {
   name?: string;
   transport?: string;
-  command?: string[];
-  env?: Record<string, string>;
-  url?: string;
-  headers?: Record<string, string>;
+  privateRef?: string;
 }
 
 interface PluginCliCommand {
@@ -172,16 +170,16 @@ async function postServiceAction(pluginId: string, action: PluginServiceAction):
   return normalizePluginManagementPayload(await res.json());
 }
 
-function Tags(props: { values?: readonly string[] }): JSX.Element {
+function Tags(props: { values?: readonly string[] }): React.JSX.Element {
   if (!props.values?.length) return <span className="plugin-muted">-</span>;
   return <>{props.values.map(value => <span className="plugin-chip" key={value}>{value}</span>)}</>;
 }
 
-function InlineCode(props: { children: ReactNode }): JSX.Element {
+function InlineCode(props: { children: ReactNode }): React.JSX.Element {
   return <code className="plugin-inline-code">{props.children}</code>;
 }
 
-function InfoRows(props: { rows: Array<{ label: string; content: ReactNode }> }): JSX.Element {
+function InfoRows(props: { rows: Array<{ label: string; content: ReactNode }> }): React.JSX.Element {
   if (props.rows.length === 0) return <div className="plugin-empty-state">暂无内容</div>;
   return (
     <div className="plugin-info-table">
@@ -195,7 +193,7 @@ function InfoRows(props: { rows: Array<{ label: string; content: ReactNode }> })
   );
 }
 
-function PanelHeading(props: { title: string; description: string }): JSX.Element {
+function PanelHeading(props: { title: string; description: string }): React.JSX.Element {
   return (
     <div className="plugin-tab-panel-head">
       <h3>{props.title}</h3>
@@ -204,7 +202,7 @@ function PanelHeading(props: { title: string; description: string }): JSX.Elemen
   );
 }
 
-function EmptyPanel(props: { children: ReactNode }): JSX.Element {
+function EmptyPanel(props: { children: ReactNode }): React.JSX.Element {
   return <div className="plugin-empty-state">{props.children}</div>;
 }
 
@@ -241,7 +239,7 @@ function serviceStatusClass(report?: PluginServiceReport): string {
   return 'plugin-status-muted';
 }
 
-function ServiceAccessLink(props: { url?: string; health?: boolean }): JSX.Element {
+function ServiceAccessLink(props: { url?: string; health?: boolean }): React.JSX.Element {
   if (!props.url) return <span className="plugin-muted">{props.health ? '无健康检查' : '暂无访问地址'}</span>;
   return (
     <a
@@ -255,7 +253,7 @@ function ServiceAccessLink(props: { url?: string; health?: boolean }): JSX.Eleme
   );
 }
 
-function ServiceDetails(props: { plugin: ManagedPlugin }): JSX.Element {
+function ServiceDetails(props: { plugin: ManagedPlugin }): React.JSX.Element {
   const { plugin } = props;
   if (!plugin.service) return <EmptyPanel>这个插件没有需要单独启动的后台进程。</EmptyPanel>;
   const report = plugin.serviceReport;
@@ -283,7 +281,7 @@ function ServiceActions(props: {
   plugin: ManagedPlugin;
   busy: boolean;
   onAction(action: PluginServiceAction): void;
-}): JSX.Element | null {
+}): React.JSX.Element | null {
   const { plugin } = props;
   if (!plugin.service) return null;
   const report = plugin.serviceReport;
@@ -318,7 +316,7 @@ function ServiceActions(props: {
   );
 }
 
-function DashboardActions(props: { plugin: ManagedPlugin }): JSX.Element | null {
+function DashboardActions(props: { plugin: ManagedPlugin }): React.JSX.Element | null {
   const entries = props.plugin.dashboard ?? [];
   if (entries.length === 0) return null;
   return (
@@ -338,7 +336,7 @@ function PluginActionArea(props: {
   plugin: ManagedPlugin;
   busy: boolean;
   onServiceAction(action: PluginServiceAction): void;
-}): JSX.Element | null {
+}): React.JSX.Element | null {
   const hasService = Boolean(props.plugin.service);
   const hasDashboard = (props.plugin.dashboard?.length ?? 0) > 0;
   if (!hasService && !hasDashboard) return null;
@@ -356,7 +354,7 @@ function PluginActionArea(props: {
   );
 }
 
-function TabPanel(props: { id: string; active: boolean; children: ReactNode }): JSX.Element {
+function TabPanel(props: { id: string; active: boolean; children: ReactNode }): React.JSX.Element {
   return (
     <section
       className={`plugin-tab-panel${props.active ? ' is-active' : ''}`}
@@ -368,7 +366,7 @@ function TabPanel(props: { id: string; active: boolean; children: ReactNode }): 
   );
 }
 
-function SkillsPanel(props: { plugin: ManagedPlugin; active: boolean }): JSX.Element {
+function SkillsPanel(props: { plugin: ManagedPlugin; active: boolean }): React.JSX.Element {
   const skills = props.plugin.contributions?.skills ?? [];
   const rows = skills.map(skill => ({
     label: skill.name || skill.path || 'skill',
@@ -382,22 +380,15 @@ function SkillsPanel(props: { plugin: ManagedPlugin; active: boolean }): JSX.Ele
   );
 }
 
-function McpPanel(props: { plugin: ManagedPlugin; active: boolean }): JSX.Element {
+function McpPanel(props: { plugin: ManagedPlugin; active: boolean }): React.JSX.Element {
   const plugin = props.plugin;
   const server = plugin.contributions?.mcp;
   const serverRows: Array<{ label: string; content: ReactNode }> = server ? [{
     label: server.name || 'mcp',
     content: (
       <div className="plugin-info-stack">
-        <div>
-          <span>{server.transport === 'streamable-http' ? '服务地址' : '启动命令'}</span>
-          <InlineCode>{server.transport === 'streamable-http' ? server.url || '-' : server.command?.join(' ') || '-'}</InlineCode>
-        </div>
         <div><span>传输</span><Tags values={[server.transport || 'stdio']} /></div>
-        <div><span>环境变量</span><Tags values={Object.keys(server.env ?? {})} /></div>
-        {Object.keys(server.headers ?? {}).length > 0
-          ? <div><span>请求头</span><Tags values={Object.keys(server.headers ?? {})} /></div>
-          : null}
+        <div><span>运行配置</span><Tags values={['受保护，由 Gateway 按会话加载']} /></div>
       </div>
     ),
   }] : [];
@@ -439,7 +430,7 @@ function McpPanel(props: { plugin: ManagedPlugin; active: boolean }): JSX.Elemen
   );
 }
 
-function CliPanel(props: { plugin: ManagedPlugin; active: boolean }): JSX.Element {
+function CliPanel(props: { plugin: ManagedPlugin; active: boolean }): React.JSX.Element {
   const cli = props.plugin.contributions?.cli;
   const rows: Array<{ label: string; content: ReactNode }> = [
     ...(cli?.entry ? [{ label: '入口文件', content: <InlineCode>{cli.entry}</InlineCode> }] : []),
@@ -456,7 +447,7 @@ function CliPanel(props: { plugin: ManagedPlugin; active: boolean }): JSX.Elemen
   );
 }
 
-function DashboardPanel(props: { plugin: ManagedPlugin; active: boolean }): JSX.Element {
+function DashboardPanel(props: { plugin: ManagedPlugin; active: boolean }): React.JSX.Element {
   const rows = (props.plugin.dashboard ?? []).map(entry => ({
     label: entry.id,
     content: (
@@ -474,7 +465,7 @@ function DashboardPanel(props: { plugin: ManagedPlugin; active: boolean }): JSX.
   );
 }
 
-function ServicePanel(props: { plugin: ManagedPlugin; active: boolean }): JSX.Element {
+function ServicePanel(props: { plugin: ManagedPlugin; active: boolean }): React.JSX.Element {
   return (
     <TabPanel id="service" active={props.active}>
       <PanelHeading title="Service" description="插件后台服务的声明、当前状态和访问地址。启动、停止、重启在上方操作区处理。" />
@@ -483,7 +474,7 @@ function ServicePanel(props: { plugin: ManagedPlugin; active: boolean }): JSX.El
   );
 }
 
-function PluginTabs(props: { plugin: ManagedPlugin }): JSX.Element {
+function PluginTabs(props: { plugin: ManagedPlugin }): React.JSX.Element {
   const commands = props.plugin.contributions?.cli?.commands ?? [];
   const tabs = useMemo(() => [
     { id: 'skills', label: 'Skills', count: props.plugin.skillsCount ?? 0, hint: '会话加载' },
@@ -547,7 +538,7 @@ function PluginEnableRow(props: {
   checked: boolean;
   busy: boolean;
   onToggle(scope: string, enabled: boolean): void;
-}): JSX.Element {
+}): React.JSX.Element {
   return (
     <label className="toggle-row plugin-enable-row">
       <span className="plugin-enable-copy">
@@ -567,44 +558,16 @@ function PluginEnableRow(props: {
   );
 }
 
-function PluginGlobalSetting(props: {
-  plugin: ManagedPlugin;
-  bots: PluginBotScope[];
-  pendingToggles: PendingToggles;
-  busy: boolean;
-  onToggle(scope: string, enabled: boolean): void;
-}): JSX.Element {
-  const enabled = pluginEnabledInScope(props.plugin, 'global', props.pendingToggles);
-  return (
-    <label className="toggle-row plugin-global-setting">
-      <span className="plugin-global-setting-copy">
-        <strong>全局启用</strong>
-        <small>{enabled
-          ? `已对全部 ${props.bots.length} 个 Bot 启用`
-          : '关闭时可展开卡片，按 Bot 单独启用'}</small>
-      </span>
-      <input
-        type="checkbox"
-        data-plugin-toggle="global"
-        data-plugin-id={props.plugin.id}
-        checked={enabled}
-        disabled={props.busy}
-        onChange={event => props.onToggle('global', event.currentTarget.checked)}
-      />
-      <span className="switch" aria-hidden="true"></span>
-    </label>
-  );
-}
-
 function PluginBotSettings(props: {
   plugin: ManagedPlugin;
   bots: PluginBotScope[];
   pendingToggles: PendingToggles;
   busy: boolean;
+  globalEnabled: boolean;
+  globalTogglePending: boolean;
   onToggle(scope: string, enabled: boolean): void;
-}): JSX.Element {
+}): React.JSX.Element {
   const { plugin, bots, pendingToggles } = props;
-  const enabledBotCount = bots.filter(bot => pluginEnabledInScope(plugin, bot.id, pendingToggles)).length;
   return (
     <section className="plugin-enable-panel" aria-label={`${plugin.displayName || plugin.id} 按 Bot 启用`}>
       <div className="plugin-enable-panel-head">
@@ -612,27 +575,44 @@ function PluginBotSettings(props: {
           <strong>按 Bot 启用</strong>
           <small>全局关闭时，可为需要此插件的 Bot 单独开启；新启动的 CLI 会话生效。</small>
         </div>
-        <span>{enabledBotCount}/{bots.length} 个 Bot 已启用</span>
+        <label className="toggle-row plugin-global-toggle">
+          <input
+            type="checkbox"
+            data-plugin-toggle="global"
+            data-plugin-id={plugin.id}
+            checked={props.globalEnabled}
+            disabled={props.busy}
+            onChange={event => props.onToggle('global', event.currentTarget.checked)}
+          />
+          <span className="switch" aria-hidden="true"></span>
+          <span>为所有 Bot 启用</span>
+        </label>
       </div>
-      <div className="plugin-enable-list">
-        {bots.map(bot => {
-          const checked = pluginEnabledInScope(plugin, bot.id, pendingToggles);
-          const enabledState = checked ? '已启用' : '未启用';
-          return (
-            <PluginEnableRow
-              plugin={plugin}
-              scope={bot.id}
-              label={bot.name}
-              hint={`当前${enabledState}`}
-              checked={checked}
-              busy={props.busy}
-              onToggle={props.onToggle}
-              key={bot.id}
-            />
-          );
-        })}
-        {bots.length === 0 ? <div className="plugin-enable-empty">暂无已配置 Bot</div> : null}
-      </div>
+      {props.globalTogglePending ? (
+        <div className="plugin-enable-empty">正在更新全局设置...</div>
+      ) : props.globalEnabled ? (
+        <div className="plugin-enable-empty">已对全部 {bots.length} 个 Bot 启用；关闭上方开关后可单独设置。</div>
+      ) : (
+        <div className="plugin-enable-list">
+          {bots.map(bot => {
+            const checked = pluginEnabledInScope(plugin, bot.id, pendingToggles);
+            const enabledState = checked ? '已启用' : '未启用';
+            return (
+              <PluginEnableRow
+                plugin={plugin}
+                scope={bot.id}
+                label={bot.name}
+                hint={`当前${enabledState}`}
+                checked={checked}
+                busy={props.busy}
+                onToggle={props.onToggle}
+                key={bot.id}
+              />
+            );
+          })}
+          {bots.length === 0 ? <div className="plugin-enable-empty">暂无已配置 Bot</div> : null}
+        </div>
+      )}
     </section>
   );
 }
@@ -642,7 +622,10 @@ function PluginCapabilitySummary(props: {
   globalEnabled: boolean;
   enabledBotCount: number;
   botCount: number;
-}): JSX.Element {
+  expanded: boolean;
+  detailsId: string;
+  onToggle(): void;
+}): React.JSX.Element {
   const commands = props.plugin.contributions?.cli?.commands ?? [];
   const capabilities = [
     { label: 'Skills', count: props.plugin.skillsCount ?? 0 },
@@ -651,8 +634,14 @@ function PluginCapabilitySummary(props: {
     { label: 'Dashboard', count: props.plugin.dashboard?.length ?? 0 },
   ].filter(item => item.count > 0);
   return (
-    <div className="plugin-card-summary">
-      <div className="plugin-capability-summary" aria-label="插件能力摘要">
+    <button
+      type="button"
+      className="plugin-card-summary"
+      aria-expanded={props.expanded}
+      aria-controls={props.detailsId}
+      onClick={props.onToggle}
+    >
+      <span className="plugin-capability-summary" aria-label="插件能力摘要">
         {capabilities.map(item => (
           <span className="plugin-capability-chip" key={item.label}><strong>{item.count}</strong>{item.label}</span>
         ))}
@@ -662,36 +651,24 @@ function PluginCapabilitySummary(props: {
           </span>
         ) : null}
         {capabilities.length === 0 && !props.plugin.service ? <span className="plugin-muted">未声明扩展能力</span> : null}
-      </div>
+      </span>
       <span className="plugin-scope-summary">
         {props.globalEnabled
           ? `全部 ${props.botCount} 个 Bot`
           : `${props.enabledBotCount}/${props.botCount} 个 Bot 单独启用`}
       </span>
-    </div>
+    </button>
   );
 }
 
-function FeedbackDialog(props: { feedback: PluginFeedback | null; onClose(): void }): JSX.Element {
-  const dialogRef = useRef<HTMLDialogElement | null>(null);
-  useEffect(() => {
-    const dialog = dialogRef.current;
-    if (!dialog) return;
-    if (props.feedback && !dialog.open) {
-      try { dialog.showModal(); } catch { dialog.setAttribute('open', ''); }
-    } else if (!props.feedback && dialog.open) {
-      dialog.close();
-    }
-  }, [props.feedback]);
+function FeedbackDialog(props: { feedback: PluginFeedback | null; onClose(): void }): React.JSX.Element {
   return (
-    <dialog
+    <ModalDialog
       className="plugin-feedback-dialog"
       data-plugin-feedback-dialog
-      ref={dialogRef}
+      open={!!props.feedback}
       onClose={props.onClose}
-      onClick={event => {
-        if (event.target === event.currentTarget) props.onClose();
-      }}
+      onOpenError={(_error, dialog) => dialog.setAttribute('open', '')}
     >
       <article>
         <header>
@@ -704,7 +681,7 @@ function FeedbackDialog(props: { feedback: PluginFeedback | null; onClose(): voi
         <p className="plugin-feedback-message" data-plugin-feedback-message>{props.feedback?.message}</p>
         <footer><button type="button" className="btn-link" data-plugin-feedback-close onClick={props.onClose}>知道了</button></footer>
       </article>
-    </dialog>
+    </ModalDialog>
   );
 }
 
@@ -717,7 +694,7 @@ function PluginCard(props: {
   onToggle(scope: string, enabled: boolean): void;
   onPin(pinned: boolean): void;
   onServiceAction(action: PluginServiceAction): void;
-}): JSX.Element {
+}): React.JSX.Element {
   const { plugin } = props;
   const [expanded, setExpanded] = useState(false);
   const title = plugin.displayName || plugin.id;
@@ -756,31 +733,26 @@ function PluginCard(props: {
           {expanded ? '收起详情' : '展开详情'}
         </button>
       </header>
-      <PluginGlobalSetting
-        plugin={plugin}
-        bots={props.bots}
-        pendingToggles={props.pendingToggles}
-        busy={props.busy}
-        onToggle={props.onToggle}
-      />
       <PluginCapabilitySummary
         plugin={plugin}
         globalEnabled={enabledGlobal}
         enabledBotCount={enabledBotCount}
         botCount={props.bots.length}
+        expanded={expanded}
+        detailsId={detailsId}
+        onToggle={() => setExpanded(current => !current)}
       />
       {expanded ? (
         <div className="plugin-card-expanded" id={detailsId}>
-          {!enabledGlobal && !globalTogglePending ? (
-            <PluginBotSettings
-              plugin={plugin}
-              bots={props.bots}
-              pendingToggles={props.pendingToggles}
-              busy={props.busy}
-              onToggle={props.onToggle}
-            />
-          ) : null}
-          {globalTogglePending ? <div className="plugin-settings-pending">正在更新全局设置...</div> : null}
+          <PluginBotSettings
+            plugin={plugin}
+            bots={props.bots}
+            pendingToggles={props.pendingToggles}
+            busy={props.busy}
+            globalEnabled={enabledGlobal}
+            globalTogglePending={globalTogglePending}
+            onToggle={props.onToggle}
+          />
           {hasDashboard ? (
             <div className="plugin-card-controls">
               <label className="toggle-row plugin-pin-toggle">
@@ -821,7 +793,7 @@ function updateSet<T>(source: ReadonlySet<T>, value: T, present: boolean): Set<T
   return next;
 }
 
-function PluginManagementPage(): JSX.Element {
+function PluginManagementPage(): React.JSX.Element {
   const [payload, setPayload] = useState<PluginManagementPayload | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
@@ -941,7 +913,20 @@ function PluginManagementPage(): JSX.Element {
 }
 
 function pluginDashboardApi(pluginId: string) {
+  async function settings(method: string, value?: unknown) {
+    const response = await fetch(`/api/plugins/${encodeURIComponent(pluginId)}/settings`, {
+      method, headers: { 'content-type': 'application/json' },
+      ...(method === 'PUT' ? { body: JSON.stringify(value) } : {}),
+    });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || `HTTP ${response.status}`);
+    return result;
+  }
   return {
+    react: React,
+    getSettings: () => settings('GET'),
+    saveSettings: (value: unknown) => settings('PUT', value),
+    async listBots() { return (await fetchPluginManagement()).bots; },
     async getServiceStatus() {
       const payload = await fetchPluginManagement();
       return payload.plugins.find(plugin => plugin.id === pluginId)?.serviceReport;
@@ -958,7 +943,7 @@ function pluginDashboardApi(pluginId: string) {
   };
 }
 
-function PluginDashboardRoute(props: { hash: string }): JSX.Element {
+function PluginDashboardRoute(props: { hash: string }): React.JSX.Element {
   const [entry, setEntry] = useState<DashboardPluginEntry | null>(null);
   const [Component, setComponent] = useState<PluginDashboardComponent | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -1014,7 +999,7 @@ function PluginDashboardRoute(props: { hash: string }): JSX.Element {
   );
 }
 
-function PluginRoutePage(): JSX.Element {
+function PluginRoutePage(): React.JSX.Element {
   const hash = location.hash || '#/plugins';
   if (hash === '#/plugins' || hash.startsWith('#/plugins?')) return <PluginManagementPage />;
   return <PluginDashboardRoute hash={hash} />;

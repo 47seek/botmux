@@ -7,7 +7,8 @@
  *
  * 仅作为可选 helper, **未启用于 setup / start 主链路**:
  * - {@link checkRequiredScopes} —— 调 `application.v6.scope.list` 比对 botmux
- *   需要的 scope. 待 spike 用真实/可复现 mock 证明 grant_status 闭环后再启用.
+ *   需要的 scope. grant_status 映射已在 Lark 国际版自建应用真机闭环验证
+ *   (见该函数注释), 1 与 2 均视为已开通.
  * - {@link applyScopesUnverified} —— 调 `application.v6.scope.apply` 触发管理
  *   员审批. Lark 文档表明它只能提交"已声明但未授权"的 scope, 不能给 manifest
  *   加新 scope, 所以无法绕开"用户去开放平台勾"这步; 同样待 spike 后启用.
@@ -34,6 +35,10 @@ export interface RequiredScope {
    */
   critical: boolean;
 }
+
+export type CriticalScopeReadbackResult =
+  | { ok: true; granted: string[]; missingCritical: RequiredScope[] }
+  | { ok: false; error: 'invalid_credentials' | 'need_self_manage' | 'network' | 'unknown'; message: string };
 
 /**
  * botmux 运行所需的 scope. 这里**只用于检测/提示**, 不用于自动申请——飞书
@@ -72,6 +77,29 @@ export const BOTMUX_REQUIRED_SCOPES: RequiredScope[] = [
   // 协作收不到事件"），等价于 critical 处理；保留 critical 标记是为了让启动
   // 时的统一巡检循环也覆盖它。
   { name: 'im:message.group_at_msg.include_bot:readonly', desc: '跨 bot @ 事件', critical: true },
+  // 「话题群新话题自动开工」(autoStartOnNewTopic) 要覆盖到「其他机器人开的新话题」时，
+  // 飞书只有开了这个 scope 才会把「其他用户和机器人发送的、未 @ 本 bot 的群消息」推到
+  // WSClient（官方 im.message.receive_v1 文档：「接收群聊中所有用户和其他机器人发送的
+  // 消息」= im:message.group_msg.include_bot:read；im:message.group_msg 只含用户、不含
+  // 机器人）。它是 opt-in 特性专用，故标 non-critical：没开该功能的 bot 缺它不该被启动
+  // 自检 DM 打扰；只有当同时缺别的 critical 项时才顺带在提示里列出。开了功能却缺它 →
+  // bot 开的新话题收不到事件、自动开工静默不触发（预期降级，非崩溃）。
+  { name: 'im:message.group_msg.include_bot:read', desc: '接收群聊中所有用户和其他机器人发送的消息（「其他机器人开的新话题也自动开工」需要）', critical: false },
+  // Dashboard 建群/创建会话的原生飞书标签功能。标签 API 只接受用户身份，
+  // 这里检测的是应用是否已经声明对应 user scope；真正使用时仍需用户做一次 OAuth。
+  // 标 non-critical：不用标签的部署不应因它阻塞 daemon 启动；有缓存的开放平台
+  // Web session 时，event-dispatcher 会在启动阶段静默补权限并发布新版本。
+  { name: 'im:feed_group_v1:read', desc: '读取飞书会话标签（Dashboard 建群分类）', critical: false },
+  { name: 'im:feed_group_v1:write', desc: '创建飞书会话标签并将新群加入标签', critical: false },
+  { name: 'im:chat.tabs:read', desc: '读取飞书群标签页（/tabs、botmux tabs）', critical: false },
+  { name: 'im:chat.tabs:write_only', desc: '管理飞书群标签页（/tabs、botmux tabs）', critical: false },
+  // `botmux send --urgent[=app|sms|phone]`. Keep these non-critical: ordinary
+  // messaging must continue when a tenant declines disruptive/quota-bearing
+  // Buzz channels. New apps import them from the default manifest; existing
+  // apps are silently topped up from the cached Open Platform session.
+  { name: 'im:message.urgent', desc: '应用内加急消息', critical: false },
+  { name: 'im:message.urgent:sms', desc: '短信加急消息（消耗租户额度）', critical: false },
+  { name: 'im:message.urgent:phone', desc: '电话加急消息（消耗租户额度）', critical: false },
   { name: 'application:application:self_manage', desc: '应用自查 (免审批)', critical: false },
 ];
 
@@ -121,6 +149,24 @@ export const VC_MEETING_FEATURE_SCOPES: RequiredScope[] = [
 /** Realtime voice is only required when vcMeetingAgent.realtimeVoice.enabled is true. */
 export const VC_MEETING_REALTIME_VOICE_SCOPES: RequiredScope[] = [
   { name: 'vc:meeting.bot.realtime:write', desc: '会议智能体实时语音发言', critical: false },
+];
+
+/**
+ * Dashboard「飞书原生命令面板」（应用级 Slash 命令注册）专用的**可选**权限。
+ *
+ * 刻意**不在** {@link BOTMUX_REQUIRED_SCOPES}、也**不在** lark-scopes.json 默认 manifest：
+ * - 该能力在飞书侧仍处于灰度（需 FG 白名单 + 7.70+ PC 端），部分租户的权限目录里可能
+ *   根本没有这两个 scope；放进 manifest 会让新建应用的导入多一个不可识别项。
+ * - 放进 BOTMUX_REQUIRED_SCOPES 时，启动自检会把 non-critical 缺失项静默补进应用并
+ *   **发布新版本**（event-dispatcher 的 optional top-up）——为一个用户可能永远不用、
+ *   且可能不可用的 Dashboard 功能去改应用版本，违背「可选」。
+ * 缺失时只有 Dashboard 的该面板降级为「不可用 + 开通深链」，不影响 daemon 启动与其它功能。
+ */
+export const APP_SLASH_COMMAND_READ_SCOPE = 'application:app_slash_command:read';
+export const APP_SLASH_COMMAND_WRITE_SCOPE = 'application:app_slash_command:write';
+export const APP_SLASH_COMMAND_FEATURE_SCOPES: RequiredScope[] = [
+  { name: APP_SLASH_COMMAND_READ_SCOPE, desc: '读取应用 Slash 命令（Dashboard 原生命令面板，可选）', critical: false },
+  { name: APP_SLASH_COMMAND_WRITE_SCOPE, desc: '注册 / 更新 / 删除应用 Slash 命令（Dashboard 原生命令面板，可选）', critical: false },
 ];
 
 /** VC bot push 事件。开放平台当前没有公开 API 可列出已订阅事件，只能给管理员检查清单。 */
@@ -228,6 +274,75 @@ export async function validateCredentials(
   return { ok: false, error: 'unknown', message: `code=${body?.code ?? '?'} msg=${body?.msg ?? ''}` };
 }
 
+/**
+ * Runtime-proven scope readback used by Dashboard VC validation and daemon
+ * startup checks: tenant token followed by Get application info. Unlike the
+ * legacy grant_status helper below, this endpoint returns the effective scope
+ * names directly in data.app.scopes.
+ */
+export async function readCriticalScopesFromApplicationInfo(
+  appId: string,
+  appSecret: string,
+  brand: Brand = 'feishu',
+  opts: { budgetMs?: number } = {},
+): Promise<CriticalScopeReadbackResult> {
+  const openApi = larkHosts(brand).openApi;
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), opts.budgetMs ?? 10_000);
+  try {
+    const tokenRes = await fetch(`${openApi}/open-apis/auth/v3/tenant_access_token/internal`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ app_id: appId, app_secret: appSecret }),
+      signal: ac.signal,
+    });
+    const tokenData = await tokenRes.json() as any;
+    if (tokenData?.code !== 0 || typeof tokenData?.tenant_access_token !== 'string') {
+      return {
+        ok: false,
+        error: 'invalid_credentials',
+        message: `tenant_access_token failed: code=${tokenData?.code ?? '?'} msg=${tokenData?.msg ?? ''}`,
+      };
+    }
+    const infoRes = await fetch(
+      `${openApi}/open-apis/application/v6/applications/${appId}?lang=zh_cn`,
+      { headers: { Authorization: `Bearer ${tokenData.tenant_access_token}` }, signal: ac.signal },
+    );
+    const infoData = await infoRes.json() as any;
+    if (infoData?.code === 99991672) {
+      return { ok: false, error: 'need_self_manage', message: 'missing application:application:self_manage' };
+    }
+    if (infoData?.code !== 0) {
+      return {
+        ok: false,
+        error: 'unknown',
+        message: `application info failed: code=${infoData?.code ?? '?'} msg=${infoData?.msg ?? ''}`,
+      };
+    }
+    const scopesRaw: any[] = infoData.data?.app?.scopes
+      ?? infoData.data?.application?.scopes
+      ?? infoData.data?.scopes
+      ?? [];
+    const granted = [...new Set(
+      scopesRaw.map(scope => typeof scope === 'string' ? scope : scope?.scope).filter(Boolean) as string[],
+    )];
+    const grantedSet = new Set(granted);
+    return {
+      ok: true,
+      granted,
+      missingCritical: BOTMUX_REQUIRED_SCOPES.filter(scope => scope.critical && !grantedSet.has(scope.name)),
+    };
+  } catch (err: any) {
+    return {
+      ok: false,
+      error: 'network',
+      message: ac.signal.aborted ? 'scope readback timeout' : `scope readback failed: ${err?.message ?? String(err)}`,
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 // ─── Scope check (helper, not in main path) ──────────────────────────────
 
 export type ScopeCheckResult =
@@ -251,13 +366,23 @@ export type ScopeCheckResult =
 /**
  * 列出应用的 scope grant 状态, 比对 BOTMUX_REQUIRED_SCOPES.
  *
- * **不在主路径使用** — 待 spike 用真实/可复现 mock 证明 grant_status 含义和
- * 状态闭环后再启用. 当前主路径只输出"剩余步骤 + 深链", 不做 grant_status 判定.
+ * **不在主路径使用** — 当前主路径只输出"剩余步骤 + 深链", 不做 grant_status 判定.
+ * (daemon 启动的"缺少 N 项必需权限"自检走 event-dispatcher.checkRequiredScopes,
+ * 数据源是 application/v6/applications 的**生效 scope 名列表**, 不消费 grant_status,
+ * 因此不受本映射影响。)
  *
  * scope.list 返回 shape (SDK type):
  *   `{ data: { scopes: [{ scope_name, grant_status, scope_type }] } }`
- * grant_status 含义未在官方文档明确, 但社区 SDK / 实测一般约定:
- *   1 = 已申请未生效, 2 = 已生效. 启用前 spike 务必确认这个映射.
+ * grant_status 含义未在官方文档明确. 曾按社区约定只认 2 = 已生效; Lark 国际版
+ * (larksuite.com) 自建应用真机 spike 推翻了"1 = 已申请未生效"的假设: **已开通的
+ * scope 返回 grant_status = 1, 且功能实测可用** — 用 bot tenant token 直调
+ * `im/v1/messages` (im:message.group_msg) code 0 且拿到群历史消息;
+ * `im/v1/chats/{id}/members` (im:chat.members:read) 同样 code 0. 这两个 scope
+ * 在 scope.list 里都是 status=1. 故 1 与 2 均视为 granted, 避免对已开通 scope
+ * 持续误报 missing.
+ *
+ * 边界: 该实证来自 Lark 国际版自建应用; feishu.cn 域未单独验证. 两侧 scope.list
+ * 是同一 API, 故按同一映射处理 (行为一致), 如后续发现 feishu.cn 语义不同再分域.
  */
 export async function checkRequiredScopes(
   appId: string,
@@ -292,9 +417,10 @@ export async function checkRequiredScopes(
   }
 
   const scopes = resp?.data?.scopes ?? [];
-  // grant_status === 2 → granted (待 spike 确认这是正确映射)
+  // grant_status 1 与 2 都算 granted —— Lark 国际版真机实证: 已开通 scope 返回 1
+  // 且 API 直调可用 (见函数头注释). 只认 2 会把已开通的 scope 误报成 missing.
   const grantedNames: string[] = scopes
-    .filter((s: any) => s?.grant_status === 2 && typeof s?.scope_name === 'string')
+    .filter((s: any) => (s?.grant_status === 1 || s?.grant_status === 2) && typeof s?.scope_name === 'string')
     .map((s: any) => s.scope_name);
 
   const missingCritical = BOTMUX_REQUIRED_SCOPES.filter(s => s.critical && !grantedNames.includes(s.name));
@@ -383,9 +509,14 @@ export async function applyScopesUnverified(
 
 /**
  * setup 后 "还要手动点的步骤" 结构化数据. 跟 cli.ts 的 printRemainingSteps + README
- * "5 分钟快速接入" 一致: 主线就两步 (权限申请 + 按需重定向 URL); PersonalAgent
+ * "5 分钟快速接入" 一致: 主线就两步 (权限申请 + 重定向 URL); PersonalAgent
  * 应用默认订阅事件 + bot 能力, 不在主线提示, 收不到消息时见 README 的 fallback
  * 自查清单.
+ *
+ * 重定向 URL 曾被写成 "按需, 可跳过" —— 那是误导. 群聊模式 (p2pMode=group)、
+ * 会话群标签 (feed-group) 和 /login 都要走 OAuth 拿用户 token, 白名单里没有回调
+ * 地址时 authorize 直接报 20029, 用户连飞书授权页都打不开. 只有纯话题模式且从不
+ * 用 /login 才真的用不上它.
  */
 export function buildRemainingSteps(appId: string, brand: Brand = 'feishu'): RemainingStep[] {
   return [
@@ -396,8 +527,48 @@ export function buildRemainingSteps(appId: string, brand: Brand = 'feishu'): Rem
     },
     {
       title:
-        '添加重定向 URL http://127.0.0.1:9768/callback (按需, 用于 botmux 内 /login 跨用户调 API)',
+        `添加重定向 URL ${remainingStepRedirectUrls().join(' 和 ')} `
+        + '(群聊模式 p2pMode=group / 会话群标签 feed-group / /login 必需, 用于跨用户调 API; 缺了会报 20029)',
       url: `${buildAppHomeDeepLink(appId, brand)}/safe`,
     },
   ];
+}
+
+/**
+ * 提示里要让用户填的重定向 URL 实际列表。
+ *
+ * 写死 `http://127.0.0.1:9768/callback` 会误导：配了 `oauthRedirectBase` / 接了中心
+ * 平台 / 自建反代的机器，真正发起授权用的是 `<base>/oauth/callback`，只填 loopback
+ * 那条照样 20029。
+ *
+ * ⚠️ 这里必须用**动态 import**，不能在文件头静态 import：
+ * `open-platform-automation.ts` 反过来 import 本模块的 `VC_MEETING_BOT_EVENTS`，
+ * 而且是在它自己的**模块顶层 const 初始化**里用。静态互引会让「先加载
+ * verify-permissions」的入口在对方模块体执行时撞上 TDZ（`Cannot access
+ * 'VC_MEETING_BOT_EVENTS' before initialization`）而整个进程起不来。
+ *
+ * `buildRemainingSteps` 是同步函数（onboarding 落终态时直接调），所以用同步可用的
+ * 已加载模块缓存：`automateOpenPlatformSetup` 这条链路一定先加载过对方模块，缓存
+ * 就有值；缓存没命中（例如 dashboard 在没跑过自动化的上下文里落 remainingSteps）
+ * 就回落到 loopback 单条 —— 保守但绝不炸。
+ */
+function remainingStepRedirectUrls(): string[] {
+  try {
+    const urls = loadedCollectBotmuxRedirectUrls?.();
+    if (urls && urls.length > 0) return urls;
+  } catch { /* 配置读不动：回落到最核心的那一条 */ }
+  return [DEFAULT_BOTMUX_REDIRECT_URL];
+}
+
+const DEFAULT_BOTMUX_REDIRECT_URL = 'http://127.0.0.1:9768/callback';
+
+/** 由 {@link registerBotmuxRedirectUrlCollector} 注入，见上方注释解释为何不能静态 import。 */
+let loadedCollectBotmuxRedirectUrls: (() => string[]) | undefined;
+
+/**
+ * 让 `open-platform-automation.ts` 在自己加载完成后把 `collectBotmuxRedirectUrls`
+ * 注册进来。单向依赖（automation → verify-permissions）保持不变，不引入新的环。
+ */
+export function registerBotmuxRedirectUrlCollector(collect: () => string[]): void {
+  loadedCollectBotmuxRedirectUrls = collect;
 }

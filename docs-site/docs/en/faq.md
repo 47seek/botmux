@@ -2,19 +2,45 @@
 
 > Compiled from the README and high-frequency questions in the community group, and continuously expanded. For more pitfalls, see [Common Pitfalls](/en/pitfalls).
 
-## The bot receives no messages at all — what do I do?
+## Troubleshooting "the bot doesn't reply" (the #1 question)
+
+Match your **symptom** first — the root cause differs:
+
+| Symptom | Likely cause | Jump |
+|------|-----------|------|
+| **No reaction at all** (not even an emoji) | Event subscription / release / long connection not working | [A. No messages received at all](#a-no-messages-received-at-all) |
+| Only **I (owner)** can trigger it; others get an auth card / no reply | Only operate permission granted, no talk permission | [B. Others can't use it / auth card](#b-others-cant-use-it--auth-card) |
+| Must **@ it** to get a reply / want auto-reply without @ | Group @ policy | [B. Others can't use it / auth card](#b-others-cant-use-it--auth-card) |
+| Shows 🟡 "working" but **the result never comes back** (terminal has output) | Terminal CLI session: model didn't call `botmux send` (`codex-app` auto-forwards — it's the exception) | [C. Terminal has output but nothing sent to Lark](#c-terminal-has-output-but-nothing-sent-to-lark) |
+| Session **won't start** / first message errors `zsh: parse error` | Login shell startup file jumps shells | [Session won't start](#sessions-never-start--the-first-message-errors-with-zsh-parse-error-near-n) |
+
+### A. No messages received at all
 
 Check these in order (PersonalAgent comes configured correctly by default; normally you don't need to touch it):
 
-1. **Event subscription**: Open Platform → Events & Callbacks → you should subscribe to `im.message.receive_v1` + `card.action.trigger`, with the delivery method set to "Long connection (WebSocket)", and the daemon must be running.
+1. **Event subscription**: Open Platform → Events & Callbacks → subscribe to `im.message.receive_v1` + `card.action.trigger`, with delivery method "Long connection (WebSocket)", and the daemon must be running.
 2. **Bot capability**: Open Platform → App Features → Bot should already be enabled.
-3. **Release**: The app must have a version created and published (availability "visible only to myself" passes automatically).
-4. **Exclusive long connection**: Confirm this bot isn't having its long connection grabbed by another app at the same time.
+3. **Release**: the app must have a version created and published (availability "visible only to myself" passes automatically). After changing permissions / events you **must re-publish** for them to take effect.
+4. **Exclusive long connection**: confirm this bot isn't having its long connection grabbed by another app.
 5. After confirming, run `botmux restart` (from a clean shell).
 
-## The bot has output in the terminal, but nothing was sent to Lark?
+> To have an agent triage it, see [Common Pitfalls · General troubleshooting approach](/en/pitfalls#general-troubleshooting-approach) (`botmux logs` to find the spawn command and reproduce locally + the web terminal for the real error).
 
-Terminal stdout ≠ sent to Lark. You must explicitly run `botmux send` (with one of `--mention-back` / `--mention` / `--no-mention`) for the group to see it. If the model only `echo`s/`print`s or forgets to call `botmux send`, nothing goes out. Use a heredoc for multi-line content; don't write it as `"line one\nline two"`.
+### B. Others can't use it / auth card
+
+botmux has two permission layers (the full layer model is in [Permissions & Access](/en/permissions); quick reference below in [How are permissions divided](#how-are-permissions-divided-who-can-operate-it)): **talk permission** (who can ask) and **operate permission** (who can `/cd` `/restart` / tap buttons). By default only people on the `allowedUsers` list have talk permission, so others get refused / see an auth card. **Being added to a group does not authorize any member.**
+
+- **Let a whole group use it**: send bare `@bot /grant` in the group (writes `allowedChatGroups`; everyone takes effect immediately, no quota), or use **authorize the whole group in one click** in Dashboard **Groups → Manage**; no need to add people one by one.
+- **Trial access for specific people**: `@bot /grant @someone` opens a card defaulting to 3 messages / 1 hour, with quota and duration adjustable on the card; the Dashboard group-member modal also supports multi-select **batch grant** (up to 50).
+- **Group @ policy** (must-@ vs no-@): multi-person groups require @ by default; `/mention-mode topic|never|ambient` changes it, and the four modes plus the 8 no-@ exceptions are explained in [Mention Policy](/en/mention-mode). A 1-on-1 "you + 1 bot" group is @-free already.
+- **On-call scenario** (a new group per ticket, everyone asks @-free): see [On-Call Mode](/en/oncall).
+- **Block someone**: Dashboard **Bot Config → `blockedUsers`** — denied globally in groups and DMs, with no more request cards.
+
+### C. Terminal has output but nothing sent to Lark
+
+**This applies only to terminal CLI sessions that require explicit sending** (Claude Code / Codex CLI / Gemini / CoCo, etc.): terminal stdout ≠ sent to Lark, so the model must explicitly run `botmux send` (with one of `--mention-back` / `--mention` / `--no-mention`) for the group to see it. Just `echo`ing/`print`ing or forgetting `botmux send` means nothing goes out. Use a heredoc for multi-line content; don't write it as `"line one\nline two"`.
+
+> ⚠️ **Exception: `codex-app` (Codex App app-server protocol)** — its final assistant message is **auto-forwarded** back to Lark by botmux, so **don't call `botmux send` for normal replies** (that would double-send); use it only for mid-turn pushes / attachments / cross-bot @mentions.
 
 ## `botmux history` reports 400 / Lark gateway 411?
 
@@ -47,11 +73,17 @@ Yes. Both Feishu (feishu.cn) and Lark (international, larksuite.com) work: when 
 
 ## How do multiple bots collaborate with each other?
 
-Use `botmux bots list` or the `<available_bots>` block to find the target bot's `openId`, then explicitly trigger it with `botmux send --mention <the other's openId>`. Without `--mention`, the other bot won't be triggered. `/introduce` is now only a legacy / external-bot fallback: use it when the target is missing or shows `mentionable=false`.
+**It works by default — no extra setup.** Just add the bots you want to collaborate to the same group.
+
+- **Just you and one bot**: talk to it directly; it responds automatically, no @ needed.
+- **A group with multiple bots / people**: @ the bot you want to hand the work to.
+- When bots need to relay (e.g. one writes, one reviews), the bots @ each other to pass it along — you just hand the work to the first one.
+
+See [Multi-bot Collaboration](/en/multi-bot) for details.
 
 ## Does restarting the daemon lose context?
 
-With **tmux** installed, no — the CLI process stays resident in a tmux session, and after `botmux restart` the next message automatically re-attaches, with no need for `--resume`. Without tmux, it runs in pty mode, and a restart reloads everything.
+With **tmux** installed, no — tmux is the default backend, the CLI process stays resident in a tmux session, and after `botmux restart` the next message automatically re-attaches, with no need for `--resume`. ⚠️ Without tmux it does **not** silently downgrade to pty; it hard-gates and posts a card asking you to install tmux. Only an explicit `BACKEND_TYPE=pty` (or per-bot `backendType:"pty"`) uses pty, and pty sessions **do not survive daemon restarts** — a restart reloads everything.
 
 ## Does a session keep running if I don't close it? Is there automatic reclamation?
 
@@ -65,7 +97,27 @@ It keeps running, and there is **currently no idle-TTL automatic reclamation**. 
 
 ## How are permissions divided? Who can operate it?
 
-Three layers: `allowedChatGroups` / `globalGrants` grant **conversation rights** (everyone in the group can ask); `allowedUsers` grants **operation rights** (only the owner can `/cd`, `/restart`, `/close`, click buttons). When `allowedChatGroups` is configured, `allowedUsers` must have at least one owner.
+Quick reference: `allowedUsers` grants **operate rights** (owner and admins — `/cd`, `/restart`, `/close`, card buttons, and changing `/card`, `/cot`, `/mention-mode`); `allowedChatGroups` (bare `/grant`, whole group, no quota), on-call (whole group, always allowed + directory bound), and `chatGrants` / `globalGrants` (per person, default 3 messages / 1 hour) grant **talk rights**; `blockedUsers` is the global deny that precedes every allow leg. Layers, quotas, expiry, and request cards are fully documented in [Permissions & Access](/en/permissions).
+
+## How do I let the whole group use it without authorizing people one by one?
+
+Send bare `@bot /grant` (equivalent to `/grant all`) in the group: it adds the group to `allowedChatGroups` in one step, so everyone in the group can talk immediately, with no quota and no expiry; new members take effect automatically and leaving the group revokes access. Revoke with bare `/revoke`. In a topic group it is keyed by the `oc_` group and covers all its topics. Dashboard **Groups → Manage** also has **authorize the whole group in one click**. It grants talk only; operate rights remain with `allowedUsers`.
+
+## How do I give someone just a 3-message trial?
+
+`@bot /grant @someone` — the grant card defaults to **3 messages / 1 hour** per person. To set the count directly use `@bot /grant @someone 20`; both duration and quota are editable on the card (1 hour / 8 hours / 1 day / 7 days / permanent; leave the quota blank for unlimited).
+
+## What's the difference between on-call and bare `/grant`?
+
+Both grant talk only (never operate) and neither is quota-limited. The difference is the directory: `/oncall bind <dir>` also anchors the group to a working directory, so new topics skip repository picking and start immediately; bare `/grant` only opens talk and binds no directory. Use on-call for duty Q&A, and `/grant` when the group just needs to ask in topics whose repo is already chosen.
+
+## Why must I @ the bot in a group? Can it answer without an @?
+
+In the default `always` mode, regular groups respond only to explicit @-mentions, which prevents bots from answering over each other in multi-bot / multi-person groups. Send `/mention-mode` in the group to change it: `topic` (no @ inside its own topics), `never` (no @ group-wide), `ambient` (no @, but yields when someone else is named). Changing it requires operate rights and works in regular groups only; 8 further no-@ exceptions exist (1-person-1-bot groups, the message listener, and more) — see [Mention Policy](/en/mention-mode).
+
+## Can I forbid people from adding this bot to groups?
+
+"Who can add the bot to a group" is controlled on the **Lark platform side** (app availability scope / who can add bots); botmux has no such switch and cannot fake one. Two things the bot side can do: ① turn off **Auto-start when added to a new group** (`autoStartOnGroupJoin`, Dashboard **Bot Defaults → Proactive Start** — and that gate itself still requires an authorized user in the group); ② keep the bot restricted — **being added is not authorization**, so a non-listed member @-mentioning it is blocked and the owner gets a request card instead. Whether the owner is auto-invited into new groups is controlled by `autoInviteOwnerOnGroupAdd` (on by default): turn it off in Dashboard → Bot Defaults → Proactive Start, via `/botconfig set autoInviteOwnerOnGroupAdd off`, or in `bots.json`. Turn it off when an alert/on-call platform batch-adds the bot to incident chats and the owner should not be pulled into every one.
 
 ## Can I ask a follow-up / interrupt a running session?
 
@@ -87,10 +139,10 @@ botmux launches the session inside tmux via `<$SHELL> -i -c '… start the CLI'`
 
 Since v2.95.0 botmux detects this "the session never really started" state and posts a diagnostic card instead of typing the message into the bare shell. Two ways to fix it:
 
-- **Set `launchShell` (recommended)**: tell the bot to launch directly under the target shell, bypassing the trampolining startup file. `/config launchShell zsh`, or the dashboard ("Bot defaults → Launch shell"), or add `"launchShell": "zsh"` to `bots.json`. Note: PATH / nvm etc. must then live in the chosen shell's startup files (e.g. `.zshrc`).
+- **Set `launchShell` (recommended)**: tell the bot to launch directly under the target shell, bypassing the trampolining startup file. `/config launchShell zsh`, or the dashboard ("Bot defaults → Launch shell"), or add `"launchShell": "zsh"` to `bots.json`. Note: PATH / nvm etc. must then live in the chosen shell's startup files (e.g. `.zshrc`, or `~/.config/fish/config.fish` for fish, which is supported as a first-class launch shell).
 - **Fix the startup file**: guard the switch so it only fires for a real interactive terminal: `[ -z "$BASH_EXECUTION_STRING" ] && [ -t 1 ] && exec zsh` (put PATH / nvm exports before it).
 
-Then `botmux restart` and resend a message. Only the `tmux` / `zellij` backends are affected; the `pty` backend launches the CLI directly and is immune.
+Then `botmux restart` and resend a message. This affects shell-wrapped persistent backends (`tmux` / `zellij` / `zmx`); the `pty` backend launches the CLI directly and is immune.
 
 ## Can a bot added to a new group see the earlier chat history?
 
@@ -110,7 +162,25 @@ It hasn't been verified on native Windows, but WSL2 should be fine.
 
 ## How do I upgrade?
 
-`botmux upgrade`. The `botmux` wrapper version inside sessions always stays in sync with the daemon, so it doesn't need to be upgraded separately.
+**Re-run the install command (curl), no matter how you originally installed** — this upgrades npm/pnpm global installs too:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/deepcoldy/botmux/master/install.sh | sh
+```
+
+It replaces the self-contained binary in place at `~/.botmux/bin/botmux`: the downloaded binary is smoke-run on this host first, and if it cannot run the installer fails explicitly and **preserves your existing version**; it is idempotent (no second PATH line) and never needs Node. Then open a **new terminal** and run `botmux restart` — the installer prepends `~/.botmux/bin` to PATH, and only a new shell guarantees `botmux` resolves to the new version (in an old npm user's current shell it may still point at the npm global directory). The `botmux` wrapper inside sessions always tracks the daemon version, so it needs no separate upgrade.
+
+**Installing a pinned version** (same mechanism for rollbacks / version pinning; the tag needs the `v` prefix):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/deepcoldy/botmux/master/install.sh | BOTMUX_VERSION=v3.18.8 sh
+```
+
+> ⚠️ `BOTMUX_VERSION` must precede the `sh` on the **right** side of the pipe. Written as `BOTMUX_VERSION=… curl … | sh`, the variable only reaches curl — `sh` never sees it and the installer silently falls back to latest.
+
+### Why can't I npm-upgrade from a release older than v3.18.0?
+
+Starting with v3.18.0 the npm package changed form, from "Node + `dist/` sources" to a **platform binary subpackage**, and `node-pty` left `dependencies`. Old builds shipped a `botmux upgrade` that simply delegated to npm; when npm installs across that boundary it prunes `node-pty` from the old tree, while the old daemon's first restart step is still `node …/dist/cli.js restart` — and that file still statically imports `node-pty`. The driver dies on `ERR_MODULE_NOT_FOUND` and the whole daemon fleet never comes back, even though output may already have said "restarting to apply". The curl route drops in the new binary and points the launcher at it without touching the old directory or depending on what npm prunes, which makes it the one reliable way across this boundary. On current (≥3.18) binary installs `botmux upgrade` is equivalent to re-running curl; when you don't remember your install form, curl always works.
 
 ## CoCo loses messages while busy?
 

@@ -33,16 +33,37 @@
  *         <environment_context>, or replayed history) is IGNORED and does NOT
  *         drop the collecting turn — keying HOL-drop off the turn-start
  *         decision reuses its tooOld/fingerprint freshness as one invariant.
- *       * 'assistant_final' event → the currently-collecting turn closes
- *         with finalText set; eligible for emit on the next drain.
- *   - drainEmittable() — pop FIFO any leading turn that is started AND
- *     has finalText.
+ *       * terminal event → the currently-collecting turn closes with
+ *         finalText set; an abort uses empty text plus an ambiguous terminal
+ *         outcome so durable delivery settles without inventing a reply.
+ *   - drainEmittable() — pop FIFO any leading turn that is started AND has
+ *     reached either terminal edge.
  */
 import { makeFingerprint, normaliseForFingerprint } from './bridge-turn-queue.js';
-import type { CodexBridgeEvent } from './codex-transcript.js';
+import type { CodexBridgeEvent, CodexCotEntry } from './codex-transcript.js';
 
 const UNMATCHED_REPLAY_WINDOW_MS = 5_000;
 const MAX_BUFFERED_UNMATCHED_EVENTS = 20;
+/** A verified submit may be parked in a type-ahead queue before its transcript
+ *  user event is written. Keep that hand-off busy for a bounded interval: long
+ *  enough for the active turn to finish and dequeue it, but never forever if
+ *  the CLI accepted the keypress without producing a structured event. */
+export const STRUCTURED_SUBMIT_START_GRACE_MS = 20_000;
+/** Maximum time an unconfirmed worker mark may remain at the attribution
+ *  head after the adapter write/verification path stops. This lease never
+ *  contributes to lifecycle busy: it exists only so a late transcript user
+ *  event can still claim the mark without allowing a silent write to wedge
+ *  every later turn forever. */
+export const STRUCTURED_UNCONFIRMED_ATTRIBUTION_GRACE_MS = 20_000;
+/** Maximum time a task_started-only claim may wait for its fingerprinted user
+ *  record. Real Codex rollouts have shown delays just under ten minutes, but
+ *  this is an empirical bound rather than a provider guarantee: a missing
+ *  record must not make an uncorroborated claim permanently busy. */
+export const STRUCTURED_TASK_START_CORROBORATION_GRACE_MS = 10 * 60_000;
+/** Maximum time a worker may wait for an adapter/history verification call.
+ *  This covers Codex/CoCo's in-band polling plus the 20s deferred recheck,
+ *  while remaining bounded if an adapter promise or recheck is stranded. */
+export const STRUCTURED_SUBMIT_VERIFICATION_GRACE_MS = 30_000;
 
 export interface CodexPendingTurn {
   turnId: string;
@@ -53,12 +74,40 @@ export interface CodexPendingTurn {
    *  the lower bound of the "did `botmux send` happen for this turn?"
    *  window. Optional only for legacy / test-injected turns. */
   markTimeMs?: number;
+  /** Transcript identity and durable byte frontier observed at mark time.
+   * Stored on the turn because the path may not be officially attached yet;
+   * a later checkpoint must not replace this with an attach/post-ingest cursor. */
+  recoveryJsonlPathAtMark?: string;
+  recoveryOffsetAtMark?: number;
+  /** Timestamp of the transcript user record that actually started this
+   *  turn. Kept separate from markTimeMs, whose max(worker mark, transcript)
+   *  semantics intentionally serve the outbound-send suppression window. */
+  transcriptStartTimeMs?: number;
+  /** Local observation time for a task_started-only provisional claim. Cleared
+   *  once the fingerprinted user record corroborates the claim. */
+  provisionalTaskStartedAtMs?: number;
+  /** Local observation time when a provisional task_started claim was rolled
+   *  back. While the mark remains unstarted, unmatched terminals are dropped
+   *  rather than buffered back onto it. */
+  taskStartedRollbackAtMs?: number;
+  /** Wall-clock millis when an authoritative adapter/history check confirmed
+   *  the submit. Unverified writes deliberately leave this unset. */
+  submitConfirmedAtMs?: number;
+  /** Wall-clock millis anchoring the bounded attribution-only lease for an
+   *  unconfirmed mark. Unlike verification/confirmation leases, this never
+   *  gates screen-ready or reports the CLI busy. */
+  unconfirmedAttributionStartedAtMs?: number;
+  /** Wall-clock millis when worker-side authoritative submit verification
+   *  began. This closes the race where screen-ready arrives while writeInput
+   *  is still polling history, before it can return `submitted: true`. */
+  submitVerificationStartedAtMs?: number;
   /** Set once an assistant_final event closes this turn. */
   finalText?: string;
   /** Explicit transcript terminal semantics. Undefined keeps the historical
    *  assistant-final => completed behaviour. */
   terminalStatus?: 'completed' | 'failed' | 'ambiguous';
   terminalErrorCode?: string;
+  terminalErrorSummary?: string;
   /** Set when this turn was synthesised from a user_message that didn't
    *  match any pending Lark fingerprint. Adopt-only. The worker emit path
    *  formats these with both userText and finalText under a "终端本地对话"
@@ -68,12 +117,34 @@ export interface CodexPendingTurn {
    *  assistant reply so the Lark thread sees both sides of the exchange. */
   userText?: string;
   sourceSessionId?: string;
+  /** Native provider turn id learned from the transcript user event. */
+  sourceTurnId?: string;
+  /** True when the turn was delivered via Codex RPC (turn/start) and the
+   *  app-server has acknowledged it. RPC turns have no local transcript to
+   *  ingest, so they can never reach the started state; this flag keeps the
+   *  lifecycle gate asserted for the full server-side execution instead of
+   *  letting the bounded 20s confirmation lease expire mid-turn (which would
+   *  falsely release idle and prune a still-running turn). Cleared by the
+   *  terminal edge or an explicit stop. */
+  rpcActive?: boolean;
 }
 
 export class CodexBridgeQueue {
   private seen = new Set<string>();
   private queue: CodexPendingTurn[] = [];
   private collecting: CodexPendingTurn | null = null;
+  /** Recently closed native turns. Providers can replay terminal/CoT records
+   *  after the owning local turn has already drained; without this tombstone
+   *  those stable-id events could fall back onto a newer id-less turn. */
+  private closedNativeTurns: Array<{ sourceSessionId?: string; sourceTurnId: string }> = [];
+  /** Cosmetic observer for 'cot' events attributed to the collecting turn —
+   *  feeds the native CoT (thinking process) message. Never affects
+   *  attribution or lifecycle; exceptions are swallowed at the call site. */
+  private cotObserver?: (entries: readonly CodexCotEntry[], turn: CodexPendingTurn) => void;
+  /** A steer can retire a collecting turn without producing its terminal or
+   * any CoT on the successor. Let the UI close that exact abandoned timeline;
+   * this notification is not evidence that the work completed. */
+  private cotSupersededObserver?: (turn: CodexPendingTurn) => void;
   private localTurnsEnabled = false;
   private bufferedUnmatched: CodexBridgeEvent[] = [];
   private lastClosedAssistantFinalTimeMs: number | undefined;
@@ -81,6 +152,95 @@ export class CodexBridgeQueue {
    *  fresh-empty attach replaying historical iTerm conversation as
    *  "live" local input. Typically set to the moment adopt was wired up. */
   private localLowerBoundMs = 0;
+  private static readonly CLOSED_NATIVE_TURNS_MAX = 4_096;
+
+  constructor(
+    private readonly now: () => number = Date.now,
+    private readonly onLocalTurnStarted?: (turn: CodexPendingTurn) => void,
+  ) {}
+
+  private isClosedNativeTurn(sourceSessionId: string | undefined, sourceTurnId: string): boolean {
+    return this.closedNativeTurns.some(closed => closed.sourceTurnId === sourceTurnId
+      && (!closed.sourceSessionId || !sourceSessionId || closed.sourceSessionId === sourceSessionId));
+  }
+
+  private rememberClosedNativeTurn(turn: CodexPendingTurn): void {
+    if (!turn.sourceTurnId
+      || this.isClosedNativeTurn(turn.sourceSessionId, turn.sourceTurnId)) return;
+    this.closedNativeTurns.push({
+      ...(turn.sourceSessionId ? { sourceSessionId: turn.sourceSessionId } : {}),
+      sourceTurnId: turn.sourceTurnId,
+    });
+    if (this.closedNativeTurns.length > CodexBridgeQueue.CLOSED_NATIVE_TURNS_MAX) {
+      this.closedNativeTurns.splice(
+        0, this.closedNativeTurns.length - CodexBridgeQueue.CLOSED_NATIVE_TURNS_MAX,
+      );
+    }
+  }
+
+  private sourceSessionsCompatible(left: string | undefined, right: string | undefined): boolean {
+    return !left || !right || left === right;
+  }
+
+  private isProvisionalTaskStart(turn: CodexPendingTurn | null | undefined): boolean {
+    return !!turn
+      && turn.started
+      && turn.finalText === undefined
+      && turn.transcriptStartTimeMs === undefined
+      && turn.provisionalTaskStartedAtMs !== undefined;
+  }
+
+  private matchingProvisionalTaskStart(ev: CodexBridgeEvent): CodexPendingTurn | null {
+    if (!ev.sourceTurnId) return null;
+    return this.queue.find(turn => this.isProvisionalTaskStart(turn)
+      && turn.sourceTurnId === ev.sourceTurnId
+      && this.sourceSessionsCompatible(turn.sourceSessionId, ev.sourceSessionId)) ?? null;
+  }
+
+  private rollbackProvisionalTaskStart(turn: CodexPendingTurn, observedAtMs: number = this.now()): void {
+    if (!this.isProvisionalTaskStart(turn)) return;
+    turn.started = false;
+    turn.provisionalTaskStartedAtMs = undefined;
+    turn.taskStartedRollbackAtMs = observedAtMs;
+    turn.sourceSessionId = undefined;
+    turn.sourceTurnId = undefined;
+    turn.submitVerificationStartedAtMs = undefined;
+    if (turn.submitConfirmedAtMs !== undefined) {
+      turn.submitConfirmedAtMs = observedAtMs;
+      turn.unconfirmedAttributionStartedAtMs = undefined;
+    } else {
+      turn.unconfirmedAttributionStartedAtMs = observedAtMs;
+    }
+    if (this.collecting === turn) this.collecting = null;
+  }
+
+  private hasRolledBackTaskStart(): boolean {
+    return this.queue.some(turn => !turn.started
+      && turn.finalText === undefined
+      && turn.taskStartedRollbackAtMs !== undefined);
+  }
+
+  private targetForNativeEvent(ev: CodexBridgeEvent): CodexPendingTurn | null {
+    if (!ev.sourceTurnId) {
+      return this.isProvisionalTaskStart(this.collecting) ? null : this.collecting;
+    }
+    const exact = this.queue.find(turn => turn.started && turn.finalText === undefined
+      && !this.isProvisionalTaskStart(turn)
+      && turn.sourceTurnId === ev.sourceTurnId
+      && this.sourceSessionsCompatible(turn.sourceSessionId, ev.sourceSessionId));
+    if (exact) return exact;
+    const fallback = this.collecting;
+    if (!fallback
+      || this.isProvisionalTaskStart(fallback)
+      || fallback.sourceTurnId
+      || !this.sourceSessionsCompatible(fallback.sourceSessionId, ev.sourceSessionId)
+      // Native records for a legacy turn cannot precede that turn's user
+      // record in the append-only transcript. This remains a replay guard
+      // after an old closed-turn tombstone ages out of the bounded cache.
+      || (fallback.transcriptStartTimeMs !== undefined
+        && ev.timestampMs < fallback.transcriptStartTimeMs)) return null;
+    return fallback;
+  }
 
   /** Register events as historical without producing pending-turn side
    *  effects. Used at attach time when resume mode wants to swallow prior
@@ -92,7 +252,7 @@ export class CodexBridgeQueue {
   /** Toggle adopt-mode local-turn synthesis. `lowerBoundMs` (typically
    *  Date.now() at adopt-time) protects against a fresh-empty attach
    *  feeding historical user_messages back as "live" local turns. */
-  setLocalTurns(enabled: boolean, lowerBoundMs: number = Date.now()): void {
+  setLocalTurns(enabled: boolean, lowerBoundMs: number = this.now()): void {
     this.localTurnsEnabled = enabled;
     this.localLowerBoundMs = lowerBoundMs;
     if (enabled) this.bufferedUnmatched = [];
@@ -103,15 +263,48 @@ export class CodexBridgeQueue {
    *  to start this turn. Pre-path-known marking is allowed: the worker can
    *  call this before late-attach has located the rollout file, and the
    *  ingest call after attach will still match correctly. */
-  mark(turnId: string, message: string, markTimeMs: number = Date.now(), dispatchAttempt?: number): void {
+  mark(
+    turnId: string,
+    message: string,
+    markTimeMs: number = this.now(),
+    dispatchAttempt?: number,
+    recoveryCursorAtMark?: { jsonlPath: string; offsetAtMark: number },
+  ): void {
     this.queue.push({
       turnId,
       dispatchAttempt,
       started: false,
       contentFingerprint: makeFingerprint(message),
       markTimeMs,
+      recoveryJsonlPathAtMark: recoveryCursorAtMark?.jsonlPath,
+      recoveryOffsetAtMark: recoveryCursorAtMark?.offsetAtMark,
+      unconfirmedAttributionStartedAtMs: markTimeMs,
     });
     this.replayBufferedUnmatched(markTimeMs);
+  }
+
+  /** Restore older marks before input accepted during rollout discovery. Only
+   * valid before the first transcript ingest; preserve current delivery owners
+   * and their confirmation state when a message is already in this queue. */
+  restorePendingTurns(entries: readonly {
+    turnId: string;
+    fingerprint: string;
+    markTimeMs: number;
+    jsonlPath?: string;
+    offsetAtMark?: number;
+  }[]): void {
+    const existing = new Set(this.queue.map(turn => turn.turnId));
+    const restored: CodexPendingTurn[] = [];
+    for (const entry of entries) {
+      if (existing.has(entry.turnId)) continue;
+      existing.add(entry.turnId);
+      restored.push({ turnId: entry.turnId, started: false,
+        contentFingerprint: makeFingerprint(entry.fingerprint), markTimeMs: entry.markTimeMs,
+        recoveryJsonlPathAtMark: entry.jsonlPath,
+        recoveryOffsetAtMark: entry.offsetAtMark,
+        unconfirmedAttributionStartedAtMs: entry.markTimeMs });
+    }
+    this.queue.unshift(...restored);
   }
 
   /** Drop all pending turns. Used when the worker decides it can't reliably
@@ -124,18 +317,238 @@ export class CodexBridgeQueue {
     return dropped;
   }
 
-  /** Remove one exact worker delivery attempt after a failed/ambiguous
-   *  terminal. A replay may reuse turnId with a higher dispatchAttempt; if
-   *  the retired mark stayed queued, its fingerprint would claim the replay's
-   *  transcript events and permanently head-of-line block the live attempt. */
-  dropPendingTurn(turnId: string, dispatchAttempt?: number): CodexPendingTurn | null {
-    const idx = this.queue.findIndex(turn =>
-      turn.turnId === turnId && turn.dispatchAttempt === dispatchAttempt,
+  /** Remove one exact worker delivery attempt. Submit-confirmation cleanup is
+   *  pre-start-only by default: once the transcript has started a turn, only a
+   *  structured terminal may retire it. An authoritative failed/ambiguous
+   *  terminal may opt into removing a started attempt via `allowStarted`.
+   *  Matching dispatchAttempt keeps a replay of the same turnId isolated from
+   *  the retired delivery attempt. */
+  dropPendingTurn(
+    turnId: string,
+    dispatchAttempt?: number,
+    allowStarted = false,
+  ): CodexPendingTurn | null {
+    const index = this.queue.findIndex(turn =>
+      turn.turnId === turnId
+      && turn.dispatchAttempt === dispatchAttempt
+      && (allowStarted || !turn.started),
     );
-    if (idx < 0) return null;
-    const [dropped] = this.queue.splice(idx, 1);
+    if (index < 0) return null;
+    const [dropped] = this.queue.splice(index, 1);
     if (this.collecting === dropped) this.collecting = null;
+    if (allowStarted) this.refreshNextPreStartLease();
+    // A later turn's user event can already be buffered behind this failed
+    // head mark: ingestOne only matches the first unstarted fingerprint. Once
+    // the failed head is gone, replay recent events against the new head or it
+    // can remain unstarted forever and wedge fallback delivery.
+    const next = this.queue.find(turn => !turn.started);
+    if (next?.markTimeMs !== undefined) this.replayBufferedUnmatched(next.markTimeMs);
     return dropped ?? null;
+  }
+
+  /** Remove expired pre-start queue heads that never reached transcript
+   *  start, whether positively confirmed or only retained for attribution.
+   *  Only the first unresolved fingerprint(s) are eligible, and never
+   *  while an earlier started turn is still running: that predecessor's final
+   *  is the dequeue boundary that refreshes the next legitimate type-ahead
+   *  lease. Dropping a stale head replays buffered events immediately, so a
+   *  later real turn can become started instead of remaining hidden behind a
+   *  dead fingerprint. */
+  pruneExpiredPreStartHeads(nowMs: number = this.now()): CodexPendingTurn[] {
+    const dropped: CodexPendingTurn[] = [];
+    for (;;) {
+      const expiredProvisional = this.queue.find(turn => this.isProvisionalTaskStart(turn)
+        && nowMs - turn.provisionalTaskStartedAtMs!
+          > STRUCTURED_TASK_START_CORROBORATION_GRACE_MS);
+      if (expiredProvisional) {
+        this.rollbackProvisionalTaskStart(expiredProvisional, nowMs);
+        continue;
+      }
+      // A long-running predecessor legitimately keeps later confirmed input in
+      // the CLI's type-ahead queue. Its assistant_final refreshes the next head
+      // from local observation time, so expiring anything before that boundary
+      // would drop valid queued work.
+      if (this.queue.some(turn => turn.started && turn.finalText === undefined)) break;
+
+      const head = this.queue.find(turn => !turn.started && turn.finalText === undefined);
+      if (!head) break;
+
+      // An RPC turn is running server-side with no local transcript to ingest.
+      // It can never reach started, so the bounded lease must NOT be used to
+      // prune it — that would falsely release idle while the app-server is still
+      // executing. Keep it until the terminal edge or explicit stop.
+      if (head.rpcActive) break;
+
+      // An authoritative adapter/history check can legitimately outlive the
+      // shorter attribution lease. Do not prune under that in-flight await;
+      // once it finishes, finishSubmitVerification refreshes attribution from
+      // local observation time, and once this bounded verification lease
+      // expires the old mark becomes eligible again.
+      const verificationActive = head.submitVerificationStartedAtMs !== undefined
+        && nowMs - head.submitVerificationStartedAtMs <= STRUCTURED_SUBMIT_VERIFICATION_GRACE_MS;
+      if (verificationActive) break;
+
+      const leaseStartedAtMs = head.submitConfirmedAtMs
+        ?? head.unconfirmedAttributionStartedAtMs;
+      if (leaseStartedAtMs === undefined) break;
+      const leaseGraceMs = head.submitConfirmedAtMs !== undefined
+        ? STRUCTURED_SUBMIT_START_GRACE_MS
+        : STRUCTURED_UNCONFIRMED_ATTRIBUTION_GRACE_MS;
+      if (nowMs - leaseStartedAtMs <= leaseGraceMs) break;
+
+      const removed = this.dropPendingTurn(head.turnId, head.dispatchAttempt);
+      if (!removed) break;
+      dropped.push(removed);
+      // dropPendingTurn replays buffered user/final events. If that starts the
+      // next real turn, the started-turn guard above stops the loop.
+    }
+    return dropped;
+  }
+
+  /** Record positive submit evidence from an adapter/history check. The turn
+   *  can still be waiting in the CLI's type-ahead queue, so this starts a
+   *  bounded hand-off lease until its transcript user event appears. */
+  confirmPendingTurn(
+    turnId: string,
+    confirmedAtMs: number = this.now(),
+    dispatchAttempt?: number,
+  ): boolean {
+    const turn = this.queue.find(candidate => candidate.turnId === turnId
+      && candidate.dispatchAttempt === dispatchAttempt
+      && candidate.finalText === undefined);
+    if (!turn) return false;
+    turn.submitVerificationStartedAtMs = undefined;
+    turn.unconfirmedAttributionStartedAtMs = undefined;
+    turn.submitConfirmedAtMs = confirmedAtMs;
+    return true;
+  }
+
+  /** Mark a turn as actively running server-side via Codex RPC. The app-server
+   *  ack for turn/start is authoritative confirmation that execution has begun,
+   *  but no local transcript event will follow to flip started. This flag keeps
+   *  the lifecycle gate asserted and protects the turn from lease expiry pruning
+   *  until the terminal edge (or an explicit stop) clears it. */
+  markRpcActive(turnId: string, dispatchAttempt?: number): boolean {
+    const turn = this.queue.find(candidate => candidate.turnId === turnId
+      && candidate.dispatchAttempt === dispatchAttempt
+      && candidate.finalText === undefined);
+    if (!turn) return false;
+    turn.rpcActive = true;
+    turn.submitVerificationStartedAtMs = undefined;
+    turn.unconfirmedAttributionStartedAtMs = undefined;
+    turn.submitConfirmedAtMs = undefined;
+    return true;
+  }
+
+  /** Clear the server-side active flag when an RPC turn reaches a terminal edge
+   *  or is otherwise retired. Without this, a completed RPC turn would keep the
+   *  lifecycle gate asserted forever (permanent false-busy). */
+  stopRpcActive(turnId: string, dispatchAttempt?: number): boolean {
+    const turn = this.queue.find(candidate => candidate.turnId === turnId
+      && candidate.dispatchAttempt === dispatchAttempt);
+    if (!turn || !turn.rpcActive) return false;
+    turn.rpcActive = undefined;
+    return true;
+  }
+
+  /** Start bounded adapter/history verification before awaiting writeInput. */
+  beginSubmitVerification(
+    turnId: string,
+    startedAtMs: number = this.now(),
+    dispatchAttempt?: number,
+  ): boolean {
+    const turn = this.queue.find(candidate => candidate.turnId === turnId
+      && candidate.dispatchAttempt === dispatchAttempt
+      && candidate.finalText === undefined);
+    if (!turn) return false;
+    turn.submitVerificationStartedAtMs = startedAtMs;
+    return true;
+  }
+
+  /** Finish verification without positive submit evidence. A bare mark remains
+   *  available for transcript attribution but no longer gates screen-ready. */
+  finishSubmitVerification(
+    turnId: string,
+    finishedAtMs: number = this.now(),
+    dispatchAttempt?: number,
+  ): boolean {
+    const turn = this.queue.find(candidate => candidate.turnId === turnId
+      && candidate.dispatchAttempt === dispatchAttempt);
+    if (!turn || turn.submitVerificationStartedAtMs === undefined) return false;
+    turn.submitVerificationStartedAtMs = undefined;
+    if (!turn.started && turn.submitConfirmedAtMs === undefined) {
+      turn.unconfirmedAttributionStartedAtMs = finishedAtMs;
+    }
+    return true;
+  }
+
+  /** Exact-attempt existence check for deferred callbacks. A replay reuses
+   *  turnId with a higher dispatchAttempt, so an old timer must treat that as
+   *  a missing target rather than mutating the new delivery generation. */
+  hasPendingTurn(turnId: string, dispatchAttempt?: number): boolean {
+    return this.queue.some(candidate => candidate.turnId === turnId
+      && candidate.dispatchAttempt === dispatchAttempt
+      && candidate.finalText === undefined);
+  }
+
+  /** True when buffered transcript replay has already closed this exact turn
+   *  before its RPC turn/start continuation installs rpcActive. */
+  hasTerminalTurn(turnId: string, dispatchAttempt?: number): boolean {
+    return this.queue.some(candidate => candidate.turnId === turnId
+      && candidate.dispatchAttempt === dispatchAttempt
+      && candidate.finalText !== undefined);
+  }
+
+  /** True while the transcript proves a turn is running, or while a verified
+   *  submit is in the bounded pre-start hand-off window. A bare worker mark is
+   *  never authoritative, preventing a dropped Enter from causing permanent
+   *  false-busy. */
+  hasBlockingTurn(nowMs: number = this.now()): boolean {
+    return this.queue.some(turn => {
+      if (turn.finalText !== undefined) return false;
+      if (turn.started) return true;
+      if (turn.rpcActive) return true;
+      const confirmed = turn.submitConfirmedAtMs !== undefined
+        && nowMs - turn.submitConfirmedAtMs <= STRUCTURED_SUBMIT_START_GRACE_MS;
+      const verifying = turn.submitVerificationStartedAtMs !== undefined
+        && nowMs - turn.submitVerificationStartedAtMs <= STRUCTURED_SUBMIT_VERIFICATION_GRACE_MS;
+      return confirmed || verifying;
+    });
+  }
+
+  /** Remaining bounded pre-start verification/confirmation lease. The worker
+   *  uses this to re-drive a previously rejected ready signal once every active
+   *  lease expires. Started turns return undefined because their eventual
+   *  assistant_final is the authoritative re-drive. */
+  preStartLeaseRemainingMs(nowMs: number = this.now()): number | undefined {
+    if (this.queue.some(turn => ((turn.started && !this.isProvisionalTaskStart(turn)) || turn.rpcActive)
+      && turn.finalText === undefined)) return undefined;
+    const activeRemaining = this.queue.flatMap(candidate => {
+      if (candidate.finalText !== undefined) return [];
+      const leases: number[] = [];
+      if (this.isProvisionalTaskStart(candidate)) {
+        leases.push(STRUCTURED_TASK_START_CORROBORATION_GRACE_MS
+          - (nowMs - candidate.provisionalTaskStartedAtMs!));
+        return leases.filter(remaining => remaining >= 0);
+      }
+      if (candidate.started) return [];
+      if (candidate.submitConfirmedAtMs !== undefined) {
+        leases.push(STRUCTURED_SUBMIT_START_GRACE_MS - (nowMs - candidate.submitConfirmedAtMs));
+      }
+      if (candidate.submitVerificationStartedAtMs !== undefined) {
+        leases.push(STRUCTURED_SUBMIT_VERIFICATION_GRACE_MS - (nowMs - candidate.submitVerificationStartedAtMs));
+      }
+      return leases.filter(remaining => remaining >= 0);
+    });
+    return activeRemaining.length > 0 ? Math.max(...activeRemaining) : undefined;
+  }
+  /** Register the CoT observer (see field doc). */
+  setCotObserver(fn: (entries: readonly CodexCotEntry[], turn: CodexPendingTurn) => void): void {
+    this.cotObserver = fn;
+  }
+
+  setCotSupersededObserver(fn: (turn: CodexPendingTurn) => void): void {
+    this.cotSupersededObserver = fn;
   }
 
   /** Process newly-appended events. Idempotent on uuid: events with seen
@@ -152,7 +565,10 @@ export class CodexBridgeQueue {
     if (this.bufferedUnmatched.length === 0) return;
     const replay = this.bufferedUnmatched.filter(ev => ev.timestampMs >= markTimeMs - UNMATCHED_REPLAY_WINDOW_MS);
     this.bufferedUnmatched = [];
-    for (const ev of replay) this.ingestOne(ev, false);
+    // Keep still-unmatched events buffered: more than one failed head can sit
+    // ahead of the successful turn. Each drop gets another chance to replay
+    // the same bounded event set against the new head.
+    for (const ev of replay) this.ingestOne(ev, true);
   }
 
   private rememberUnmatched(ev: CodexBridgeEvent): void {
@@ -162,8 +578,147 @@ export class CodexBridgeQueue {
     }
   }
 
+  /** Refresh the next queued submit from the locally-observed terminal edge.
+   *  External transcript clocks may be skewed, so lease boundedness must use
+   *  this process's clock for both successful and aborted predecessors. */
+  private refreshNextPreStartLease(): void {
+    const nextPending = this.queue.find(turn => !turn.started
+      && turn.finalText === undefined);
+    if (!nextPending) return;
+    // RPC turns keep their own rpcActive flag for lifecycle gating; do not
+    // overwrite it with a bounded confirmation/attribution lease.
+    if (nextPending.rpcActive) return;
+    const observedAtMs = this.now();
+    if (nextPending.submitConfirmedAtMs !== undefined) {
+      nextPending.submitConfirmedAtMs = observedAtMs;
+    } else {
+      nextPending.unconfirmedAttributionStartedAtMs = observedAtMs;
+    }
+  }
+
   private ingestOne(ev: CodexBridgeEvent, bufferUnmatched: boolean): void {
+    // A stable-id replay from a closed turn is never evidence for the current
+    // id-less turn. Reject it before any compatibility fallback can run.
+    if (ev.sourceTurnId && this.isClosedNativeTurn(ev.sourceSessionId, ev.sourceTurnId)) return;
+    if (ev.kind === 'turn_bind') {
+      // A provider may expose its stable turn id only in a duplicate user
+      // record after an id-less legacy record already started the turn. Bind
+      // that id without treating the mirror as another user/steer boundary.
+      const target = this.queue.find(turn => turn.started && turn.finalText === undefined
+        && turn.sourceTurnId === ev.sourceTurnId
+        && this.sourceSessionsCompatible(turn.sourceSessionId, ev.sourceSessionId))
+        ?? this.queue.find(turn => turn.started && turn.finalText === undefined
+          && !turn.sourceTurnId
+          && this.sourceSessionsCompatible(turn.sourceSessionId, ev.sourceSessionId)
+          && (turn.transcriptStartTimeMs === undefined
+            || ev.timestampMs >= turn.transcriptStartTimeMs));
+      if (!target || !ev.sourceTurnId) return;
+      if (target.sourceSessionId && ev.sourceSessionId
+        && target.sourceSessionId !== ev.sourceSessionId) return;
+      target.sourceTurnId = ev.sourceTurnId;
+      return;
+    }
+    if (ev.kind === 'turn_started') {
+      // task_started is an authoritative native lifecycle edge. When the
+      // fingerprinted response_item/user is delayed, bind and start the
+      // pending head now so its short pre-start attribution lease cannot
+      // expire while Codex is demonstrably running the task.
+      const active = this.collecting;
+      if (active && active.finalText === undefined
+        && this.sourceSessionsCompatible(active.sourceSessionId, ev.sourceSessionId)) {
+        if (active.sourceTurnId) {
+          if (!ev.sourceTurnId || active.sourceTurnId === ev.sourceTurnId) return;
+          // Codex can abandon one native task_started id and immediately
+          // retry the same logical turn under another id, without ever
+          // emitting a terminal for the first. A still-provisional claim has
+          // no fingerprint evidence tying it to that abandoned id, so let the
+          // new start supersede it and reclaim the same queue head below.
+          if (this.isProvisionalTaskStart(active)) {
+            this.rollbackProvisionalTaskStart(active);
+          }
+        } else {
+          // A native start cannot precede the user record of the same turn.
+          // Reject stale starts instead of binding them onto an id-less active
+          // turn and making its real terminal impossible to route.
+          if (active.transcriptStartTimeMs !== undefined
+            && ev.timestampMs < active.transcriptStartTimeMs) return;
+          if (ev.sourceTurnId) active.sourceTurnId = ev.sourceTurnId;
+          if (!active.sourceSessionId && ev.sourceSessionId) active.sourceSessionId = ev.sourceSessionId;
+          return;
+        }
+      }
+      const next = this.queue.find(turn => !turn.started && turn.finalText === undefined);
+      if (!next) return;
+      const tooOld = next.markTimeMs !== undefined
+        && ev.timestampMs < next.markTimeMs - UNMATCHED_REPLAY_WINDOW_MS;
+      if (tooOld) return;
+      next.started = true;
+      next.submitVerificationStartedAtMs = undefined;
+      next.unconfirmedAttributionStartedAtMs = undefined;
+      next.provisionalTaskStartedAtMs = this.now();
+      next.taskStartedRollbackAtMs = undefined;
+      next.sourceSessionId = ev.sourceSessionId;
+      next.sourceTurnId = ev.sourceTurnId;
+      next.markTimeMs = next.markTimeMs === undefined
+        ? ev.timestampMs
+        : Math.max(next.markTimeMs, ev.timestampMs);
+      this.collecting = next;
+      return;
+    }
+    if (ev.kind === 'cot') {
+      // Cosmetic thinking-timeline record. Only meaningful while a turn is
+      // collecting; history replay / unmatched events are dropped (never
+      // buffered — a late replay into the wrong turn is worse than a gap).
+      const target = this.targetForNativeEvent(ev);
+      if (target && this.cotObserver && ev.cotEntries && ev.cotEntries.length > 0) {
+        if (target.sourceSessionId && ev.sourceSessionId && target.sourceSessionId !== ev.sourceSessionId) return;
+        if (!target.sourceTurnId && ev.sourceTurnId) target.sourceTurnId = ev.sourceTurnId;
+        try { this.cotObserver(ev.cotEntries, target); } catch { /* cosmetic channel — never break attribution */ }
+      }
+      return;
+    }
     if (ev.kind === 'user') {
+      // task_started can precede the response_item/user by well over the
+      // pre-start lease. When that delayed record matches the already-started
+      // collecting turn, treat it as corroborating metadata rather than a new
+      // turn boundary. Preserve markTimeMs: in-turn botmux sends may have
+      // landed after task_started but before this late user record.
+      const collecting = this.collecting;
+      const provisional = this.isProvisionalTaskStart(collecting)
+        && this.sourceSessionsCompatible(collecting?.sourceSessionId, ev.sourceSessionId)
+        ? collecting
+        : null;
+      if (provisional) {
+        const collectingTooOld = provisional.markTimeMs !== undefined
+          && ev.timestampMs < provisional.markTimeMs - UNMATCHED_REPLAY_WINDOW_MS;
+        const collectingFingerprintOk = !provisional.contentFingerprint
+          || normaliseForFingerprint(ev.text).includes(provisional.contentFingerprint);
+        if (!collectingTooOld && collectingFingerprintOk) {
+          provisional.transcriptStartTimeMs = ev.timestampMs;
+          provisional.provisionalTaskStartedAtMs = undefined;
+          provisional.taskStartedRollbackAtMs = undefined;
+          if (!provisional.sourceSessionId && ev.sourceSessionId) {
+            provisional.sourceSessionId = ev.sourceSessionId;
+          }
+          if (!provisional.sourceTurnId && ev.sourceTurnId) {
+            provisional.sourceTurnId = ev.sourceTurnId;
+          }
+          return;
+        }
+        // In non-adopt mode an unmatched user record may only be transcript
+        // scaffolding (AGENTS/environment) written before the real prompt, so
+        // it is not evidence of a competing turn. Keep the provisional claim
+        // until its exact terminal, a distinct native start, or the bounded
+        // corroboration timeout releases it. Adopt mode can synthesize a real
+        // local turn from the mismatch and must roll back immediately.
+        if (!collectingTooOld && this.localTurnsEnabled) {
+          this.rollbackProvisionalTaskStart(provisional);
+        }
+      }
+      // Some providers mirror one native user turn in more than one record.
+      // Once its stable id has started a pending turn, ignore any duplicate
+      // before considering HOL-drop or matching the next queued prompt.
+      if (ev.sourceTurnId && this.queue.some(turn => turn.started && turn.sourceTurnId === ev.sourceTurnId)) return;
       // First decide whether this user event is a REAL turn-start: either it
       // matches the head pending Lark turn's fingerprint (and isn't tooOld),
       // or — in adopt mode — it synthesises a local turn. Both the HOL-drop
@@ -191,15 +746,33 @@ export class CodexBridgeQueue {
       // is ignored rather than treated as a turn boundary. Mirrors Claude's
       // BridgeTurnQueue.handleTurnStart HOL drop (which keys off "no assistant
       // text yet" — the streaming-transcript equivalent of "no finalText").
-      if ((willStartNext || willSynthLocal) && this.collecting && this.collecting.finalText === undefined) {
-        const idx = this.queue.indexOf(this.collecting);
+      const isDistinctNativeTurn = !!ev.sourceTurnId
+        && !!this.collecting?.sourceTurnId
+        && ev.sourceTurnId !== this.collecting.sourceTurnId;
+      if ((willStartNext || willSynthLocal)
+        && this.collecting
+        && this.collecting.finalText === undefined
+        && !this.isProvisionalTaskStart(this.collecting)
+        && !isDistinctNativeTurn
+        && ev.preserveCollecting !== true) {
+        const superseded = this.collecting;
+        const idx = this.queue.indexOf(superseded);
         if (idx >= 0) this.queue.splice(idx, 1);
         this.collecting = null;
+        if (idx >= 0) {
+          try { this.cotSupersededObserver?.(superseded); } catch { /* cosmetic only */ }
+        }
       }
 
       if (willStartNext) {
         next!.started = true;
+        next!.submitVerificationStartedAtMs = undefined;
+        next!.unconfirmedAttributionStartedAtMs = undefined;
+        next!.provisionalTaskStartedAtMs = undefined;
+        next!.taskStartedRollbackAtMs = undefined;
         next!.sourceSessionId = ev.sourceSessionId;
+        next!.sourceTurnId = ev.sourceTurnId;
+        next!.transcriptStartTimeMs = ev.timestampMs;
         // Anchor the bridge-fallback suppression window to when the turn
         // ACTUALLY started processing (the transcript user event's
         // timestamp), not when the worker marked it. With type-ahead the
@@ -246,12 +819,15 @@ export class CodexBridgeQueue {
           isLocal: true,
           userText: ev.text,
           markTimeMs: ev.timestampMs,
+          transcriptStartTimeMs: ev.timestampMs,
           sourceSessionId: ev.sourceSessionId,
+          sourceTurnId: ev.sourceTurnId,
         };
         const insertAt = this.queue.findIndex(t => !t.started);
         if (insertAt === -1) this.queue.push(localTurn);
         else this.queue.splice(insertAt, 0, localTurn);
         this.collecting = localTurn;
+        this.onLocalTurnStarted?.(localTurn);
       } else if (bufferUnmatched && !this.localTurnsEnabled) {
         // Cursor can write the Lark/user line to JSONL before the daemon IPC
         // that marks the turn reaches this worker. Keep a tiny recent buffer
@@ -259,21 +835,66 @@ export class CodexBridgeQueue {
         this.rememberUnmatched(ev);
       }
     } else if (ev.kind === 'assistant_final') {
-      if (this.collecting) {
-        if (this.collecting.sourceSessionId && ev.sourceSessionId && this.collecting.sourceSessionId !== ev.sourceSessionId) return;
-        this.collecting.finalText = ev.text;
-        this.collecting.terminalStatus = ev.terminalStatus;
-        this.collecting.terminalErrorCode = ev.terminalErrorCode;
+      const provisional = this.matchingProvisionalTaskStart(ev);
+      if (provisional) {
+        // A terminal before fingerprint corroboration proves that this native
+        // turn must not settle the pending Lark mark. Roll back immediately;
+        // the terminal is intentionally not buffered onto another turn.
+        this.rollbackProvisionalTaskStart(provisional);
+        return;
+      }
+      const target = this.targetForNativeEvent(ev);
+      if (target) {
+        if (target.sourceSessionId && ev.sourceSessionId && target.sourceSessionId !== ev.sourceSessionId) return;
+        if (!target.sourceTurnId && ev.sourceTurnId) target.sourceTurnId = ev.sourceTurnId;
+        target.finalText = ev.text;
+        target.terminalStatus = ev.terminalStatus;
+        target.terminalErrorCode = ev.terminalErrorCode;
+        target.terminalErrorSummary = ev.terminalErrorSummary;
+        this.rememberClosedNativeTurn(target);
         this.lastClosedAssistantFinalTimeMs = ev.timestampMs;
-        this.collecting = null;
-      } else if (bufferUnmatched && !this.localTurnsEnabled) {
+        if (this.collecting === target) this.collecting = null;
+        // CoCo-style type-ahead writes the next user event only after this
+        // final dequeues it. Refresh the next turn's pre-start lease at that
+        // hand-off boundary instead of letting either its confirmed lease or
+        // attribution-only lease expire while the predecessor was legitimately
+        // running.
+        this.refreshNextPreStartLease();
+      } else if (bufferUnmatched && !this.localTurnsEnabled && !this.hasRolledBackTaskStart()) {
         this.rememberUnmatched(ev);
       }
+    } else if (ev.kind === 'turn_aborted') {
+      const provisional = this.matchingProvisionalTaskStart(ev);
+      if (provisional) {
+        this.rollbackProvisionalTaskStart(provisional);
+        return;
+      }
+      const target = this.targetForNativeEvent(ev);
+      if (!target) {
+        if (bufferUnmatched && !this.localTurnsEnabled && !this.hasRolledBackTaskStart()) {
+          this.rememberUnmatched(ev);
+        }
+        return;
+      }
+      if (target.sourceSessionId && ev.sourceSessionId && target.sourceSessionId !== ev.sourceSessionId) return;
+      if (!target.sourceTurnId && ev.sourceTurnId) target.sourceTurnId = ev.sourceTurnId;
+      // Interrupted Codex turns have no assistant_final. Close with empty text
+      // so the worker skips final_output but still publishes the authoritative
+      // exact-attempt turn_terminal required by reliable durable delivery.
+      // Side effects may already have happened, so mirror TRAE-X and classify
+      // an otherwise-untyped abort as ambiguous rather than completed/failed.
+      target.finalText = '';
+      target.terminalStatus = ev.terminalStatus ?? 'ambiguous';
+      target.terminalErrorCode = ev.terminalErrorCode ?? 'structured_turn_aborted';
+      this.rememberClosedNativeTurn(target);
+      if (this.collecting === target) this.collecting = null;
+      this.lastClosedAssistantFinalTimeMs = ev.timestampMs;
+      this.refreshNextPreStartLease();
     }
   }
 
-  /** Pop FIFO any leading turn that is started AND observed assistant_final.
-   *  Empty final text still closes a durable turn. */
+  /** Pop FIFO any leading turn that is started AND observed a terminal edge.
+   *  Empty final text closes a durable turn without producing final_output. */
   drainEmittable(): CodexPendingTurn[] {
     const out: CodexPendingTurn[] = [];
     while (this.queue.length > 0) {
@@ -294,4 +915,25 @@ export class CodexBridgeQueue {
   peek(): readonly CodexPendingTurn[] {
     return this.queue;
   }
+}
+
+/** Explicit mutation boundary for lease expiry. Pruning can replay a buffered
+ *  successor user+final pair, so callers must drain/emit in the same call
+ *  stack; keeping that invariant here prevents a status/query path from
+ *  silently creating an unconsumed completion. */
+export function pruneExpiredPreStartHeadsAndEmit(
+  queue: CodexBridgeQueue,
+  emitReady: () => void,
+  nowMs?: number,
+  /** Settle exact durable attempts before a replayed successor is emitted.
+   *  The queue removal can expose buffered successor user/final events, so
+   *  running this after emitReady would publish N+1 ahead of N's terminal. */
+  onDropped?: (dropped: readonly CodexPendingTurn[]) => void,
+): CodexPendingTurn[] {
+  const dropped = queue.pruneExpiredPreStartHeads(nowMs);
+  if (dropped.length > 0) {
+    onDropped?.(dropped);
+    emitReady();
+  }
+  return dropped;
 }

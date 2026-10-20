@@ -1,19 +1,46 @@
 # 会话接入（Adopt）
 
-把**已经在本地 tmux 里跑着**的 CLI 进程无缝接入 botmux，在手机上通过飞书查看进度和交互。
+把**已经在本地 tmux 里跑着**的 CLI 进程无缝接入 botmux，在手机上通过飞书查看进度和交互。典型场景：公司电脑 tmux 里 Claude Code 写到一半要走，手机飞书发 `/adopt` 就能接着看、接着发。
 
 <video src="https://magic-builder.tos-cn-beijing.volces.com/uploads/1780421531476_adopt-video.aud.mp4" controls preload="metadata" style={{width:'100%',borderRadius:'8px'}}></video>
 
 ```
 /adopt              # 扫描本机 tmux，弹出选择卡片
-/adopt 0:2.0        # 直接接入指定 tmux pane
+/adopt 0:2.0        # 直接接入指定 tmux pane（session:window.pane）
 ```
 
-## 三种动作
+> 选择卡片只列**当前 bot 所绑 CLI** 的会话（Pi bot 不会列出 Codex/TRAE 的 pane），且排除 botmux 自己的 `bmx-*` 常驻会话。
 
-- **共享模式**：接入后，本地终端（如 iTerm2）和飞书双向同步——流式卡片实时显示终端输出，飞书聊天框输入直接透传到终端。本地的 tmux 全程保持连接。
-- **一键接管**：点流式卡片上的「🔄 接管」，botmux 以 `--resume` 重建会话，转为标准 botmux 会话。
-- **安全断开**：点「⏏ 断开」，botmux 退出观察，原 CLI 不受影响。
+## 它是「桥接」，不是接管
+
+adopt 采用**零打扰桥接**：botmux 只旁路观察 pane（`tmux pipe-pane` 读输出、`send-keys` 写输入），**从不 attach、不 zoom、不 group** 你本地的 tmux——你在 iTerm2 里的会话全程不受影响。
+
+- **共享模式**：接入后，本地终端（如 iTerm2）和飞书双向同步——流式卡片实时显示终端输出，飞书聊天框输入直接透传到终端。本地 tmux 全程保持连接、毫发无损。
+- **安全断开**：点流式卡片上的「⏏ 断开」（或发 `/close`），botmux 退出观察、清掉自己这侧的 worker，**绝不结束你的 CLI**——原进程继续在你本地 tmux 里跑。
+
+> ⚠️ 卡片上旧的「🔄 接管」按钮**已停用**：桥接模式下不再渲染，历史卡片点了也是空操作。以 `--resume` 完整重建为标准 botmux 会话的能力（`/adopt --takeover`）仍在路线图上、尚未上线。当前 adopt 始终是「共享桥接」这一种形态。
+
+## Codex 共享后台兼容
+
+Codex 使用共享后台服务器时，BotMux 仍向原 tmux pane 输入消息。接入和每次发送前，若前台进程没有持有会话文件，BotMux 只读终端状态栏中的当前会话 ID，以确认输入归属并观察回复。请在 Codex 的 `/statusline` 中启用 `thread-id`（旧名 `session-id`），默认放在末尾；请确保完整 ID 可见，必要时加宽窗口或减少其他显示项目。状态栏没有完整 ID 时，BotMux 会尝试从原 Codex 进程的环境确认配置目录（`CODEX_HOME` 或该进程的 `HOME/.codex`），自动将会话 ID 项放到 `tui.status_line` 末尾（保留已有 ID 别名并去重）。保留原有项目、注释和其他配置；没有自定义列表时保留内置默认项目，首次修改前备份原文件到同路径加 `.botmux-statusline.bak`。配置目录无法确认、格式无法安全编辑或写入失败时会保留原文件，并提示手动设置。
+
+BotMux 会通知配置已补齐、原本已配置或自动修改失败。保存配置不代表当前运行的 Codex 已经应用：后续启动并使用这份配置的终端会读取设置；当前会话请通过 `/statusline` 启用 ID 并保存，必要时加宽窗口。无需新建会话，BotMux 不会自动重启原 Codex。
+
+BotMux 不会自动输入 `/status`。即使配置已保存，状态栏未显示完整 ID 时仍会停止发送，并明确提示消息尚未写入原终端。不需要切换到 `existingAppServer`；旧版或内嵌运行模式继续使用进程持有的会话文件，无需配置版本开关。
+
+输入框有草稿、弹窗、加载状态，或终端布局无法可靠识别时，也会停止发送。请在原 Terminal 处理后再重发。若在本地通过 `/new` 或 `/resume` 切换会话，下一次飞书输入前会重新读取 ID 并切换回复观察。
+
+若系统无法枚举前台进程的会话文件（例如 macOS 缺少 `lsof`），BotMux 保留原有的会话识别路径；只有确认前台没有持有会话文件时，才要求通过实时状态栏识别。状态栏支持单行布局及独立状态栏加快捷键提示的双行布局，也支持执行中的 spinner；不会把工作目录路径中的 UUID 当作会话 ID。
+
+## 边界与注意
+
+adopt 会话的生命周期在**你的机器上**，不归 botmux 管，因此有几条硬边界：
+
+- **不能接力（`/relay`）**：CLI 在你电脑里跑，botmux 控不了它的 tmux 生命周期，接力会被拒。要换群继续，用新会话 + 交接。
+- **不能 resume**：adopt 会话不支持 `--resume` 重建。
+- **CLI 退出即结束**：adopt 模式下 botmux **不做自动重启**——被接入的 CLI 自己退出后，会话随之结束（卡片冻结、worker 收掉），不会像常驻会话那样重开。
+- **沙盒 bot 不能 adopt**：沙盒要包住一个从头启动的 CLI，无法套在一个已在跑的进程上（fail-closed 拒绝）。
+- **daemon 重启后的恢复很谨慎**：重启时会先核对被接入的宿主 CLI 是否还活着——确认没了才关会话；探测结果不确定（瞬时失败）时保持会话关闭，**要等下一次 restore pass（例如再次重启 daemon）才重新验证**，不会在下一条消息到来时自动复验。
 
 ## 典型用法
 

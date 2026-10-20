@@ -7,7 +7,8 @@ import {
   type TriggerLogRequest,
   type TriggerLogTarget,
 } from '../services/trigger-log-store.js';
-import { jsonRes } from './workflow-api.js';
+import { jsonRes } from './http.js';
+import { logger } from '../utils/logger.js';
 
 const MAX_TRIGGER_BODY_BYTES = 512 * 1024;
 
@@ -78,7 +79,24 @@ export async function queryTriggerResult(
       errorCode: 'trigger_failed',
     };
   }
-  return { status: upstream.status, body: parsed };
+  // Legacy-consumer adapter: the daemon's four-state trigger-result returns
+  // `ok:true` + HTTP 200 for terminal `failed`/`not_found` (task state lives in
+  // `.state`). Existing webhook async pollers + audit logging predate `.state`
+  // and branch on BOTH `ok` AND the HTTP status — the pre-four-state baseline was
+  // `404 + ok:false` for a missing session. Leaving `200 + ok:true` here would
+  // record a failed/lost task as `completed` AND break clients that switch on
+  // status. So for THIS webhook path we restore the legacy shape: `ok:false` plus
+  // a non-200 status (not_found→404, matching the old session_not_found; failed→
+  // 404 too, since to a legacy poller "terminated with no output" is equally "no
+  // result to fetch"). `.state` is preserved for consumers that have adopted it.
+  // The new four-state contract (raw dashboard proxy → task-runner callers) does
+  // NOT pass through queryTriggerResult and is therefore unaffected.
+  let status = upstream.status;
+  if (parsed.ok && (parsed.state === 'failed' || parsed.state === 'not_found')) {
+    parsed = { ...parsed, ok: false };
+    if (status === 200) status = 404;
+  }
+  return { status, body: parsed };
 }
 
 export async function dispatchTriggerRequest(
@@ -124,27 +142,37 @@ export async function dispatchTriggerRequest(
     };
   }
 
-  appendTriggerLog({
-    triggerId: parsed.triggerId ?? newTriggerId(),
-    connectorId: body.source.connectorId,
-    requestId: logContext?.requestId ?? body.source.requestId,
-    action: parsed.ok ? (parsed.action ?? 'delivered') : 'failed',
-    status: parsed.ok ? 'ok' : 'error',
-    error: parsed.error,
-    errorCode: parsed.errorCode,
-    ...(logContext?.request ? { request: logContext.request } : {}),
-    ...(logContext?.target ? { target: logContext.target } : {}),
-    ...(logContext?.startedAtMs !== undefined ? {
-      response: {
-        httpStatus: upstream.status,
-        durationMs: Math.max(0, Date.now() - logContext.startedAtMs),
-        ...(parsed.target?.sessionId ? { sessionId: parsed.target.sessionId } : {}),
-        ...(parsed.target?.workflowRunId ? { workflowRunId: parsed.target.workflowRunId } : {}),
-        ...(parsed.target?.chatId ? { chatId: parsed.target.chatId } : {}),
-      },
-    } : {}),
-    ...(logContext?.createdAt ? { createdAt: logContext.createdAt } : {}),
-  });
+  // Audit logging is BEST-EFFORT and must never reverse a delivery decision. By
+  // this point the daemon has already accepted (or rejected) the turn, so a
+  // throw here — disk full, EIO, EACCES — would turn a proven outcome into a 5xx
+  // and, for an idempotent webhook, release the key so an at-least-once sender
+  // re-runs a turn that really did queue. Same principle the retention prune
+  // already states ("logging must never break webhook delivery").
+  try {
+    appendTriggerLog({
+      triggerId: parsed.triggerId ?? newTriggerId(),
+      connectorId: body.source.connectorId,
+      requestId: logContext?.requestId ?? body.source.requestId,
+      action: parsed.ok ? (parsed.action ?? 'delivered') : 'failed',
+      status: parsed.ok ? 'ok' : 'error',
+      error: parsed.error,
+      errorCode: parsed.errorCode,
+      ...(logContext?.request ? { request: logContext.request } : {}),
+      ...(logContext?.target ? { target: logContext.target } : {}),
+      ...(logContext?.startedAtMs !== undefined ? {
+        response: {
+          httpStatus: upstream.status,
+          durationMs: Math.max(0, Date.now() - logContext.startedAtMs),
+          ...(parsed.target?.sessionId ? { sessionId: parsed.target.sessionId } : {}),
+          ...(parsed.target?.workflowRunId ? { workflowRunId: parsed.target.workflowRunId } : {}),
+          ...(parsed.target?.chatId ? { chatId: parsed.target.chatId } : {}),
+        },
+      } : {}),
+      ...(logContext?.createdAt ? { createdAt: logContext.createdAt } : {}),
+    });
+  } catch (err) {
+    logger.warn(`[trigger] audit log write failed (delivery unaffected): ${(err as Error).message}`);
+  }
 
   return { status: upstream.status, body: parsed };
 }

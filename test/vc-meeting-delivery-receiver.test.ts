@@ -223,7 +223,10 @@ describe('vc meeting delivery receiver', () => {
       const harness = receiverHarness(dir);
       await registerActiveMember(harness);
 
-      expect(harness.ensureMemberSession).toHaveBeenCalledWith(projection(), undefined);
+      expect(harness.ensureMemberSession).toHaveBeenCalledWith({
+        ...projection(),
+        outputRoute: { chatId: CHAT_ID, placement: 'auto' },
+      }, undefined);
       expect(getVcMeetingMemberProjection(dir, {
         listenerAppId: LISTENER_APP_ID,
         meetingId: MEETING_ID,
@@ -235,6 +238,7 @@ describe('vc meeting delivery receiver', () => {
         receiverSessionId: SESSION_ID,
         outputChatId: CHAT_ID,
         responseMode: 'silent',
+        outputPlacement: 'auto',
       });
     });
 
@@ -451,6 +455,25 @@ describe('vc meeting delivery receiver', () => {
     expect(trigger.envelope.payload.member.role).toBe(unsafeRole);
   });
 
+  it('requires the internal skip/publish envelope only for listener-visible automatic output', () => {
+    const request = delivery();
+    request.instructionVersion = 'meeting-consumer-v2';
+    const listener = buildVcMeetingDeliveryTriggerRequest(
+      request,
+      'delivery-key',
+      'listener_thread',
+      'Publish only meaningful changes.',
+    );
+    expect(listener.instruction).toContain('<botmux_role_instructions>\nPublish only meaningful changes.');
+    expect(listener.instruction).toContain('{"decision":"skip"}');
+    expect(listener.instruction).toContain('{"decision":"publish","content":"<message markdown>"}');
+    expect(listener.instruction.indexOf('Final answer transport contract'))
+      .toBeGreaterThan(listener.instruction.indexOf('</botmux_role_instructions>'));
+
+    const silent = buildVcMeetingDeliveryTriggerRequest(request, 'delivery-key', 'silent');
+    expect(silent.instruction).not.toContain('Final answer transport contract');
+  });
+
   it('returns the same exact recovery ref when CLI-exit ambiguity precedes worker exit', async () => {
     const harness = receiverHarness(dir, { workerGeneration: 7 });
     await registerActiveMember(harness);
@@ -607,6 +630,65 @@ describe('vc meeting delivery receiver', () => {
       memberId: MEMBER_ID,
       memberEpoch: 1,
     })).toMatchObject({ receiverCommittedThrough: 2 });
+  });
+
+  // Regression guard for the RPC-abort mapping: an RPC turn interrupted after
+  // it started executing is finalized as `ambiguous` (not `failed`). The
+  // receiver must turn that into a parked `ambiguous` receipt — NOT the
+  // `failed_retryable` receipt a worker `failed` terminal produces.
+  // `failed_retryable` is what the reconciler auto-retries (re-running
+  // already-executed side effects); `ambiguous` parks and is never auto-retried.
+  // This test pins both sides of that contrast so the two statuses can never be
+  // collapsed again.
+  it('maps an RPC-aborted (ambiguous) terminal to a parked receipt, unlike a retryable failed terminal', async () => {
+    const abortedHarness = receiverHarness(dir, { workerGeneration: 7 });
+    await registerActiveMember(abortedHarness);
+    const abortedReq = delivery();
+    const abortedKey = deriveVcMeetingDeliveryIdentity(abortedReq).deliveryKey;
+    await receiveVcMeetingDelivery(abortedReq, abortedHarness.deps);
+
+    // Worker maps RPC `aborted` -> `ambiguous` (side effects may already have
+    // run), matching the transcript path.
+    expect(handleVcMeetingTurnTerminal({
+      type: 'turn_terminal',
+      sessionId: SESSION_ID,
+      turnId: abortedKey,
+      dispatchAttempt: 1,
+      status: 'ambiguous',
+      errorCode: 'rpc_turn_aborted',
+    }, { workerGeneration: 7 }, abortedHarness.deps)).toMatchObject({
+      handled: true,
+      receipt: { status: 'ambiguous', dispatchAttempt: 1 },
+    });
+    // Parked as ambiguous — not failed_retryable — so the reconciler does not
+    // automatically re-run the turn.
+    expect(getVcMeetingDeliveryStatus(abortedKey, abortedHarness.deps)).toMatchObject({
+      body: { status: 'ambiguous', dispatchAttempt: 1 },
+    });
+
+    // Contrast: a genuine worker `failed` terminal on a distinct delivery yields
+    // a retryable receipt, which IS what the auto-retry budget acts on.
+    const failedDir = mkdtempSync(join(tmpdir(), 'vc-abort-contrast-'));
+    try {
+      const failedHarness = receiverHarness(failedDir, { workerGeneration: 7 });
+      await registerActiveMember(failedHarness);
+      const failedReq = delivery();
+      const failedKey = deriveVcMeetingDeliveryIdentity(failedReq).deliveryKey;
+      await receiveVcMeetingDelivery(failedReq, failedHarness.deps);
+      expect(handleVcMeetingTurnTerminal({
+        type: 'turn_terminal',
+        sessionId: SESSION_ID,
+        turnId: failedKey,
+        dispatchAttempt: 1,
+        status: 'failed',
+        errorCode: 'rpc_turn_failed',
+      }, { workerGeneration: 7 }, failedHarness.deps)).toMatchObject({
+        handled: true,
+        receipt: { status: 'failed_retryable', dispatchAttempt: 1 },
+      });
+    } finally {
+      rmSync(failedDir, { recursive: true, force: true });
+    }
   });
 
   it('rejects partial overlap, gaps, and a forged canonical input hash', async () => {

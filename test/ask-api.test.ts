@@ -25,6 +25,23 @@ function validBody(over: Record<string, unknown> = {}) {
 }
 
 describe('parseAskBody — happy path', () => {
+  it('parses explicit result acknowledgement without treating it as a new Ask', () => {
+    expect(parseAskBody(validBody({ requestId: 'stable', originKind: 'explicit', acknowledge: true }))).toMatchObject({ acknowledge: true, requestId: 'stable' });
+  });
+  it.each(['true', 1, null])('rejects non-boolean acknowledgement %s', acknowledge => {
+    expect(parseAskBody(validBody({ acknowledge }))).toEqual({ error: 'bad_acknowledge' });
+  });
+  it.each(['host_explicit', 'host_cross_principal_wait', 'host_anything'])
+  ('rejects daemon-internal host_ originKind %s over HTTP', originKind => {
+    // host_* claimants are constructed in-process only; a client typing one
+    // would collect broker GC/handoff exemptions without a daemon-owned record.
+    expect(parseAskBody(validBody({ originKind }))).toEqual({ error: 'bad_originKind' });
+  });
+  it('still accepts the client-facing explicit originKind', () => {
+    const out = parseAskBody(validBody({ originKind: 'explicit' }));
+    expect('error' in out).toBe(false);
+  });
+
   it('accepts a fully populated body and returns the parsed shape', () => {
     const out = parseAskBody(validBody());
     expect('error' in out).toBe(false);
@@ -111,6 +128,26 @@ describe('parseAskBody — validation', () => {
   });
 });
 
+describe('parseAskBody — supported request semantics', () => {
+  it('rejects an unsupported request contract instead of reducing it to an ordinary Ask', () => {
+    expect(parseAskBody(validBody({
+      requestId: 'original-request', originKind: 'explicit',
+      requiredContract: { kind: 'durable-approval', revision: 1 },
+    }))).toEqual({ error: 'unsupported_fields' });
+  });
+
+  it('preserves native hook identity while leaving route claims to the authorizer', () => {
+    const out = parseAskBody(validBody({
+      requestId: 'original-hook', originKind: 'hook',
+      originCapability: 'fixture-capability', originTurnId: 'original-turn', originDispatchAttempt: 2,
+    }));
+    expect(out).toMatchObject({ requestId: 'original-hook', originKind: 'hook' });
+    expect(out).not.toHaveProperty('originCapability');
+    expect(out).not.toHaveProperty('originTurnId');
+    expect(out).not.toHaveProperty('originDispatchAttempt');
+  });
+});
+
 describe('parseAskBody — questions[] 多问多选', () => {
   it('接受 questions[]（多问多选）', () => {
     const body = parseAskBody({
@@ -136,5 +173,36 @@ describe('parseAskBody — questions[] 多问多选', () => {
   it('每问 options<2 报错', () => {
     const body = parseAskBody({ sessionId: 's', chatId: 'c', larkAppId: 'a', rootMessageId: null, timeoutMs: 60000, questions: [{ prompt: 'q', multiSelect: false, options: [{ key: 'x', label: 'X' }] }] });
     expect('error' in body).toBe(true);
+  });
+});
+
+describe('parseAskBody — requestId / originKind (invocation identity)', () => {
+  it('接受并透传合法 requestId + originKind', () => {
+    const out = parseAskBody(validBody({ requestId: 'req-abc', originKind: 'hook' }));
+    expect('error' in out).toBe(false);
+    if (!('error' in out)) {
+      expect(out.requestId).toBe('req-abc');
+      expect(out.originKind).toBe('hook');
+    }
+  });
+
+  it('缺省时 requestId/originKind 为 undefined（旧调用方兼容）', () => {
+    const out = parseAskBody(validBody());
+    if (!('error' in out)) {
+      expect(out.requestId).toBeUndefined();
+      expect(out.originKind).toBeUndefined();
+    }
+  });
+
+  it('非法 requestId（空 / 超 128 / 非字符串）报错', () => {
+    expect('error' in parseAskBody(validBody({ requestId: '' }))).toBe(true);
+    expect('error' in parseAskBody(validBody({ requestId: 'x'.repeat(129) }))).toBe(true);
+    expect('error' in parseAskBody(validBody({ requestId: 123 }))).toBe(true);
+  });
+
+  it('非法 originKind（空 / 超 32 / 非字符串）报错', () => {
+    expect('error' in parseAskBody(validBody({ originKind: '' }))).toBe(true);
+    expect('error' in parseAskBody(validBody({ originKind: 'x'.repeat(33) }))).toBe(true);
+    expect('error' in parseAskBody(validBody({ originKind: {} }))).toBe(true);
   });
 });

@@ -1,6 +1,6 @@
 /**
  * Shared helpers for sessions backed by a persistent multiplexer
- * (tmux / herdr / zellij). These backends keep the CLI alive across worker
+ * (tmux / herdr / zellij / zmx). These backends keep the CLI alive across worker
  * exits BY DESIGN (idle-suspend, lazy restore), so several daemon paths must
  * resolve / name / probe / kill the backing session WITHOUT a live worker:
  * the restore-time zombie sweep and terminal wake (session-manager.ts), and
@@ -12,18 +12,37 @@
  * import cycle with each other.
  */
 import { getBot } from '../bot-registry.js';
+import { isRemoteBackendId, reconcilePairedBackendId } from './remote-cli-ids.js';
 import { TmuxBackend } from '../adapters/backend/tmux-backend.js';
 import { HerdrBackend } from '../adapters/backend/herdr-backend.js';
 import { ZellijBackend } from '../adapters/backend/zellij-backend.js';
-import type { BackendType, SessionProbe } from '../adapters/backend/types.js';
+import { ZmxBackend } from '../adapters/backend/zmx-backend.js';
+import { zmxEnv } from '../setup/ensure-zmx.js';
+import type { BackendType, PersistentBackendTarget, SessionProbe } from '../adapters/backend/types.js';
 import type { DaemonSession } from './types.js';
+import type { Session } from '../types.js';
 
-export type PersistentBackendType = Exclude<BackendType, 'pty'>;
+export type PersistentBackendType = Extract<BackendType, 'tmux' | 'herdr' | 'zellij' | 'zmx'>;
+
+/**
+ * Decide whether a post-kill probe still blocks a cold replacement.
+ *
+ * ZMX owns sessions by labels + frozen PID, so an inconclusive confirmation
+ * must remain fail-closed. The older mux backends only have best-effort
+ * process/session probes: after a successful kill, `unknown` is not proof that
+ * the target survived (notably zellij reports zero live sessions with exit 1).
+ */
+export function shouldRejectPersistentPostKillProbe(
+  backendType: PersistentBackendType,
+  probe: SessionProbe,
+): boolean {
+  return probe === 'exists' || (backendType === 'zmx' && probe === 'unknown');
+}
 
 export function isSuspendableBackendType(
   backendType: BackendType | undefined,
 ): backendType is PersistentBackendType {
-  return backendType === 'tmux' || backendType === 'herdr' || backendType === 'zellij';
+  return backendType === 'tmux' || backendType === 'herdr' || backendType === 'zellij' || backendType === 'zmx';
 }
 
 /**
@@ -73,24 +92,48 @@ export function resolveSpawnBackendType(
 }
 
 /**
- * Enforce the `cliId === 'riff' ⇔ backendType === 'riff'` pairing invariant at
- * the ONE spawn chokepoint, so every config entry point (dashboard, `/config
+ * CLIs that are NOT local processes: they have an empty `resolvedBin` and their
+ * backend translates write() into remote API / headless-CLI calls. For each of
+ * these the cliId and the backendType share a name and must stay paired.
+ *
+ * Adding a remote CLI means adding it here — the alternative (another
+ * hardcoded `=== 'riff'` chain in every helper below) is exactly what made this
+ * generalization necessary.
+ */
+// The set itself now lives in the dependency-free core/remote-cli-ids leaf so
+// light consumers (e.g. the Lark card builder) can share it without pulling in
+// every PTY backend class through this module.
+
+/** True for a backend that runs the agent off-box (no local PTY to own). */
+export function isRemoteBackendType(type: BackendType): boolean {
+  return isRemoteBackendId(type);
+}
+
+export { isRemoteCliId } from './remote-cli-ids.js';
+
+/**
+ * Enforce the `cliId === <remote> ⇔ backendType === <remote>` pairing invariant
+ * at the ONE spawn chokepoint, so every config entry point (dashboard, `/config
  * set cli|backendType`, `botmux setup`, hand-edited bots.json) converges:
- *   - riff CLI on a local backend → force 'riff' (a pty/tmux spawn would fail
- *     on the empty resolvedBin);
- *   - non-riff CLI on the riff backend → fall back to the daemon default (the
- *     CLI's PTY chunked writes would otherwise fan out into riff tasks).
- * Manual pty/tmux/herdr/zellij overrides for non-riff CLIs pass through.
+ *   - a remote CLI on a local backend → force its own backend (a pty/tmux spawn
+ *     would fail on the empty resolvedBin);
+ *   - a non-remote CLI on a remote backend → fall back to the daemon default
+ *     (the CLI's PTY chunked writes would otherwise fan out into remote tasks).
+ * Manual pty/tmux/herdr/zellij overrides for local CLIs pass through.
+ *
+ * NOTE: kept under its historical name `reconcileRiffBackendType` on purpose —
+ * it is imported by name in several modules and renaming it would bloat this
+ * behaviour-preserving refactor into a cross-cutting rename.
  */
 export function reconcileRiffBackendType(
   cliId: string,
   resolved: BackendType,
   defaultType: BackendType,
 ): BackendType {
-  if (cliId === 'riff') return 'riff';
-  // defaultType 本身被误配成 riff 时兜底到确定可用的本地后端（pty 无外部依赖）。
-  if (resolved === 'riff') return defaultType !== 'riff' ? defaultType : 'pty';
-  return resolved;
+  // A remote CLI dictates its own backend (same name by construction);
+  // defaultType 本身被误配成远端后端时兜底到确定可用的本地后端（pty 无外部依赖）。
+  // 规则本体在无依赖的 remote-cli-ids，Dashboard 判断零注入时复用同一份。
+  return reconcilePairedBackendId(cliId, resolved, defaultType) as BackendType;
 }
 
 /** Resolve the frozen/live/default backend precedence and then enforce the
@@ -109,6 +152,26 @@ export function resolvePairedSpawnBackendType(
   );
 }
 
+/** Whether the live/persisted session is frozen onto the remote Riff backend.
+ *  Restart guards must use the session stamp rather than the bot's mutable
+ *  current config: changing a bot later must not make an existing Riff
+ *  generation look locally restartable. */
+export function isRiffBackendSession(ds: DaemonSession): boolean {
+  return (ds.initConfig?.backendType ?? ds.session.backendType) === 'riff';
+}
+
+/** Whether the live/persisted session is frozen onto ANY remote backend.
+ *  Same frozen-stamp rule as isRiffBackendSession. Used by the guards that
+ *  must reject BEFORE mutating persisted state (e.g. /cd repin): killWorker
+ *  refuses unprepared live retirement for every remote backend, so a caller
+ *  that mutates first and retires after would report success while the live
+ *  generation keeps running against the old state — the split-brain the riff
+ *  guard has always prevented, now needed for mojo too. */
+export function isRemoteBackendSession(ds: DaemonSession): boolean {
+  const frozen = ds.initConfig?.backendType ?? ds.session.backendType;
+  return frozen !== undefined && isRemoteBackendType(frozen);
+}
+
 /**
  * How a session's worker is torn down at daemon shutdown, branched on the
  * session's FROZEN backend (via getSessionPersistentBackendType), NOT live config:
@@ -118,12 +181,14 @@ export function resolvePairedSpawnBackendType(
  * Freezing here stops a live backendType edit from changing how a running session
  * tears down — e.g. detach-preserving a "herdr" session whose real pane is tmux.
  */
-export function shutdownBackendDisposition(ds: DaemonSession): 'detach' | 'close' {
-  // riff：远端任务独立于本地进程存活。daemon shutdown 走 'close' 会经 worker 的
-  // destroySession() 取消远端任务——重启不该杀任务（血缘已持久化，重启后
-  // follow-up 续上，agent 的 botmux send 照常送达）。detach = 仅 SIGTERM worker。
+export function shutdownBackendDisposition(ds: DaemonSession): 'remote-drain-detach' | 'detach' | 'close' {
   const frozen = ds.initConfig?.backendType ?? ds.session.backendType;
-  if (frozen === 'riff') return 'detach';
+  // Every remote backend must publish its exact final lineage before the local
+  // worker exits. Riff may wait for create/follow-up HTTP; Mojo may wait for the
+  // first `system/init`. Their backend-specific implementations stay behind the
+  // common prepare/abort/commit interface, while the daemon owns one atomic
+  // fleet transaction. Detach never cancels the remote session.
+  if (frozen && isRemoteBackendType(frozen)) return 'remote-drain-detach';
   return getSessionPersistentBackendType(ds) ? 'detach' : 'close';
 }
 
@@ -131,37 +196,199 @@ export function shutdownBackendDisposition(ds: DaemonSession): 'detach' | 'close
 export function persistentSessionName(backendType: PersistentBackendType, sessionId: string): string {
   if (backendType === 'tmux') return TmuxBackend.sessionName(sessionId);
   if (backendType === 'zellij') return ZellijBackend.sessionName(sessionId);
+  if (backendType === 'zmx') return ZmxBackend.sessionName(sessionId);
   return HerdrBackend.sessionName(sessionId);
+}
+
+/**
+ * Resolve the exact backing resource for daemon lifecycle work. The persisted
+ * worker-selected target wins only when it still matches the frozen backend;
+ * legacy rows fall back to the historical deterministic whole-session target.
+ */
+export function resolvePersistentBackendTarget(
+  backendType: PersistentBackendType,
+  sessionId: string,
+  persisted?: PersistentBackendTarget,
+): PersistentBackendTarget {
+  if (persisted?.backendType === backendType && persisted.sessionName.trim()) {
+    if (persisted.backendType !== 'herdr' || persisted.agentName === undefined || persisted.agentName.trim()) {
+      return persisted;
+    }
+  }
+  return { backendType, sessionName: persistentSessionName(backendType, sessionId) };
+}
+
+export function persistentBackendTargetForSession(ds: DaemonSession): PersistentBackendTarget | undefined {
+  const backendType = getSessionPersistentBackendType(ds);
+  if (!backendType) return undefined;
+  return resolvePersistentBackendTarget(
+    backendType,
+    ds.session.sessionId,
+    ds.session.persistentBackendTarget,
+  );
+}
+
+/** Exact managed resources to remove when a single-bot CLI changes.
+ * Adopted panes are user-owned; machine-wide Herdr agents must be returned as
+ * agent-scoped targets rather than collapsing to the shared host session. */
+export function managedTargetsForCliChange(
+  backendType: PersistentBackendType,
+  sessions: readonly Pick<Session, 'sessionId' | 'adoptedFrom' | 'persistentBackendTarget'>[],
+): PersistentBackendTarget[] {
+  return sessions
+    .filter(session => !session.adoptedFrom)
+    .map(session => resolvePersistentBackendTarget(
+      backendType,
+      session.sessionId,
+      session.persistentBackendTarget,
+    ));
+}
+
+export function probePersistentBackendTarget(target: PersistentBackendTarget): SessionProbe {
+  if (target.backendType === 'zmx' && target.socketDir !== undefined) {
+    return ZmxBackend.probeSession(target.sessionName, zmxEnv(process.env, target.socketDir));
+  }
+  if (target.backendType === 'herdr' && target.agentName) {
+    return HerdrBackend.probeAgent(target.sessionName, target.agentName);
+  }
+  return probePersistentSession(target.backendType, target.sessionName);
+}
+
+/**
+ * `sessionId` is REQUIRED for ZMX: its destruction is identity-verified against
+ * the botmux labels stamped on the session, and `killPersistentSession` refuses
+ * a name-only ZMX kill rather than risk destroying a same-named user session.
+ * Callers that hold the owning session must always pass it through.
+ */
+export function killPersistentBackendTarget(
+  target: PersistentBackendTarget,
+  sessionId?: string,
+): void {
+  if (target.backendType === 'zmx' && target.socketDir !== undefined) {
+    if (!sessionId) throw new Error('ZMX teardown requires the complete owning session id');
+    ZmxBackend.killManagedSession(target.sessionName, sessionId, undefined, zmxEnv(process.env, target.socketDir));
+    return;
+  }
+  if (target.backendType === 'herdr' && target.agentName) {
+    HerdrBackend.killAgent(target.sessionName, target.agentName);
+    return;
+  }
+  killPersistentSession(target.backendType, target.sessionName, sessionId);
 }
 
 export function probePersistentSession(backendType: PersistentBackendType, name: string): SessionProbe {
   if (backendType === 'tmux') return TmuxBackend.probeSession(name);
   if (backendType === 'zellij') return ZellijBackend.probeSession(name);
+  if (backendType === 'zmx') return ZmxBackend.probeSession(name);
   return HerdrBackend.probeSession(name);
 }
 
 /**
- * Tri-state liveness of the backend's multiplexer SERVER itself (not one
- * session). The restore path consults this when a session probes 'missing' to
- * tell apart a true solo zombie (server up, this one pane gone → close) from a
- * machine reboot (server gone, every pane wiped at once → keep for lazy resume,
- * since the CLI transcript on disk is still resumable). See
- * TmuxBackend.serverState for the full rationale.
+ * Take one liveness snapshot for a set of backing-session names.
  *
- * herdr has no cheap server-liveness probe, so it returns 'unknown' →
- * the restore gate falls back to the prior (close-on-missing) behaviour for it.
+ * ZMX and Zellij expose all session states in one command, so probing each row
+ * separately would repeatedly scan the same control plane (and makes `botmux
+ * list` quadratic for ZMX). tmux and Herdr keep their established per-session
+ * probes, but duplicate names are still coalesced here.
  */
-export function probePersistentBackendServer(
+export function probePersistentSessions(
   backendType: PersistentBackendType,
-): 'running' | 'down' | 'unknown' {
-  if (backendType === 'tmux') return TmuxBackend.serverState();
-  if (backendType === 'zellij') return ZellijBackend.serverState();
-  return 'unknown';
+  names: Iterable<string>,
+  socketDir?: string,
+): ReadonlyMap<string, SessionProbe> {
+  const uniqueNames = [...new Set(names)];
+  const result = new Map<string, SessionProbe>();
+
+  if (backendType === 'zmx') {
+    const snapshot = socketDir === undefined
+      ? ZmxBackend.probeSessions()
+      : ZmxBackend.probeSessions(zmxEnv(process.env, socketDir));
+    for (const name of uniqueNames) {
+      result.set(
+        name,
+        !snapshot.ok
+          ? 'unknown'
+          : snapshot.sessions.includes(name)
+            ? 'exists'
+            : snapshot.unhealthySessions.includes(name)
+              ? 'unknown'
+              : 'missing',
+      );
+    }
+    return result;
+  }
+
+  if (backendType === 'zellij') {
+    const snapshot = ZellijBackend.probeLiveSessions();
+    for (const name of uniqueNames) {
+      result.set(name, !snapshot.ok ? 'unknown' : snapshot.sessions.includes(name) ? 'exists' : 'missing');
+    }
+    return result;
+  }
+
+  for (const name of uniqueNames) {
+    result.set(name, probePersistentSession(backendType, name));
+  }
+  return result;
 }
 
-/** Kill a backing session (each backend's killSession is a no-op when absent). */
-export function killPersistentSession(backendType: PersistentBackendType, name: string): void {
+/** Address identity for caches/batches; ownership still requires the session UUID. */
+export function persistentBackendTargetKey(target: PersistentBackendTarget): string {
+  return JSON.stringify([
+    target.backendType,
+    target.sessionName,
+    target.backendType === 'herdr' ? target.agentName ?? '' : '',
+    target.backendType === 'zmx' ? target.socketDir ?? '' : '',
+  ]);
+}
+
+/** One list per backend namespace, shared by CLI display and daemon restore. */
+export function probePersistentBackendTargets(
+  targets: Iterable<PersistentBackendTarget>,
+): ReadonlyMap<string, SessionProbe> {
+  const result = new Map<string, SessionProbe>();
+  const groups = new Map<string, Map<string, PersistentBackendTarget>>();
+  for (const target of targets) {
+    const key = persistentBackendTargetKey(target);
+    if (target.backendType === 'herdr' && target.agentName) {
+      if (!result.has(key)) result.set(key, probePersistentBackendTarget(target));
+      continue;
+    }
+    const socketDir = target.backendType === 'zmx' ? target.socketDir : undefined;
+    const groupKey = JSON.stringify([target.backendType, socketDir ?? '']);
+    const group = groups.get(groupKey) ?? new Map<string, PersistentBackendTarget>();
+    group.set(target.sessionName, target);
+    groups.set(groupKey, group);
+  }
+  for (const group of groups.values()) {
+    const target = group.values().next().value!;
+    const probes = probePersistentSessions(
+      target.backendType,
+      group.keys(),
+      target.backendType === 'zmx' ? target.socketDir : undefined,
+    );
+    for (const [name, item] of group) {
+      result.set(persistentBackendTargetKey(item), probes.get(name) ?? 'unknown');
+    }
+  }
+  return result;
+}
+
+/**
+ * Kill a backing session. ZMX additionally requires the complete botmux UUID:
+ * its public name contains only eight UUID characters, so name-only deletion
+ * could destroy a different session after a prefix collision.
+ */
+export function killPersistentSession(
+  backendType: PersistentBackendType,
+  name: string,
+  sessionId?: string,
+): void {
   if (backendType === 'tmux') TmuxBackend.killSession(name);
   else if (backendType === 'zellij') ZellijBackend.killSession(name);
+  else if (backendType === 'zmx') {
+    if (!sessionId) throw new Error(`refusing name-only ZMX kill for ${name}`);
+    ZmxBackend.killManagedSession(name, sessionId);
+  }
   else HerdrBackend.killSession(name);
 }

@@ -16,13 +16,62 @@ vi.mock('../src/im/lark/client.js', async (importOriginal) => {
   return { ...actual, replyMessage: (...a: any[]) => replyMock(...a) };
 });
 
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { parseGrantTarget, parseGrantTargets, parseGrantQuota, tryHandleGrantCommand, isGrantTargetOnly } from '../src/im/lark/grant-command.js';
 import { registerBot, getBot, loadBotConfigs } from '../src/bot-registry.js';
 import { addChatGrant } from '../src/services/grant-store.js';
 import * as pending from '../src/im/lark/grant-pending.js';
+import { hasTriggeredMessage, _resetCacheForTest as resetTriggered } from '../src/services/triggered-message-store.js';
+
+let executionDataDir: string;
+beforeEach(() => {
+  executionDataDir = mkdtempSync(join(tmpdir(), 'botmux-grant-execution-'));
+  vi.stubEnv('SESSION_DATA_DIR', executionDataDir);
+  resetTriggered();
+});
+afterEach(() => {
+  resetTriggered();
+  vi.unstubAllEnvs();
+  rmSync(executionDataDir, { recursive: true, force: true });
+});
+
+function findCardCallbackValue(card: any, action: string): any {
+  const visit = (node: any): any => {
+    if (node?.behaviors?.[0]?.value?.action === action) return node.behaviors[0].value;
+    if (node?.value?.action === action) return node.value;
+    if (Array.isArray(node)) {
+      for (const child of node) {
+        const found = visit(child);
+        if (found) return found;
+      }
+    } else if (node && typeof node === 'object') {
+      for (const child of Object.values(node)) {
+        const found = visit(child);
+        if (found) return found;
+      }
+    }
+    return undefined;
+  };
+  return visit(card);
+}
+
+function findCardNode(card: any, predicate: (node: any) => boolean): any {
+  if (predicate(card)) return card;
+  if (Array.isArray(card)) {
+    for (const child of card) {
+      const found = findCardNode(child, predicate);
+      if (found) return found;
+    }
+  } else if (card && typeof card === 'object') {
+    for (const child of Object.values(card)) {
+      const found = findCardNode(child, predicate);
+      if (found) return found;
+    }
+  }
+  return undefined;
+}
 
 describe('parseGrantTarget', () => {
   it('extracts first non-bot human mention', () => {
@@ -203,15 +252,87 @@ describe('tryHandleGrantCommand (@bot /grant @user)', () => {
     const [, , content, msgType] = replyMock.mock.calls.at(-1)!;
     expect(msgType).toBe('interactive');
     expect(content).toContain('grant_chat');           // card carries grant actions
-    expect(pending.checkNonce('b1', 'oc_1', 'ou_z', JSON.parse(content).elements.find((e: any)=>e.tag==='action').actions[0].value.nonce)).toBe(true);
+    const grantChat = findCardCallbackValue(JSON.parse(content), 'grant_chat');
+    expect(pending.checkNonce('b1', 'oc_1', 'ou_z', grantChat.nonce)).toBe(true);
+    expect(pending.getPendingGrantLimits('b1', 'oc_1', 'ou_z')?.durationMs).toBe(60 * 60 * 1000);
   });
 
-  it('non-owner: replies owner_only, no card', async () => {
+  it('uses the configured finite duration for both the /grant card and pending limits', async () => {
+    getBot('b1').config.grantDefaultDurationMs = 8 * 60 * 60 * 1000;
+
+    await tryHandleGrantCommand('b1', grantMessage(), 'ou_owner');
+
+    const [, , content] = replyMock.mock.calls.at(-1)!;
+    const card = JSON.parse(content);
+    const grantChat = findCardCallbackValue(card, 'grant_chat');
+    const durationSelect = findCardNode(card, node => node?.tag === 'select_static' && node?.name === 'grant_duration');
+    expect(durationSelect.initial_option).toBe(String(8 * 60 * 60 * 1000));
+    expect(pending.getPendingGrantLimits('b1', 'oc_1', 'ou_z')).toMatchObject({
+      durationMs: 8 * 60 * 60 * 1000,
+    });
+    expect(pending.checkNonce('b1', 'oc_1', 'ou_z', grantChat.nonce)).toBe(true);
+  });
+
+  it('dedupes while the first send is in flight and preserves its pending nonce', async () => {
+    let finishSend!: (id: string) => void;
+    replyMock.mockImplementationOnce(() => new Promise<string>(resolve => { finishSend = resolve; }));
+    const first = tryHandleGrantCommand('b1', grantMessage(), 'ou_owner');
+    try {
+      expect(replyMock).toHaveBeenCalledOnce();
+      const value = findCardCallbackValue(JSON.parse(replyMock.mock.calls[0][2]), 'grant_chat');
+      expect(await tryHandleGrantCommand('b1', grantMessage(), 'ou_owner')).toBe(true);
+      expect(replyMock).toHaveBeenCalledOnce();
+      expect(pending.checkNonce('b1', 'oc_1', 'ou_z', value.nonce)).toBe(true);
+    } finally {
+      finishSend('om_reply');
+      await first;
+    }
+  });
+
+  it('keeps the execution claim after a cache reload and an uncertain send failure', async () => {
+    replyMock.mockRejectedValueOnce(new Error('response lost after send'));
+    await tryHandleGrantCommand('b1', grantMessage(), 'ou_owner');
+    resetTriggered();
+    expect(hasTriggeredMessage('b1', 'om_x')).toBe(true);
+    await tryHandleGrantCommand('b1', grantMessage(), 'ou_owner');
+    expect(replyMock).toHaveBeenCalledOnce();
+  });
+
+  it('allows a distinct command and keeps execution claims scoped to each app', async () => {
+    await tryHandleGrantCommand('b1', grantMessage(), 'ou_owner');
+    await tryHandleGrantCommand('b1', { ...grantMessage(), message_id: 'om_next' }, 'ou_owner');
+    const secondBot = registerBot({ larkAppId: 'b_other', larkAppSecret: 's', cliId: 'codex', allowedUsers: ['ou_owner'] });
+    secondBot.botOpenId = 'ou_bot';
+    secondBot.resolvedAllowedUsers = ['ou_owner'];
+    await tryHandleGrantCommand('b_other', grantMessage(), 'ou_owner');
+    expect(replyMock).toHaveBeenCalledTimes(3);
+  });
+
+  it('does not consume invalid input before the owner corrects it', async () => {
+    const invalid = { ...grantMessage(), content: JSON.stringify({ text: '@_user_1 /grant @_user_2 -1' }) };
+    await tryHandleGrantCommand('b1', invalid, 'ou_owner');
+    expect(hasTriggeredMessage('b1', 'om_x')).toBe(false);
+    await tryHandleGrantCommand('b1', grantMessage(), 'ou_owner');
+    expect(replyMock.mock.calls.filter(call => call[3] === 'interactive')).toHaveLength(1);
+  });
+
+  it('non-admin: replies owner_only, no card', async () => {
     const handled = await tryHandleGrantCommand('b1', grantMessage(), 'ou_intruder');
     expect(handled).toBe(true);
     const [, , content, msgType] = replyMock.mock.calls.at(-1)!;
     expect(msgType ?? 'text').not.toBe('interactive');  // text reply, not a card
-    expect(content).toContain('owner');                 // owner_only message text
+    expect(content).toContain('管理员');                // owner_only message text
+  });
+
+  it('co-owner: can also execute /grant and card reflects co-owner', async () => {
+    const bot = getBot('b1');
+    bot.resolvedAllowedUsers = ['ou_owner', 'ou_coowner'];
+    const handled = await tryHandleGrantCommand('b1', grantMessage(), 'ou_coowner');
+    expect(handled).toBe(true);
+    const [, , cardStr, msgType] = replyMock.mock.calls.at(-1)!;
+    expect(msgType).toBe('interactive');
+    const card = JSON.parse(cardStr);
+    expect(card.body.elements[0].content).toContain('ou_coowner');
   });
 
   it('unrelated message is not intercepted', async () => {
@@ -249,7 +370,7 @@ describe('tryHandleGrantCommand multi-target (@bot /grant @a @b)', () => {
     expect(msgType).toBe('interactive');
     expect(content).toContain('张三');
     expect(content).toContain('李四');
-    const grantChat = JSON.parse(content).elements.find((e: any) => e.tag === 'action').actions[0].value;
+    const grantChat = findCardCallbackValue(JSON.parse(content), 'grant_chat');
     expect(grantChat.target_open_ids).toEqual(['ou_a', 'ou_b']);
     // one shared nonce validates every target
     expect(pending.checkNonce('bm', 'oc_1', 'ou_a', grantChat.nonce)).toBe(true);
@@ -426,6 +547,46 @@ describe('tryHandleGrantCommand bot-as-target (@operator /grant @thisBot)', () =
     const [, , , msgType] = replyMock.mock.calls.at(-1)!;
     expect(msgType).toBe('interactive');                         // card still pops for the operator
   });
+
+  // 本 bot 以 **app_id 形态**（larkAppId=btb）作为目标出现在命令词后。这是协作 bot 被 @
+  // 的常见形态。修复前 guard 只认 open_id → 漏判 → parseGrantTargets 的 .filter(openId)
+  // 把 app_id-only 自身剔空 → targets 空 → 误走整群授权分支（提权，codex 警告的失败模式）。
+  it('owner sender, this bot @ed as app_id after /grant → silent, whole-chat NOT opened', async () => {
+    const appIdTargetMsg = {
+      message_id: 'om_aid', chat_id: 'oc_1',
+      content: JSON.stringify({ text: '@_user_1 /grant @_user_2' }),
+      mentions: [
+        { key: '@_user_1', id: { open_id: 'ou_op' }, name: 'Claude' },      // 操作 bot（前导 @）
+        { key: '@_user_2', id: 'btb', id_type: 'app_id', name: 'Codex' },   // 本 bot，app_id 形态目标
+      ],
+    };
+    const handled = await tryHandleGrantCommand('btb', appIdTargetMsg, 'ou_owner');
+    expect(handled).toBe(true);
+    expect(replyMock).not.toHaveBeenCalled();
+    expect(getBot('btb').config.allowedChatGroups ?? []).toEqual([]);   // 整群授权绝不被误开
+  });
+
+  // OPERATOR 视角（codex delta-3）：本 bot 是**前导** operator（命令前），尾部目标是**别的**
+  // app_id-only bot。parseGrantTargets 的 .filter 会把 app_id-only 目标剔空 → targets 空 →
+  // 若据此走裸 /grant 整群授权 = 提权（owner 本意授权某 bot，误对全群开放 talk）。必须 fail
+  // closed：hasAnyTargetMention 识别「命令后有目标只是不可按 open_id 授权」→ 回 usage、不开整群。
+  it('owner sender, this bot is OPERATOR + tail target is another app_id-only bot → fail closed, whole-chat NOT opened', async () => {
+    const opWithAppIdTarget = {
+      message_id: 'om_opa', chat_id: 'oc_1',
+      content: JSON.stringify({ text: '@_user_1 /grant @_user_2' }),
+      mentions: [
+        { key: '@_user_1', id: { open_id: 'ou_bot' }, name: 'Codex' },          // 本 bot = 前导 operator
+        { key: '@_user_2', id: 'cli_other', id_type: 'app_id', name: 'Other' }, // 别的 bot，app_id-only，尾部目标
+      ],
+    };
+    const handled = await tryHandleGrantCommand('btb', opWithAppIdTarget, 'ou_owner');
+    expect(handled).toBe(true);
+    expect(getBot('btb').config.allowedChatGroups ?? []).toEqual([]);   // 绝不因目标被剔空而误开整群
+    // 且不是静默：应回 usage 明确「不按 app_id 授权」，不能与真正裸 /grant 等价。
+    const [, , content, msgType] = replyMock.mock.calls.at(-1) ?? [];
+    expect(msgType ?? 'text').not.toBe('interactive');   // 不是授权卡
+    expect(String(content ?? '')).not.toContain('已授权本群所有成员');   // 绝不是整群授权回执
+  });
 });
 
 describe('tryHandleGrantCommand two bots co-addressed (@Claude @Codex /grant)', () => {
@@ -450,6 +611,7 @@ describe('tryHandleGrantCommand two bots co-addressed (@Claude @Codex /grant)', 
     const dir = mkdtempSync(join(tmpdir(), 'botmux-grant-co-'));
     configPath = join(dir, 'bots.json');
     process.env.BOTS_CONFIG = configPath;
+    process.env.SESSION_DATA_DIR = dir; // isolate allowedUsers sidecar (revokeGrant writes it)
     writeFileSync(configPath, JSON.stringify([
       { larkAppId: 'bco', larkAppSecret: 's', cliId: 'claude-code', allowedUsers: ['ou_owner'] },
     ], null, 2), 'utf-8');
@@ -458,7 +620,7 @@ describe('tryHandleGrantCommand two bots co-addressed (@Claude @Codex /grant)', 
     bot.botOpenId = 'ou_bot';
     bot.resolvedAllowedUsers = ['ou_owner'];
   });
-  afterEach(() => { delete process.env.BOTS_CONFIG; vi.restoreAllMocks(); });
+  afterEach(() => { delete process.env.BOTS_CONFIG; delete process.env.SESSION_DATA_DIR; vi.restoreAllMocks(); });
 
   it('owner: does NOT grant the other bot — no per-target card, no chatGrants entry', async () => {
     const handled = await tryHandleGrantCommand('bco', coAddressedMsg(), 'ou_owner');
@@ -482,6 +644,7 @@ describe('tryHandleGrantCommand whole-chat grant (@bot /grant, no target)', () =
     const dir = mkdtempSync(join(tmpdir(), 'botmux-grant-cmd-'));
     configPath = join(dir, 'bots.json');
     process.env.BOTS_CONFIG = configPath;
+    process.env.SESSION_DATA_DIR = dir; // isolate allowedUsers sidecar (revokeGrant writes it)
     writeFileSync(configPath, JSON.stringify([
       { larkAppId: 'b2', larkAppSecret: 's', cliId: 'claude-code', allowedUsers: ['ou_owner'] },
     ], null, 2), 'utf-8');
@@ -490,7 +653,7 @@ describe('tryHandleGrantCommand whole-chat grant (@bot /grant, no target)', () =
     bot.botOpenId = 'ou_bot';
     bot.resolvedAllowedUsers = ['ou_owner'];
   });
-  afterEach(() => { delete process.env.BOTS_CONFIG; vi.restoreAllMocks(); });
+  afterEach(() => { delete process.env.BOTS_CONFIG; delete process.env.SESSION_DATA_DIR; vi.restoreAllMocks(); });
 
   // only the bot is @mentioned, no human target → whole-chat grant
   const bareMsg = (text: string, chatId = 'oc_room') => ({
@@ -530,9 +693,17 @@ describe('tryHandleGrantCommand whole-chat grant (@bot /grant, no target)', () =
   it('owner: bare /revoke removes the whole-chat grant', async () => {
     await tryHandleGrantCommand('b2', bareMsg('/grant'), 'ou_owner');
     expect(getBot('b2').config.allowedChatGroups).toEqual(['oc_room']);
-    const handled = await tryHandleGrantCommand('b2', bareMsg('/revoke'), 'ou_owner');
+    const handled = await tryHandleGrantCommand('b2', { ...bareMsg('/revoke'), message_id: 'om_revoke' }, 'ou_owner');
     expect(handled).toBe(true);
     expect(getBot('b2').config.allowedChatGroups ?? []).toEqual([]);
+  });
+
+  it('does not replay a whole-chat grant after a later revoke', async () => {
+    await tryHandleGrantCommand('b2', bareMsg('/grant'), 'ou_owner');
+    await tryHandleGrantCommand('b2', { ...bareMsg('/revoke'), message_id: 'om_revoke' }, 'ou_owner');
+    await tryHandleGrantCommand('b2', bareMsg('/grant'), 'ou_owner');
+    expect(getBot('b2').config.allowedChatGroups ?? []).toEqual([]);
+    expect(replyMock).toHaveBeenCalledTimes(2);
   });
 
   it('non-owner: bare /grant is rejected, chat not opened', async () => {
@@ -566,5 +737,14 @@ describe('tryHandleGrantCommand whole-chat grant (@bot /grant, no target)', () =
     expect(content).toContain('张三');
     expect(content).toContain('李四');
     expect(content).not.toContain('{"text"');
+  });
+
+  it('does not replay an old targeted revoke after a subsequent grant', async () => {
+    await addChatGrant('b2', 'oc_room', 'ou_a');
+    await tryHandleGrantCommand('b2', revokeMultiMsg(), 'ou_owner');
+    await addChatGrant('b2', 'oc_room', 'ou_a');
+    await tryHandleGrantCommand('b2', revokeMultiMsg(), 'ou_owner');
+    expect(getBot('b2').config.chatGrants?.oc_room).toContain('ou_a');
+    expect(replyMock).toHaveBeenCalledOnce();
   });
 });

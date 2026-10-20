@@ -11,7 +11,7 @@
  */
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { config } from '../config.js';
-import { jsonRes } from './workflow-api.js';
+import { jsonRes } from './http.js';
 import { consumeInvite } from '../services/invite-store.js';
 import { getTeam } from '../services/team-store.js';
 import {
@@ -119,6 +119,10 @@ function sanitizeBots(input: unknown): FederatedBot[] {
       botUnionId: typeof r.botUnionId === 'string' ? r.botUnionId : undefined,
       capability: typeof r.capability === 'string' ? r.capability : null,
       hasTeamRole: !!r.hasTeamRole,
+      // Preserve the remote's transport capability. ABSENT (pre-capability spoke)
+      // stays undefined → consumers treat undefined as legacy normal (true).
+      // Only an explicit boolean is propagated, so a false (apiOnly) survives.
+      larkTransportEnabled: typeof r.larkTransportEnabled === 'boolean' ? r.larkTransportEnabled : undefined,
       ownerUnionId: typeof r.ownerUnionId === 'string' ? r.ownerUnionId : undefined,
       ownerName: typeof r.ownerName === 'string' ? r.ownerName : undefined,
     });

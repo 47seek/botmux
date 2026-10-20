@@ -208,6 +208,39 @@ describe('nextAttemptIdFor', () => {
     expect(nextAttemptIdFor(events, 'a')).toBe('a/attempts/003'); // 预留已消费
     expect(latestAttemptIdFor(events, 'a')).toBe('a/attempts/002');
   });
+
+  it('仅有 pre-intent blocked verdict 也消费 attempt number', () => {
+    const events: StoredEvent[] = [
+      ts({
+        type: 'nodeBlocked',
+        nodeId: 'send',
+        instanceId: 'send#001',
+        attemptId: 'send#001/attempts/001',
+        errorClass: 'resultInvalid',
+        errorCode: 'HOST_INPUT_UNRECOVERABLE',
+      }),
+    ];
+    expect(latestAttemptIdFor(events, 'send#001')).toBe('send#001/attempts/001');
+    expect(nextAttemptIdFor(events, 'send#001')).toBe('send#001/attempts/002');
+  });
+
+  it('迟到的旧 attempt verdict 不会让 latest 从 002 回退到 001', () => {
+    const events: StoredEvent[] = [
+      ts({
+        type: 'nodeDispatched', nodeId: 'a', instanceId: 'a#001',
+        attemptId: 'a#001/attempts/001',
+      }),
+      ts({
+        type: 'nodeDispatched', nodeId: 'a', instanceId: 'a#001',
+        attemptId: 'a#001/attempts/002',
+      }),
+      ts({
+        type: 'nodeBlocked', nodeId: 'a', instanceId: 'a#001',
+        attemptId: 'a#001/attempts/001', errorClass: 'workerError',
+      }),
+    ];
+    expect(latestAttemptIdFor(events, 'a#001')).toBe('a#001/attempts/002');
+  });
 });
 
 // ─── runtime verdict：自报契约 + blocked 不塌 ────────────────────────────────
@@ -280,7 +313,7 @@ describe('runWorkflow — blocked 终态', () => {
 // ─── retry 全链路（防 Blocker1 回归：解锁必须是 journal 事件）─────────────────
 
 describe('requestV3Retry + 重驱动全链路', () => {
-  function seedBlockedRun(base: string, runId: string) {
+  function seedBlockedRun(base: string, runId: string, recovery?: 'reviseWorkflow') {
     const { runDir } = birthRun({
       goal: 'g', baseDir: base, runId,
       chatBinding: { larkAppId: 'cli_test', chatId: 'oc_chat', rootMessageId: 'om_root' },
@@ -297,6 +330,7 @@ describe('requestV3Retry + 重驱动全链路', () => {
     appendEvent(journalPath, {
       type: 'nodeBlocked', nodeId: 'work', instanceId: 'work#001', attemptId: 'work#001/attempts/001',
       errorClass: 'workerError', errorCode: 'AUTH_REQUIRED', message: '需要登录',
+      ...(recovery ? { recovery } : {}),
     });
     appendEvent(journalPath, { type: 'runBlocked', blockedNodeId: 'work' });
     return { runDir, journalPath };
@@ -344,6 +378,18 @@ describe('requestV3Retry + 重驱动全链路', () => {
     expect(requestV3Retry(base, 'retry-002')).toMatchObject({ kind: 'already-requested', nodeId: 'work' });
     const retries = readJournal(journalPath).filter((e) => e.type === 'nodeRetryRequested');
     expect(retries).toHaveLength(1);
+    rmSync(base, { recursive: true, force: true });
+  });
+
+  it('产物契约错误要求修订 Workflow，普通 retry 被拒绝', () => {
+    const base = freshBase();
+    const { journalPath } = seedBlockedRun(base, 'retry-contract', 'reviseWorkflow');
+
+    expect(requestV3Retry(base, 'retry-contract')).toEqual({
+      kind: 'stale-run',
+      reason: 'revise-workflow-required',
+    });
+    expect(readJournal(journalPath).filter((e) => e.type === 'nodeRetryRequested')).toHaveLength(0);
     rmSync(base, { recursive: true, force: true });
   });
 
@@ -581,6 +627,16 @@ describe('renderGoalFile golden', () => {
     expect(txt).toContain('Structured result');
     expect(txt).toContain('"ok"');
     expect(txt).toContain('result.json');
+  });
+
+  it('有公开产物契约：把 output key/path/kind 注入节点任务并说明禁重试', () => {
+    const txt = renderGoalFile('生成报告', undefined, undefined, undefined, false, {
+      report: { path: 'report.md', kind: 'markdown' },
+    });
+    expect(txt).toContain('Public artifact outputs');
+    expect(txt).toContain('"report":{"path":"report.md","kind":"markdown"}');
+    expect(txt).toContain('Manifest `name` is presentation-only');
+    expect(txt).toContain('ordinary retry is disabled');
   });
 });
 

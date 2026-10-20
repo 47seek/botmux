@@ -1,6 +1,6 @@
 /**
  * Ready-gate state machine — holds the FIRST prompt for Claude-family CLIs until
- * a SessionStart hook fires a "真就绪" (true-ready) signal.
+ * a SessionStart hook proves the outer startup selector has been passed.
  *
  * Why this exists: a custom launcher (e.g. `cjadk claude`) shows an interactive
  * model/session selector at startup whose cursor is `❯` (U+276F). That glyph
@@ -10,11 +10,11 @@
  * trailing Enter mis-selects a menu item). The selector clears before Claude's
  * real input box renders, so the message is silently lost.
  *
- * Claude Code's `SessionStart` hook fires within ~3ms of the real input box
- * rendering, and crucially does NOT fire while the launcher is still on its
- * selector — so it's an unambiguous "the CLI is genuinely ready" signal. This
- * gate suspends the first flush until that signal (or a fallback timeout) so the
- * selector can never eat the first message.
+ * Claude Code's `SessionStart` hook crucially does NOT fire while the launcher
+ * is still on its selector. Claude can run multiple matching hooks in parallel,
+ * though, and renders the real prompt only after all finish. This gate therefore
+ * establishes the anti-selector boundary; the worker separately waits for fresh
+ * post-signal prompt evidence before it flushes Claude input.
  *
  * Lifecycle (recreated per CLI spawn in the worker):
  *   - `arm()`        — call at spawn when the adapter injects the SessionStart
@@ -34,11 +34,19 @@
 /**
  * Decide whether the worker should ARM the ready-gate for a given spawn. The
  * gate is only valid when a SessionStart hook will actually fire — i.e. a FRESH
- * Claude-family spawn that re-runs the CLI binary with our `--settings`:
+ * ready-gated spawn whose hook/transport preflight succeeded:
  *
- *   - `injectsReadyHook`        — the adapter injects the hook (claude / seed).
+ *   - `injectsReadyHook`        — the adapter injects the hook: the Claude
+ *                                 family (claude-code / seed / relay, via the
+ *                                 settings.json SessionStart hook) or dsh-tui
+ *                                 (a direct ready command, no config hook).
+ *   - `readySignalAvailable`    — the effective config contains the hook (or the
+ *                                 CLI has a direct ready-command integration),
+ *                                 and an isolated child has a usable callback
+ *                                 route to the daemon.
  *   - NOT `adoptMode`           — adopt panes are pre-existing, never spawned with
- *                                 our `--settings`, so they can't get the hook.
+ *                                 our ready integration, so they can't get a
+ *                                 fresh SessionStart signal.
  *   - NOT `willReattachPersistent` — on daemon restart / worker recovery the
  *                                 worker re-attaches to an existing tmux/zellij/
  *                                 herdr session and does NOT re-run the CLI's
@@ -51,17 +59,21 @@
  * exactly as before (readyPattern + quiescence).
  *
  * NB: `wrapperCli=aiden x claude` strips our process-level `--settings`, but the
- * SessionStart hook is ALSO installed globally (~/.claude/settings.json — see
+ * SessionStart hook is installed in the effective settings.json (see
  * claude-code.ts hookInstall.sessionStartCommand), which aiden's Claude still
  * reads. So the real signal fires there too → we KEEP arming for that case
  * (no readyPattern fallback, which could misjudge).
  */
 export function shouldArmReadyGate(state: {
   injectsReadyHook: boolean;
+  readySignalAvailable: boolean;
   adoptMode: boolean;
   willReattachPersistent: boolean;
 }): boolean {
-  return state.injectsReadyHook && !state.adoptMode && !state.willReattachPersistent;
+  return state.injectsReadyHook
+    && state.readySignalAvailable
+    && !state.adoptMode
+    && !state.willReattachPersistent;
 }
 
 export class ReadyGate {

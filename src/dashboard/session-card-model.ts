@@ -10,6 +10,7 @@
  */
 
 import type { SessionRow } from '../core/dashboard-rows.js';
+import { backendSupportsWebTerminal } from '../adapters/backend/capabilities.js';
 import type {
   ButtonState,
   PaginationMeta,
@@ -21,6 +22,7 @@ export type SessionStatus =
   | 'working'
   | 'idle'
   | 'analyzing'
+  | 'stalled'
   | 'limited'
   | 'starting'
   | 'dormant'
@@ -83,6 +85,8 @@ export function statusToDot(status: string): StatusDot {
       return { tone: 'success', pulse: true, label: 'sessions.status.working' };
     case 'analyzing':
       return { tone: 'info', pulse: true, label: 'sessions.status.analyzing' };
+    case 'stalled':
+      return { tone: 'danger', pulse: false, label: 'sessions.status.stalled' };
     case 'starting':
       return { tone: 'info', pulse: true, label: 'sessions.status.starting' };
     case 'idle':
@@ -121,6 +125,7 @@ function formatRelative(fromMs: number, nowMs: number): string {
 function buildSecondary(row: SessionRow, nowMs?: number): string {
   const parts: string[] = [];
   if (row.cliId) parts.push(String(row.cliId));
+  if (row.cliInstanceSource) parts.push(`instance:${row.cliInstanceId ?? 'legacy'} (${row.cliInstanceSource})`);
   if (row.workingDir) parts.push(row.workingDir);
   if (typeof nowMs === 'number' && Number.isFinite(row.lastMessageAt)) {
     parts.push(formatRelative(row.lastMessageAt, nowMs));
@@ -183,11 +188,12 @@ export function filterByCli(entries: ReadonlyArray<SessionRowDto>, cliId: string
 const STATUS_ORDER: Record<string, number> = {
   working: 0,
   analyzing: 1,
-  starting: 2,
-  idle: 3,
-  dormant: 4,
-  limited: 5,
-  closed: 6,
+  stalled: 2,
+  starting: 3,
+  idle: 4,
+  dormant: 5,
+  limited: 6,
+  closed: 7,
 };
 
 function statusRank(status: string): number {
@@ -237,13 +243,15 @@ export function composeDetail(row: SessionRow, _nowMs?: number): SessionDetailDt
   const isClosed = row.status === 'closed';
   const isStarting = row.status === 'starting';
   const canCloseNow = !isClosed && !isStarting;
+  const supportsWebTerminal = row.backendType === undefined
+    || backendSupportsWebTerminal(row.backendType);
   // Closed sessions can still carry a stale
   // webPort (closeSession / dashboard close don't null the field), so a
   // simple `webPort != null` check would surface a dead terminal link on
   // the closed detail card. Gate openTerminal on status too — terminals
   // are only meaningful on a live worker.
   const canOpenTerminal =
-    !isClosed && row.webPort !== null && row.webPort !== undefined;
+    supportsWebTerminal && !isClosed && row.webPort !== null && row.webPort !== undefined;
   const locateMode: LocateMode = row.scope === 'chat' ? 'openChat' : 'openTopic';
 
   const actions: SessionActionMatrix = {
@@ -252,7 +260,12 @@ export function composeDetail(row: SessionRow, _nowMs?: number): SessionDetailDt
       enabled: false,
       reasonKey: isStarting ? 'sessions.action.close.starting' : 'sessions.action.close.alreadyClosed',
     },
-    openTerminal: canOpenTerminal ? { enabled: true } : { enabled: false, reasonKey: 'sessions.action.terminal.noPort' },
+    openTerminal: canOpenTerminal ? { enabled: true } : {
+      enabled: false,
+      reasonKey: supportsWebTerminal
+        ? 'sessions.action.terminal.noPort'
+        : 'sessions.action.terminal.unsupported',
+    },
     locate: { enabled: true },
     locateMode,
   };

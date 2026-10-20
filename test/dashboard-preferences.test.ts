@@ -4,13 +4,16 @@ import { stripMentionPrefix } from '../src/dashboard/web/ui.js';
 import {
   DEFAULT_BOARD_ORDER,
   normalizeBoardOrder,
+  normalizeHiddenTableColumns,
   normalizeSessionsViewMode,
   normalizeSkin,
   normalizeThemeMode,
+  readStoredHiddenTableColumns,
   readStoredSessionsViewMode,
   readStoredSessionsShowUnknownChats,
   readStoredSkin,
   resolveThemeMode,
+  writeStoredHiddenTableColumns,
   writeStoredSessionsShowUnknownChats,
 } from '../src/dashboard/web/preferences.js';
 
@@ -67,9 +70,10 @@ describe('dashboard skin preferences', () => {
 });
 
 describe('sessions view mode preference', () => {
-  it('accepts kanban, board, and table', () => {
+  it('accepts kanban, board, topics, and table', () => {
     expect(normalizeSessionsViewMode('kanban')).toBe('kanban');
     expect(normalizeSessionsViewMode('board')).toBe('board');
+    expect(normalizeSessionsViewMode('topics')).toBe('topics');
     expect(normalizeSessionsViewMode('table')).toBe('table');
     expect(normalizeSessionsViewMode('list')).toBeNull();
     expect(normalizeSessionsViewMode(undefined)).toBeNull();
@@ -82,6 +86,7 @@ describe('sessions view mode preference', () => {
     expect(readStoredSessionsViewMode(make(null))).toBe('board');
     expect(readStoredSessionsViewMode(make('nope'))).toBe('board');
     expect(readStoredSessionsViewMode(make('kanban'))).toBe('kanban');
+    expect(readStoredSessionsViewMode(make('topics'))).toBe('topics');
   });
 });
 
@@ -113,16 +118,31 @@ describe('sessions unknown chat preference', () => {
 describe('sessions board column order', () => {
   it('accepts any permutation of the four column ids', () => {
     expect(normalizeBoardOrder([...DEFAULT_BOARD_ORDER])).toEqual([...DEFAULT_BOARD_ORDER]);
-    expect(normalizeBoardOrder(['working', 'idle', 'needs-you', 'starting']))
-      .toEqual(['working', 'idle', 'needs-you', 'starting']);
+    expect(normalizeBoardOrder(['working', 'todo', 'idle', 'needs-you']))
+      .toEqual(['working', 'todo', 'idle', 'needs-you']);
   });
 
-  it('rejects missing, extra, duplicated, or unknown columns', () => {
-    expect(normalizeBoardOrder(['needs-you', 'starting', 'working'])).toBeNull();
+  it('migrates a legacy order: drops merged "starting", appends the new "todo" column', () => {
+    // 旧版本存过 needs-you/starting/working/idle 四列；starting 已并入 working，
+    // 新列 todo 补到末尾 → 得到当前四列（needs-you/working/idle/todo）。
+    expect(normalizeBoardOrder(['needs-you', 'starting', 'working', 'idle']))
+      .toEqual(['needs-you', 'working', 'idle', 'todo']);
+    // 旧的三列存值（没 starting 也没 todo）同样补齐 todo。
+    expect(normalizeBoardOrder(['working', 'idle', 'needs-you']))
+      .toEqual(['working', 'idle', 'needs-you', 'todo']);
+  });
+
+  it('fills a partial order up to the full four columns', () => {
+    // 缺列不再判死：迁移会把缺失的默认列补到末尾（兼容旧的少列存值）。
+    expect(normalizeBoardOrder(['needs-you', 'working']))
+      .toEqual(['needs-you', 'working', 'todo', 'idle']);
+  });
+
+  it('rejects extra, duplicated, or unknown columns', () => {
     expect(normalizeBoardOrder([...DEFAULT_BOARD_ORDER, 'closed'])).toBeNull();
     expect(normalizeBoardOrder(['needs-you', 'needs-you', 'working', 'idle'])).toBeNull();
     expect(normalizeBoardOrder(['a', 'b', 'c', 'd'])).toBeNull();
-    expect(normalizeBoardOrder('needs-you,starting,working,idle')).toBeNull();
+    expect(normalizeBoardOrder('needs-you,working,todo,idle')).toBeNull();
     expect(normalizeBoardOrder(null)).toBeNull();
   });
 
@@ -130,6 +150,49 @@ describe('sessions board column order', () => {
     const input = [...DEFAULT_BOARD_ORDER];
     const out = normalizeBoardOrder(input)!;
     expect(out).not.toBe(input);
+  });
+});
+
+describe('sessions table column visibility preferences', () => {
+  it('strips fixed columns (select/actions) and non-string entries', () => {
+    expect(normalizeHiddenTableColumns(['botName', 'status', 'chat']))
+      .toEqual(['botName', 'status', 'chat']);
+    expect(normalizeHiddenTableColumns(['select', 'botName', 'actions', 'status']))
+      .toEqual(['botName', 'status']);
+    expect(normalizeHiddenTableColumns(['botName', 42, true, 'status']))
+      .toEqual(['botName', 'status']);
+  });
+
+  it('dedupes entries and returns a fresh array', () => {
+    const input = ['botName', 'status', 'botName'];
+    expect(normalizeHiddenTableColumns(input)).toEqual(['botName', 'status']);
+  });
+
+  it('returns an empty array for invalid input', () => {
+    expect(normalizeHiddenTableColumns(null)).toEqual([]);
+    expect(normalizeHiddenTableColumns(undefined)).toEqual([]);
+    expect(normalizeHiddenTableColumns('botName')).toEqual([]);
+  });
+
+  it('falls back to empty for missing/invalid storage', () => {
+    const make = (value: string | null): Storage =>
+      ({ getItem: () => value }) as unknown as Storage;
+    expect(readStoredHiddenTableColumns(undefined)).toEqual([]);
+    expect(readStoredHiddenTableColumns(make(null))).toEqual([]);
+    expect(readStoredHiddenTableColumns(make('nope'))).toEqual([]);
+    expect(readStoredHiddenTableColumns(make(JSON.stringify(['botName', 'status']))))
+      .toEqual(['botName', 'status']);
+  });
+
+  it('persists hidden columns and strips fixed columns on write', () => {
+    const values = new Map<string, string>();
+    const storage = {
+      getItem: (key: string) => values.get(key) ?? null,
+      setItem: (key: string, value: string) => values.set(key, value),
+    } as unknown as Storage;
+
+    writeStoredHiddenTableColumns(storage, ['botName', 'select', 'status', 'actions']);
+    expect(readStoredHiddenTableColumns(storage)).toEqual(['botName', 'status']);
   });
 });
 

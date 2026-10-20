@@ -23,13 +23,20 @@ export interface PluginApplyContext {
 export interface PluginServiceDefinition {
   mode?: 'manual' | 'auto';
   port?: number;
+  /** Legacy field name retained for plugin compatibility; the built-in
+   * supervisor interprets this definition, not PM2. */
   pm2: {
     script: string;
     cwd?: string;
     args?: string[];
     env?: Record<string, string>;
     autorestart?: boolean;
+    killTimeoutMs?: number;
+    watchDelayMs?: number;
   };
+  /** Build the plugin's advertised URLs. `host` is already URL-ready — an IPv6
+   *  literal arrives bracketed (`[::1]`) — so interpolate it straight into a URL
+   *  (`http://${host}:${port}/`) without re-formatting. */
   urls?(ctx: { host: string; env: Record<string, string>; port?: number }): {
     openUrl?: string;
     healthUrl?: string;
@@ -93,7 +100,7 @@ function setPath(obj: Record<string, unknown>, path: string, value: unknown): vo
   cur[parts[parts.length - 1]] = value;
 }
 
-function createConfigApi(pluginId: string): PluginConfigApi {
+export function createConfigApi(pluginId: string): PluginConfigApi {
   const path = pluginConfigPath(pluginId);
   const write = (value: Record<string, unknown>) => {
     mkdirSync(dirname(path), { recursive: true });

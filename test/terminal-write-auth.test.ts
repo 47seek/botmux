@@ -14,9 +14,13 @@
 // Independently of the role, a matching private write-link `?token=` is a
 // capability in its own right: the owner explicitly issued that link, so it
 // grants write even when the platform authenticated the viewer as guest.
+import { createHmac } from 'node:crypto';
 import { describe, it, expect } from 'vitest';
+import * as terminalWriteAuth from '../src/core/terminal-write-auth.js';
 import {
-  deriveTerminalViewToken,
+  authorizeTerminalStatusPage,
+  deriveTerminalCardViewToken,
+  deriveTerminalWriteToken,
   resolveTerminalAccess,
   resolveTerminalAccessForRequest,
   resolveTerminalWrite,
@@ -27,12 +31,22 @@ import {
 
 const TOK = 'dash-secret-token';
 
+/** The RETIRED stable view derivation (P1-5), reproduced here so tests can
+ *  prove nothing accepts or re-mints it any more. */
+function retiredStableViewToken(secret: string, sessionId: string): string {
+  return createHmac('sha256', secret)
+    .update('botmux-terminal-view-v1\0')
+    .update(sessionId)
+    .digest('base64url');
+}
+
 describe('terminal view capability', () => {
-  it('is stable for one session, domain-bound to the session, and secret-bound', () => {
-    const a = deriveTerminalViewToken('host-secret', 'session-a');
-    expect(a).toBe(deriveTerminalViewToken('host-secret', 'session-a'));
-    expect(a).not.toBe(deriveTerminalViewToken('host-secret', 'session-b'));
-    expect(a).not.toBe(deriveTerminalViewToken('other-secret', 'session-a'));
+  it('P1-5: the stable view derivation is retired — the module no longer exports a view-token minter', () => {
+    // A stable per-session view HMAC could never be revoked (logout/expiry/
+    // worker restart all left it valid). Read capabilities are now either the
+    // worker's per-boot random token or a short-lived signed read grant; no
+    // code path may re-grow a stable derivation under this name.
+    expect((terminalWriteAuth as Record<string, unknown>).deriveTerminalViewToken).toBeUndefined();
   });
 
   it('compares capabilities safely and rejects empty/wrong values', () => {
@@ -69,6 +83,85 @@ describe('terminal view capability', () => {
       platformBound: false,
       platformProxied: false,
     })).toEqual({ hasRead: true, hasWrite: true, platformReadonly: false });
+  });
+});
+
+describe('terminal write capability', () => {
+  it('is stable for one session, domain-bound to the session, and secret-bound', () => {
+    // Stability across derivations is what keeps an issued operate link valid
+    // after a worker restart re-derives the token.
+    const a = deriveTerminalWriteToken('host-secret', 'session-a');
+    expect(a).toBe(deriveTerminalWriteToken('host-secret', 'session-a'));
+    expect(a).not.toBe(deriveTerminalWriteToken('host-secret', 'session-b'));
+    expect(a).not.toBe(deriveTerminalWriteToken('other-secret', 'session-a'));
+  });
+
+  it('is distinct from the retired stable view token for the same session + secret (domain separation)', () => {
+    // Knowing a historical read-only view token must never yield the write
+    // token — old view links must stay read-dead, not become operate links.
+    expect(deriveTerminalWriteToken('host-secret', 'session-a'))
+      .not.toBe(retiredStableViewToken('host-secret', 'session-a'));
+  });
+});
+
+describe('terminal card view capability', () => {
+  it('is stable within one epoch and rotates across session lifecycles', () => {
+    const first = deriveTerminalCardViewToken('host-secret', 'session-a', 'epoch-1');
+    expect(first).toBe(deriveTerminalCardViewToken('host-secret', 'session-a', 'epoch-1'));
+    expect(first).not.toBe(deriveTerminalCardViewToken('host-secret', 'session-a', 'epoch-2'));
+    expect(first).not.toBe(deriveTerminalCardViewToken('host-secret', 'session-b', 'epoch-1'));
+    expect(first).not.toBe(deriveTerminalCardViewToken('other-secret', 'session-a', 'epoch-1'));
+    expect(first).not.toBe(deriveTerminalWriteToken('host-secret', 'session-a'));
+    expect(first).not.toBe(retiredStableViewToken('host-secret', 'session-a'));
+  });
+});
+
+describe('authorizeTerminalStatusPage', () => {
+  const secret = 'host-secret';
+  const sessionId = 'session-a';
+  const epoch = 'epoch-1';
+  const session = { terminalCardEpoch: epoch };
+  const live = {
+    workerViewToken: 'boot-view',
+    workerCardViewToken: 'live-card-view',
+  };
+  const authorize = (
+    capability: { viewToken?: string; token?: string },
+    overrides: Partial<Parameters<typeof authorizeTerminalStatusPage>[0]> = {},
+  ) => authorizeTerminalStatusPage({
+    secret,
+    sessionId,
+    session,
+    live,
+    capability,
+    ...overrides,
+  });
+
+  it('accepts the stable write capability', () => {
+    expect(authorize({ token: deriveTerminalWriteToken(secret, sessionId) })).toBe(true);
+  });
+
+  it('accepts both live worker view capabilities', () => {
+    expect(authorize({ viewToken: live.workerViewToken })).toBe(true);
+    expect(authorize({ viewToken: live.workerCardViewToken })).toBe(true);
+  });
+
+  it('accepts the persisted card epoch after the worker is gone', () => {
+    expect(authorize(
+      { viewToken: deriveTerminalCardViewToken(secret, sessionId, epoch) },
+      { live: undefined },
+    )).toBe(true);
+  });
+
+  it('fails closed for missing sessions, missing capabilities, and stale values', () => {
+    const persisted = deriveTerminalCardViewToken(secret, sessionId, epoch);
+    expect(authorize({ viewToken: persisted }, { session: undefined, live: undefined })).toBe(false);
+    expect(authorize({})).toBe(false);
+    expect(authorize({ token: 'wrong', viewToken: 'stale' })).toBe(false);
+    expect(authorize(
+      { viewToken: persisted },
+      { session: { terminalCardEpoch: 'rotated-epoch' }, live: undefined },
+    )).toBe(false);
   });
 });
 
@@ -166,6 +259,22 @@ describe('resolveTerminalWriteForRequest', () => {
       .toEqual({ hasWrite: false, platformReadonly: false });
   });
 
+  it('fails closed when the live dashboard token cannot be read during rotation', () => {
+    const unreadable = () => { throw new Error('token changed during read'); };
+    expect(() => resolveTerminalWriteForRequest(
+      { 'x-botmux-role': 'owner', ...cookie(TOK) },
+      false,
+      bound,
+      unreadable,
+    )).not.toThrow();
+    expect(resolveTerminalWriteForRequest(
+      { 'x-botmux-role': 'owner', ...cookie(TOK) },
+      false,
+      bound,
+      unreadable,
+    )).toEqual({ hasWrite: false, platformReadonly: false });
+  });
+
   it('ignores the role when unbound even with a matching cookie', () => {
     expect(resolveTerminalWriteForRequest({ 'x-botmux-role': 'owner', ...cookie(TOK) }, false, unbound, token))
       .toEqual({ hasWrite: false, platformReadonly: false });
@@ -228,6 +337,16 @@ describe('resolveTerminalAccessForRequest', () => {
   it('lets an authenticated local dashboard cookie view without platform binding', () => {
     expect(resolveTerminalAccessForRequest(cookie(TOK), false, false, unbound, token))
       .toEqual({ hasRead: true, hasWrite: false, platformReadonly: false });
+  });
+
+  it('denies the request instead of throwing when token rotation races the read', () => {
+    const unreadable = () => { throw new Error('token changed during read'); };
+    expect(() => resolveTerminalAccessForRequest(
+      cookie(TOK), false, false, unbound, unreadable,
+    )).not.toThrow();
+    expect(resolveTerminalAccessForRequest(
+      cookie(TOK), false, false, unbound, unreadable,
+    )).toEqual({ hasRead: false, hasWrite: false, platformReadonly: false });
   });
 
   it('keeps authenticated platform guest read-only and owner writable', () => {

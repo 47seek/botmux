@@ -34,7 +34,7 @@ async function loadFreshModules() {
   const botRegistry = await import('../src/bot-registry.js');
   const sessionStore = await import('../src/services/session-store.js');
   const daemon = await import('../src/daemon.js');
-  sessionStore.init();
+  sessionStore.init('test-app');
   return { botRegistry, sessionStore, daemon };
 }
 
@@ -85,6 +85,86 @@ describe('resolvePinnedWorkingDir', () => {
     expect(result.pinnedWorkingDir).toBe(defaultDir);
     expect(result.inheritedFrom).toBeNull();
     // Its OWN defaultWorkingDir (layer 3) → auto-worktree may opt in here.
+    expect(result.pinnedFromBotDefault).toBe(true);
+  });
+
+  it('prefers bot@bot same-dir over auto-worktree when both dashboard options are enabled', async () => {
+    const { botRegistry, sessionStore, daemon } = await loadFreshModules();
+    const peerDir = tempDir('peer-worktree');
+    const defaultDir = tempDir('default-repo');
+    botRegistry.registerBot({ larkAppId: 'app-peer', larkAppSecret: 's', cliId: 'claude-code' });
+    botRegistry.registerBot({
+      larkAppId: 'app-self',
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      defaultWorkingDir: defaultDir,
+      defaultWorkingDirAutoWorktree: true,
+      // botToBotSameDir omitted => default on
+    });
+    const peer = await seedPeerSession(sessionStore, peerDir);
+
+    const result = await daemon.__testOnly_resolvePinnedWorkingDir({
+      scope: 'thread',
+      anchor: 'om_root',
+      chatId: 'oc_chat',
+      chatType: 'group',
+      larkAppId: 'app-self',
+    });
+
+    expect(result.pinnedWorkingDir).toBe(peerDir);
+    expect(result.inheritedFrom).toEqual({ sessionId: peer.sessionId, larkAppId: 'app-peer', workingDir: peerDir });
+    expect(result.pinnedFromBotDefault).toBe(false);
+  });
+
+  it('uses the bot default for auto-worktree when bot@bot same-dir is disabled', async () => {
+    const { botRegistry, sessionStore, daemon } = await loadFreshModules();
+    const peerDir = tempDir('peer-worktree');
+    const defaultDir = tempDir('default-repo');
+    botRegistry.registerBot({ larkAppId: 'app-peer', larkAppSecret: 's', cliId: 'claude-code' });
+    botRegistry.registerBot({
+      larkAppId: 'app-self',
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      defaultWorkingDir: defaultDir,
+      defaultWorkingDirAutoWorktree: true,
+      botToBotSameDir: false,
+    });
+    await seedPeerSession(sessionStore, peerDir);
+
+    const result = await daemon.__testOnly_resolvePinnedWorkingDir({
+      scope: 'thread',
+      anchor: 'om_root',
+      chatId: 'oc_chat',
+      chatType: 'group',
+      larkAppId: 'app-self',
+    });
+
+    expect(result.pinnedWorkingDir).toBe(defaultDir);
+    expect(result.inheritedFrom).toBeNull();
+    expect(result.pinnedFromBotDefault).toBe(true);
+  });
+
+  it('falls back to auto-worktree when same-dir is enabled but no peer exists', async () => {
+    const { botRegistry, daemon } = await loadFreshModules();
+    const defaultDir = tempDir('default-repo');
+    botRegistry.registerBot({
+      larkAppId: 'app-self',
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      defaultWorkingDir: defaultDir,
+      defaultWorkingDirAutoWorktree: true,
+    });
+
+    const result = await daemon.__testOnly_resolvePinnedWorkingDir({
+      scope: 'thread',
+      anchor: 'om_root',
+      chatId: 'oc_chat',
+      chatType: 'group',
+      larkAppId: 'app-self',
+    });
+
+    expect(result.pinnedWorkingDir).toBe(defaultDir);
+    expect(result.inheritedFrom).toBeNull();
     expect(result.pinnedFromBotDefault).toBe(true);
   });
 
@@ -346,5 +426,33 @@ describe('resolvePinnedWorkingDir', () => {
 
     expect(result.oncallEntry?.workingDir).toBe(selfOncallDir);
     expect(result.pinnedWorkingDir).toBe(selfOncallDir);
+  });
+
+  it('uses defaultWorkingDir after an auto-bound oncall chat is released', async () => {
+    const { botRegistry, daemon } = await loadFreshModules();
+    const oncallDir = tempDir('self-oncall-repo');
+    const defaultDir = tempDir('self-default-repo');
+    // Simulates the state after the dashboard switched from Oncall mode to
+    // defaultWorkingDir mode: the autobound chat record is gone from oncallChats
+    // but the old oncall dir is still preserved in defaultOncall for round-trip.
+    botRegistry.registerBot({
+      larkAppId: 'app-self', larkAppSecret: 's', cliId: 'claude-code',
+      defaultWorkingDir: defaultDir,
+      defaultOncall: { enabled: false, workingDir: oncallDir, since: 5_000 },
+      defaultOncallAutoboundChats: ['oc_chat'],
+    });
+
+    const result = await daemon.__testOnly_resolvePinnedWorkingDir({
+      scope: 'thread',
+      anchor: 'om_root',
+      chatId: 'oc_chat',
+      chatType: 'group',
+      larkAppId: 'app-self',
+    });
+
+    expect(result.oncallEntry).toBeFalsy();
+    expect(result.inheritedFrom).toBeNull();
+    expect(result.pinnedWorkingDir).toBe(defaultDir);
+    expect(result.pinnedFromBotDefault).toBe(true);
   });
 });

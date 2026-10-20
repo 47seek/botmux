@@ -16,66 +16,28 @@
 
 import type { CliId } from '../../adapters/cli/types.js';
 import type { V3GoalNode } from './dag.js';
+import type { RunChatBinding } from './grill-state.js';
+import type { V3ArmedAttemptWorkerFence } from './worker-fence.js';
+import type { AttemptLease } from './runtime-host-contract.js';
+import type { ManifestFileKind } from './artifact-contract.js';
 
 // ─── Manifest (node product declaration) ───────────────────────────────────
 
-/** Enumerated, NOT free-string (design Q8 / §7).  Unknown → validator rejects
- *  (or the producer downgrades to `binary`). */
-export type ManifestFileKind =
-  | 'markdown'
-  | 'json'
-  | 'text'
-  | 'code'
-  | 'log'
-  | 'binary'
-  | 'directory';
-
-export const MANIFEST_FILE_KINDS: readonly ManifestFileKind[] = [
-  'markdown', 'json', 'text', 'code', 'log', 'binary', 'directory',
-];
-
-/** Soft limits the manifest validator enforces (codex point 2). */
-export const MANIFEST_SUMMARY_MAX_BYTES = 4 * 1024;
-export const MANIFEST_PREVIEW_MAX_BYTES = 4 * 1024;
-
-export interface ManifestFile {
-  name: string;
-  /** Relative to the node's `outputDir` — absolute paths are REJECTED by the
-   *  validator (which canonicalizes `outputDir/path` and asserts it stays
-   *  inside outputDir).  Downstream `inputs.json` carries the resolved
-   *  absolute path; the manifest author may only write relative. */
-  path: string;
-  kind: ManifestFileKind;
-  bytes: number;
-  /** sha256 of the file; the empty string is the agreed sentinel for
-   *  `kind: 'directory'`. */
-  sha256: string;
-  mime: string;
-  /** Optional human-readable excerpt; validator truncates to
-   *  MANIFEST_PREVIEW_MAX_BYTES. */
-  preview?: string;
-}
-
-export type ManifestStatus = 'ok' | 'fail';
-
-export const MANIFEST_STATUSES: readonly ManifestStatus[] = ['ok', 'fail'];
-
-/**
- * Written by a goal-mode worker at `BOTMUX_GOAL_MANIFEST_PATH` before exit.
- * Invariants (enforced by the validator on codex's side):
- *   - `status:'ok'`  → `files.length >= 1`, `error` absent
- *   - `status:'fail'` → `error` required, `files` may be empty
- */
-export interface Manifest {
-  schemaVersion: 1;
-  status: ManifestStatus;
-  /** Truncated to MANIFEST_SUMMARY_MAX_BYTES. */
-  summary: string;
-  error?: { code: string; message: string; retryable?: boolean };
-  files: ManifestFile[];
-}
-
-export const MANIFEST_SCHEMA_VERSION = 1 as const;
+export {
+  MANIFEST_FILE_KINDS,
+  MANIFEST_PREVIEW_MAX_BYTES,
+  MANIFEST_SCHEMA_VERSION,
+  MANIFEST_STATUSES,
+  MANIFEST_SUMMARY_MAX_BYTES,
+} from './artifact-contract.js';
+export type {
+  Manifest,
+  ManifestFile,
+  ManifestFileKind,
+  ManifestStatus,
+  ManifestValidationResult,
+  ValidateManifest,
+} from './artifact-contract.js';
 
 // ─── Downstream inputs (runtime writes, goal-mode reads) ────────────────────
 
@@ -88,6 +50,7 @@ export const MANIFEST_SCHEMA_VERSION = 1 as const;
 export interface GoalInputs {
   inputs: Array<{
     from: string;          // upstream nodeId
+    output?: string;       // schemaVersion 2 stable public-output key
     name: string;          // logical file name (from upstream manifest)
     path: string;          // ABSOLUTE path, ready to Read
     kind: ManifestFileKind;
@@ -150,51 +113,27 @@ export const GOAL_ASK_FILE = 'ask.json';
  *  human's {@link GoalAnswer} to; the retry's GoalInputs points at this path. */
 export const GOAL_ANSWER_FILE = 'answer.json';
 
-export type GoalAsk =
-  | {
-    /** The single question to put to the human. */
-    question: string;
-    /** 2–6 concrete options the human picks from; each becomes a card button. */
-    options: string[];
-    freeText?: false;
-  }
-  | {
-    /** The single question to put to the human. */
-    question: string;
-    /** Ask the human to provide free-form text instead of picking an option. */
-    freeText: true;
-    options?: never;
-  };
-
-export type GoalAnswer =
-  | {
-    /** The option the human selected (one of {@link GoalAsk.options}). */
-    selected: string;
-    /** open_id of the human who answered. */
-    by: string;
-  }
-  | {
-    /** Free-form text the human provided. */
-    text: string;
-    /** open_id of the human who answered. */
-    by: string;
-  };
+export type { GoalAnswer, GoalAsk } from './event-contract.js';
 
 // ─── Supported CLIs ─────────────────────────────────────────────────────────
 
 /**
- * v3 goal-mode is delivered via the native `/goal` command, which only Claude
- * Code, Codex, and Seed support (2026-06-01, Seed added
- * 2026-06-02).  We deliberately do NOT abstract goal delivery across every CLI
- * — instead the feature is scoped to the CLIs whose command mechanism can host
- * `/goal`.  Seed is a Claude Code-compatible CLI (binary `seed`): identical
- * flags, slash commands, and session layout — it
- * reuses the entire claude-family adapter, so `/goal`, paste-detection
- * avoidance, and the manifest watcher all behave exactly as on claude-code with
- * zero CLI-specific branching.  The runtime rejects a run whose nodes resolve
- * to any other CLI at start time.
+ * v3 goal-mode is delivered via the native `/goal` command.  Keep this list
+ * capability-based and explicit. Claude Code, Codex, Seed, and Traex have
+ * direct `/goal` execution evidence (Traex 0.200.16+ also needs its automation
+ * hook-trust flag). Relay is admitted from its exact Claude-family adapter and
+ * slash-command compatibility with Seed; a Relay-binary smoke remains pending
+ * on hosts where that binary is installed. The manifest watcher and goal env
+ * contract are CLI-neutral after dispatch. The runtime rejects a run whose
+ * nodes resolve to any other CLI at start time.
  */
-export const V3_SUPPORTED_CLIS: readonly CliId[] = ['claude-code', 'codex', 'seed'];
+export const V3_SUPPORTED_CLIS: readonly CliId[] = [
+  'claude-code',
+  'codex',
+  'seed',
+  'traex',
+  'relay',
+];
 
 export function isV3SupportedCli(cliId: CliId): boolean {
   return V3_SUPPORTED_CLIS.includes(cliId);
@@ -215,21 +154,31 @@ export function isV3SupportedCli(cliId: CliId): boolean {
  * fully-hermetic replay we can revisit, but not at the cost of secrets on disk.
  */
 export interface BotSnapshot {
+  envPolicy?: import('../../core/env-policy.js').EnvPolicy;
+  cliInstanceBinding?: import('../../services/codex-instance-pool.js').SessionCliInstanceBindingV1;
+  cliRuntime?: import('../../adapters/cli/runtime.js').CliRuntimeSnapshot;
   larkAppId: string;
   cliId: CliId;
   cliPathOverride?: string;
+  /** Frozen configured launch prefix.  Workflow workers must use
+   *  the same gateway/runtime selection as ordinary bot sessions. */
+  wrapperCli?: string;
   model?: string;
-  /** Frozen from the bot's `disableCliBypass` config — when true the CLI's
-   *  permission bypass stays OFF for every node of this run.  A node-level
-   *  `override.permissionMode:'restricted'` can additionally set this per
-   *  dispatch; nothing can clear it (no-escalation red line, P2). */
-  disableCliBypass?: boolean;
   /** Frozen per-bot sandbox policy. Workflow workers must not silently lose
-   *  these fields when spawning outside the main forkWorker path. */
-  sandbox?: boolean;
+   *  these fields when spawning outside the main forkWorker path. Tri-state:
+   *  'oncall' (fs-policy whitelist) or 'scratch' (full-root COW). */
+  sandbox?: boolean | 'off' | 'oncall' | 'scratch';
+  scratchStorage?: 'tmpfs' | 'disk';
+  scratchTmpfsSizeMb?: number;
+  scratchDenyPaths?: string[];
+  /** New three-tier fs-policy lists (deny-by-default). Carried alongside the
+   *  legacy fields so a workflow worker builds the SAME policy as a normal
+   *  session; without it the readWrite tier + user-expressed deny are lost. */
+  sandboxPaths?: { readWrite?: string[]; readOnly?: string[]; deny?: string[] };
   sandboxHidePaths?: string[];
   sandboxReadonlyPaths?: string[];
   sandboxNetwork?: boolean;
+  sandboxNetworkPolicy?: import('../../core/sandbox-network-policy.js').SandboxNetworkPolicy;
   /** The resolved working directory for this run. */
   workingDir: string;
 }
@@ -242,13 +191,19 @@ export interface BotSnapshot {
 export interface WorkerSessionInfo {
   sessionId: string;
   webPort?: number;
+  /** Private write capability. May return to the runtime result, never journal it. */
   token?: string;
+  /** Per-worker-boot read capability used by card terminal links. */
+  viewToken?: string;
 }
 
 export interface RunNodeRequest {
   runId: string;
   /** Stable id e.g. `research/attempts/001`, used for sessionId / log naming. */
   attemptId: string;
+  /** Host-neutral scheduler ownership. New runtime calls always provide this;
+   * optional during the compatibility window for older RunNode adapters. */
+  attemptLease?: AttemptLease;
   node: V3GoalNode;
   /** Frozen at run start; do NOT re-resolve the bot here. */
   botSnapshot: BotSnapshot;
@@ -258,6 +213,16 @@ export interface RunNodeRequest {
   outputDir: string;
   /** Already includes the GOAL_ENV keys; pool merges into the worker env. */
   env: Record<string, string>;
+  /** The run's authenticated chat binding (recorded by the daemon at run
+   *  birth).  The pool threads it into the worker init so the CLI child sees
+   *  the standard BOTMUX_* identity env (real chatId / ownerOpenId / …)
+   *  instead of synthetic `v3-chat-*` values — custom CLI wrappers rely on
+   *  `BOTMUX_OWNER_OPEN_ID` for per-user permission isolation.  Absent for
+   *  standalone/dev runs → synthetic values, no owner env. */
+  chatBinding?: RunChatBinding;
+  /** Durable pre-fork ownership record. The pool must activate this exact
+   * fence before it sends init, and may resolve only after outer `close`. */
+  workerFence?: V3ArmedAttemptWorkerFence;
   timeoutMs: number;
   cancelSignal?: AbortSignal;
   /** Called as soon as the worker web terminal is ready, before the node
@@ -275,7 +240,10 @@ export interface RunNodeResult {
   /** Process-level outcome.  Final node verdict = this AND manifest validation
    *  (runtime validates the manifest at `manifestPath` after `runNode`
    *  resolves — codex point 4: NOT v0.2 final_output semantics). */
-  status: 'ok' | 'fail';
+  status: 'ok' | 'fail' | 'cancelled';
+  /** Preserved AbortSignal.reason for a cancelled worker. The runtime treats
+   *  this as audit/control metadata only; it is never rendered to users. */
+  cancelReason?: unknown;
   /** Where the worker wrote its manifest (defaults to attemptDir/manifest.json
    *  but returned explicitly so the layout stays the pool's choice within
    *  attemptDir). */
@@ -291,33 +259,6 @@ export interface RunNodeResult {
  * manifest — the runtime validates it.
  */
 export type RunNode = (req: RunNodeRequest) => Promise<RunNodeResult>;
-
-// ─── Manifest validation (codex implements, runtime calls) ──────────────────
-
-export interface ManifestValidationResult {
-  ok: boolean;
-  /** Present when `ok` — the parsed, normalized manifest. */
-  manifest?: Manifest;
-  /** Present when `!ok` — the full problem list (mirror dag.ts's style). */
-  problems?: string[];
-}
-
-/**
- * The runtime's view of manifest validation: read + validate the manifest at
- * `manifestPath` against `outputDir`, returning a result object (never throws,
- * so the dispatch loop stays branch-clean).
- *
- * codex's `manifest.ts` exposes the validation in a throw-based async form
- * (`readAndValidateManifest(path, outputDir): Promise<Manifest>`); the daemon /
- * CLI wiring adapts it to this shape at the injection boundary
- * (try → `{ok:true, manifest}` / catch `ManifestValidationError` →
- * `{ok:false, problems}`).  Async because the underlying impl reads the file
- * and hashes its contents.
- */
-export type ValidateManifest = (
-  manifestPath: string,
-  outputDir: string,
-) => Promise<ManifestValidationResult>;
 
 // ─── Spec (grill 产物 → architect 输入) ──────────────────────────────────────
 

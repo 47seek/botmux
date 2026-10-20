@@ -20,7 +20,13 @@
  * plaintext). See the design doc for the two-layer rationale.
  */
 
-import { managedOriginCapabilityPath } from '../../core/managed-origin-capability.js';
+import { createHash } from 'node:crypto';
+import type { SessionProbe } from '../backend/types.js';
+import {
+  DEVICE_AUTHORITY_DIRECTORY,
+  DEVICE_CREDENTIAL_FILE,
+  DEVICE_ENROLLMENT_JOURNAL_FILE,
+} from '../../platform/device-paths.js';
 
 /** Normalize a path for the deny/allow lists: require ABSOLUTE, strip trailing
  *  slashes, reject `..` traversal. Returns null for anything unusable so the
@@ -75,6 +81,23 @@ export function botHomePath(botmuxHome: string, appId: string): string {
   return `${botmuxHome.replace(/\/+$/, '')}/bots/${assertSafeAppId(appId)}`;
 }
 
+/** Whether a worker can redirect CLI data into BOT_HOME for this session.
+ * A forced per-bot home (currently Codex `codexAuthSync=isolated`) is separate
+ * from the OS sandbox: it changes CLI state ownership without implying file
+ * read/write confinement. */
+export function shouldRedirectCliData(input: {
+  sandboxRequested: boolean;
+  forcePerBotHome?: boolean;
+  supportsReadIsolation: boolean;
+  wrapperCli?: string;
+  sessionDataDir?: string;
+}): boolean {
+  return (input.sandboxRequested || input.forcePerBotHome === true)
+    && input.supportsReadIsolation
+    && !input.wrapperCli
+    && !!input.sessionDataDir;
+}
+
 /**
  * Minimal read carve-outs needed to launch a CLI whose executable itself lives
  * under a globally denied data root. The standalone Codex installer exposes
@@ -99,482 +122,133 @@ export function buildCliExecutableReadCarveOuts(input: {
   return [standaloneRoot];
 }
 
-export interface V2IsolationContext {
-  /** The bot user's home directory. */
-  homeDir: string;
-  /** BOTMUX_HOME root (e.g. `~/.botmux`). NOT denied wholesale — the botmux CLI the
-   *  agent runs (`botmux send`/`list`/`status`) needs broad read access to it (config,
-   *  daemon registry, pm2, session store). Only its cross-bot-SENSITIVE parts are denied. */
-  botmuxHome: string;
-  /** Canonical fixed `~/.botmux` root when it differs from botmuxHome (custom
-   * SESSION_DATA_DIR or a symlinked default root). */
-  defaultBotmuxHome?: string;
-  /** botmux session data root (SESSION_DATA_DIR, e.g. `~/.botmux/data`). */
-  sessionDataDir: string;
-  /** This bot's Feishu app id. All carve-outs are keyed on it (immutable, never the
-   *  user-controllable cwd) — sibling data needs NO enumeration: per-bot dirs are
-   *  denied WHOLESALE and per-bot session files by a filename-pattern regex. */
-  currentAppId: string;
-  /** Current botmux session. Used only to carve back the exact rotating IPC
-   * capability file from the otherwise denied read-isolation runtime dir. */
-  currentSessionId: string;
-  /** Per-bot extra deny paths (BotConfig.readDenyExtraPaths). */
-  extraDenyPaths?: string[];
+/** Host device-authority files must never be visible to a chat-driven CLI.
+ * New credentials live below DEVICE_AUTHORITY_DIRECTORY; the exact legacy
+ * files remain covered for upgrades from older layouts. */
+export const HOST_DEVICE_CREDENTIAL_FILES = [
+  'platform.json',
+  DEVICE_CREDENTIAL_FILE,
+  DEVICE_ENROLLMENT_JOURNAL_FILE,
+] as const;
+export const DEVICE_CREDENTIAL_ISOLATION_MARKER_BASENAME = '.device-credential-isolation';
+
+function hostDeviceAuthorityPaths(root: string): string[] {
+  return [
+    `${root}/${DEVICE_AUTHORITY_DIRECTORY}`,
+    ...HOST_DEVICE_CREDENTIAL_FILES.map(file => `${root}/${file}`),
+  ];
 }
 
-/** v2 DENY set (HYBRID). The F1 fix is a WHOLE-deny of the CLI data dirs `~/.claude`
- *  (+ `~/.claude.json`) and `~/.codex`: this bot's OWN CLI data is redirected into its
- *  BOT_HOME (readable) via CLAUDE_CONFIG_DIR/CODEX_HOME, so whole-denying the globals
- *  blocks the admin/other/pre-migration data + kills the per-cwd carve-out + /cd hole,
- *  while own resume/memory keep working from BOT_HOME. `~/.botmux` is NOT whole-denied
- *  (the agent's botmux CLI needs its config/registry/pm2/data structure) — instead its
- *  cross-bot-SENSITIVE parts are denied surgically: bots.json, logs, other bots' lark
- *  configs / session files / send-creds / BOT_HOMEs, and the shared conversation-content
- *  dirs (frozen-cards, queues, attachments, whiteboards, …). Own BOT_HOME + own
- *  session/cred + own attachments bucket + config/registry stay readable by default.
- *  Plus the system-credential stores. Everything else (code/repos/runtime) stays open.
+/** Fixed host marker; deliberately independent of SESSION_DATA_DIR and child env. */
+export function deviceCredentialIsolationMarkerPath(homeDir: string): string {
+  return `${homeDir.replace(/\/+$/, '')}/.botmux/${DEVICE_CREDENTIAL_ISOLATION_MARKER_BASENAME}`;
+}
+
+/** Match current atomic-write sidecars and legacy backups as well as the
+ * dedicated authority directory. */
+export function isCredentialIsolationReservedBasename(name: string): boolean {
+  return name === DEVICE_AUTHORITY_DIRECTORY
+    || name === DEVICE_CREDENTIAL_ISOLATION_MARKER_BASENAME
+    || name.startsWith(`${DEVICE_CREDENTIAL_ISOLATION_MARKER_BASENAME}.`)
+    || HOST_DEVICE_CREDENTIAL_FILES.some(file => name === file || name.startsWith(`${file}.`));
+}
+
+export function credentialIsolationRequired(input: {
+  markerExists: boolean;
+  deviceCredentialExists: boolean;
+}): boolean {
+  return input.markerExists || input.deviceCredentialExists;
+}
+
+export type CredentialOnlyIsolationGate =
+  | { required: false; mode: 'off' }
+  | { required: true; mode: 'remote-bypass' }
+  | { required: true; mode: 'covered' }
+  | { required: true; mode: 'seatbelt' | 'bwrap' }
+  | { required: true; mode: 'blocked'; failClosedReason: string };
+
+/** Mandatory device-credential isolation is independent of the optional bot
+ * sandbox toggle: once enrolled, every local child must be confined.
  *
- *  NOTE: per-bot session stores (`sessions-<appId>.json`) are denied by PATTERN — see
- *  {@link buildV2DenyRegexes} — so no sibling-appId enumeration is needed anywhere. */
-export function buildV2DenyPaths(ctx: V2IsolationContext): string[] {
-  const h = ctx.homeDir.replace(/\/+$/, '');
-  const bh = ctx.botmuxHome.replace(/\/+$/, '');
-  const sd = ctx.sessionDataDir.replace(/\/+$/, '');
-  const defaultBh = (ctx.defaultBotmuxHome ?? `${h}/.botmux`).replace(/\/+$/, '');
-  return dedupe(
-    [
-      // ── F1: whole-deny the CLI data dirs (own is redirected to BOT_HOME) ──
-      `${h}/.claude`,
-      `${h}/.claude.json`,
-      `${h}/.codex`,
-      // ── System credential / secret stores (broad, since outside is open by default) ──
-      `${h}/.ssh`,
-      `${h}/.aws`,
-      `${h}/.azure`,
-      `${h}/.gnupg`,
-      `${h}/.netrc`,
-      `${h}/.config/gh`,
-      `${h}/.config/glab-cli`,
-      `${h}/.config/gcloud`,
-      `${h}/.config/op`,
-      `${h}/.config/1Password`,
-      `${h}/.1password`,
-      `${h}/.password-store`,
-      `${h}/.git-credentials`,
-      `${h}/.npmrc`,
-      `${h}/.pypirc`,
-      `${h}/.docker/config.json`,
-      `${h}/.kube`,
-      `${h}/Library/Keychains`,
-      // ── botmux SENSITIVE (surgical — leave config/registry/pm2/data structure readable) ──
-      `${bh}/bots.json`,               // ALL bots' secrets
-      `${bh}/logs`,                    // daemon logs (cross-bot content)
-      `${h}/.lark-cli`,                // default lark config (may hold creds)
-      // WHOLESALE-deny the per-bot lark config dir (same rationale as bots/ below): a
-      // newly-added bot is covered without cold-restart, and `ls .lark-cli-bots/` can't
-      // enumerate siblings. Own is re-allowed via buildV2CarveOuts (+ traverse shim).
-      `${h}/.lark-cli-bots`,
-      // WHOLESALE-deny the bots/ dir (every sibling BOT_HOME + their send-cred). Own is
-      // re-allowed via buildV2CarveOuts (allow subpath own + file-read-metadata traverse
-      // shim so the CLI can realpath its redirected config). Denying the DIR (not each
-      // sibling appId) means a NEWLY-ADDED bot is covered WITHOUT cold-restarting this
-      // one, and `ls bots/` can't enumerate siblings.
-      `${bh}/bots`,
-      `${sd}/sessions.json`,           // legacy shared store
-      `${sd}/frozen-cards`,            // conversation content (all bots')
-      `${sd}/turn-sends`,              // CLI only APPENDS markers here — read-deny is safe
-      `${sd}/crash-diagnostics`,
-      // All bots' Feishu-uploaded files. Own per-appId bucket (attachments/<self>/) is
-      // re-allowed via buildV2CarveOuts; siblings' buckets + the legacy flat
-      // per-messageId layout stay denied.
-      `${sd}/attachments`,
-      // whiteboards/ is deliberately NOT denied (owner decision): whiteboards are
-      // shared content, meant to be visible across the bots that collaborate on
-      // them. NOTE the store is currently GLOBAL (no per-chat scoping), so a
-      // sandboxed bot can `whiteboard list`/`read` boards from other chats too —
-      // an accepted tradeoff until whiteboards are bucketed by chat/appId. Also
-      // un-denying the read avoids the read-modify-write clobber a deny would cause.
-      // Queued inbound messages (queues/<rootMessageId>.jsonl = full LarkMessage
-      // content for EVERY bot). Daemon-side only — the CLI never reads it.
-      `${sd}/queues`,
-      // Seatbelt profiles + reattach markers: filenames/rules enumerate sibling
-      // session ids and appIds. sandbox-exec parses the profile BEFORE applying it,
-      // and the markers are read by the daemon — the sandboxed CLI never reads these.
-      `${sd}/read-isolation`,
-      // Worker PID markers contain every live session/turn/attempt tuple. They
-      // are routing metadata, never a credential, and isolated CLIs now use an
-      // exact per-session capability carve-out for fresh turn context.
-      `${sd}/.botmux-cli-pids`,
-      // NOTE: schedules.json is deliberately NOT denied. It's a read-modify-write
-      // store: denying the read makes a sandboxed `botmux schedule` load an empty
-      // map and then overwrite the shared file, silently wiping EVERY bot's tasks
-      // (read-modify-write degraded to write-only). We accept the minor leak
-      // (isolated bots can read others' scheduled prompts) until schedule-store
-      // fail-closes on read errors (ENOENT vs EPERM). See PR #387 review.
-      `${bh}/feishu-session.json`,     // Feishu web login session (setup automation) — can mint bots
-      // The dashboard admin credentials. `.dashboard-secret` signs the loopback-HMAC
-      // that gates `/__cli/rotate` AND the daemon-IPC write-link routes — the ipc-server
-      // comment (dashboard-ipc-server.ts) explicitly relies on the sandbox hiding it to
-      // "keep a sandboxed worker from minting write tokens" for sessions it doesn't own
-      // (a cross-bot escalation reachable by a semi-trusted conversant driving the agent).
-      // Only owner-facing admin verbs (`botmux dashboard`/`term-link`) sign with it — the
-      // agent's send/list/status never do, so denying it costs the agent nothing. Its
-      // sibling `.dashboard-token` (dashboard bearer) is denied for the same reason;
-      // `.dashboard-port` is just a port number (no credential value) → left readable.
-      // The dashboard IPC secret/token live at the fixed default home even
-      // when SESSION_DATA_DIR points at a custom BOTMUX_HOME. Deny both roots:
-      // the fixed real credential location and the custom runtime root.
-      `${defaultBh}/.dashboard-secret`,
-      `${defaultBh}/.dashboard-token`,
-      `${bh}/.dashboard-secret`,
-      `${bh}/.dashboard-token`,
-      // NOTE: extraDenyPaths (readDenyExtraPaths) are NOT here — they go to
-      // buildV2CarveOuts().finalDenyPaths so they win over the own-BOT_HOME allow.
-    ]
-      .map(normalizeIsolationPath)
-      .filter((p): p is string => !!p),
-  );
+ * Threat model / known boundary: this isolation (credential-only included)
+ * keeps an agent from INADVERTENTLY reading device credentials. It is not a
+ * code-integrity boundary against a malicious agent. A credential-only pane
+ * has `/` writable, so it can modify this install's built CLI (`dist/cli.js`)
+ * and its dependencies; the host relay watcher re-executes that CLI outside
+ * the pane, and the daemon executes the same files on its next worker/CLI
+ * spawn. That held before the relay existed — the relay adds no capability.
+ * Code-integrity needs the full file sandbox (read-only install tree) or a
+ * remote backend. See docs/file-sandbox.md「仅凭据隔离」. */
+export function evaluateCredentialOnlyIsolationGate(input: {
+  markerExists: boolean;
+  deviceCredentialExists: boolean;
+  remoteBackend: boolean;
+  platform: string;
+  mechanismAvailable: boolean;
+  fullIsolationCoversCredentials: boolean;
+}): CredentialOnlyIsolationGate {
+  const required = credentialIsolationRequired(input);
+  if (!required) return { required: false, mode: 'off' };
+  if (input.remoteBackend) return { required: true, mode: 'remote-bypass' };
+  if (input.fullIsolationCoversCredentials) return { required: true, mode: 'covered' };
+  if (input.platform !== 'darwin' && input.platform !== 'linux') {
+    return {
+      required: true,
+      mode: 'blocked',
+      failClosedReason: `credential isolation unsupported on ${input.platform}`,
+    };
+  }
+  if (!input.mechanismAvailable) {
+    return {
+      required: true,
+      mode: 'blocked',
+      failClosedReason: input.platform === 'darwin'
+        ? 'sandbox-exec is unavailable'
+        : 'bubblewrap is unavailable',
+    };
+  }
+  return { required: true, mode: input.platform === 'darwin' ? 'seatbelt' : 'bwrap' };
 }
 
-/** Escape a literal path for embedding in a Seatbelt regex filter. */
+export interface CredentialIsolationContext {
+  homeDir: string;
+  botmuxHome: string;
+  defaultBotmuxHome?: string;
+}
+
 function escapeForRegex(p: string): string {
   return p.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-/** v2 PATTERN denies — Seatbelt `regex` filters that deny a whole FILENAME CLASS
- *  instead of enumerating sibling app ids. Covers:
- *   - per-bot session stores (`<sd>/sessions-<appId>.json`, routing metadata): a
- *     newly-added bot's store is denied WITHOUT cold-restarting the ones already
- *     running, and no caller needs to know the sibling app ids. The bot's OWN store
- *     is re-allowed by carve-out (Seatbelt last-match).
- *   - EVERY `bots.json.*` sidecar (`.bak` written by setup/migration, `.tmp`, ad-hoc
- *     `.bak.<suffix>` copies): the exact `bots.json` is subpath-denied in
- *     {@link buildV2DenyPaths}, but its backups carry the SAME plaintext
- *     larkAppSecret for every bot under a DIFFERENT basename, which `subpath` does
- *     not match — so without this an isolated bot could `cat bots.json.bak` and
- *     recover all siblings' credentials, defeating the whole isolation. */
-export function buildV2DenyRegexes(ctx: V2IsolationContext): string[] {
-  const sd = ctx.sessionDataDir.replace(/\/+$/, '');
-  const bh = ctx.botmuxHome.replace(/\/+$/, '');
-  const h = ctx.homeDir.replace(/\/+$/, '');
-  const defaultBh = (ctx.defaultBotmuxHome ?? `${h}/.botmux`).replace(/\/+$/, '');
-  const dashboardRoots = dedupe([defaultBh, bh]);
-  return dedupe([
-    `^${escapeForRegex(sd)}/sessions-[^/]+\\.json$`,
-    // Any `bots.json.` sidecar (backups/temp) — trailing dot so it matches
-    // bots.json.bak / .tmp / .bak.<suffix> but NOT the exact bots.json (that is
-    // the subpath deny's job) and NOT an unrelated `bots.jsonx`.
-    `^${escapeForRegex(bh)}/bots\\.json\\.`,
-    // LEGACY pre-BOT_HOME send-cred files (`<sd>/.send-cred-<appId>`): current
-    // builds write send-cred.json inside BOT_HOME, but leftovers from older
-    // builds still carry live per-bot send credentials at the data root.
-    `^${escapeForRegex(sd)}/\\.send-cred-`,
-    // Per-bot user display-name caches (`identities-<appId>.json`): open_id→name
-    // PII of every bot's interlocutors. The CLI never reads them (daemon-side
-    // prompt injection only), so the OWN file gets NO carve-out — the whole
-    // filename class is denied.
-    `^${escapeForRegex(sd)}/identities-[^/]+\\.json$`,
-    // Secret/token creation and atomic rotation use sibling temp files. Deny
-    // the whole basename class at both the fixed and custom roots so a live
-    // isolated process cannot race-read a fully populated temp inode.
-    ...dashboardRoots.flatMap(root => [
-      `^${escapeForRegex(root)}/\\.dashboard-secret(?:\\.|$)`,
-      `^${escapeForRegex(root)}/\\.dashboard-token(?:\\.|$)`,
-    ]),
-  ]);
-}
-
-/** Host-owned authority files that a read-isolated child must not mutate.
- * Read isolation otherwise keeps normal write access for backwards
- * compatibility, so these rules are emitted after every other write allow. */
-export function buildReadIsolationProtectedWriteRules(
-  ctx: V2IsolationContext,
-  extraRoots: { dashboardRoots?: string[]; sessionDataDirs?: string[] } = {},
-): {
+/** Legacy credential-only Seatbelt/bwrap rule shape. Full fs-policy sessions
+ * consume the same authority paths through buildFsPolicy instead. */
+export function buildCredentialIsolationRules(ctx: CredentialIsolationContext): {
+  roots: string[];
+  denyPaths: string[];
+  denyRegexes: string[];
   denyWritePaths: string[];
   denyWriteRegexes: string[];
   denyWriteLiterals: string[];
 } {
   const h = ctx.homeDir.replace(/\/+$/, '');
   const bh = ctx.botmuxHome.replace(/\/+$/, '');
-  const sd = ctx.sessionDataDir.replace(/\/+$/, '');
   const defaultBh = (ctx.defaultBotmuxHome ?? `${h}/.botmux`).replace(/\/+$/, '');
-  const dashboardRoots = dedupe([
-    defaultBh,
-    bh,
-    ...(extraRoots.dashboardRoots ?? []).map(root => root.replace(/\/+$/, '')),
-  ]);
-  const sessionDataDirs = dedupe([
-    sd,
-    ...(extraRoots.sessionDataDirs ?? []).map(root => root.replace(/\/+$/, '')),
-  ]);
+  const roots = dedupe([defaultBh, bh]);
+  const credentialPaths = roots.flatMap(hostDeviceAuthorityPaths);
+  const markerPath = `${defaultBh}/${DEVICE_CREDENTIAL_ISOLATION_MARKER_BASENAME}`;
+  const denyRegexes = roots.flatMap(root =>
+    HOST_DEVICE_CREDENTIAL_FILES.map(file =>
+      `^${escapeForRegex(root)}/${escapeForRegex(file)}(?:\\.|$)`));
+  denyRegexes.push(
+    `^${escapeForRegex(defaultBh)}/${escapeForRegex(DEVICE_CREDENTIAL_ISOLATION_MARKER_BASENAME)}(?:\\.|$)`,
+  );
   return {
-    denyWritePaths: dedupe([
-      ...dashboardRoots.flatMap(root => [
-        `${root}/.dashboard-secret`,
-        `${root}/.dashboard-token`,
-      ]),
-      ...sessionDataDirs.flatMap(root => [
-        `${root}/.botmux-cli-pids`,
-        `${root}/read-isolation`,
-      ]),
-    ]),
-    denyWriteRegexes: dedupe(dashboardRoots.flatMap(root => [
-      `^${escapeForRegex(root)}/\\.dashboard-secret(?:\\.|$)`,
-      `^${escapeForRegex(root)}/\\.dashboard-token(?:\\.|$)`,
-    ])),
-    // Prevent replacing an entire authority-bearing root to sidestep the
-    // exact/regex child rules. `literal` protects only the directory entry;
-    // ordinary writes to unrelated descendants remain available.
-    denyWriteLiterals: dedupe([...dashboardRoots, ...sessionDataDirs]),
-  };
-}
-
-/** The v2 Seatbelt carve-outs that accompany {@link buildV2DenyPaths} +
- *  {@link buildV2DenyRegexes}. They re-open the bot's OWN slice of each denied class:
- *   - allowPaths: the own BOT_HOME subpath (redirected CLI data + creds + send-cred),
- *     the own lark-cli config dir, and the own session store file.
- *   - traverseDirs: `bots/` etc., as file-read-metadata ONLY — lets the CLI realpath()
- *     its config dir THROUGH the denied parent WITHOUT allowing `ls bots/` (enumeration).
- *   - finalDenyPaths: admin `readDenyExtraPaths`, emitted AFTER the allows so an admin
- *     deny UNDER the own BOT_HOME still wins (Seatbelt last-match). */
-export function buildV2CarveOuts(ctx: V2IsolationContext): {
-  allowPaths: string[];
-  traverseDirs: string[];
-  finalDenyPaths: string[];
-} {
-  const bh = ctx.botmuxHome.replace(/\/+$/, '');
-  const sd = ctx.sessionDataDir.replace(/\/+$/, '');
-  const h = ctx.homeDir.replace(/\/+$/, '');
-  const self = assertSafeAppId(ctx.currentAppId);
-  return {
-    // Re-open the bot's OWN slice of each wholesale/pattern-denied per-bot class.
-    allowPaths: [
-      botHomePath(bh, self),
-      `${h}/.lark-cli-bots/${self}`,
-      // Own routing metadata (`botmux send` reads it to route replies); siblings'
-      // stay denied by the buildV2DenyRegexes filename pattern.
-      `${sd}/sessions-${self}.json`,
-      // Own Feishu-upload bucket (attachments/<appId>/<messageId>/…) — the agent must
-      // read files the user uploads in chat. getAttachmentsDir keys the bucket on the
-      // appId precisely so this spawn-time-static carve-out can exist.
-      `${sd}/attachments/${self}`,
-      // Parent read-isolation/ stays wholesale-denied; only this session's
-      // rotating origin capability is visible to the confined CLI.
-      managedOriginCapabilityPath(sd, ctx.currentSessionId),
-    ],
-    // file-read-metadata on the wholesale-denied parents so the CLI/skill can realpath()
-    // through them WITHOUT `ls` (enumeration) leaking.
-    traverseDirs: [
-      `${bh}/bots`, `${h}/.lark-cli-bots`, `${sd}/attachments`, `${sd}/read-isolation`,
-    ],
-    finalDenyPaths: (ctx.extraDenyPaths ?? [])
-      .map(normalizeIsolationPath)
-      .filter((p): p is string => !!p),
-  };
-}
-
-// ─── Mac file-sandbox: WRITE isolation (the Seatbelt twin of Linux bwrap) ─────
-
-export interface WriteSandboxContext {
-  /** The bot user's home directory. */
-  homeDir: string;
-  /** BOTMUX_HOME root (e.g. `~/.botmux`). */
-  botmuxHome: string;
-  /** botmux session data root (SESSION_DATA_DIR, e.g. `~/.botmux/data`). */
-  sessionDataDir: string;
-  /** The session's project working dir — writes here PERSIST (the point of the sandbox). */
-  workingDir: string;
-  /** This bot's Feishu app id (keys its own BOT_HOME carve-out). */
-  currentAppId: string;
-  /** Extra writable roots the worker resolves at spawn time (realpath'd TMPDIR,
-   *  extra worktrees, admin-configured writable paths). */
-  extraWritePaths?: string[];
-}
-
-/**
- * Write-isolation rules for the macOS file sandbox — the FUNCTIONAL twin of the
- * Linux bwrap overlay (which lets the agent read the whole real FS but confines
- * WRITES). Seatbelt has no copy-on-write overlay, so we approximate the same
- * guarantee with a deny-all-writes + allow-list: the agent can write its project
- * and the ephemeral scratch/cache the CLI needs, but CANNOT tamper the rest of
- * your real disk (home dotfiles, other projects, other bots' data, system dirs).
- * Reads stay wide open (like Linux) — this is orthogonal to read isolation, which
- * layers its own read-deny set into the SAME profile when also enabled.
- *
- * `allowWritePaths` re-open the writable zones AFTER the profile's `(deny
- * file-write* (subpath "/"))`; `denyWritePaths` are crown jewels re-denied AFTER
- * the allows (Seatbelt last-match), so they stay protected even if the project or
- * an allowed zone nests them. The allow-list is intentionally generous toward
- * CLI scratch/cache — the exact set is empirically tuned on real macOS (a missing
- * cache path makes the CLI fail, an over-broad one weakens the sandbox). Pure: the
- * worker realpath's every path (symlink-safe) before emitting.
- */
-export function buildWriteSandboxRules(ctx: WriteSandboxContext): {
-  allowWritePaths: string[];
-  allowWriteRegexes: string[];
-  denyWritePaths: string[];
-} {
-  const h = ctx.homeDir.replace(/\/+$/, '');
-  const bh = ctx.botmuxHome.replace(/\/+$/, '');
-  const sd = ctx.sessionDataDir.replace(/\/+$/, '');
-  const defaultBh = `${h}/.botmux`;
-  const wd = ctx.workingDir.replace(/\/+$/, '');
-  const keep = (arr: string[]) =>
-    dedupe(arr.map(normalizeIsolationPath).filter((p): p is string => !!p));
-  return {
-    allowWritePaths: keep([
-      // The project — writes here PERSIST (no overlay/landing step; direct like a
-      // non-sandboxed run would, only nothing OUTSIDE the allow-list can be touched).
-      wd,
-      // Own BOT_HOME — where read isolation redirects the CLI's data when co-enabled;
-      // harmless to allow when write-sandbox is standalone (dir just won't exist).
-      botHomePath(bh, ctx.currentAppId),
-      // CLI data dirs (write-sandbox standalone leaves them at the real path).
-      `${h}/.claude`, `${h}/.claude.json`, `${h}/.codex`,
-      // Claude Code's updater/OAuth refresh uses sibling lock directories rather
-      // than placing every state file under ~/.claude. Without these, a valid
-      // login can fail to refresh because lock acquisition returns EPERM.
-      `${h}/.claude.lock`, `${h}/.claude.json.lock`,
-      `${h}/.local/state/claude`,
-      // Ephemeral scratch / caches every CLI + spawned tool (git, npm, node) needs.
-      `${h}/Library/Caches`,
-      `${h}/Library/Application Support`,
-      `${h}/.cache`,
-      `${h}/.npm`,
-      '/private/var/folders',   // macOS per-user TMPDIR / DARWIN_USER_TEMP_DIR root
-      '/private/tmp', '/tmp', '/var/tmp',
-      '/dev',                   // ptys, /dev/null, /dev/tty — required to run at all
-      ...(ctx.extraWritePaths ?? []),
-    ]),
-    allowWriteRegexes: [
-      // Claude Code saves ~/.claude.json atomically through a PID/random-suffixed
-      // sibling (e.g. .claude.json.tmp.1234.abcd). A subpath rule for the exact
-      // state file cannot match those siblings, so allow only that basename class
-      // at the home root — not arbitrary home dotfiles.
-      `^${escapeForRegex(h)}/\\.claude\\.json\\.tmp\\.[^/]+$`,
-    ],
-    denyWritePaths: keep([
-      // Crown jewels — re-denied AFTER the allows so a semi-trusted operator can't
-      // plant an ssh key or tamper another bot's creds even if the project/home
-      // nests these. (Most already fall under deny-by-default; this is the guard for
-      // a broad workingDir and defence-in-depth.)
-      `${h}/.ssh`, `${h}/.aws`, `${h}/.gnupg`,
-      `${bh}/bots.json`,
-      `${bh}/feishu-session.json`,
-      `${defaultBh}/.dashboard-secret`, `${defaultBh}/.dashboard-token`,
-      `${bh}/.dashboard-secret`, `${bh}/.dashboard-token`,
-      `${sd}/.botmux-cli-pids`, `${sd}/read-isolation`,
-    ]),
-  };
-}
-
-// ─── Linux read isolation: bwrap mask set (the Seatbelt read-deny twin) ──────
-
-export interface LinuxReadIsolationInput {
-  ctx: V2IsolationContext;
-  /** Every OTHER bot's appId — the worker enumerates these from the registry.
-   *  bwrap has NO regex (unlike the macOS Seatbelt profile), so each sibling's
-   *  per-bot paths are masked INDIVIDUALLY. Consequence: the mask set is
-   *  spawn-time-static — a bot added AFTER this session spawned isn't covered
-   *  until a cold restart (the macOS regex covers new bots without one). */
-  siblingAppIds: string[];
-  /** Existing `bots.json.*` sidecars (backups/tmp) globbed by the worker at spawn
-   *  — each carries every bot's plaintext secret under a dynamic name that no
-   *  wholesale rule matches, so they're masked individually. */
-  botsJsonSidecars?: string[];
-}
-
-/**
- * The bwrap MASK set for Linux read isolation — the functional twin of the macOS
- * Seatbelt read-deny profile ({@link buildV2DenyPaths} + regexes + carve-outs),
- * expressed for bwrap (which blanks paths with tmpfs/empty-binds and has no regex).
- *
- * SAME cross-bot-sensitive set as macOS, but the per-bot classes (other bots'
- * BOT_HOMEs / lark configs / session stores / identities / send-creds / attachment
- * buckets) are enumerated PER SIBLING instead of wholesale-denied + regex-matched.
- * The read-isolation-specific set does not mask the bot's OWN slice. The file
- * sandbox still masks BOTMUX_HOME wholesale as its mandatory credential
- * boundary, so `ownReadWritePaths` re-opens only this bot's BOT_HOME after that
- * parent mask; the worker separately re-masks send-cred.json.
- *
- * Pure: the worker resolves the impure inputs (sibling list, sidecar glob, realpath).
- * NOTE: keep the `shared` set in lock-step with {@link buildV2DenyPaths} — the
- * `read-isolation.test.ts` parity test fails if a sensitive path is added to one
- * platform but not the other.
- */
-export function buildLinuxReadIsolationMasks(input: LinuxReadIsolationInput): {
-  /** Paths to blank inside bwrap (prepareSandbox stat-classifies: dir→tmpfs,
-   *  file→empty ro-bind, missing→skipped). Feed as prepareSandbox.hidePaths. */
-  hidePaths: string[];
-  /** The bot's OWN BOT_HOME — bound REAL + writable (feed as
-   *  prepareSandbox.trustedWritablePaths) so the
-   *  redirected CLI data (CLAUDE_CONFIG_DIR/CODEX_HOME) persists and escapes the
-   *  write overlay after the mandatory BOTMUX_HOME mask. */
-  ownReadWritePaths: string[];
-  /** The bot's OWN slices that sit UNDER a wholesale-masked parent and must be
-   *  re-exposed read-only AFTER the masks (feed as readonlyRoots — bound after the
-   *  tmpfs masks). Currently the own attachments bucket, under the wholesale
-   *  `data/attachments` mask. Read-only is enough (the agent only READS uploads). */
-  ownReadOnlyPaths: string[];
-} {
-  const { ctx } = input;
-  const h = ctx.homeDir.replace(/\/+$/, '');
-  const bh = ctx.botmuxHome.replace(/\/+$/, '');
-  const sd = ctx.sessionDataDir.replace(/\/+$/, '');
-  const defaultBh = (ctx.defaultBotmuxHome ?? `${h}/.botmux`).replace(/\/+$/, '');
-  const self = assertSafeAppId(ctx.currentAppId);
-  const keep = (arr: string[]) => dedupe(arr.map(normalizeIsolationPath).filter((p): p is string => !!p));
-
-  // Cross-bot-sensitive paths handled WHOLESALE (not per-bot, OR a per-bot dir with
-  // a non-enumerable layout) — MUST mirror the same entries in buildV2DenyPaths.
-  const shared = [
-    `${h}/.claude`, `${h}/.claude.json`, `${h}/.codex`,
-    `${h}/.ssh`, `${h}/.aws`, `${h}/.azure`, `${h}/.gnupg`, `${h}/.netrc`,
-    `${h}/.config/gh`, `${h}/.config/glab-cli`, `${h}/.config/gcloud`, `${h}/.config/op`,
-    `${h}/.config/1Password`, `${h}/.1password`, `${h}/.password-store`,
-    `${h}/.git-credentials`, `${h}/.npmrc`, `${h}/.pypirc`, `${h}/.docker/config.json`, `${h}/.kube`,
-    `${h}/Library/Keychains`,
-    `${bh}/bots.json`, `${bh}/logs`, `${h}/.lark-cli`,
-    `${bh}/feishu-session.json`,
-    `${defaultBh}/.dashboard-secret`, `${defaultBh}/.dashboard-token`,
-    `${bh}/.dashboard-secret`, `${bh}/.dashboard-token`,
-    `${sd}/sessions.json`, `${sd}/frozen-cards`, `${sd}/turn-sends`,
-    `${sd}/crash-diagnostics`, `${sd}/queues`, `${sd}/read-isolation`,
-    `${sd}/.botmux-cli-pids`,
-    // attachments/ is masked WHOLESALE (like macOS) — covers every sibling bucket
-    // AND the legacy flat per-messageId layout (which per-sibling enumeration can't
-    // reach); the OWN bucket is re-exposed read-only via ownReadOnlyPaths below.
-    `${sd}/attachments`,
-    // schedules.json + whiteboards deliberately NOT masked (same owner decision as
-    // macOS: RMW-clobber / shared content).
-  ];
-
-  // Per-sibling enumeration for the classes macOS covers by REGEX (bwrap has none):
-  // other bots' BOT_HOMEs, lark configs, session stores, identities, send-creds. Own
-  // BOT_HOME + lark + session stay UNMASKED by this per-bot set (the outer file
-  // sandbox still masks BOTMUX_HOME wholesale and re-opens only own BOT_HOME).
-  // identities/send-cred get NO own carve-out — the
-  // CLI never reads them (daemon-side) — so the own ones are masked too.
-  const perBot: string[] = [];
-  for (const raw of input.siblingAppIds) {
-    let sib: string;
-    try { sib = assertSafeAppId(raw); } catch { continue; }
-    if (sib === self) continue;
-    perBot.push(
-      `${bh}/bots/${sib}`,
-      `${h}/.lark-cli-bots/${sib}`,
-      `${sd}/sessions-${sib}.json`,
-      `${sd}/identities-${sib}.json`,
-      `${sd}/.send-cred-${sib}`,
-    );
-  }
-  perBot.push(`${sd}/identities-${self}.json`, `${sd}/.send-cred-${self}`);
-
-  return {
-    hidePaths: keep([...shared, ...perBot, ...(input.botsJsonSidecars ?? [])]),
-    ownReadWritePaths: keep([botHomePath(bh, self)]),
-    ownReadOnlyPaths: keep([`${sd}/attachments/${self}`]),
+    roots,
+    denyPaths: dedupe([...credentialPaths, markerPath]),
+    denyRegexes: dedupe(denyRegexes),
+    denyWritePaths: dedupe([...credentialPaths, markerPath]),
+    denyWriteRegexes: dedupe(denyRegexes),
+    denyWriteLiterals: roots,
   };
 }
 
@@ -612,28 +286,20 @@ export function evaluateReadIsolationGate(opts: {
   return { enabled: true };
 }
 
-/**
- * macOS Seatbelt (sandbox-exec) profile for the whole-process isolation wrapper.
- * Blocklist: allow everything, deny reads of the sensitive paths/patterns, THEN
- * re-allow the carve-outs — `subpath` covers a file or a whole subtree. Rule ORDER
- * matters: Seatbelt applies the LAST matching rule, so an allow listed AFTER a
- * broader deny re-opens that subpath, and the final denies win over the allows.
- * Verified: reads of denied paths fail EPERM; carved-out subpaths read normally; the
- * wrapped CLI (which bypasses its OWN sandbox — nested Seatbelt would hang) runs fine.
- */
+/** Legacy allow-default profile retained only for mandatory credential-only
+ * confinement when the full fs-policy sandbox is disabled. */
 export function buildSeatbeltProfile(
   denyPaths: string[],
   allowPaths: string[] = [],
   finalDenyPaths: string[] = [],
   traverseDirs: string[] = [],
   denyRegexes: string[] = [],
-  /** When set, layer the macOS file-sandbox WRITE isolation (Linux-bwrap twin) into
-   *  the SAME profile: deny all writes, re-allow the writable zones, then final-deny
-   *  the crown jewels. Reads are unaffected. Omit for read-isolation-only sessions. */
-  writeSandbox?: { allowWritePaths: string[]; allowWriteRegexes?: string[]; denyWritePaths: string[] },
-  /** Host-owned files that must remain immutable even for legacy read-only
-   * isolation (where writes are otherwise unrestricted). Emitted last so they
-   * also win over a broad write-sandbox allow. */
+  writeSandbox?: {
+    allowWritePaths: string[];
+    allowWriteRegexes?: string[];
+    denyWritePaths: string[];
+    denyWriteRegexes?: string[];
+  },
   protectedWrites?: {
     denyWritePaths: string[];
     denyWriteRegexes?: string[];
@@ -641,36 +307,19 @@ export function buildSeatbeltProfile(
   },
 ): string {
   const esc = (p: string) => p.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
-  // Regex literals (#"…") pass backslashes RAW to the regex engine — do NOT
-  // double-escape them. A `"` would terminate the literal; swap it for `.`
-  // (single-char wildcard that still matches the quote) instead of breaking syntax.
   const escRe = (r: string) => r.replace(/"/g, '.');
   const lines = ['(version 1)', '(allow default)'];
   for (const p of denyPaths) lines.push(`(deny file-read* (subpath "${esc(p)}"))`);
-  // Filename-pattern denies (e.g. every bot's sessions-<appId>.json) — no sibling
-  // enumeration; the own file is re-opened by an allow below (last-match).
   for (const r of denyRegexes) lines.push(`(deny file-read* (regex #"${escRe(r)}"))`);
-  // Traversal metadata-allows: a carve-out under a DENIED parent (e.g. BOT_HOME under
-  // ~/.botmux) is reachable for a plain open (Seatbelt matches the final path), but a
-  // realpath()/stat of an INTERMEDIATE dir is denied — which crashes CLIs that
-  // canonicalize their config dir (Codex: "failed to canonicalize CODEX_HOME"). Allow
-  // read-METADATA (stat/traverse) on those specific ancestor DIRS only (literal, not
-  // subpath) — dir LISTING (read-data) stays denied, so no enumeration leak.
   for (const p of traverseDirs) lines.push(`(allow file-read-metadata (literal "${esc(p)}"))`);
-  // Carve-outs override the broad denies above (Seatbelt applies the LAST match).
   for (const p of allowPaths) lines.push(`(allow file-read* (subpath "${esc(p)}"))`);
-  // FINAL denies win over the carve-outs — admin `readDenyExtraPaths` must hold even
-  // for a path that falls under the bot's own re-allowed BOT_HOME.
   for (const p of finalDenyPaths) lines.push(`(deny file-read* (subpath "${esc(p)}"))`);
-  // ── Write isolation (macOS file sandbox): deny ALL writes, re-allow the writable
-  // zones, then re-deny the crown jewels. Ordered AFTER the read rules but they are
-  // an independent operation class (file-write* vs file-read*), so they never
-  // interact with the read allow/deny above. Emitted only when write-sandbox is on.
   if (writeSandbox) {
     lines.push('(deny file-write* (subpath "/"))');
     for (const p of writeSandbox.allowWritePaths) lines.push(`(allow file-write* (subpath "${esc(p)}"))`);
     for (const r of writeSandbox.allowWriteRegexes ?? []) lines.push(`(allow file-write* (regex #"${escRe(r)}"))`);
     for (const p of writeSandbox.denyWritePaths) lines.push(`(deny file-write* (subpath "${esc(p)}"))`);
+    for (const r of writeSandbox.denyWriteRegexes ?? []) lines.push(`(deny file-write* (regex #"${escRe(r)}"))`);
   }
   for (const p of protectedWrites?.denyWritePaths ?? []) {
     lines.push(`(deny file-write* (subpath "${esc(p)}"))`);
@@ -684,11 +333,270 @@ export function buildSeatbeltProfile(
   return lines.join('\n') + '\n';
 }
 
-export const ISOLATION_PANE_MARKER_VERSION = 2;
+// A marker records which confinement capabilities are attached to the live
+// process. Credential-only panes must cold-spawn when a full sandbox is enabled.
+//
+// BUMP THIS whenever the START-TIME sandbox contract of an isolated CLI changes
+// in a way a still-running process cannot satisfy — warm reattach preserves the
+// live process + its original bwrap mounts/env untouched, so a new mount/env the
+// reattach path relies on but the old process lacks makes reattach unsafe.
+//   · 7 → 8 (#709): isolated CLIs must carry host-injected BOTMUX_READ_ISOLATION
+//     / BOTMUX_API_ONLY env (bots.json EPERM fix). Panes spawned by v3.8.0 have a
+//     v7 marker but a process with NEITHER key, so `botmux` inside them dies on
+//     the denied bots.json read; reattaching leaves the regression unfixed after
+//     a plain `daemon:restart`.
+//   · 8 → 9 (#714): traex/coco now bind ~/.trae migration done-markers read-only
+//     (sandboxReadonlyPaths) so goal-mode stops wedging on the TRAE first-run
+//     migration prompt. That is a new spawn-time mount; a pane predating it warm-
+//     reattaches with the old mount set and still wedges, so it must cold-spawn.
+//   · 9 → 10: credential-only Seatbelt/bwrap panes receive a private rotating
+//     managed-origin channel for capability-gated daemon IPC. A warm pane with
+//     the v9 marker lacks both the env and the private read carve-out.
+//   · 10 → 11: provenance proofs gain a two-phase `state:'pending'|'committed'`
+//     lifecycle (generational-race fix). A v10 marker was written UNCONDITIONALLY
+//     BEFORE spawn (the vulnerable path) and has NO `state` field, so a late-winner
+//     pane may already wear a "valid" v10 marker it never earned. Requiring v11 +
+//     strict `state:'committed'` forces every pre-existing no-state marker to
+//     cold-spawn ONCE under the new pending→commit contract — closing the INSTALLED
+//     BASE risk, not just new spawns. (A legacy no-state marker is now version-
+//     rejected, so validators no longer need to tolerate `state===undefined`.)
+//   · 11 → 12: sandboxed Codex receives a host-selected SSL_CERT_FILE so npm
+//     Codex's Rust TLS stack can use a stable CA bundle inside Seatbelt. Warm
+//     reattach would keep the old process environment and continue to fail on
+//     UnknownIssuer, so existing panes must cold-spawn once.
+// #709 (→8) merged first; this PR (#714) rebased on top and takes 9. Numbers stay
+// strictly monotonic — a pane at any intermediate version must be rejected so it
+// cold-spawns under the current contract rather than bypassing a migration. Version
+// 12 adds the session-scoped plugin-card selector snapshot to the pane contract; 13
+// adds the host CA bundle startup env a sandboxed Codex pane needs — a pane spawned
+// before it keeps its ORIGINAL environment, so it would never see SSL_CERT_FILE and
+// would keep failing TLS on UnknownIssuer with no output at all.
+// 14 pins canonical SESSION_DATA_DIR and matching managed-origin mounts on
+// Linux. Warm reattach would retain the old lexical env/mount namespace split.
+// 15 adds an inherited Linux seccomp isolation probe. Existing processes cannot
+// acquire it on warm reattach and must cold-spawn under the new contract.
+// 16 gives a Linux credential-only pane a read-WRITE relay outbox bind plus
+// BOTMUX_SEND_RELAY in its startup env. Inside that flavour `botmux send` had no
+// satisfiable authority: the inherited seccomp probe (and `--unshare-pid`) force
+// the read-isolated arm, whose data-root locator is never written on Linux AND
+// would be masked to /dev/null by this flavour's own `.dashboard-secret.*`
+// enumeration. A v15 pane carries neither the mount nor the env, so a warm
+// reattach would keep failing every send; it must cold-spawn once.
+// 17 adds BOTMUX_SEND_RELAY_SCOPE=send to the credential-only pane's wrapper env
+// (cmdDispatch routes by shape on it). A v16 pane never got it, so a warm
+// reattach would keep refusing the legacy --bot / --repo / --standby dispatch
+// forms; it must cold-spawn once.
+export const ISOLATION_PANE_MARKER_VERSION = 17;
 
-/** Versioned marker written beside a freshly spawned persistent sandbox. */
-export function isolationPaneMarkerContent(bootId: string): string {
-  return JSON.stringify({ version: ISOLATION_PANE_MARKER_VERSION, bootId });
+export type IsolationCapability = 'credential' | 'read' | 'write';
+
+const ALL_ISOLATION_CAPABILITIES: readonly IsolationCapability[] = [
+  'credential',
+  'read',
+  'write',
+] as const;
+
+function normalizeIsolationCapabilities(
+  capabilities: readonly IsolationCapability[],
+): IsolationCapability[] {
+  const requested = new Set(capabilities);
+  return ALL_ISOLATION_CAPABILITIES.filter(capability => requested.has(capability));
+}
+
+export interface IsolationPanePolicyInput {
+  readIsolation: boolean;
+  writeSandbox: boolean;
+  readDenyExtraPaths?: readonly string[];
+  writeAllowExtraPaths?: readonly string[];
+  readOnlyExtraPaths?: readonly string[];
+  readWriteExtraPaths?: readonly string[];
+  workingDir?: string;
+  homeDir?: string;
+  osUserHomeDir?: string;
+  botmuxHome?: string;
+  sessionDataDir?: string;
+  currentAppId?: string;
+  cliId?: string;
+  resolvedBin?: string;
+}
+
+/** Deterministic fingerprint of effective Darwin Seatbelt inputs that can
+ * change between worker forks while the pane survives. Arrays are normalized
+ * as sets because rule order does not change their final deny semantics. */
+export function isolationPanePolicyDigest(input: IsolationPanePolicyInput): string {
+  const normalizedExtra = (input.readDenyExtraPaths ?? [])
+    .map(normalizeIsolationPath)
+    .filter((value): value is string => !!value)
+    .sort();
+  const normalizedWriteExtra = (input.writeAllowExtraPaths ?? [])
+    .map(normalizeIsolationPath)
+    .filter((value): value is string => !!value)
+    .sort();
+  const normalizedReadOnlyExtra = (input.readOnlyExtraPaths ?? [])
+    .map(normalizeIsolationPath)
+    .filter((value): value is string => !!value)
+    .sort();
+  const normalizedReadWriteExtra = (input.readWriteExtraPaths ?? [])
+    .map(normalizeIsolationPath)
+    .filter((value): value is string => !!value)
+    .sort();
+  return createHash('sha256').update(JSON.stringify({
+    domain: 'botmux.darwin-seatbelt-policy.v7',
+    readIsolation: input.readIsolation,
+    writeSandbox: input.writeSandbox,
+    readDenyExtraPaths: normalizedExtra,
+    writeAllowExtraPaths: normalizedWriteExtra,
+    readOnlyExtraPaths: normalizedReadOnlyExtra,
+    readWriteExtraPaths: normalizedReadWriteExtra,
+    workingDir: input.workingDir ?? '',
+    homeDir: input.homeDir ?? '',
+    osUserHomeDir: input.osUserHomeDir ?? '',
+    botmuxHome: input.botmuxHome ?? '',
+    sessionDataDir: input.sessionDataDir ?? '',
+    currentAppId: input.currentAppId ?? '',
+    cliId: input.cliId ?? '',
+    resolvedBin: input.resolvedBin ?? '',
+  })).digest('hex');
+}
+
+export function isolationPaneMarkerContent(
+  bootId: string,
+  capabilities: readonly IsolationCapability[],
+  policy?: {
+    originChannelId: string;
+    readIsolation: boolean;
+    writeSandbox: boolean;
+    policyDigest: string;
+  },
+): string {
+  if (policy
+    && (!/^[a-f0-9]{64}$/.test(policy.originChannelId)
+      || !/^[a-f0-9]{64}$/.test(policy.policyDigest))) {
+    throw new Error('invalid isolation marker policy');
+  }
+  return JSON.stringify({
+    version: ISOLATION_PANE_MARKER_VERSION,
+    bootId,
+    capabilities: normalizeIsolationCapabilities(capabilities),
+    // Committed = an attributably-fresh generation was established (the proof is
+    // written PENDING before the pane exists, then rewritten committed only after
+    // spawn confirms a fresh, non-reattached generation). isolatedPaneReattachSafe
+    // refuses anything whose state is present-but-not-'committed'.
+    state: 'committed',
+    ...(policy ?? {}),
+  });
+}
+
+export function isolatedPaneOriginChannel(
+  markerContent: string | null | undefined,
+): string | undefined {
+  try {
+    const parsed = JSON.parse(markerContent ?? '') as { originChannelId?: unknown };
+    return typeof parsed.originChannelId === 'string'
+      && /^[a-f0-9]{64}$/.test(parsed.originChannelId)
+      ? parsed.originChannelId
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Directory holding per-session persistent-pane provenance files. */
+export function persistentPaneProvenanceDir(runtimeDataDir: string): string {
+  return `${runtimeDataDir.replace(/\/+$/, '')}/read-isolation`;
+}
+
+/** ISOLATION marker path (`<sid>.boot`) — stamped for a policy-ON sandboxed pane. */
+export function isolationPaneMarkerPath(runtimeDataDir: string, sessionId: string): string {
+  return `${persistentPaneProvenanceDir(runtimeDataDir)}/${assertSafeAppId(sessionId)}.boot`;
+}
+
+/** TOMBSTONE path (`<sid>.policy-off`) — positively proves a live pane was
+ *  cold-spawned by the current NO-SANDBOX policy (see
+ *  {@link evaluatePersistentPaneMigration}). Distinct filename so it survives /
+ *  is cleared independently of the isolation marker. */
+export function policyOffTombstonePath(runtimeDataDir: string, sessionId: string): string {
+  return `${persistentPaneProvenanceDir(runtimeDataDir)}/${assertSafeAppId(sessionId)}.policy-off`;
+}
+
+/** Tombstone body: a self-describing, version-stamped generation proof. Content
+ *  is diagnostic-bearing but its PRESENCE-as-valid (not equality to any live boot
+ *  id) is the reattach signal — a legitimate policy-off pane warm-reattaches
+ *  across daemon restarts, so binding to the current boot id would cold-spawn it
+ *  every restart. bootId is kept only for diagnostics.
+ *
+ *  `state:'committed'` is REQUIRED for authorization: a proof is written first as
+ *  PENDING (see {@link provenancePendingContent}) before the pane is created, and
+ *  only rewritten to committed once the fresh generation is attributably
+ *  established (see the generational-race guard in worker.ts). A pending record
+ *  never authorizes a reattach — {@link policyOffTombstoneValid} rejects it. */
+export function policyOffTombstoneContent(bootId: string): string {
+  return JSON.stringify({ version: ISOLATION_PANE_MARKER_VERSION, policyOff: true, bootId, state: 'committed' });
+}
+
+/**
+ * PENDING provenance body: written to the FINAL proof path BEFORE `backend.spawn()`
+ * for a predicted-fresh persistent launch, then rewritten to the committed body
+ * only after the fresh generation is attributably established. It carries a random
+ * `nonce` (compare-before-replace at commit time, so a superseded generation's
+ * deferred callback can't overwrite a newer pending) and, deliberately, NEITHER a
+ * committed `state` NOR the structural fields the validators require — so both
+ * {@link policyOffTombstoneValid} and {@link isolatedPaneReattachSafe} reject it
+ * outright. Its on-disk PRESENCE still drives the conservative guard: a pending
+ * file means "this system KNOWS a generation's attribution is incomplete", which
+ * is STRONGER than legacy provenance and dominates the migration scope (a live
+ * pane with a pending proof is always killed + cold-spawned; see
+ * {@link evaluatePersistentPaneMigration}).
+ */
+export function provenancePendingContent(nonce: string): string {
+  return JSON.stringify({ version: ISOLATION_PANE_MARKER_VERSION, state: 'pending', nonce });
+}
+
+/** Extract the pending nonce for the compare-before-replace at commit time.
+ *  Returns the nonce string only for a well-formed pending record read from a
+ *  secure 0600 file; null otherwise (so a garbage/committed/absent file never
+ *  matches a live launch's nonce). */
+export function provenancePendingNonce(content: string | null | undefined): string | null {
+  try {
+    const parsed = JSON.parse(content ?? '') as { state?: unknown; nonce?: unknown };
+    return parsed.state === 'pending' && typeof parsed.nonce === 'string' && parsed.nonce.length > 0
+      ? parsed.nonce
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Validate a policy-off tombstone body (already securely read from a real 0600
+ * file by the caller — see readManagedOriginAuthorityFile). Returns true only for
+ * a well-formed CURRENT-version `policyOff:true` record with a non-empty string
+ * bootId. bootId is NOT compared to the live daemon boot id (a legit policy-off
+ * pane must reattach across restarts); it only has to be present + a string, so a
+ * blank/garbage/structurally-wrong tombstone cannot authorize a warm reattach.
+ * Mirror of {@link isolatedPaneReattachSafe}'s fail-closed parse discipline, but
+ * for the opposite polarity: here VALID authorizes reattach.
+ *
+ * A `state:'pending'` record is explicitly rejected (an incomplete generation
+ * proof must never authorize). `state` is now REQUIRED to equal 'committed': the
+ * v11 version bump means every legitimate proof carries it, so a missing/other
+ * state is refused (this is what forces a pre-v11 no-state marker — possibly
+ * washed onto a late-winner pane under the old pre-spawn-write path — to
+ * cold-spawn once instead of being trusted).
+ */
+export function policyOffTombstoneValid(content: string | null | undefined): boolean {
+  try {
+    const parsed = JSON.parse(content ?? '') as {
+      version?: unknown; policyOff?: unknown; bootId?: unknown; state?: unknown;
+    };
+    return parsed.version === ISOLATION_PANE_MARKER_VERSION
+      && parsed.policyOff === true
+      && typeof parsed.bootId === 'string'
+      && parsed.bootId.trim().length > 0
+      && parsed.state === 'committed';
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -704,17 +612,438 @@ export function isolationPaneMarkerContent(bootId: string): string {
  * permissions across daemon restarts and must be cold-spawned under the new
  * profile. The boot id remains diagnostic and is not compared across restarts.
  */
-export function isolatedPaneReattachSafe(markerContent: string | null | undefined): boolean {
+export function isolatedPaneReattachSafe(
+  markerContent: string | null | undefined,
+  expected: readonly IsolationCapability[] | {
+    requiredCapabilities: readonly IsolationCapability[];
+    exactCapabilities?: boolean;
+    readIsolation?: boolean;
+    writeSandbox?: boolean;
+    requireOriginChannel?: boolean;
+    policyDigest?: string;
+  } = [],
+): boolean {
   try {
-    const parsed = JSON.parse(markerContent ?? '') as { version?: unknown; bootId?: unknown };
-    return parsed.version === ISOLATION_PANE_MARKER_VERSION
-      && typeof parsed.bootId === 'string'
-      && parsed.bootId.trim().length > 0;
+    const parsed = JSON.parse(markerContent ?? '') as {
+      version?: unknown;
+      bootId?: unknown;
+      capabilities?: unknown;
+      readIsolation?: unknown;
+      writeSandbox?: unknown;
+      originChannelId?: unknown;
+      policyDigest?: unknown;
+      state?: unknown;
+    };
+    if (parsed.version !== ISOLATION_PANE_MARKER_VERSION
+      || typeof parsed.bootId !== 'string'
+      || parsed.bootId.trim().length === 0
+      // A committed generation proof is REQUIRED. A PENDING record (written before
+      // the pane is attributably established) must never authorize; and with the
+      // v11 bump every legitimate marker carries state:'committed', so a
+      // missing/other state (e.g. a washed pre-v11 no-state marker) is refused →
+      // cold-spawn once. (Version check above already rejects pre-v11; this keeps
+      // the contract explicit and rejects a same-version pending.)
+      || parsed.state !== 'committed'
+      || !Array.isArray(parsed.capabilities)
+      || parsed.capabilities.some(capability =>
+        typeof capability !== 'string'
+        || !ALL_ISOLATION_CAPABILITIES.includes(capability as IsolationCapability))) {
+      return false;
+    }
+    const expectedPolicy = Array.isArray(expected)
+      ? undefined
+      : expected as {
+          requiredCapabilities: readonly IsolationCapability[];
+          exactCapabilities?: boolean;
+          readIsolation?: boolean;
+          writeSandbox?: boolean;
+          requireOriginChannel?: boolean;
+          policyDigest?: string;
+        };
+    const requiredCapabilities: readonly IsolationCapability[] = expectedPolicy
+      ? expectedPolicy.requiredCapabilities
+      : expected as readonly IsolationCapability[];
+    const actual = new Set(parsed.capabilities as IsolationCapability[]);
+    if (!requiredCapabilities.every(capability => actual.has(capability))) return false;
+    if (expectedPolicy?.exactCapabilities
+      && actual.size !== new Set(requiredCapabilities).size) return false;
+    if (!expectedPolicy) return true;
+    if (expectedPolicy.readIsolation !== undefined
+      && parsed.readIsolation !== expectedPolicy.readIsolation) return false;
+    if (expectedPolicy.writeSandbox !== undefined
+      && parsed.writeSandbox !== expectedPolicy.writeSandbox) return false;
+    if (expectedPolicy.policyDigest !== undefined
+      && parsed.policyDigest !== expectedPolicy.policyDigest) return false;
+    return !expectedPolicy.requireOriginChannel
+      || (typeof parsed.originChannelId === 'string'
+        && /^[a-f0-9]{64}$/.test(parsed.originChannelId));
   } catch {
     return false;
   }
 }
 
+/**
+ * Persistent-pane (tmux/zellij/herdr/zmx) reattach migration decision — the pure
+ * state machine behind the worker's stale-pane guard. Isolation is injected at
+ * CLI *spawn* time and lives on the RUNNING process, so a pane that survives a
+ * daemon restart keeps whatever confinement it was born with. This function
+ * decides, from persisted evidence + the current policy, whether the live pane
+ * may be warm-reattached or must be killed + cold-spawned under the new policy.
+ *
+ * Two provenance files live under `<runtimeDataDir>/read-isolation/`:
+ *   · `<sid>.boot`      — ISOLATION marker: written (best-effort) when a policy-ON
+ *                         (sandboxed) pane is spawned. Its capabilities/policy are
+ *                         version-checked by {@link isolatedPaneReattachSafe}.
+ *   · `<sid>.policy-off` — TOMBSTONE: written when a policy-OFF (no-sandbox) pane
+ *                         is cold-spawned, positively proving "this generation was
+ *                         created by the current no-sandbox policy".
+ *
+ * Why a tombstone and not just "no isolation marker": the isolation stamp is
+ * BEST-EFFORT (its write is wrapped in try/catch and the spawn proceeds anyway),
+ * so "no marker" does NOT prove the live process was never isolated — a sandboxed
+ * pane whose stamp write lost a race/perm/disk error looks identical. Under
+ * policy-OFF we therefore require POSITIVE, VALIDATED proof (a tombstone that
+ * passes secure-read + schema check) to warm-reattach; any other shape (isolation
+ * marker present, tombstone missing/invalid, or NEITHER file) is treated as
+ * possibly-still-confined and killed. Absence is never trusted as safe.
+ *
+ * Scope is split by policy direction:
+ *   · policy ON (file sandbox OR credential-only `credential` cap): the exact-
+ *     capability/policy check runs on EVERY persistent backend — credential-only
+ *     panes exist on zellij/herdr/zmx too, so this must NOT be tmux-scoped.
+ *   · policy OFF migration arm: scoped to `noTransport && isolationCapableBackend`
+ *     (only no-transport tmux was ever file-force-isolated by the removed rule).
+ *     An ordinary transport chat / non-tmux backend is never subjected to the
+ *     tombstone requirement — no false kills — though a DEAD pane's stale
+ *     provenance is still cleared so it cannot mislead a later decision.
+ *
+ * Existence flags MUST come from no-follow existence probes (a planted/tampered
+ * leaf that fails to parse still counts as present, so it can never be used to
+ * force a silent reattach). `policyOffTombstoneValid` is the secure-read result.
+ *
+ * Pane liveness is TRI-STATE (`paneProbe`: exists | missing | unknown), NOT a
+ * boolean. `unknown` (the backend could not answer) is never collapsed into
+ * "dead": a still-alive, still-confined pane whose probe is momentarily `unknown`
+ * would otherwise have its provenance cleared and be cold-spawned around, silently
+ * downgrading confinement. On `unknown` the machine returns
+ * `refuse-inconclusive-probe` (fail-closed) whenever anything is at stake — policy
+ * ON, in the policy-off migration scope, or ANY provenance on disk — and only
+ * `skip`s when a wholly unconcerned session (policy OFF, out of scope, no
+ * provenance) sees probe flakiness, so an ordinary chat never fails to start.
+ * Only an authoritative `missing` clears stale provenance / cold-spawns.
+ */
+export type PersistentPaneMigrationInput = {
+  /** Current-spawn isolation capabilities (empty ⇒ policy OFF this spawn). May be
+   *  non-empty on ANY persistent backend — `credential` is pushed for enrolled
+   *  hosts independent of the file sandbox, and its wrapper applies to
+   *  tmux/zellij/herdr/zmx alike. So the policy-ON capability check below is NOT
+   *  scoped to tmux. */
+  appliedIsolationCapabilities: readonly IsolationCapability[];
+  /** Backend can carry a FILE sandbox (tmux). Scopes ONLY the policy-off
+   *  no-transport migration arm (the removed force-isolation rule only ever
+   *  file-sandboxed tmux); policy-ON capability checks run on every backend. */
+  isolationCapableBackend: boolean;
+  /** apiOnly bot OR HTTP-virtual chat — the sessions the old rule force-isolated. */
+  noTransport: boolean;
+  /** `<sid>.boot` exists on disk (no-follow existence — planted/garbage counts). */
+  isolationMarkerPresent: boolean;
+  /** `<sid>.policy-off` tombstone exists on disk (no-follow existence). Triggers
+   *  CLEANUP / conservative decisions; does NOT by itself authorize a reattach. */
+  policyOffTombstonePresent: boolean;
+  /** The `<sid>.policy-off` tombstone passed secure-read + schema/version
+   *  validation ({@link policyOffTombstoneValid}). ONLY this authorizes a
+   *  policy-off warm reattach. */
+  policyOffTombstoneValid: boolean;
+  /** The persistent pane's liveness probe — TRI-STATE, NOT a boolean. `exists`
+   *  and `missing` are authoritative; `unknown` means the probe could not answer
+   *  (flaky/unavailable backend). Collapsing `unknown` into "dead" is the bug this
+   *  field prevents: a still-alive, still-confined pane whose probe is momentarily
+   *  `unknown` must never have its provenance cleared nor be cold-spawned around.
+   *  Only an authoritative `missing` proves the pane is gone. */
+  paneProbe: SessionProbe;
+  /** A PENDING provenance file (marker OR tombstone whose secure-read body parses
+   *  as `state:'pending'`) is present on disk. This is STRONGER than legacy
+   *  provenance and DOMINATES everything below: it means the system explicitly
+   *  knows a generation's fresh-attribution never completed (crash between
+   *  pending-write and commit, or a late-flip/collision that was never committed).
+   *  A pending file is evaluated FIRST, on ALL backends and BOTH policy directions,
+   *  independent of the tmux migration scope — `exists`→kill, `unknown`→refuse,
+   *  `missing`→clear. Its no-follow presence also keeps isolationMarkerPresent /
+   *  policyOffTombstonePresent true (the file exists), but the pending branch runs
+   *  before any of the committed-provenance logic. */
+  pendingProvenancePresent: boolean;
+  /**
+   * Result of {@link isolatedPaneReattachSafe}(marker, current policy) — only
+   * meaningful when policy is ON. The caller computes it (it needs the parsed
+   * marker + policy digest); passed in to keep this function pure.
+   */
+  isolationMarkerReattachSafe: boolean;
+};
+
+export type PersistentPaneMigrationDecision =
+  /** Guard does not apply (nothing to evaluate). */
+  | { action: 'skip' }
+  /** Live pane matches the current policy → keep the running process. */
+  | { action: 'reattach' }
+  /** Live pane's provenance is wrong/unknown → kill, then cold-spawn. Provenance
+   *  files are cleared ONLY AFTER the kill is confirmed (clearAfterKill). */
+  | { action: 'kill-then-cold-spawn'; clearAfterKill: boolean }
+  /** No live pane, but stale provenance files linger → clear them (verified) then
+   *  cold-spawn fresh, so a later restart doesn't misjudge the new pane. */
+  | { action: 'clear-stale-then-cold-spawn' }
+  /** The liveness probe is INCONCLUSIVE (`unknown`) in a context where acting would
+   *  be unsafe — clearing provenance the pane might still own, or cold-spawning
+   *  around a pane a later `exists` probe would warm-reattach unvalidated. The
+   *  caller MUST refuse to start rather than guess (fail-closed). Only reached when
+   *  the guard is security-concerned; an ordinary transport chat with no provenance
+   *  skips on `unknown` instead (no gratuitous start-failures on probe flakiness). */
+  | { action: 'refuse-inconclusive-probe' };
+
+/**
+ * Break the cold-machine tie for the read-isolation pre-spawn gate.
+ *
+ * After a reboot /tmp is wiped, so the tmux socket file does not exist and the
+ * liveness probe reads 'unknown' (a connection-level error is deliberately
+ * never 'missing' — #962). evaluatePersistentPaneMigration fail-closes on
+ * 'unknown', the refused session never starts a tmux server, and so every
+ * isolated session on the machine is refused until something unrelated starts
+ * one. Only here — not in the general probe that kill-verify / close / wake
+ * paths consume — an 'unknown' tmux probe is upgraded to 'missing' when the
+ * caller's cold-machine check (TmuxBackend.serverAbsentOnColdMachine) confirms the
+ * socket is gone AND no tmux process is visible. `exists` / `missing` and every
+ * non-tmux backend pass through untouched; the check is not even invoked then.
+ */
+export function resolveReadIsolationPaneProbe(
+  paneProbe: SessionProbe,
+  backendType: string,
+  serverAbsentOnColdMachine: () => boolean,
+): { probe: SessionProbe; coldServerAbsent: boolean } {
+  if (paneProbe !== 'unknown' || backendType !== 'tmux') return { probe: paneProbe, coldServerAbsent: false };
+  let absent = false;
+  try { absent = serverAbsentOnColdMachine() === true; } catch { absent = false; }
+  return absent ? { probe: 'missing', coldServerAbsent: true } : { probe: 'unknown', coldServerAbsent: false };
+}
+
+export function evaluatePersistentPaneMigration(
+  input: PersistentPaneMigrationInput,
+): PersistentPaneMigrationDecision {
+  const {
+    appliedIsolationCapabilities, isolationCapableBackend, noTransport,
+    isolationMarkerPresent, policyOffTombstonePresent, policyOffTombstoneValid: tombstoneValid,
+    paneProbe, pendingProvenancePresent, isolationMarkerReattachSafe,
+  } = input;
+  const policyOn = appliedIsolationCapabilities.length > 0;
+  const anyProvenance = isolationMarkerPresent || policyOffTombstonePresent;
+  const paneLive = paneProbe === 'exists';
+
+  // ── PENDING dominates everything (all backends, both policy directions, ANY
+  //    scope). A pending provenance file means the system EXPLICITLY knows a
+  //    generation's fresh-attribution never completed — a crash between the
+  //    pre-spawn pending-write and the post-spawn commit, or a late-flip/collision
+  //    that was never committed. This is STRONGER than legacy provenance, so it is
+  //    judged BEFORE the migration-scope logic (which would otherwise `skip` a
+  //    live pane out of the tmux scope and warm-reattach an undetermined
+  //    generation — e.g. an enrolled zellij pane whose credential policy later
+  //    flipped OFF). Only an authoritative `missing` clears it; `unknown` refuses
+  //    (never erase evidence of a possibly-live pane); `exists` kills + cold-spawns.
+  if (pendingProvenancePresent) {
+    if (paneProbe === 'exists') return { action: 'kill-then-cold-spawn', clearAfterKill: true };
+    if (paneProbe === 'unknown') return { action: 'refuse-inconclusive-probe' };
+    return { action: 'clear-stale-then-cold-spawn' }; // authoritative missing
+  }
+
+  // TRI-STATE liveness. `unknown` is NOT "dead": the backend (tmux/zellij/herdr/
+  // zmx) could not answer, so the pane may still be alive AND still confined under
+  // its original (possibly obsolete) policy. Acting on `unknown` — clearing
+  // provenance the pane might still own, or cold-spawning around it so a later
+  // `exists` probe warm-reattaches an unvalidated generation — is exactly the
+  // silent-downgrade this guard exists to prevent. We fail closed on `unknown`
+  // whenever there is anything at stake (policy ON, in the policy-off migration
+  // scope, or ANY provenance on disk); only a truly unconcerned session (policy
+  // OFF, out of scope, no provenance) skips on `unknown` so probe flakiness on an
+  // ordinary chat never blocks startup. Only an authoritative `missing` is trusted
+  // as "the pane is gone".
+  const inMigrationScope = noTransport && isolationCapableBackend;
+  const guardConcerned = policyOn || inMigrationScope || anyProvenance;
+
+  if (policyOn) {
+    // Policy ON (file sandbox OR credential-only): runs on EVERY persistent
+    // backend — credential-only panes on zellij/herdr/zmx carry a marker too, so
+    // this check must not be scoped to tmux (that would skip their capability
+    // validation and warm-reattach a stale/mismatched credential pane).
+    if (paneLive) {
+      // Only a live pane stamped under the CURRENT policy may reattach; a
+      // legacy/mismatched one is killed. (isolationMarkerReattachSafe already
+      // fail-closes on a missing/garbage marker.)
+      if (isolationMarkerReattachSafe) return { action: 'reattach' };
+      return { action: 'kill-then-cold-spawn', clearAfterKill: true };
+    }
+    // Not authoritatively alive. An `unknown` probe under policy ON must not clear
+    // a still-confined pane's marker nor cold-spawn around it — fail closed.
+    if (paneProbe === 'unknown') return { action: 'refuse-inconclusive-probe' };
+    // Authoritative `missing`: nothing to reattach. A fresh policy-on spawn
+    // re-stamps its marker, but any stale tombstone from a prior policy-off
+    // generation must be cleared first, or a later flip back to policy-off could
+    // misread it.
+    if (anyProvenance) return { action: 'clear-stale-then-cold-spawn' };
+    return { action: 'skip' };
+  }
+
+  // Policy OFF. The file-sandbox migration only ever confined no-transport tmux
+  // sessions, so the tombstone requirement is scoped to them; an ordinary chat
+  // (or a non-file-sandboxable backend) was never force-isolated and is left
+  // untouched — EXCEPT we still clear any stale provenance on a dead pane so a
+  // lingering file can't mislead a future decision.
+  if (paneLive) {
+    if (!inMigrationScope) return { action: 'skip' };
+    // Warm reattach requires POSITIVE, VALIDATED proof the live generation is a
+    // known policy-off pane: a VALID tombstone AND no isolation marker. Any other
+    // shape — isolation marker present (dominates), tombstone missing/invalid, or
+    // NEITHER file (absence never proves "was never isolated", since the isolation
+    // stamp is best-effort) — is treated as possibly-still-confined and killed.
+    const provenPolicyOffGeneration = tombstoneValid && !isolationMarkerPresent;
+    if (provenPolicyOffGeneration) return { action: 'reattach' };
+    return { action: 'kill-then-cold-spawn', clearAfterKill: true };
+  }
+
+  // Not authoritatively alive under policy OFF.
+  if (paneProbe === 'unknown') {
+    // Inconclusive. Clearing provenance now could delete the marker/tombstone of a
+    // pane that is actually still alive (and, if it predates the 放宽, still
+    // confined) — and cold-spawning would let a later `exists` probe warm-reattach
+    // that unvalidated pane. Fail closed whenever the guard is concerned; a wholly
+    // unconcerned session (out of scope, no provenance) just skips.
+    return guardConcerned ? { action: 'refuse-inconclusive-probe' } : { action: 'skip' };
+  }
+
+  // Authoritative `missing`. Clear any lingering provenance (verified) before the
+  // fresh cold-spawn regardless of scope — a stale file must never survive to
+  // mislead a later restart.
+  if (anyProvenance) return { action: 'clear-stale-then-cold-spawn' };
+  return { action: 'skip' };
+}
+
+/**
+ * Injectable side-effect seam for {@link executePersistentPaneMigration}. The
+ * worker supplies real implementations (backend kill, post-kill probe, verified
+ * provenance removal, backend re-selection); tests supply mocks to observe the
+ * ORDER of effects and the "not called" guarantees on each failure path — the
+ * part a pure truth-table cannot cover.
+ */
+export type PersistentPaneMigrationEffects = {
+  /** Kill the stale persistent pane. Throw on failure — caller must NOT proceed. */
+  killStalePane: () => void;
+  /** Probe AFTER the kill; throw (fail-closed) if termination cannot be confirmed. */
+  confirmPaneGone: () => void;
+  /** Remove BOTH provenance files, each verified-gone; throw if any cannot be
+   *  removed (fail-closed — a surviving file would mis-drive the next restart). */
+  clearProvenanceVerified: () => void;
+  /** Re-select the backend so a stale isReattach=true does not target the pane we
+   *  just destroyed. Only called after a confirmed kill + cleared provenance. */
+  reselectBackend: () => void;
+  /** Refuse to start the session because the liveness probe was inconclusive
+   *  (`unknown`) where acting would be unsafe. MUST throw — there is no safe
+   *  fall-through. */
+  refuseInconclusiveProbe: () => never;
+};
+
+/**
+ * Execute a {@link PersistentPaneMigrationDecision} with strict fail-closed
+ * ordering. Extracted from the worker so the ordering + "stop on failure"
+ * guarantees are unit-testable with injected effects:
+ *
+ *   kill-then-cold-spawn : killStalePane → confirmPaneGone → (clearAfterKill?
+ *                          clearProvenanceVerified) → reselectBackend.
+ *     Any throw from killStalePane or confirmPaneGone aborts BEFORE clearing
+ *     provenance (evidence is preserved for the retry) and BEFORE reselect. A
+ *     throw from clearProvenanceVerified aborts BEFORE reselect (never publish a
+ *     new generation while a stale proof lingers).
+ *   clear-stale-then-cold-spawn : clearProvenanceVerified only (no live pane to
+ *                          kill; a throw aborts the spawn).
+ *   refuse-inconclusive-probe : refuseInconclusiveProbe (always throws — the probe
+ *                          was `unknown` where clearing/cold-spawning is unsafe).
+ *                          NO provenance is touched and NO reselect happens.
+ *   reattach / skip : no effects.
+ *
+ * Returns the action taken so the caller can branch (e.g. set warm-reattach).
+ */
+export function executePersistentPaneMigration(
+  decision: PersistentPaneMigrationDecision,
+  effects: PersistentPaneMigrationEffects,
+): PersistentPaneMigrationDecision['action'] {
+  switch (decision.action) {
+    case 'reattach':
+    case 'skip':
+      return decision.action;
+    case 'refuse-inconclusive-probe':
+      effects.refuseInconclusiveProbe(); // always throws — no safe fall-through
+      return decision.action;
+    case 'clear-stale-then-cold-spawn':
+      effects.clearProvenanceVerified();
+      return decision.action;
+    case 'kill-then-cold-spawn':
+      effects.killStalePane();       // throws → stop (evidence preserved)
+      effects.confirmPaneGone();     // throws → stop (evidence preserved)
+      if (decision.clearAfterKill) {
+        effects.clearProvenanceVerified(); // throws → stop before reselect
+      }
+      effects.reselectBackend();
+      return decision.action;
+  }
+}
+
+/**
+ * Which kill/probe primitive a persistent-pane teardown must use, so it targets
+ * the EXACT just-launched pane and never a shared host. Pure so the worker's
+ * inline teardown and the migration effects share one behaviorally-tested policy:
+ *
+ *   · 'zmx'    — identity-verified kill against the frozen managed PID + owned probe.
+ *   · 'target' — the recorded PersistentBackendTarget (REQUIRED when one exists):
+ *                a herdr isolated/MCP agent lives as `{sessionName:'botmux',
+ *                agentName:<topic>}` on the SHARED host, so a name-only kill of
+ *                'botmux' would tear down every bot's agent. The target scopes the
+ *                kill to this agent.
+ *   · 'name'   — last-resort name-only kill, ONLY when no target was recorded
+ *                (legacy tmux/zellij that own their whole session by name).
+ */
+export type PersistentTeardownKillKind = 'zmx' | 'target' | 'name';
+export function persistentTeardownKillKind(input: {
+  backendType: string;
+  hasBackendTarget: boolean;
+}): PersistentTeardownKillKind {
+  if (input.backendType === 'zmx') return 'zmx';
+  if (input.hasBackendTarget) return 'target';
+  return 'name';
+}
+
 function dedupe(xs: string[]): string[] {
   return Array.from(new Set(xs));
+}
+
+/**
+ * True when this process is a CLI the worker spawned for a bot under READ
+ * ISOLATION (the sandbox), where `~/.botmux/bots.json` is denied ON PURPOSE (it
+ * holds every sibling bot's app secret). Callers use it to tell that EXPECTED
+ * denial apart from a genuine unreadable-config fault.
+ *
+ * The signal is `BOTMUX_READ_ISOLATION`, which the worker sets (and otherwise
+ * explicitly DELETES) on the child env, gated on `sandboxRequested`. It has to
+ * come from the host; two CLI-side guesses were tried and are both wrong:
+ *
+ *   · `SESSION_DATA_DIR` + `BOTMUX_LARK_APP_ID` — injected for EVERY
+ *     worker-spawned CLI, sandboxed or not. Matches ordinary bots, so a real
+ *     "bots.json is unreadable" fault would be silently downgraded to "there are
+ *     no bots" on a normal host.
+ *   · existence of `<BOT_HOME>/send-cred.json` — wrong in BOTH directions: a
+ *     no-transport (apiOnly) bot has its own copy denied by fs-policy
+ *     (`push([`${ctx.botHome}/send-cred.json`], 'deny', 'mandatory')` in the
+ *     `!larkTransport` branch), so a genuinely sandboxed bot reads as
+ *     not-isolated; and the file is never cleaned up, so flipping a bot from
+ *     `sandbox: true` back to `false` leaves a stale one behind that makes an
+ *     ordinary CLI look isolated.
+ *
+ * (Both caught in review, 2026-08-03. Do not "simplify" this back to either.)
+ */
+export function underReadIsolation(): boolean {
+  return process.env.BOTMUX_READ_ISOLATION === '1';
 }

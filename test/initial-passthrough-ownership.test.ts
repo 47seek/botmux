@@ -30,7 +30,9 @@ function fnRegion(name: string, span = 6000): string {
 }
 
 describe('startInitialPassthroughSession ownership', () => {
-  const region = fnRegion('startInitialPassthroughSession');
+  // span widened past the default: the fn body grew (per-turn participant
+  // window build) and the registration-loser handoff sits ~6.1k chars in.
+  const region = fnRegion('startInitialPassthroughSession', 8000);
 
   it('never falls back from an explicit undefined owner to the sender', () => {
     expect(region).not.toContain('ownerOpenId ??');
@@ -51,12 +53,38 @@ describe('startInitialPassthroughSession ownership', () => {
     expect(region).toContain('session.ownerUnionId = ownerUnionId;');
     expect(region).toContain('session.creatorOpenId = creatorOpenId;');
   });
+
+  it('hands a registration loser to the current canonical owner via the ownership claim', () => {
+    // PR #597's ownership backbone: startInitialPassthroughSession claims the
+    // routing key through claimNewDaemonSession (compare-and-set). On loss to an
+    // existing owner it routes the inbound to that canonical owner instead of
+    // silently dropping it — the same intent master expressed via
+    // rollbackRejectedSessionAndGetWinner, now expressed through the claim +
+    // routeToCanonicalOwner callback.
+    expect(region).toContain('claimNewDaemonSession(activeSessions, ds)');
+    expect(region).toContain("registration.reason === 'existing_owner'");
+    expect(region).toContain('activeSessions.get(registration.key) === registration.owner');
+    expect(region).toContain('await routeToCanonicalOwner();');
+  });
+});
+
+describe('startInitialPassthroughSession substitute marking', () => {
+  it('carries quoteOnly / substitute onto the reply target like every other inbound path', () => {
+    // Regression: `substitute` was destructured but never read, so a
+    // substitute-triggered cold-start passthrough lost its chat-scope
+    // quote-reply / footer substitute addressing.
+    const region = fnRegion('startInitialPassthroughSession', 14000);
+    const call = region.slice(region.indexOf('beginReplyTargetTurn(ds, replyRootId, messageId'));
+    expect(call.slice(0, 400)).toMatch(/quoteOnly: substituteReplyMode === 'quote', substitute,/);
+    expect(region).toMatch(/const substituteReplyMode = substitute\s*\?/);
+  });
 });
 
 describe('startInitialPassthroughSession call sites', () => {
   it('thread-reply injection keeps the foreign-bot guard on owner fields', () => {
-    expect(src).toContain('ownerOpenId: isForeignBot ? undefined : threadSenderOpenId');
-    expect(src).toMatch(/ownerUnionId: isForeignBot \? undefined :/);
+    // thread 执行段（executeThreadSlash）里的字段名已与新话题入口对齐：isForeignBotSender / senderOpenId。
+    expect(src).toContain('ownerOpenId: isForeignBotSender ? undefined : senderOpenId');
+    expect(src).toMatch(/ownerUnionId: isForeignBotSender \? undefined :/);
   });
 
   it('every call site passes ownership explicitly', () => {
@@ -66,8 +94,42 @@ describe('startInitialPassthroughSession call sites', () => {
     expect(calls.length).toBeGreaterThanOrEqual(2);
     for (const call of calls) {
       const body = call.slice(0, call.indexOf('});'));
+      expect(body).toContain('cmd,');
       expect(body).toContain('ownerOpenId:');
       expect(body).toContain('creatorOpenId:');
     }
+  });
+});
+
+describe('registration loser command handoff', () => {
+  it('routes new-topic and thread daemon commands through the ownership claim', () => {
+    // Both the new-topic and thread daemon-command paths claim the routing key
+    // through claimNewDaemonSession(activeSessions, cmdDs). On loss to an
+    // existing owner they still deliver the command (handleCommand) so the
+    // inbound reaches the canonical session — PR #597's ownership backbone
+    // replacing master's rollbackRejectedSessionAndGetWinner here.
+    const claimCalls = src.split('claimNewDaemonSession(activeSessions, cmdDs)').length - 1;
+    expect(claimCalls).toBeGreaterThanOrEqual(2);
+    // 执行段搬进 executeNewTopicSlash / executeThreadSlash 之后用 true 表示「已处理」，入口据此 return。
+    expect(src).toContain("if (registration.reason !== 'existing_owner') return true;");
+    expect(src).toContain(
+      'await handleCommand(cmd, anchor, { ...parsed, content: commandContent }, invocationDeps, larkAppId)',
+    );
+    expect(src).toContain(
+      'await handleCommand(cmd, anchor, cmdMessage, invocationDeps, larkAppId)',
+    );
+  });
+
+  it('prepared message handoff skips duplicate resolve, identity-learning, and hook effects', () => {
+    const start = src.indexOf('async function handleThreadReply(');
+    const end = src.indexOf('/**\n * 文档评论入口', start);
+    expect(start).toBeGreaterThanOrEqual(0);
+    expect(end).toBeGreaterThan(start);
+    const region = src.slice(start, end);
+    // prepared 重投与级联推迟重入（replay 快照）都不再重新解析。replay 不是 prepared，配额与下载仍重过。
+    expect(region).toContain('if (!prepared && !replay) await resolveNonsupportMessage(data, larkAppId);');
+    // runtime 级联正文重入（cascadeBodyReentry）与 Completion Proposal 合成续跑同样跳过这两处一次性副作用。
+    expect(region).toContain('if (!prepared && !ctx.cascadeBodyReentry && !ctx.completionProposalContinuation) learnFromMentions(larkAppId, parsed.mentions);');
+    expect(region).toMatch(/if \(!prepared && !ctx\.cascadeBodyReentry && !ctx\.completionProposalContinuation\) \{[\s\S]*emitHookEvent\('thread\.reply'/);
   });
 });

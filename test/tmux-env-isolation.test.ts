@@ -22,7 +22,13 @@ import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { probeTmuxFunctional, scrubTmuxServerGlobalEnv, tmuxEnv } from '../src/setup/ensure-tmux.js';
-import { BOTMUX_INJECTED_ENV_KEYS, REDACTED_CHILD_ENV_KEYS, isBotmuxManagedTmuxEnvKey } from '../src/utils/child-env.js';
+import {
+  BOTMUX_INJECTED_ENV_KEYS,
+  PROXY_ENV_KEYS,
+  REDACTED_CHILD_ENV_KEYS,
+  isBotmuxManagedTmuxEnvKey,
+  isBotmuxManagedTmuxServerGlobalEnvKey,
+} from '../src/utils/child-env.js';
 
 describe('tmuxEnv()', () => {
   it('strips TMUX and TMUX_PANE from the env', () => {
@@ -57,6 +63,8 @@ describe('tmuxEnv()', () => {
       BOTMUX: '1',
       BOTMUX_SESSION_ID: '190222fc-bc5f-4481-849b-6161901b8506',
       BOTMUX_CHAT_ID: 'oc_abc',
+      BOTMUX_MCP_GATEWAY_SOCKET: '/tmp/botmux-mcp/session/gateway.sock',
+      BOTMUX_MCP_GATEWAY_REQUIRED: '1',
       BOTMUX_LARK_APP_ID: 'cli_x',
       BOTMUX_ROOT_MESSAGE_ID: 'om_x',
       BOTMUX_BOT_INDEX: '12',           // daemon-internal, swept by the BOTMUX prefix
@@ -74,6 +82,13 @@ describe('tmuxEnv()', () => {
       LARK_APP_ID: 'cli_bot',           // bare creds must not seed the global either
       LARK_APP_SECRET: 'secret',
       CLAUDECODE: '1',
+      // Claude session markers: seeded into the server global they flip
+      // transcript saving OFF in every pane's CLI (CLAUDE_CODE_CHILD_SESSION).
+      CLAUDE_CODE_CHILD_SESSION: '1',
+      CLAUDE_CODE_SESSION_ID: 'e48f97c3-dead-dead-dead-parent-session',
+      CLAUDE_CODE_ENTRYPOINT: 'cli',
+      CLAUDE_CODE_EXECPATH: '/stale/claude.exe',
+      CLAUDE_PID: '41028',
       // Legit passthrough — the tmux client still needs these.
       PATH: '/usr/bin',
       HOME: '/root',
@@ -82,12 +97,15 @@ describe('tmuxEnv()', () => {
     });
     for (const leaked of [
       'BOTMUX', 'BOTMUX_SESSION_ID', 'BOTMUX_CHAT_ID', 'BOTMUX_LARK_APP_ID',
+      'BOTMUX_MCP_GATEWAY_SOCKET', 'BOTMUX_MCP_GATEWAY_REQUIRED',
       'BOTMUX_ROOT_MESSAGE_ID', 'BOTMUX_BOT_INDEX', 'BOTMUX_QUIET_RESTART',
       'SESSION_DATA_DIR', 'IS_SANDBOX', 'CLAUDE_CONFIG_DIR', '__OWNER_OPEN_ID',
       'CODEX_HOME', 'HERMES_HOME', 'HERMES_BOTMUX_SOURCE_HOME',
       'HERMES_BOTMUX_PROFILES_ROOT', 'CLAUDE_CODE_RESUME_TOKEN_THRESHOLD',
       'CJADK_INTERACTIVE',
       'LARK_APP_ID', 'LARK_APP_SECRET', 'CLAUDECODE',
+      'CLAUDE_CODE_CHILD_SESSION', 'CLAUDE_CODE_SESSION_ID',
+      'CLAUDE_CODE_ENTRYPOINT', 'CLAUDE_CODE_EXECPATH', 'CLAUDE_PID',
     ]) {
       expect(stripped[leaked]).toBeUndefined();
     }
@@ -108,6 +126,53 @@ describe('tmuxEnv()', () => {
   it('classifies every per-pane and redacted key as tmux-managed', () => {
     for (const key of [...BOTMUX_INJECTED_ENV_KEYS, ...REDACTED_CHILD_ENV_KEYS]) {
       expect(isBotmuxManagedTmuxEnvKey(key), key).toBe(true);
+    }
+  });
+
+  it('strips SSL_CERT_FILE from the tmux CLIENT env but never from the server global env', () => {
+    // Client-side strip: a daemon-side CA bundle must not be seeded into the
+    // shared server's global table. Server-global scrub: must NOT include it,
+    // or daemon startup would delete a CA bundle the user set on their own tmux
+    // server — for every CLI, on every platform (same rule as the proxy keys).
+    expect(isBotmuxManagedTmuxEnvKey('SSL_CERT_FILE')).toBe(true);
+    expect(isBotmuxManagedTmuxServerGlobalEnvKey('SSL_CERT_FILE')).toBe(false);
+    for (const key of PROXY_ENV_KEYS) {
+      expect(isBotmuxManagedTmuxEnvKey(key), key).toBe(true);
+      expect(isBotmuxManagedTmuxServerGlobalEnvKey(key), key).toBe(false);
+    }
+  });
+
+  it('does not classify GitHub tokens as botmux-owned tmux server-global keys', () => {
+    expect(isBotmuxManagedTmuxServerGlobalEnvKey('GITHUB_TOKEN')).toBe(false);
+    expect(isBotmuxManagedTmuxServerGlobalEnvKey('GH_TOKEN')).toBe(false);
+    for (const key of [
+      'BOTMUX_SESSION_ID', 'LARK_APP_ID', 'LARK_APP_SECRET', 'CLAUDECODE',
+      // Claude session markers ARE repairable out of a running server: in a
+      // GLOBAL env table they can only be stale (seeded by whatever process
+      // booted the server), unlike a user's general-purpose tokens.
+      'CLAUDE_CODE_CHILD_SESSION', 'CLAUDE_CODE_SESSION_ID',
+      'CLAUDE_CODE_ENTRYPOINT', 'CLAUDE_CODE_EXECPATH', 'CLAUDE_PID',
+    ]) {
+      expect(isBotmuxManagedTmuxServerGlobalEnvKey(key), key).toBe(true);
+    }
+  });
+
+  it('classifies every proxy key as tmux client-managed (stripped by tmuxEnv)', () => {
+    // PROXY_ENV_KEYS are in TMUX_CLIENT_STRIP_KEYS so botmux never seeds the
+    // shared tmux server's global env with daemon-side proxy (which may carry
+    // embedded credentials) and leaks it to the user's own interactive panes.
+    for (const key of PROXY_ENV_KEYS) {
+      expect(isBotmuxManagedTmuxEnvKey(key), key).toBe(true);
+    }
+  });
+
+  it('does not classify proxy keys as botmux-owned tmux server-global keys', () => {
+    // PROXY_ENV_KEYS are deliberately NOT in TMUX_SERVER_GLOBAL_SCRUB_KEYS:
+    // scrubTmuxServerGlobalEnv must not delete proxy config the user set on
+    // their own tmux server. Per-pane injection reads opts.env directly, so
+    // the client-side strip above doesn't affect botmux's own sessions.
+    for (const key of PROXY_ENV_KEYS) {
+      expect(isBotmuxManagedTmuxServerGlobalEnvKey(key), key).toBe(false);
     }
   });
 
@@ -252,6 +317,14 @@ describe('tmux subcommand with stale $TMUX', () => {
         CODEX_HOME: '/stale/codex',
         HERMES_HOME: '/stale/hermes',
         LARK_APP_ID: 'stale-app',
+        GITHUB_TOKEN: 'ghp_server_global',
+        GH_TOKEN: 'ghs_server_global',
+        // The 2026-07 incident shape: a tmux server born from a daemon that was
+        // pm2-restarted inside a Claude session carries the issuing session's
+        // markers in its global env, and every pane's CLI stops saving
+        // transcripts (CLAUDE_CODE_CHILD_SESSION → nested-child mode).
+        CLAUDE_CODE_CHILD_SESSION: '1',
+        CLAUDE_CODE_SESSION_ID: 'stale-claude-session',
         HOME: '/safe/home',
       };
       delete pollutedEnv.TMUX;
@@ -271,16 +344,28 @@ describe('tmux subcommand with stale $TMUX', () => {
         expect(scrub.failed).toEqual([]);
         expect(scrub.removed).toEqual(expect.arrayContaining([
           'BOTMUX_SESSION_ID', 'BOTMUX_CHAT_ID', 'CODEX_HOME', 'HERMES_HOME', 'LARK_APP_ID',
+          'CLAUDE_CODE_CHILD_SESSION', 'CLAUDE_CODE_SESSION_ID',
         ]));
+        expect(scrub.removed).not.toContain('GITHUB_TOKEN');
+        expect(scrub.removed).not.toContain('GH_TOKEN');
 
         const globalEnv = spawnSync('tmux', ['-L', sock, 'show-environment', '-g'], {
           env: tmuxEnv(), encoding: 'utf-8', timeout: 5000,
         });
         expect(globalEnv.status, globalEnv.stderr).toBe(0);
         expect(globalEnv.stdout).toContain('HOME=/safe/home');
-        for (const key of ['BOTMUX_SESSION_ID', 'BOTMUX_CHAT_ID', 'CODEX_HOME', 'HERMES_HOME', 'LARK_APP_ID']) {
+        expect(globalEnv.stdout).toContain('GITHUB_TOKEN=ghp_server_global');
+        expect(globalEnv.stdout).toContain('GH_TOKEN=ghs_server_global');
+        for (const key of [
+          'BOTMUX_SESSION_ID', 'BOTMUX_CHAT_ID', 'CODEX_HOME', 'HERMES_HOME', 'LARK_APP_ID',
+          'CLAUDE_CODE_CHILD_SESSION', 'CLAUDE_CODE_SESSION_ID',
+        ]) {
           expect(globalEnv.stdout).not.toMatch(new RegExp(`(?:^|\\n)-?${key}(?:=|\\n|$)`));
         }
+
+        const strippedClientEnv = tmuxEnv(pollutedEnv);
+        expect(strippedClientEnv.GITHUB_TOKEN).toBeUndefined();
+        expect(strippedClientEnv.GH_TOKEN).toBeUndefined();
 
         // The holder existed before the global-table repair, so its process
         // environment remains untouched.
@@ -293,6 +378,7 @@ describe('tmux subcommand with stale $TMUX', () => {
         const existingEnv = readFileSync(existingOut, 'utf-8').split('\n');
         expect(existingEnv).toContain('BOTMUX_SESSION_ID=stale-session');
         expect(existingEnv).toContain('CODEX_HOME=/stale/codex');
+        expect(existingEnv).toContain('CLAUDE_CODE_CHILD_SESSION=1');
 
         // A raw pane created after the scrub no longer inherits any stale key.
         const fresh = spawnSync('tmux', [
@@ -306,7 +392,10 @@ describe('tmux subcommand with stale $TMUX', () => {
           env: tmuxEnv(), timeout: 5000,
         }).status).toBe(0);
         const freshEnv = readFileSync(freshOut, 'utf-8').split('\n');
-        for (const key of ['BOTMUX_SESSION_ID', 'BOTMUX_CHAT_ID', 'CODEX_HOME', 'HERMES_HOME', 'LARK_APP_ID']) {
+        for (const key of [
+          'BOTMUX_SESSION_ID', 'BOTMUX_CHAT_ID', 'CODEX_HOME', 'HERMES_HOME', 'LARK_APP_ID',
+          'CLAUDE_CODE_CHILD_SESSION', 'CLAUDE_CODE_SESSION_ID',
+        ]) {
           expect(freshEnv.some(line => line.startsWith(`${key}=`)), key).toBe(false);
         }
         expect(freshEnv).toContain('HOME=/safe/home');

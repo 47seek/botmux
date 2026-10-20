@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import {
   buildBotFromAddFlags,
@@ -5,12 +6,14 @@ import {
   isScriptedSetupInvocation,
   maskAppSecret,
   parseSetupCommand,
+  SETUP_CLI_USAGE,
+  cliSelectionKeys,
 } from '../src/setup/setup-args.js';
 import { applyBotConfigEdits } from '../src/setup/bot-config-editor.js';
 
 describe('isScriptedSetupInvocation', () => {
   it('recognizes scripted subcommands and help aliases', () => {
-    for (const first of ['list', 'add', 'edit', 'remove', 'help', '--help', '-h']) {
+    for (const first of ['list', 'add', 'configure', 'edit', 'remove', 'help', '--help', '-h']) {
       expect(isScriptedSetupInvocation([first])).toBe(true);
     }
   });
@@ -23,6 +26,13 @@ describe('isScriptedSetupInvocation', () => {
 
   it('routes unknown bare words to the scripted parser instead of hanging the TUI', () => {
     expect(isScriptedSetupInvocation(['frobnicate'])).toBe(true);
+  });
+});
+
+describe('SETUP_CLI_USAGE', () => {
+  it('warns Agents that open_id is app-scoped and must not be copied across Bots', () => {
+    expect(SETUP_CLI_USAGE).toContain('ou_xxx 仅限已有目标应用自身');
+    expect(SETUP_CLI_USAGE).toContain('勿跨 Bot 复制');
   });
 });
 
@@ -68,6 +78,32 @@ describe('parseSetupCommand', () => {
     });
   });
 
+  it('parses --cli-runtime as an add/edit field without changing legacy flags', () => {
+    const runtime = JSON.stringify({
+      id: 'vendor-codex',
+      displayName: 'VendorCodex',
+      executable: 'vendor-codex',
+      update: { provider: 'auto' },
+    });
+    expect(parseSetupCommand(['add', '--cli', 'codex', '--cli-runtime', runtime])).toMatchObject({
+      action: 'add',
+      flags: { cli: 'codex', cliRuntime: runtime },
+    });
+    expect(parseSetupCommand(['edit', 'botmux-0', '--cli-runtime=-'])).toMatchObject({
+      action: 'edit',
+      selector: 'botmux-0',
+      flags: { cliRuntime: '-' },
+    });
+  });
+
+  it('parses --lang flag', () => {
+    const res = parseSetupCommand(['add', '--app-id', 'cli_123', '--lang', 'en']);
+    expect(res).toMatchObject({
+      action: 'add',
+      flags: { lang: 'en' },
+    });
+  });
+
   it('parses --open-platform-auto with last-one-wins against --no-open-platform-auto', () => {
     const on = parseSetupCommand(['add', '--open-platform-auto']);
     expect(on).toMatchObject({ action: 'add', openPlatformAuto: true });
@@ -104,13 +140,32 @@ describe('parseSetupCommand', () => {
     });
     expect(() => parseSetupCommand(['add', '--switch-account'])).toThrow(/必须与 add --create-app/);
     expect(() => parseSetupCommand(['add', '--create-app', '--compatibility-mode', '--switch-account'])).toThrow(/不适用于 SDK 兼容模式/);
-    expect(() => parseSetupCommand(['list', '--switch-account'])).toThrow(/仅适用于 add --create-app/);
-    expect(() => parseSetupCommand(['edit', 'botmux-0', '--switch-account'])).toThrow(/仅适用于 add --create-app/);
+    expect(() => parseSetupCommand(['list', '--switch-account'])).toThrow(/add --create-app 或 configure/);
+    expect(() => parseSetupCommand(['edit', 'botmux-0', '--switch-account'])).toThrow(/add --create-app 或 configure/);
   });
 
   it('rejects ambiguous create-app credential combinations and app-name without creation', () => {
     expect(() => parseSetupCommand(['add', '--create-app', '--app-id', 'cli_x'])).toThrow(/不能与 --app-id/);
     expect(() => parseSetupCommand(['add', '--app-name', 'Bot'])).toThrow(/必须与 add --create-app/);
+  });
+
+  it('parses configure as a stable retry entry and rejects unrelated flags', () => {
+    expect(parseSetupCommand(['configure', 'botmux-1', '--json'])).toEqual({
+      action: 'configure',
+      selector: 'botmux-1',
+      json: true,
+      switchAccount: false,
+    });
+    expect(parseSetupCommand(['configure', 'cli_x', '--switch-account'])).toEqual({
+      action: 'configure',
+      selector: 'cli_x',
+      json: false,
+      switchAccount: true,
+    });
+    expect(() => parseSetupCommand(['configure'])).toThrow(/需要指定机器人/);
+    expect(() => parseSetupCommand(['configure', 'a', 'b'])).toThrow(/只接受一个机器人标识/);
+    expect(() => parseSetupCommand(['configure', 'botmux-1', '--cli', 'codex'])).toThrow(/不接受字段参数/);
+    expect(() => parseSetupCommand(['configure', 'botmux-1', '--open-platform-auto'])).toThrow(/只接受机器人标识、--switch-account 和 --json/);
   });
 
   it('accepts "-" as a clear value but treats a following --flag as a missing value', () => {
@@ -169,6 +224,71 @@ describe('buildBotFromAddFlags', () => {
     expect(bot.wrapperCli).toBe('aiden x claude');
   });
 
+  it('accepts the documented traecli command name as TRAE CLI 2.0', () => {
+    expect(cliSelectionKeys()).toContain('traecli');
+    expect(SETUP_CLI_USAGE).toContain('traecli 映射到 TRAE CLI 2.0');
+    expect(buildBotFromAddFlags({ ...REQUIRED, cli: 'traecli' })).toMatchObject({
+      cliId: 'traex',
+    });
+    expect(editInputFromFlags({ cli: 'traecli' })).toEqual({
+      cliChoice: 'traex',
+      wrapperCli: null,
+      cliLaunchMode: null,
+      cliRuntime: null,
+    });
+  });
+
+  it('builds Forge x TraeX as TraeX plus a first-class launch mode', () => {
+    const bot = buildBotFromAddFlags({ ...REQUIRED, cli: 'forge-x-traex' });
+    expect(bot.cliId).toBe('traex');
+    expect(bot.cliLaunchMode).toBe('forge-traex');
+    expect(bot.wrapperCli).toBeUndefined();
+  });
+
+  it('rejects combining Forge x TraeX with an explicit wrapper in add', () => {
+    expect(() => buildBotFromAddFlags({
+      ...REQUIRED,
+      cli: 'forge-x-traex',
+      wrapperCli: 'aiden x traex',
+    })).toThrow(/不能与 --wrapper-cli 同时使用/);
+  });
+
+  it('builds a Codex-compatible runtime from --cli-runtime JSON', () => {
+    const runtime = JSON.stringify({
+      id: 'vendor-codex',
+      displayName: 'VendorCodex',
+      executable: 'vendor-codex',
+      update: { provider: 'auto' },
+    });
+    const bot = buildBotFromAddFlags({ ...REQUIRED, cli: 'codex', cliRuntime: runtime });
+    expect(bot.cliRuntime).toMatchObject({
+      id: 'vendor-codex',
+      displayName: 'VendorCodex',
+      executable: 'vendor-codex',
+      update: { provider: 'auto' },
+    });
+    expect(bot.cliPathOverride).toBe('vendor-codex');
+  });
+
+  it('rejects malformed --cli-runtime JSON and invalid runtime structure', () => {
+    expect(() => buildBotFromAddFlags({ ...REQUIRED, cli: 'codex', cliRuntime: '{bad' }))
+      .toThrow(/--cli-runtime 不是合法 JSON/);
+    expect(() => buildBotFromAddFlags({ ...REQUIRED, cli: 'codex', cliRuntime: '{"id":"vendor-codex"}' }))
+      .toThrow(/cliRuntime|executable/);
+  });
+
+  it('keeps path-only setup backwards-compatible but rejects two executable sources', () => {
+    const runtime = JSON.stringify({ id: 'vendor-codex', executable: 'vendor-codex', update: { provider: 'none' } });
+    expect(buildBotFromAddFlags({ ...REQUIRED, cli: 'codex', cliPath: '/opt/legacy/codex' }))
+      .toMatchObject({ cliId: 'codex', cliPathOverride: '/opt/legacy/codex' });
+    expect(() => buildBotFromAddFlags({
+      ...REQUIRED,
+      cli: 'codex',
+      cliRuntime: runtime,
+      cliPath: '/opt/legacy/codex',
+    })).toThrow(/cliRuntime conflicts with cliPathOverride/);
+  });
+
   it('lets an explicit --wrapper-cli override the --cli derived prefix, and "-" clear it', () => {
     const overridden = buildBotFromAddFlags({ ...REQUIRED, cli: 'aiden-x-claude', wrapperCli: 'ccr code' });
     expect(overridden.wrapperCli).toBe('ccr code');
@@ -206,6 +326,11 @@ describe('buildBotFromAddFlags', () => {
     expect(buildBotFromAddFlags({ ...REQUIRED, showInTeam: 'false' }).showInTeam).toBe(false);
     expect(buildBotFromAddFlags({ ...REQUIRED, showInTeam: 'true' }).showInTeam).toBeUndefined();
   });
+
+  it('stores lang when specified', () => {
+    expect(buildBotFromAddFlags({ ...REQUIRED, lang: 'en' }).lang).toBe('en');
+    expect(buildBotFromAddFlags({ ...REQUIRED, lang: 'zh' }).lang).toBe('zh');
+  });
 });
 
 describe('editInputFromFlags', () => {
@@ -221,11 +346,31 @@ describe('editInputFromFlags', () => {
     });
   });
 
+  it('maps lang and handles clear', () => {
+    expect(editInputFromFlags({ lang: 'en' })).toEqual({ lang: 'en' });
+    expect(editInputFromFlags({ lang: '-' })).toEqual({ lang: '-' });
+    const bot = applyBotConfigEdits({ larkAppId: 'cli_1', larkAppSecret: 'sec', allowedUsers: ['a@b.com'], lang: 'en' }, { lang: '-' });
+    expect(bot.lang).toBeUndefined();
+  });
+
   it('clears wrapperCli when switching to a plain cli, keeps it for gateway keys', () => {
-    expect(editInputFromFlags({ cli: 'codex' })).toEqual({ cliChoice: 'codex', wrapperCli: null });
+    expect(editInputFromFlags({ cli: 'codex' })).toEqual({
+      cliChoice: 'codex',
+      wrapperCli: null,
+      cliLaunchMode: null,
+      cliRuntime: null,
+    });
     expect(editInputFromFlags({ cli: 'ttadk-x-codex' })).toEqual({
       cliChoice: 'codex',
       wrapperCli: 'ttadk codex',
+      cliLaunchMode: null,
+      cliRuntime: null,
+    });
+    expect(editInputFromFlags({ cli: 'forge-x-traex' })).toEqual({
+      cliChoice: 'traex',
+      wrapperCli: null,
+      cliLaunchMode: 'forge-traex',
+      cliRuntime: null,
     });
   });
 
@@ -233,12 +378,103 @@ describe('editInputFromFlags', () => {
     expect(editInputFromFlags({ cli: 'codex', wrapperCli: 'cjadk codex' })).toEqual({
       cliChoice: 'codex',
       wrapperCli: 'cjadk codex',
+      cliLaunchMode: null,
+      cliRuntime: null,
     });
+  });
+
+  it('rejects combining Forge x TraeX with an explicit wrapper in edit', () => {
+    expect(() => editInputFromFlags({
+      cli: 'forge-x-traex',
+      wrapperCli: 'aiden x traex',
+    })).toThrow(/不能与 --wrapper-cli 同时使用/);
   });
 
   it('passes tri-state clears through and rejects brand on edit', () => {
     expect(editInputFromFlags({ defaultWorkingDir: '-' })).toEqual({ defaultWorkingDir: '-' });
     expect(() => editInputFromFlags({ brand: 'lark' })).toThrow(/--brand 仅在 add 时可指定/);
+  });
+
+  it('maps --cli-runtime JSON and clear into the editor tri-state', () => {
+    const runtime = JSON.stringify({
+      id: 'vendor-codex',
+      executable: 'vendor-codex',
+      update: { provider: 'none' },
+    });
+    expect(editInputFromFlags({ cliRuntime: runtime })).toEqual({
+      cliRuntime: {
+        id: 'vendor-codex',
+        executable: 'vendor-codex',
+        update: { provider: 'none' },
+      },
+    });
+    expect(editInputFromFlags({ cliRuntime: '-' })).toEqual({ cliRuntime: null });
+  });
+
+  it('clears a stored runtime when an edit switches to a non-Codex CLI', () => {
+    const base = {
+      larkAppId: 'cli_x',
+      larkAppSecret: 's',
+      cliId: 'codex',
+      cliRuntime: {
+        id: 'vendor-codex',
+        executable: 'vendor-codex',
+        update: { provider: 'none' },
+      },
+    };
+    const updated = applyBotConfigEdits(base, editInputFromFlags({ cli: 'claude-code' }));
+    expect(updated.cliId).toBe('claude-code');
+    expect(updated.cliRuntime).toBeUndefined();
+    expect(updated.cliPathOverride).toBeUndefined();
+  });
+
+  it('clears a stored Forge launch mode when an edit switches back to plain TraeX', () => {
+    const base = {
+      larkAppId: 'cli_x',
+      larkAppSecret: 's',
+      cliId: 'traex',
+      cliLaunchMode: 'forge-traex' as const,
+    };
+    const updated = applyBotConfigEdits(base, editInputFromFlags({ cli: 'traex' }));
+    expect(updated.cliId).toBe('traex');
+    expect(updated.cliLaunchMode).toBeUndefined();
+  });
+
+  it('clears a stale legacy cliPathOverride when switching to Forge x TraeX', () => {
+    const base = {
+      larkAppId: 'cli_x',
+      larkAppSecret: 's',
+      cliId: 'traex',
+      cliPathOverride: '/opt/legacy/traex',
+    };
+    const updated = applyBotConfigEdits(base, editInputFromFlags({ cli: 'forge-x-traex' }));
+    expect(updated.cliId).toBe('traex');
+    expect(updated.cliLaunchMode).toBe('forge-traex');
+    expect(updated.cliPathOverride).toBeUndefined();
+  });
+});
+
+describe('interactive setup edit launch mode wiring', () => {
+  it('preserves and writes cliLaunchMode through the CLI picker path', () => {
+    const source = readFileSync(new URL('../src/cli.ts', import.meta.url), 'utf8');
+    const start = source.indexOf('const currentKey = selectionKeyForBot');
+    const end = source.indexOf('// selKey 为 null', start);
+    const pickerBlock = source.slice(start, end);
+
+    expect(pickerBlock).toContain("selectionKeyForBot(bot.cliId ?? 'claude-code', bot.wrapperCli, bot.cliLaunchMode)");
+    expect(pickerBlock).toContain('input.cliLaunchMode = sel.cliLaunchMode ?? null;');
+    expect(pickerBlock).toContain('input.cliRuntime = null;');
+  });
+
+  it('treats cliLaunchMode as a scripted setup edit launch change', () => {
+    const source = readFileSync(new URL('../src/cli.ts', import.meta.url), 'utf8');
+    const start = source.indexOf('const agentLaunchChanged = hasAgentLaunchConfigChanged');
+    const end = source.indexOf('// Missing Agent dependencies', start);
+    const changeBlock = source.slice(start, end);
+
+    expect(start).toBeGreaterThanOrEqual(0);
+    expect(changeBlock).toContain('cliLaunchMode: original.cliLaunchMode');
+    expect(changeBlock).toContain('cliLaunchMode: edited.cliLaunchMode');
   });
 });
 

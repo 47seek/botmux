@@ -3,7 +3,21 @@
  * Run: pnpm vitest run test/grant-pending.test.ts
  */
 import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
-import { openPending, checkNonce, clearPending, markDenied, isThrottled, _resetForTest, _tableSizeForTest } from '../src/im/lark/grant-pending.js';
+import {
+  openPending,
+  checkNonce,
+  clearPending,
+  getPendingGrantLimits,
+  markDenied,
+  isThrottled,
+  updatePendingGrantLimits,
+  tryReserveOwnerDmSlot,
+  releaseOwnerDmSlot,
+  OWNER_DM_MAX_PER_WINDOW,
+  _resetForTest,
+  _tableSizeForTest,
+  _ownerDmKeyCountForTest,
+} from '../src/im/lark/grant-pending.js';
 
 beforeEach(() => { _resetForTest(); vi.useFakeTimers(); });
 afterEach(() => vi.useRealTimers());
@@ -20,6 +34,22 @@ describe('grant-pending', () => {
   it('no entry → not throttled, nonce invalid', () => {
     expect(isThrottled('a1', 'oc_x', 'ou_g')).toBe(false);
     expect(checkNonce('a1', 'oc_x', 'ou_g', 'whatever')).toBe(false);
+  });
+
+  it('defaults to one hour + three messages and stages both limits under the nonce', () => {
+    const nonce = openPending('a1', 'oc_1', 'ou_g');
+    expect(getPendingGrantLimits('a1', 'oc_1', 'ou_g')).toEqual({
+      quota: 3,
+      durationMs: 60 * 60 * 1000,
+    });
+    expect(updatePendingGrantLimits('a1', 'oc_1', ['ou_g'], nonce, { quota: 10, durationMs: 8 * 60 * 60 * 1000 })).toBe(true);
+    expect(getPendingGrantLimits('a1', 'oc_1', 'ou_g')).toEqual({
+      quota: 10,
+      durationMs: 8 * 60 * 60 * 1000,
+    });
+    expect(updatePendingGrantLimits('a1', 'oc_1', ['ou_g'], nonce, { quota: null, durationMs: null })).toBe(true);
+    expect(getPendingGrantLimits('a1', 'oc_1', 'ou_g')).toEqual({ quota: undefined, durationMs: undefined });
+    expect(updatePendingGrantLimits('a1', 'oc_1', ['ou_g'], 'wrong', { quota: 20 })).toBe(false);
   });
 
   it('clearPending lifts throttle', () => {
@@ -92,5 +122,50 @@ describe('grant-pending', () => {
       expect(isThrottled('a1', 'oc_1', 'ou_g')).toBe(true); // still throttled
       expect(checkNonce('a1', 'oc_1', 'ou_g', n)).toBe(true); // nonce still valid
     });
+  });
+});
+
+describe('grant-pending — owner DM request-card cap', () => {
+  it('allows up to the cap per (bot, owner) within the window, then refuses', () => {
+    for (let i = 0; i < OWNER_DM_MAX_PER_WINDOW; i++) {
+      expect(tryReserveOwnerDmSlot('a1', 'ou_owner')).toBe(true);
+    }
+    expect(tryReserveOwnerDmSlot('a1', 'ou_owner')).toBe(false);
+    // 别的 owner / 别的 bot 各自独立计数
+    expect(tryReserveOwnerDmSlot('a1', 'ou_other_owner')).toBe(true);
+    expect(tryReserveOwnerDmSlot('a2', 'ou_owner')).toBe(true);
+  });
+
+  it('slots free up once the window slides past', () => {
+    for (let i = 0; i < OWNER_DM_MAX_PER_WINDOW; i++) tryReserveOwnerDmSlot('a1', 'ou_owner');
+    expect(tryReserveOwnerDmSlot('a1', 'ou_owner')).toBe(false);
+    vi.advanceTimersByTime(60 * 60 * 1000);
+    expect(tryReserveOwnerDmSlot('a1', 'ou_owner')).toBe(true);
+  });
+
+  it('releaseOwnerDmSlot hands back the slot of a failed send', () => {
+    const t0 = Date.now();
+    for (let i = 0; i < OWNER_DM_MAX_PER_WINDOW; i++) tryReserveOwnerDmSlot('a1', 'ou_owner', t0 + i);
+    expect(tryReserveOwnerDmSlot('a1', 'ou_owner')).toBe(false);
+    releaseOwnerDmSlot('a1', 'ou_owner', t0 + 3);
+    expect(tryReserveOwnerDmSlot('a1', 'ou_owner')).toBe(true);
+    // 未记过的时间戳 / 别的 owner：不产生副作用
+    releaseOwnerDmSlot('a1', 'ou_owner', t0 - 1);
+    releaseOwnerDmSlot('a1', 'ou_nobody', t0);
+    expect(tryReserveOwnerDmSlot('a1', 'ou_owner')).toBe(false);
+  });
+
+  it('periodic prune drops owner DM counters once their window has passed', () => {
+    tryReserveOwnerDmSlot('a1', 'ou_owner');
+    expect(_ownerDmKeyCountForTest()).toBe(1);
+    vi.advanceTimersByTime(60 * 60 * 1000);
+    openPending('a1', 'oc_1', 'ou_g'); // 触发 pruneStale
+    expect(_ownerDmKeyCountForTest()).toBe(0);
+  });
+
+  it('_resetForTest clears the owner DM counters', () => {
+    for (let i = 0; i < OWNER_DM_MAX_PER_WINDOW; i++) tryReserveOwnerDmSlot('a1', 'ou_owner');
+    _resetForTest();
+    expect(tryReserveOwnerDmSlot('a1', 'ou_owner')).toBe(true);
   });
 });

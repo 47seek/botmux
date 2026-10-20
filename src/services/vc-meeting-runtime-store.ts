@@ -8,8 +8,10 @@ import type {
   VcMeetingConsumerManagedSink,
   VcMeetingConsumerProfileFilter,
   VcMeetingConsumerResponseMode,
+  VcMeetingListenerOutputPlacement,
 } from '../types.js';
 import type { VcMeetingActivityType } from '../vc-agent/types.js';
+import type { VcMeetingPreparationQaMode } from './vc-meeting-preparations-store.js';
 
 const RUNTIME_SCHEMA_VERSION = 3 as const;
 
@@ -32,6 +34,7 @@ export interface VcMeetingRuntimeSelectedAgent {
   activationError?: string;
   filter?: VcMeetingConsumerProfileFilter;
   responseMode: VcMeetingConsumerResponseMode;
+  listenerPlacement: VcMeetingListenerOutputPlacement;
   capabilities: string[];
   ownedSinks: VcMeetingConsumerManagedSink[];
   /** Immutable P0/P1 delivery semantics snapshot; optional for new records until hub activation. */
@@ -82,6 +85,10 @@ export interface VcMeetingRuntimeSessionRecord {
   listenerRejoinCardMessageId?: string;
   temporaryInstructionOpenIds?: string[];
   temporaryInstructionUnionIds?: string[];
+  preparationMeetingNo?: string;
+  qaMode?: VcMeetingPreparationQaMode;
+  qaAgentAppId?: string;
+  qaRecentOutputHashes?: string[];
   createdAt: number;
   updatedAt: number;
   expiresAt: number;
@@ -326,6 +333,7 @@ function normalizeSelectedAgent(value: unknown): NormalizeSelectedAgentResult {
     'activationError',
     'filter',
     'responseMode',
+    'listenerPlacement',
     'capabilities',
     'ownedSinks',
     'deliveryProfileHash',
@@ -343,6 +351,10 @@ function normalizeSelectedAgent(value: unknown): NormalizeSelectedAgentResult {
     agent.status as VcMeetingRuntimeSelectedAgentStatus,
   )) return { ok: false };
   if (agent.responseMode !== 'silent' && agent.responseMode !== 'listener_thread') return { ok: false };
+  if (agent.listenerPlacement !== undefined
+    && agent.listenerPlacement !== 'auto'
+    && agent.listenerPlacement !== 'chat'
+    && agent.listenerPlacement !== 'topic') return { ok: false };
   const capabilities = normalizeUniqueStringList(agent.capabilities);
   const ownedSinks = normalizeUniqueStringList(agent.ownedSinks);
   if (!capabilities || !ownedSinks) return { ok: false };
@@ -370,6 +382,7 @@ function normalizeSelectedAgent(value: unknown): NormalizeSelectedAgentResult {
         : {}),
       ...(filter.filter ? { filter: filter.filter } : {}),
       responseMode: agent.responseMode,
+      listenerPlacement: (agent.listenerPlacement ?? 'auto') as VcMeetingListenerOutputPlacement,
       capabilities,
       ownedSinks: ownedSinks as VcMeetingConsumerManagedSink[],
       ...(typeof agent.deliveryProfileHash === 'string'
@@ -436,6 +449,7 @@ function legacySelectedAgent(value: Record<string, unknown>): VcMeetingRuntimeSe
     role: VC_MEETING_RUNTIME_LEGACY_ROLE,
     status: value.consumerPaused === true ? 'paused' : 'active',
     responseMode: 'listener_thread',
+    listenerPlacement: 'auto',
     capabilities: ['meeting.read', 'meeting.output.request'],
     ownedSinks: ['meeting_text', 'meeting_voice'],
     deliveryProfileHash: VC_MEETING_RUNTIME_LEGACY_PROFILE_HASH,
@@ -628,6 +642,16 @@ function normalizeRecord(value: unknown): VcMeetingRuntimeSessionRecord | undefi
     ...(Array.isArray(r.temporaryInstructionUnionIds)
       ? { temporaryInstructionUnionIds: normalizeIdList(r.temporaryInstructionUnionIds) }
       : {}),
+    ...(typeof r.preparationMeetingNo === 'string' && r.preparationMeetingNo.trim()
+      ? { preparationMeetingNo: r.preparationMeetingNo.trim() }
+      : {}),
+    ...(r.qaMode === 'auto' || r.qaMode === 'off' ? { qaMode: r.qaMode } : {}),
+    ...(typeof r.qaAgentAppId === 'string' && r.qaAgentAppId.trim()
+      ? { qaAgentAppId: r.qaAgentAppId.trim() }
+      : {}),
+    ...(Array.isArray(r.qaRecentOutputHashes)
+      ? { qaRecentOutputHashes: normalizeIdList(r.qaRecentOutputHashes).slice(-20) }
+      : {}),
     createdAt,
     updatedAt,
     expiresAt,
@@ -812,6 +836,10 @@ export function recordVcMeetingRuntimeSession(
     listenerRejoinCardMessageId?: string;
     temporaryInstructionOpenIds?: string[];
     temporaryInstructionUnionIds?: string[];
+    preparationMeetingNo?: string;
+    qaMode?: VcMeetingPreparationQaMode;
+    qaAgentAppId?: string;
+    qaRecentOutputHashes?: string[];
   },
   now = Date.now(),
 ): void {
@@ -880,6 +908,12 @@ export function recordVcMeetingRuntimeSession(
         : {}),
       ...(input.temporaryInstructionUnionIds !== undefined
         ? { temporaryInstructionUnionIds: normalizeIdList(input.temporaryInstructionUnionIds) }
+        : {}),
+      ...(input.preparationMeetingNo ? { preparationMeetingNo: input.preparationMeetingNo } : {}),
+      ...(input.qaMode ? { qaMode: input.qaMode } : {}),
+      ...(input.qaAgentAppId ? { qaAgentAppId: input.qaAgentAppId } : {}),
+      ...(input.qaRecentOutputHashes !== undefined
+        ? { qaRecentOutputHashes: normalizeIdList(input.qaRecentOutputHashes).slice(-20) }
         : {}),
       createdAt: prior?.createdAt ?? now,
       updatedAt: now,

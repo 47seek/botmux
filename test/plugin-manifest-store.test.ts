@@ -1,20 +1,21 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { parsePluginPackageManifest } from '../src/core/plugins/manifest.js';
 import { scanPluginContributions } from '../src/core/plugins/convention-scanner.js';
 import { normalizePluginIdList } from '../src/core/plugins/ids.js';
-import { pluginMaterializedPath, pluginRegistryPath, resolvePluginPath } from '../src/core/plugins/paths.js';
+import { pluginHome, pluginMaterializedPath, pluginMcpPrivatePath, pluginRegistryPath, resolvePluginPath } from '../src/core/plugins/paths.js';
 import { readPluginRegistry, upsertInstalledPlugin } from '../src/services/plugin-registry-store.js';
 import { resolveEffectivePluginIds, updateBotPluginOverride } from '../src/core/plugins/effective.js';
 import { assertPluginBindingTransition, enabledPluginDependents } from '../src/core/plugins/dependencies.js';
-import { pluginPm2AppName } from '../src/core/plugins/pm2.js';
+import { pluginServiceName } from '../src/core/plugins/supervisor-store.js';
 import { installLocalPlugin } from '../src/core/plugins/install.js';
 import { collectPluginCliCommands } from '../src/core/plugins/runtime.js';
 import { dematerializePlugin, materializePlugin } from '../src/core/plugins/materializer.js';
 import { resolvePluginSkillPackages } from '../src/core/plugins/skills.js';
 import { readSkillRegistry } from '../src/services/skill-registry-store.js';
+import { readPluginMcpDescriptor } from '../src/core/plugins/mcp/private-store.js';
 
 describe('plugin manifest and registry basics', () => {
   let home: string;
@@ -28,6 +29,10 @@ describe('plugin manifest and registry basics', () => {
   afterEach(() => {
     vi.unstubAllEnvs();
     rmSync(home, { recursive: true, force: true });
+  });
+
+  it('keeps plugin state inside the stubbed test home', () => {
+    expect(pluginRegistryPath()).toBe(join(home, '.botmux', 'plugins-registry.json'));
   });
 
   it('normalizes plugin id lists by filtering invalid ids and deduping', () => {
@@ -106,8 +111,8 @@ describe('plugin manifest and registry basics', () => {
   });
 
   it('derives the PM2 service name only from the unique plugin id', () => {
-    expect(pluginPm2AppName('agent-chrome')).toBe('botmux-plugin-agent-chrome');
-    expect(pluginPm2AppName('demo-addon')).toBe('botmux-plugin-demo-addon');
+    expect(pluginServiceName('agent-chrome')).toBe('botmux-plugin-agent-chrome');
+    expect(pluginServiceName('demo-addon')).toBe('botmux-plugin-demo-addon');
   });
 
   it('ignores unconsumed manifest fields for forward compatibility', () => {
@@ -245,6 +250,149 @@ describe('plugin manifest and registry basics', () => {
     expect(JSON.parse(readFileSync(pluginRegistryPath(), 'utf8')).plugins['agent-chrome'].version).toBe('0.1.0');
   });
 
+  it('stores MCP commands and credentials in a protected private descriptor', () => {
+    const source = join(home, 'private-mcp-source');
+    mkdirSync(join(source, 'dist', 'mcp'), { recursive: true });
+    writeFileSync(join(source, 'package.json'), JSON.stringify({
+      name: '@botmux-ai/plugin-private-mcp',
+      version: '0.1.0',
+      keywords: ['botmux-plugin'],
+      botmux: { schemaVersion: 1, id: 'private-mcp' },
+    }));
+    writeFileSync(join(source, 'dist', 'mcp', 'server.mjs'), 'process.stdin.resume();\n');
+    writeFileSync(join(source, 'dist', 'mcp', 'index.json'), JSON.stringify({
+      command: ['node', './mcp/server.mjs'],
+      env: { PRIVATE_MCP_TOKEN: 'secret-value-never-in-registry' },
+    }));
+
+    const installed = installLocalPlugin(source);
+    const persisted = JSON.parse(readFileSync(pluginRegistryPath(), 'utf8'));
+    expect(persisted.plugins['private-mcp'].contributions.mcp).toEqual({
+      name: 'private-mcp',
+      transport: 'stdio',
+      privateRef: 'private/mcp.json',
+    });
+    expect(JSON.stringify(persisted)).not.toContain('secret-value-never-in-registry');
+    expect(JSON.stringify(persisted)).not.toContain('./mcp/server.mjs');
+
+    const privatePath = pluginMcpPrivatePath('private-mcp');
+    expect(lstatSync(privatePath).mode & 0o777).toBe(0o600);
+    expect(readPluginMcpDescriptor('private-mcp', installed.record.contributions!.mcp!)).toMatchObject({
+      name: 'private-mcp',
+      command: ['node', './mcp/server.mjs'],
+      env: { PRIVATE_MCP_TOKEN: 'secret-value-never-in-registry' },
+    });
+  });
+
+  it('atomically migrates legacy registry MCP descriptors and is idempotent', () => {
+    const now = new Date().toISOString();
+    mkdirSync(join(home, '.botmux'), { recursive: true });
+    writeFileSync(pluginRegistryPath(), JSON.stringify({
+      schemaVersion: 1,
+      plugins: {
+        legacy: {
+          id: 'legacy',
+          packageName: '@botmux-ai/plugin-legacy',
+          version: '0.1.0',
+          source: { type: 'npm', spec: '@botmux-ai/plugin-legacy' },
+          manifest: { schemaVersion: 1, id: 'legacy' },
+          contributions: {
+            mcp: {
+              name: 'legacy',
+              transport: 'streamable-http',
+              url: 'https://mcp.example.test/private',
+              headers: { Authorization: 'Bearer legacy-secret' },
+            },
+          },
+          installedAt: now,
+          updatedAt: now,
+        },
+      },
+    }));
+
+    const migrated = readPluginRegistry();
+    expect(migrated.plugins.legacy.contributions?.mcp).toEqual({
+      name: 'legacy',
+      transport: 'streamable-http',
+      privateRef: 'private/mcp.json',
+    });
+    const firstPrivate = readFileSync(pluginMcpPrivatePath('legacy'), 'utf8');
+    expect(firstPrivate).toContain('Bearer legacy-secret');
+    expect(readFileSync(pluginRegistryPath(), 'utf8')).not.toContain('Bearer legacy-secret');
+
+    expect(readPluginRegistry().plugins.legacy.contributions?.mcp).toEqual(
+      migrated.plugins.legacy.contributions?.mcp,
+    );
+    expect(readFileSync(pluginMcpPrivatePath('legacy'), 'utf8')).toBe(firstPrivate);
+  });
+
+  it('fails closed and leaves the legacy registry untouched when private migration cannot commit', () => {
+    const now = new Date().toISOString();
+    const id = 'legacy-broken';
+    const external = join(home, 'external-private');
+    mkdirSync(pluginHome(id), { recursive: true });
+    mkdirSync(external, { recursive: true });
+    symlinkSync(external, join(pluginHome(id), 'private'), 'dir');
+    const legacyRegistry = JSON.stringify({
+      schemaVersion: 1,
+      plugins: {
+        [id]: {
+          id,
+          packageName: `@botmux-ai/plugin-${id}`,
+          version: '0.1.0',
+          source: { type: 'npm', spec: `@botmux-ai/plugin-${id}` },
+          manifest: { schemaVersion: 1, id },
+          contributions: {
+            mcp: { name: id, transport: 'stdio', command: ['node', 'server.js'] },
+          },
+          installedAt: now,
+          updatedAt: now,
+        },
+      },
+    });
+    mkdirSync(dirname(pluginRegistryPath()), { recursive: true });
+    writeFileSync(pluginRegistryPath(), legacyRegistry);
+
+    expect(() => readPluginRegistry()).toThrow(/plugin_mcp_registry_migration_failed:unsafe_plugin_private_dir/);
+    expect(readFileSync(pluginRegistryPath(), 'utf8')).toBe(legacyRegistry);
+    expect(existsSync(join(external, 'mcp.json'))).toBe(false);
+  });
+
+  it('fails closed instead of preserving malformed or leaked MCP registry fields', () => {
+    const now = new Date().toISOString();
+    const id = 'legacy-malformed';
+    const legacyRegistry = JSON.stringify({
+      schemaVersion: 1,
+      plugins: {
+        [id]: {
+          id,
+          packageName: `@botmux-ai/plugin-${id}`,
+          version: '0.1.0',
+          source: { type: 'npm', spec: `@botmux-ai/plugin-${id}` },
+          manifest: { schemaVersion: 1, id },
+          contributions: {
+            mcp: {
+              name: id,
+              transport: 'stdio',
+              privateRef: 'private/mcp.json',
+              env: { TOKEN: 'must-not-remain-public' },
+            },
+          },
+          installedAt: now,
+          updatedAt: now,
+        },
+      },
+    });
+    mkdirSync(dirname(pluginRegistryPath()), { recursive: true });
+    writeFileSync(pluginRegistryPath(), legacyRegistry);
+
+    expect(() => readPluginRegistry()).toThrow(
+      /plugin_mcp_registry_migration_failed:invalid_plugin_mcp_contribution:legacy-malformed/,
+    );
+    expect(readFileSync(pluginRegistryPath(), 'utf8')).toBe(legacyRegistry);
+    expect(existsSync(pluginMcpPrivatePath(id))).toBe(false);
+  });
+
   it('resolves plugin paths only inside the plugin root', () => {
     const root = join(home, '.botmux', 'plugins', 'agent-chrome', 'dist');
     mkdirSync(root, { recursive: true });
@@ -333,6 +481,7 @@ describe('plugin manifest and registry basics', () => {
 
     const result = installLocalPlugin(source, { link: true });
     expect(lstatSync(result.runtimeDir).isSymbolicLink()).toBe(true);
+    expect(result.record.source).toEqual({ type: 'local', spec: source, link: true });
     expect(readFileSync(join(result.runtimeDir, 'marker.txt'), 'utf8')).toBe('v1\n');
 
     writeFileSync(join(source, 'dist', 'marker.txt'), 'v2\n');
@@ -451,5 +600,121 @@ describe('plugin manifest and registry basics', () => {
     expect(readSkillRegistry().skills.browser).toBeUndefined();
     expect(readFileSync(codexConfigPath, 'utf8')).toBe(codexConfigBefore);
     expect(existsSync(pluginMaterializedPath('full-demo'))).toBe(false);
+  });
+
+  it('安装并启用一个合法的通用卡片动作插件', () => {
+    const source = join(home, 'card-actions-source');
+    const runtime = join(source, 'dist');
+    mkdirSync(join(runtime, 'service'), { recursive: true });
+    mkdirSync(join(runtime, 'card-actions'), { recursive: true });
+    writeFileSync(join(source, 'package.json'), JSON.stringify({
+      name: '@botmux-ai/plugin-card-actions-demo',
+      version: '0.1.0',
+      type: 'module',
+      keywords: ['botmux-plugin'],
+      botmux: {
+        schemaVersion: 1,
+        id: 'card-actions-demo',
+        service: { mode: 'auto' },
+      },
+    }));
+    writeFileSync(join(runtime, 'package.json'), JSON.stringify({ type: 'module' }));
+    writeFileSync(join(runtime, 'service', 'index.js'), 'export default { port: 43210, pm2: { script: "./service/server.js" } };\n');
+    writeFileSync(join(runtime, 'service', 'server.js'), 'process.stdin.resume();\n');
+    writeFileSync(join(runtime, 'card-actions', 'index.json'), JSON.stringify({
+      schemaVersion: 1,
+      actions: ['example.review.submit'],
+      actionPrefixes: ['example.review.'],
+      endpoint: '/botmux/card-actions/v1',
+    }));
+
+    const installed = installLocalPlugin(source);
+    const materialized = materializePlugin('card-actions-demo');
+    const expected = {
+      schemaVersion: 1,
+      actions: ['example.review.submit'],
+      actionPrefixes: ['example.review.'],
+      endpoint: '/botmux/card-actions/v1',
+    };
+    expect(installed.record.contributions?.cardActions).toEqual(expected);
+    expect(readPluginRegistry().plugins['card-actions-demo'].contributions?.cardActions).toEqual(expected);
+    expect(materialized.cardActions).toEqual(expected);
+
+    for (const publicPath of [pluginRegistryPath(), pluginMaterializedPath('card-actions-demo')]) {
+      const content = readFileSync(publicPath, 'utf8');
+      expect(content).not.toContain('BOTMUX_PLUGIN_CARD_ACTION_TOKEN');
+      expect(content).not.toContain('Bearer ');
+      expect(content).not.toContain('formValue');
+      expect(content).not.toContain('operator');
+    }
+  });
+
+  it('拒绝不安全或不完整的卡片动作声明', () => {
+    const makeSource = (id: string, declaration: unknown, options: { serviceFile?: boolean; serviceManifest?: boolean } = {}) => {
+      const source = join(home, id);
+      const runtime = join(source, 'dist');
+      mkdirSync(join(runtime, 'card-actions'), { recursive: true });
+      if (options.serviceFile !== false) {
+        mkdirSync(join(runtime, 'service'), { recursive: true });
+        writeFileSync(join(runtime, 'service', 'index.js'), 'export default { port: 43210, pm2: { script: "./service/server.js" } };\n');
+        writeFileSync(join(runtime, 'service', 'server.js'), 'process.stdin.resume();\n');
+      }
+      writeFileSync(join(source, 'package.json'), JSON.stringify({
+        name: `@botmux-ai/plugin-${id}`,
+        version: '0.1.0',
+        type: 'module',
+        keywords: ['botmux-plugin'],
+        botmux: {
+          schemaVersion: 1,
+          id,
+          ...(options.serviceManifest === false ? {} : { service: { mode: 'auto' } }),
+        },
+      }));
+      writeFileSync(join(runtime, 'package.json'), JSON.stringify({ type: 'module' }));
+      writeFileSync(join(runtime, 'card-actions', 'index.json'), JSON.stringify(declaration));
+      return source;
+    };
+
+    const invalidCases: Array<[string, unknown, { serviceFile?: boolean; serviceManifest?: boolean }?]> = [
+      ['empty-selectors', { schemaVersion: 1, actions: [], actionPrefixes: [], endpoint: '/actions' }],
+      ['empty-selector', { schemaVersion: 1, actions: [''], endpoint: '/actions' }],
+      ['duplicate-selector', { schemaVersion: 1, actions: ['example.go', 'example.go'], endpoint: '/actions' }],
+      ['reserved-action', { schemaVersion: 1, actions: ['close'], endpoint: '/actions' }],
+      ['reserved-prefix', { schemaVersion: 1, actionPrefixes: ['dash_'], endpoint: '/actions' }],
+      ['remote-endpoint', { schemaVersion: 1, actions: ['example.go'], endpoint: 'https://example.test/actions' }],
+      ['query-endpoint', { schemaVersion: 1, actions: ['example.go'], endpoint: '/actions?next=remote' }],
+      ['escape-endpoint', { schemaVersion: 1, actions: ['example.go'], endpoint: '/safe/%2e%2e/escape' }],
+      ['future-schema', { schemaVersion: 2, actions: ['example.go'], endpoint: '/actions' }],
+      ['missing-service-file', { schemaVersion: 1, actions: ['example.go'], endpoint: '/actions' }, { serviceFile: false }],
+      ['missing-service-manifest', { schemaVersion: 1, actions: ['example.go'], endpoint: '/actions' }, { serviceManifest: false }],
+    ];
+
+    for (const [id, declaration, options] of invalidCases) {
+      const source = makeSource(id, declaration, options);
+      expect(() => installLocalPlugin(source), id).toThrow(/plugin_(?:card|service)|invalid_plugin_card/);
+      expect(readPluginRegistry().plugins[id], id).toBeUndefined();
+      expect(existsSync(pluginHome(id)), id).toBe(false);
+    }
+
+    const source = makeSource('atomic-actions', {
+      schemaVersion: 1,
+      actions: ['example.go'],
+      endpoint: '/actions',
+    });
+    installLocalPlugin(source);
+    const runtimeMarker = join(pluginHome('atomic-actions'), 'dist', 'marker.txt');
+    writeFileSync(runtimeMarker, 'preserve-old-runtime\n');
+    const packageJson = JSON.parse(readFileSync(join(source, 'package.json'), 'utf8'));
+    packageJson.version = '0.2.0';
+    writeFileSync(join(source, 'package.json'), JSON.stringify(packageJson));
+    writeFileSync(join(source, 'dist', 'card-actions', 'index.json'), JSON.stringify({
+      schemaVersion: 1,
+      actions: ['example.go'],
+      endpoint: 'http://remote.example/actions',
+    }));
+
+    expect(() => installLocalPlugin(source)).toThrow(/invalid_plugin_card_actions_endpoint/);
+    expect(readPluginRegistry().plugins['atomic-actions'].version).toBe('0.1.0');
+    expect(readFileSync(runtimeMarker, 'utf8')).toBe('preserve-old-runtime\n');
   });
 });

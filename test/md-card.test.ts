@@ -11,19 +11,86 @@ import { homedir, tmpdir } from 'node:os';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
+  appendReplyCardFooterToV2Card,
   buildCardBodyElements,
+  buildCanonicalFinalReplyCard,
   buildImageCardElements,
   buildMarkdownCard,
   buildContextualReplyCard,
+  buildReplyCardFooter,
   brandFooterSegment,
+  cardUsageFooterSegment,
+  cardUsageRuntimeSegment,
+  contextOverCompactThreshold,
+  createReplyCard,
   DEFAULT_BRAND_LABEL,
+  extractFirstReplyCardHeading,
   hasMarkdown,
   normalizeLocalHomeLinks,
+  REPLY_CARD_FOOTER_MARKER,
 } from '../src/im/lark/md-card.js';
 
 function mdElements(out: any[]): Array<{ tag: 'markdown'; content: string }> {
   return out.filter(e => e.tag === 'markdown');
 }
+
+describe('reply-card layout envelope and title extraction', () => {
+  it('keeps the ordinary v2 envelope identical when no header is requested', () => {
+    expect(createReplyCard([{ tag: 'markdown', content: '正文' }])).toEqual({
+      schema: '2.0',
+      config: { update_multi: true, width_mode: 'fill' },
+      body: {
+        direction: 'vertical',
+        elements: [{ tag: 'markdown', content: '正文' }],
+      },
+    });
+  });
+
+  it('puts an optional Card 2.0 header on the same canonical envelope', () => {
+    const header = {
+      template: 'indigo' as const,
+      title: { tag: 'plain_text' as const, content: '交接 · 下一位接手发布' },
+    };
+    expect(createReplyCard([], header)).toMatchObject({
+      schema: '2.0',
+      config: { update_multi: true, width_mode: 'fill' },
+      header,
+      body: { direction: 'vertical', elements: [] },
+    });
+  });
+
+  it('consumes only the first top-level ATX H1/H2 and preserves the rest', () => {
+    const input = [
+      '> # 引用标题',
+      '',
+      '```md',
+      '# 代码里的标题',
+      '```',
+      '',
+      '### 细节',
+      '',
+      '## **发布** [说明](https://example.com) `v2`',
+      '',
+      '正文',
+      '',
+      '# 第二个标题',
+    ].join('\n');
+    const extracted = extractFirstReplyCardHeading(input);
+
+    expect(extracted.heading).toBe('发布 说明 v2');
+    expect(extracted.markdown).not.toContain('## **发布**');
+    expect(extracted.markdown).toContain('> # 引用标题');
+    expect(extracted.markdown).toContain('# 代码里的标题');
+    expect(extracted.markdown).toContain('### 细节');
+    expect(extracted.markdown).toContain('# 第二个标题');
+  });
+
+  it('does not consume H3, setext, or an empty ATX heading', () => {
+    for (const input of ['### 细节\n\n正文', '旧标题\n===\n\n正文', '#\n\n正文']) {
+      expect(extractFirstReplyCardHeading(input)).toEqual({ markdown: input });
+    }
+  });
+});
 
 describe('buildCardBodyElements', () => {
   it('returns [] for empty input', () => {
@@ -36,11 +103,86 @@ describe('buildCardBodyElements', () => {
     expect(out[0]).toMatchObject({ tag: 'markdown', content: 'hello world' });
   });
 
-  it('promotes ATX headings to bold (Feishu markdown widget can\'t render #)', () => {
+  it('promotes H1/H2 to standalone heading components', () => {
     const out = buildCardBodyElements('# Title\n\nbody text');
-    const text = mdElements(out)[0].content;
-    expect(text).toContain('**Title**');
-    expect(text).not.toMatch(/^#\s/m);
+    expect(out).toEqual([
+      { tag: 'markdown', element_id: 'botmux_md_h1_1', text_size: 'heading-2', content: 'Title' },
+      { tag: 'markdown', content: 'body text' },
+    ]);
+
+    expect(buildCardBodyElements('## Section\n\nbody')).toEqual([
+      { tag: 'markdown', element_id: 'botmux_md_h2_1', text_size: 'heading-2', content: 'Section' },
+      { tag: 'markdown', content: 'body' },
+    ]);
+  });
+
+  it('encodes the original ATX level and a per-card sequence in heading element ids', () => {
+    // Message reads strip text_size, so the element id is the only carrier of
+    // heading hierarchy that survives Lark normalization (see message-parser).
+    const out = buildCardBodyElements('# 结果\n\n正文\n\n## 验证\n\n更多\n\n## 下一步\n\n尾声');
+    const ids = out.filter((e: any) => e.element_id).map((e: any) => e.element_id);
+    expect(ids).toEqual(['botmux_md_h1_1', 'botmux_md_h2_2', 'botmux_md_h2_3']);
+  });
+
+  it('keeps H3-H6 compact as bold markdown', () => {
+    const out = buildCardBodyElements('### Detail\n\nbody text');
+    expect(out).toEqual([{ tag: 'markdown', content: '**Detail**\n\nbody text' }]);
+  });
+
+  it('keeps setext headings on the compact fallback path', () => {
+    const out = buildCardBodyElements('Legacy title\n===\n\nbody text');
+    expect(out).toEqual([{ tag: 'markdown', content: '**Legacy title**\n\nbody text' }]);
+  });
+
+  it('keeps structured heading, prose, table, and code sections in source order', () => {
+    const input = [
+      '# 执行结果',
+      '',
+      '核心链路已验证。',
+      '',
+      '| 项目 | 结果 |',
+      '| --- | --- |',
+      '| build | pass |',
+      '',
+      '## 验证命令',
+      '',
+      '```bash',
+      'bun run build',
+      '```',
+    ].join('\n');
+    const out = buildCardBodyElements(input);
+
+    expect(out.map(element => element.tag)).toEqual([
+      'markdown', 'markdown', 'table', 'markdown', 'markdown',
+    ]);
+    expect(out[0]).toMatchObject({ text_size: 'heading-2', content: '执行结果' });
+    expect(out[1].content).toBe('核心链路已验证。');
+    expect(out[2].rows).toEqual([{ c0: 'build', c1: 'pass' }]);
+    expect(out[3]).toMatchObject({ text_size: 'heading-2', content: '验证命令' });
+    expect(out[4].content).toContain('```bash\nbun run build\n```');
+  });
+
+  it('bounds promoted headings and preserves overflow headings as bold text', () => {
+    const input = Array.from(
+      { length: 8 },
+      (_, index) => `# Section ${index + 1}\n\nbody ${index + 1}`,
+    ).join('\n\n');
+    const out = buildCardBodyElements(input);
+    const promoted = out.filter(element => element.text_size === 'heading-2');
+    const rendered = mdElements(out).map(element => element.content).join('\n\n');
+
+    expect(promoted).toHaveLength(6);
+    expect(rendered).toContain('**Section 7**');
+    expect(rendered).toContain('**Section 8**');
+    expect(rendered).toContain('body 8');
+  });
+
+  it('does not promote heading-looking lines inside a code fence', () => {
+    const out = buildCardBodyElements('```markdown\n# literal heading\n```');
+    expect(out).toEqual([{
+      tag: 'markdown',
+      content: '```markdown\n# literal heading\n```',
+    }]);
   });
 
   it('Bug A: code fence with no blank line before/after still emits a fenced block', () => {
@@ -55,6 +197,102 @@ describe('buildCardBodyElements', () => {
     // And must have a blank line before the opening fence and after the closing fence.
     expect(content).toMatch(/是同步返回：\n\n```ts/);
     expect(content).toMatch(/```\n\nnext prose/);
+  });
+
+  it('lifts a code fence out of an ordered list into its own card element', () => {
+    const input = [
+      '1. Read the value.',
+      '2. When it is missing, run:',
+      '   ```cpp',
+      '   values.assign(128, 0.f);',
+      '   return true;',
+      '   ```',
+      '3. Continue processing.',
+    ].join('\n');
+    expect(buildCardBodyElements(input)).toEqual([
+      { tag: 'markdown', content: '1. Read the value.\n2. When it is missing, run:' },
+      { tag: 'markdown', content: '```cpp\nvalues.assign(128, 0.f);\nreturn true;\n```' },
+      { tag: 'markdown', content: '3. Continue processing.' },
+    ]);
+  });
+
+  it.each([
+    ['- Run:', '  ', '- Done.'],
+    ['- Outer\n  - Run:', '    ', '  - Done.'],
+    ['> Run:', '> ', '> Done.'],
+    ['> - Run:', '>   ', '> - Done.'],
+  ])('lifts nested fences after %s without treating code as prose', (before, prefix, after) => {
+    const code = ['if (ready) {', '  execute();', '', '', '', '}', '![literal](https://example.com/image.png)', '', ''];
+    const input = [before, prefix + '````text', ...code.map(line => prefix + line), prefix + '````', after].join('\n');
+    const elements = buildCardBodyElements(input);
+    expect(elements).toHaveLength(3);
+    expect(elements[1]).toEqual({ tag: 'markdown', content: '````text\n' + code.join('\n') + '\n````' });
+    expect(elements[0].content).toContain('Run:');
+    expect(elements[2].content).toContain('Done.');
+  });
+
+  it('keeps multiple code blocks and intervening list-item prose in order', () => {
+    const input = [
+      '- Start', '  ```js', '  first();', '  ```',
+      '', '  Continue', '',
+      '  ~~~js', '  second();', '  ~~~', '- Done',
+    ].join('\n');
+    expect(buildCardBodyElements(input)).toEqual([
+      { tag: 'markdown', content: '- Start' },
+      { tag: 'markdown', content: '```js\nfirst();\n```' },
+      { tag: 'markdown', content: 'Continue' },
+      { tag: 'markdown', content: '~~~js\nsecond();\n~~~' },
+      { tag: 'markdown', content: '- Done' },
+    ]);
+  });
+
+  it('lifts indented code in a list without closing on literal backticks', () => {
+    const input = ['- Example:', '', '      ```', '      literal', '      ```', '', '- Done'].join('\n');
+    expect(buildCardBodyElements(input)[1]).toEqual({
+      tag: 'markdown', content: '````\n```\nliteral\n```\n````',
+    });
+  });
+
+  it('does not turn deeply indented continuation paragraphs into code after a lifted fence', () => {
+    const input = [
+      '- Outer', '  - Start', '    ```js', '    first();', '    ```',
+      '', '    Continue', '', '    Another paragraph', '', '- Done',
+    ].join('\n');
+    expect(buildCardBodyElements(input)).toEqual([
+      { tag: 'markdown', content: '- Outer\n  - Start' },
+      { tag: 'markdown', content: '```js\nfirst();\n```' },
+      { tag: 'markdown', content: 'Continue\n\nAnother paragraph\n\n- Done' },
+    ]);
+  });
+
+  it('keeps code-only list items and empty code fences', () => {
+    expect(buildCardBodyElements('- ```js\n  run();\n  ```\n- ```\n  ```')).toEqual([
+      { tag: 'markdown', content: '```js\nrun();\n```' },
+      { tag: 'markdown', content: '```\n```' },
+    ]);
+  });
+
+  it('keeps other blocks between lifted code and continuation paragraphs', () => {
+    const input = '- Start\n  ```js\n  run();\n  ```\n\n  ### Details\n\n  First paragraph\n\n  Second paragraph';
+    const elements = buildCardBodyElements(input);
+    expect(elements[2].content).toBe('### Details\n\nFirst paragraph\n\nSecond paragraph');
+  });
+
+  it('keeps source indentation of multi-paragraph list items when no code is lifted', () => {
+    // The startLine > map[0] guard must keep the generic source-slice path
+    // for paragraphs before any lifted code: stripping their indentation here
+    // would make CommonMark render the later paragraphs outside the list item.
+    const input = '- a\n\n  p1\n\n  p2';
+    expect(buildCardBodyElements(input)).toEqual([
+      { tag: 'markdown', content: '- a\n\n  p1\n\n  p2' },
+    ]);
+  });
+
+  it('keeps source markers of multi-paragraph quotes when no code is lifted', () => {
+    const input = '> q\n>\n> p1\n>\n> p2';
+    expect(buildCardBodyElements(input)).toEqual([
+      { tag: 'markdown', content: '> q\n>\n> p1\n>\n> p2' },
+    ]);
   });
 
   it('Bug B: 3-backtick nested fences don\'t corrupt later prose', () => {
@@ -115,6 +353,28 @@ describe('buildCardBodyElements', () => {
       { c0: 'a1', c1: 'b1' },
       { c0: 'a2', c1: 'b2' },
     ]);
+  });
+
+  it('native table auto-sizes wrapped rows instead of single-line ellipsis clipping', () => {
+    // Regression: row_height was hardcoded to 'low', pinning every row to one
+    // line so any cell whose text wrapped was truncated with an ellipsis.
+    const longCell = 'one '.repeat(40).trim();
+    const input = [
+      '| A rather long header that itself needs to wrap | B |',
+      '| --- | --- |',
+      `| ${longCell} | b1 |`,
+    ].join('\n');
+    const out = buildCardBodyElements(input);
+    const table = out.find(e => e.tag === 'table');
+    expect(table).toBeTruthy();
+    expect(table.row_height).toBe('auto');
+    // Feishu caps auto rows at 32px–999px; without an explicit cap the
+    // component default is only 124px, which still clips dense cells.
+    expect(table.row_max_height).toBe('300px');
+    expect(table.header_style.lines).toBeGreaterThanOrEqual(2);
+    // The full cell content survives into the row data; wrapping is the
+    // renderer's job, not a reason to clip at build time.
+    expect(table.rows[0].c0).toBe(longCell);
   });
 
   it('table flanked by prose → prose, table, prose are separate elements', () => {
@@ -659,6 +919,262 @@ describe('normalizeLocalHomeLinks', () => {
 });
 
 describe('buildMarkdownCard', () => {
+  it('uses wide-screen chrome consistently across ordinary reply builders', () => {
+    const cards = [
+      buildMarkdownCard('hello'),
+      buildCanonicalFinalReplyCard({ markdown: 'hello' }),
+      buildContextualReplyCard({
+        title: 'Local turn',
+        assistantText: 'hello',
+        assistantLabel: 'Codex',
+      }),
+    ].map(json => JSON.parse(json));
+
+    for (const card of cards) {
+      expect(card.config).toEqual({ update_multi: true, width_mode: 'fill' });
+    }
+  });
+
+  it('keeps explicit builder and fallback-final body layout identical', () => {
+    const markdown = '# 结果\n\n已完成。\n\n## 验证\n\n- build\n- test';
+    const explicitSendElements = buildImageCardElements(markdown, []);
+    const fallbackElements = JSON.parse(buildCanonicalFinalReplyCard({
+      markdown,
+      brand: '',
+    })).body.elements;
+
+    expect(fallbackElements).toEqual(explicitSendElements);
+  });
+
+  it('renders native context in the reply-card footer (token stays off the footer)', () => {
+    const json = buildMarkdownCard('hello', 'ou_abc', undefined, 'zh', undefined, 'filesystem', {
+      context: { usedTokens: 159_861, windowTokens: 258_400, percentUsed: 62 },
+      tokens: { in: 3_739_570, out: 23_299 },
+    });
+    const card = JSON.parse(json);
+    const footer = card.body.elements.at(-1).content;
+
+    expect(footer).toContain('上下文 159.9K/258.4K (62%)');
+    // Footer variant is context-only (design: keep the cramped footer clean);
+    // the cumulative token line lives on the streaming card, not here.
+    expect(footer).not.toContain('Token');
+    expect(footer).not.toContain('↑3.7M');
+    expect(footer).toContain('<at id=ou_abc></at>');
+  });
+
+  it('omits malformed native usage instead of rendering NaN or Infinity', () => {
+    const json = buildMarkdownCard('hello', undefined, '', 'zh', undefined, 'filesystem', {
+      context: { usedTokens: Number.NaN, windowTokens: 258_400 },
+      tokens: { in: Number.POSITIVE_INFINITY, out: 23_299 },
+    });
+    const card = JSON.parse(json);
+    const rendered = JSON.stringify(card);
+
+    expect(card.body.elements.map((element: any) => element.tag)).not.toContain('hr');
+    expect(rendered).not.toContain('上下文');
+    expect(rendered).not.toContain('Token');
+    expect(rendered).not.toContain('NaN');
+    expect(rendered).not.toContain('Infinity');
+  });
+
+  it('does not invent a percentage when the native snapshot has no percentage', () => {
+    const json = buildMarkdownCard('hello', undefined, '', 'zh', undefined, 'filesystem', {
+      context: { usedTokens: 12_345, windowTokens: 100_000 },
+      tokens: null,
+    });
+    const footer = JSON.parse(json).body.elements.at(-1).content;
+
+    expect(footer).toContain('上下文 12.3K/100K');
+    expect(footer).not.toContain('(12%)');
+    expect(footer).not.toContain('Token');
+  });
+
+  it('reply-card footer omits token entirely when context is absent (context-only footer)', () => {
+    const json = buildMarkdownCard('hello', undefined, '', 'zh', undefined, 'filesystem', {
+      context: null,
+      tokens: { in: 67_890, out: 123 },
+    });
+    const card = JSON.parse(json);
+    const rendered = JSON.stringify(card);
+    // Footer is context-only; with no context there is nothing to show, so the
+    // token line does NOT leak into the footer (it lives on the streaming card).
+    expect(rendered).not.toContain('Token');
+    expect(rendered).not.toContain('上下文');
+    expect(card.body.elements.map((element: any) => element.tag)).not.toContain('hr');
+  });
+
+  it('streaming variant renders 本轮 + 累计 token (context missing)', () => {
+    const seg = cardUsageFooterSegment(
+      { context: null, tokens: { in: 67_890, out: 123 }, turnTokens: { in: 5_000, out: 1_200 } },
+      'zh',
+      'streaming',
+    );
+    expect(seg).toContain('本轮 ↑5K ↓1.2K');
+    expect(seg).toContain('累计 ↑67.9K ↓123');
+    expect(seg).not.toContain('上下文');
+  });
+
+  it('keeps the metric formatter runtime-free so the streaming renderer owns the tail', () => {
+    const seg = cardUsageFooterSegment(
+      {
+        context: { usedTokens: 80_700, windowTokens: 258_400, percentUsed: 31 },
+        tokens: { in: 1_400_000, out: 7_800 },
+        model: 'GPT-5.6-Sol',
+        reasoningEffort: 'xhigh',
+      },
+      'zh',
+      'streaming',
+    );
+    expect(seg).toBe('上下文 80.7K/258.4K (31%) · 累计 ↑1.4M ↓7.8K');
+    expect(seg).not.toContain('GPT-5.6-Sol');
+  });
+
+  it('cardUsageRuntimeSegment renders a compact model (bold) + effort tail', () => {
+    expect(cardUsageRuntimeSegment(
+      { context: null, tokens: null, model: 'GPT-5.6-Sol', reasoningEffort: 'xhigh' },
+    )).toBe('**GPT-5.6-Sol** xhigh');
+    // no effort -> model only, no trailing space/placeholder
+    expect(cardUsageRuntimeSegment(
+      { context: null, tokens: null, model: 'gpt-4o' },
+    )).toBe('**gpt-4o**');
+    // no model -> nothing
+    expect(cardUsageRuntimeSegment(
+      { context: null, tokens: null, reasoningEffort: 'xhigh' },
+    )).toBeNull();
+  });
+
+  it('preserves Cursor effort and fast variants encoded in the selected model ID', () => {
+    for (const model of ['claude-opus-5-5-high', 'claude-opus-5-5-high-fast']) {
+      expect(cardUsageRuntimeSegment({ context: null, tokens: null, model })).toBe(`**${model}**`);
+    }
+  });
+
+  it('includes known model/effort in a signed final footer without token metrics', () => {
+    const card = JSON.parse(buildCanonicalFinalReplyCard({
+      markdown: 'Answer', brand: '',
+      usage: { context: null, tokens: null, model: 'gpt-5.6-sol', reasoningEffort: 'high' },
+    }));
+    const footer = card.body.elements.find((e: any) => e.element_id === 'botmux_reply_footer');
+    expect(footer.content).toContain('**gpt-5.6-sol** high');
+    expect(footer.content).toContain(REPLY_CARD_FOOTER_MARKER);
+    expect(footer.content).not.toMatch(/Context|上下文|↑|↓/);
+  });
+
+  it('renders a backend variant between the model and reasoning effort', () => {
+    expect(cardUsageRuntimeSegment(
+      { context: null, tokens: null, model: 'GPT-5.6-Terra', modelBackendVariant: 'max', reasoningEffort: 'xhigh' },
+    )).toBe('**GPT-5.6-Terra** Max · xhigh');
+  });
+
+  it('strips a leading provider/ routing prefix from the model name', () => {
+    // model_hub/es1_orange_o48 → es1_orange_o48 (relay namespace hidden);
+    // underscores are markdown-escaped by the shared compact formatter.
+    expect(cardUsageRuntimeSegment(
+      { context: null, tokens: null, model: 'model_hub/es1_orange_o48' },
+    )).toBe('**es1\\_orange\\_o48**');
+    // a value with no slash is untouched
+    expect(cardUsageRuntimeSegment(
+      { context: null, tokens: null, model: 'gpt-5.6-sol' },
+    )).toBe('**gpt-5.6-sol**');
+    // only a clean single-token prefix + one slash is removed
+    expect(cardUsageRuntimeSegment(
+      { context: null, tokens: null, model: 'a/b/c' },
+    )).toBe('**b/c**');
+  });
+
+  it('keeps the metric formatter empty when only runtime identity is known', () => {
+    expect(cardUsageFooterSegment(
+      {
+        context: null,
+        tokens: null,
+        model: 'GPT-5.6-Sol',
+        reasoningEffort: 'xhigh',
+      },
+      'zh',
+      'streaming',
+    )).toBeNull();
+  });
+
+  it('escapes runtime labels and truncates long model names', () => {
+    const seg = cardUsageRuntimeSegment(
+      {
+        context: { usedTokens: 1 },
+        tokens: null,
+        model: `[very-long-${'x'.repeat(60)}] <at id=ou_fake></at>`,
+        reasoningEffort: '*xhigh*',
+      },
+    )!;
+    expect(seg).toContain('**\\[very-long-');
+    expect(seg).toContain('…** \\*xhigh\\*');
+    expect(seg).not.toContain('<at id=ou_fake>');
+    expect(seg.length).toBeLessThan(100);
+  });
+
+  it('omits an all-zero token line (new session / synthetic zero-usage record)', () => {
+    // A brand-new topic's first read can catch a transcript record whose usage
+    // object has zero/absent token fields → in=out=0. Rendering "↑0 ↓0" is
+    // meaningless noise, so the token segment must be omitted (streaming variant,
+    // where token would otherwise show).
+    const seg = cardUsageFooterSegment(
+      { context: null, tokens: { in: 0, out: 0 }, turnTokens: { in: 0, out: 0 } },
+      'zh',
+      'streaming',
+    );
+    expect(seg).toBeNull();
+  });
+
+  it('streaming variant still renders when only one direction is zero (real one-sided usage)', () => {
+    const seg = cardUsageFooterSegment(
+      { context: null, tokens: { in: 12_345, out: 0 }, turnTokens: null },
+      'zh',
+      'streaming',
+    );
+    expect(seg).toContain('累计 ↑12.3K ↓0');
+  });
+
+  it('promotes rounded compact values at unit boundaries (streaming token)', () => {
+    const seg = cardUsageFooterSegment(
+      {
+        context: { usedTokens: 999_950, windowTokens: 999_950_000 },
+        tokens: { in: 999_950_000, out: 999_950 },
+        turnTokens: null,
+      },
+      'en',
+      'streaming',
+    );
+    expect(seg).toContain('Context 1M/1B');
+    expect(seg).toContain('Total ↑1B ↓1M');
+    expect(seg).not.toMatch(/1000[KM]/);
+  });
+
+  it('omits the usage footer when the Agent CLI reports neither metric', () => {
+    const json = buildMarkdownCard('hello', undefined, '', 'zh', undefined, 'filesystem', {
+      context: null,
+      tokens: null,
+    });
+    const card = JSON.parse(json);
+    const rendered = JSON.stringify(card);
+
+    expect(card.body.elements.map((element: any) => element.tag)).not.toContain('hr');
+    expect(rendered).not.toContain('上下文');
+    expect(rendered).not.toContain('Token');
+    expect(rendered).not.toContain('不可用');
+  });
+
+  it('keeps brand and recipient chrome when usage is entirely missing', () => {
+    const json = buildMarkdownCard('hello', 'ou_abc', undefined, 'zh', undefined, 'filesystem', {
+      context: null,
+      tokens: null,
+    });
+    const footer = JSON.parse(json).body.elements.at(-1).content;
+
+    expect(footer).toContain('[botmux](');
+    expect(footer).toContain('<at id=ou_abc></at>');
+    expect(footer).not.toContain('上下文');
+    expect(footer).not.toContain('Token');
+    expect(footer).not.toContain('不可用');
+  });
+
   it('appends footer hr + grey link element', () => {
     const json = buildMarkdownCard('hello');
     const card = JSON.parse(json);
@@ -683,6 +1199,180 @@ describe('buildMarkdownCard', () => {
   });
 });
 
+describe('buildReplyCardFooter', () => {
+  it('keeps timing-only footers identifiable and omits invalid timing', () => {
+    const footer = buildReplyCardFooter({ brand: '', executionDurationMs: 0, locale: 'en' });
+    expect(footer?.content).toContain('Execution time 0.0s');
+    expect(footer?.element.element_id).toBe('botmux_reply_footer');
+    expect(buildReplyCardFooter({ brand: '', executionDurationMs: -1 })).toBeNull();
+    expect(buildReplyCardFooter({ brand: '', executionDurationMs: Number.NaN })).toBeNull();
+    expect(buildReplyCardFooter({ brand: '', executionDurationMs: Number.POSITIVE_INFINITY })).toBeNull();
+  });
+
+  it('centralizes brand, usage, and ordered recipients for every reply-card path', () => {
+    const footer = buildReplyCardFooter({
+      brand: 'Acme',
+      usage: {
+        context: { usedTokens: 12_345 },
+        tokens: { in: 67_890, out: 123 },
+      },
+      recipientOpenIds: ['ou_owner', 'ou_reviewer'],
+      locale: 'zh',
+    });
+
+    expect(footer?.content).toContain(
+      `Acme ·${REPLY_CARD_FOOTER_MARKER} `
+      + '上下文 12.3K · '
+      + '发送给：<at id=ou_owner></at> <at id=ou_reviewer></at>',
+    );
+    expect(footer?.content).not.toContain('github.com/deepcoldy/bot%6Dux');
+    // Footer is context-only — the cumulative token line does not appear here.
+    expect(footer?.content).not.toContain('Token');
+    expect(footer?.content).not.toContain('\u200B');
+    expect(footer?.element).toMatchObject({
+      tag: 'markdown',
+      element_id: 'botmux_reply_footer',
+      text_size: 'notation',
+      content: footer?.content,
+    });
+  });
+
+  it('appends the canonical signed footer to caller-supplied v2 cards', () => {
+    const original = {
+      schema: '2.0',
+      body: { elements: [{ tag: 'markdown', content: 'body' }] },
+    };
+    const card = appendReplyCardFooterToV2Card(original, {
+      brand: '',
+      recipientOpenIds: ['ou_owner', 'ou_owner'],
+      locale: 'en',
+    }) as any;
+
+    expect(card).not.toBe(original);
+    expect(original.body.elements).toHaveLength(1);
+    expect(card.body.elements.at(-1)).toMatchObject({
+      tag: 'markdown',
+      element_id: 'botmux_reply_footer',
+    });
+    expect(card.body.elements.at(-1).content).toContain('Sent to: <at id=ou_owner></at>');
+    expect(card.body.elements.at(-1).content).not.toContain('github.com/deepcoldy/bot%6Dux');
+  });
+
+  it('rejects caller-supplied cards without schema-2 body elements', () => {
+    expect(appendReplyCardFooterToV2Card(
+      { elements: [] },
+      { brand: '', recipientOpenIds: ['ou_owner'] },
+    )).toBeNull();
+    expect(appendReplyCardFooterToV2Card(
+      { schema: '1.0', body: { elements: [] } },
+      { brand: '', recipientOpenIds: ['ou_owner'] },
+    )).toBeNull();
+  });
+
+  it('rejects a custom card that already occupies the canonical footer id', () => {
+    expect(appendReplyCardFooterToV2Card(
+      {
+        schema: '2.0',
+        body: {
+          elements: [{
+            tag: 'column_set',
+            columns: [{
+              tag: 'column',
+              elements: [{ tag: 'markdown', element_id: 'botmux_reply_footer', content: 'x' }],
+            }],
+          }],
+        },
+      },
+      { brand: '', recipientOpenIds: ['ou_owner'] },
+    )).toBeNull();
+  });
+
+  it('rejects footer-id collisions in localized header tag components', () => {
+    expect(appendReplyCardFooterToV2Card(
+      {
+        schema: '2.0',
+        header: {
+          i18n_text_tag_list: {
+            zh_cn: [{
+              tag: 'text_tag',
+              element_id: 'botmux_reply_footer',
+              text: { tag: 'plain_text', content: '状态' },
+            }],
+          },
+        },
+        body: { elements: [{ tag: 'markdown', content: 'body' }] },
+      },
+      { brand: '', recipientOpenIds: ['ou_owner'] },
+    )).toBeNull();
+  });
+
+  it('does not treat callback payload fields as card element-id collisions', () => {
+    const card = appendReplyCardFooterToV2Card(
+      {
+        schema: '2.0',
+        body: {
+          elements: [{
+            tag: 'button',
+            text: { tag: 'plain_text', content: '提交' },
+            behaviors: [{
+              type: 'callback',
+              value: { tag: 'deploy', element_id: 'botmux_reply_footer' },
+            }],
+          }],
+        },
+      },
+      { brand: '', recipientOpenIds: ['ou_owner'] },
+    ) as any;
+
+    expect(card).not.toBeNull();
+    expect(card.body.elements.at(-1).element_id).toBe('botmux_reply_footer');
+  });
+
+  it('does NOT sign a default-brand-only footer (no usage, no recipient) — avoids a dangling "botmux ·"', () => {
+    const footer = buildReplyCardFooter({});
+    expect(footer?.content).toContain(DEFAULT_BRAND_LABEL);
+    // Brand alone is legitimate content with no `@` → no ownership marker, so it
+    // renders "botmux" without a trailing separator dot.
+    expect(footer?.content).not.toContain(
+      '[·](https://github.com/deepcoldy/bot%6Dux#reply-card-footer-v1)',
+    );
+  });
+
+  it('signs a usage-only footer with non-link text', () => {
+    const footer = buildReplyCardFooter({
+      brand: '', // brand off
+      usage: { context: { usedTokens: 5_000, windowTokens: 200_000, percentUsed: 2.5 }, tokens: null, turnTokens: null },
+    });
+    expect(footer?.content).toContain('⁣');
+    expect(footer?.content).not.toContain('github.com/deepcoldy/bot%6Dux');
+  });
+
+  it('does not render a separator or link when brand is disabled and only recipient remains', () => {
+    const footer = buildReplyCardFooter({
+      brand: '',
+      recipientOpenIds: ['ou_abc'],
+    });
+    expect(footer?.content).toContain('⁣');
+    expect(footer?.content).not.toContain('github.com/deepcoldy/bot%6Dux');
+    expect(footer?.content).not.toContain('·');
+    expect(footer?.content).toContain('<at id=ou_abc></at>');
+    expect(footer?.content.replaceAll(REPLY_CARD_FOOTER_MARKER, '')).toBe(
+      "<font color='grey'>发送给：<at id=ou_abc></at></font>",
+    );
+  });
+
+  it('signs a default-brand + usage footer with a plain separator', () => {
+    const footer = buildReplyCardFooter({
+      usage: { context: { usedTokens: 5_000, windowTokens: 200_000, percentUsed: 2.5 }, tokens: null, turnTokens: null },
+    });
+    expect(footer?.content).toContain(DEFAULT_BRAND_LABEL);
+    expect(footer?.content).toContain(
+      `${DEFAULT_BRAND_LABEL} ·${REPLY_CARD_FOOTER_MARKER} 上下文 5K/200K (3%)`,
+    );
+    expect(footer?.content).not.toContain('github.com/deepcoldy/bot%6Dux');
+  });
+});
+
 describe('hasMarkdown', () => {
   it('detects fences', () => expect(hasMarkdown('a\n```\nx\n```')).toBe(true));
   it('detects headings', () => expect(hasMarkdown('# title')).toBe(true));
@@ -704,6 +1394,9 @@ describe('brandFooterSegment', () => {
   });
   it('custom string → verbatim (markdown allowed)', () => {
     expect(brandFooterSegment('[Acme](https://acme.test)')).toBe('[Acme](https://acme.test)');
+  });
+  it('normalizes custom brands to the footer single-line invariant', () => {
+    expect(brandFooterSegment(' Acme\n  Team\r\nBot ')).toBe('Acme Team Bot');
   });
 });
 
@@ -730,7 +1423,7 @@ describe('buildMarkdownCard footer brand', () => {
   it('empty brand + no recipient → no footer at all (no orphan hr)', () => {
     const els = JSON.parse(buildMarkdownCard('hi', undefined, '')).body.elements;
     expect(els.some((e: any) => e.tag === 'hr')).toBe(false);
-    expect(els.some((e: any) => e.text_size === 'notation_small_v2')).toBe(false);
+    expect(els.some((e: any) => e.element_id === 'botmux_reply_footer')).toBe(false);
     expect(JSON.stringify(els)).not.toContain('botmux');
     expect(els.some((e: any) => e.tag === 'markdown' && /hi/.test(e.content))).toBe(true);
   });
@@ -800,6 +1493,45 @@ describe('buildCardBodyElements image rows', () => {
 describe('buildImageCardElements', () => {
   const K = ['img_v2_a', 'img_v2_b', 'img_v2_c', 'img_v2_d'];
 
+  it.each([
+    ['medium', 2], ['small', 3], ['tiny', 4],
+  ])('fits the whole image in a proportional column: %s', (mode, columnCount) => {
+    for (const [markdown, keys] of [['截图', [K[0]]], ['![截图](img:0)', [K[0]]], ['![截图](img_v2_a)', []]] as const) {
+      const out = buildImageCardElements(markdown, [...keys], undefined, undefined, mode as string);
+      const row = out.find(e => e.tag === 'column_set');
+      expect(row).toMatchObject({ flex_mode: 'none', horizontal_spacing: '0px' });
+      expect(row.columns).toHaveLength(columnCount as number);
+      for (const column of row.columns) expect(column).toMatchObject({ width: 'weighted', weight: 1 });
+      for (const column of row.columns.slice(1)) expect(column.elements).toEqual([]);
+      const img = row.columns[0].elements[0];
+      expect(img).toMatchObject({ tag: 'img', img_key: K[0], scale_type: 'fit_horizontal', preview: true });
+      expect(img).not.toHaveProperty('mode');
+      expect(img).not.toHaveProperty('size');
+      expect(img).not.toHaveProperty('custom_width');
+    }
+  });
+
+  it('keeps the default output identical, including explicit fit_horizontal', () => {
+    const legacy = buildCardBodyElements('截图\n\n![](img_v2_a)');
+    expect(buildImageCardElements('截图', [K[0]])).toEqual(legacy);
+    expect(buildImageCardElements('截图', [K[0]], undefined, undefined, 'fit_horizontal')).toEqual(legacy);
+  });
+
+  it('sizes standalone placeholders and trailing images without resizing a grid', () => {
+    const out = buildImageCardElements('![预览](img:0)\n\n![](img:1,2)', K, undefined, undefined, 'tiny');
+    const rows = out.filter(e => e.tag === 'column_set');
+    expect(rows[0].columns[0].elements[0]).toMatchObject({ img_key: K[0], scale_type: 'fit_horizontal', alt: { content: '预览' } });
+    expect(rows[2].columns[0].elements[0]).toMatchObject({ img_key: K[3], scale_type: 'fit_horizontal' });
+    expect(rows[1]).toEqual(buildImageCardElements('![](img:0,1)', [K[1], K[2]])[0]);
+  });
+
+  it('keeps fenced code, indented code, inline prose and remote images as Markdown', () => {
+    for (const markdown of ['```\n![](img_v2_a)\n```', '    ![](img_v2_a)', 'see ![](img_v2_a) here', '![](https://example.com/a.png)']) {
+      expect(buildCardBodyElements(markdown, undefined, undefined, 'small')).toEqual(buildCardBodyElements(markdown));
+    }
+  });
+
+
   it('no images → identical to buildCardBodyElements', () => {
     expect(buildImageCardElements('hello **world**', [])).toEqual(
       buildCardBodyElements('hello **world**'),
@@ -853,6 +1585,22 @@ describe('buildImageCardElements', () => {
     expect(out[2]).toMatchObject({ tag: 'markdown', content: 'bottom' });
   });
 
+  it('shares the six-heading promotion budget across image-row segments', () => {
+    const input = Array.from({ length: 8 }, (_, index) => [
+      `# Section ${index + 1}`,
+      `body ${index + 1}`,
+      index < 7 ? '![](img:0,1)' : '',
+    ].filter(Boolean).join('\n\n')).join('\n\n');
+    const out = buildImageCardElements(input, K.slice(0, 2));
+    const promoted = out.filter(element => element.text_size === 'heading-2');
+    const rendered = mdElements(out).map(element => element.content).join('\n\n');
+
+    expect(out.filter(element => element.tag === 'column_set')).toHaveLength(7);
+    expect(promoted).toHaveLength(6);
+    expect(rendered).toContain('**Section 7**');
+    expect(rendered).toContain('**Section 8**');
+  });
+
   it('mixed: grouped row + an unreferenced image appended at the end', () => {
     const out = buildImageCardElements('![](img:0,1)', K.slice(0, 3));
     expect(out.some(e => e.tag === 'column_set')).toBe(true);
@@ -868,21 +1616,40 @@ describe('buildImageCardElements', () => {
     expect(mdElements(out).map(e => e.content).join('\n')).toContain('![](img_v2_a)');
   });
 
-  it('group with all indices out of range → literal text preserved', () => {
+  it('group with all indices out of range → readable omitted-image notice', () => {
     const out = buildImageCardElements('![](img:7,8)', [K[0]]);
     expect(out.some(e => e.tag === 'column_set')).toBe(false);
     const md = mdElements(out).map(e => e.content).join('');
-    expect(md).toContain('![](img:7,8)');
+    expect(md).toContain('[Image omitted] [](img:7,8)');
   });
 });
 
 describe('buildContextualReplyCard footer brand', () => {
+  it('renders the same native usage footer as a regular reply card', () => {
+    const els = JSON.parse(buildContextualReplyCard({
+      title: 'T',
+      assistantText: 'a',
+      assistantLabel: 'Codex',
+      recipientOpenId: 'ou_x',
+      usage: {
+        context: { usedTokens: 159_861, windowTokens: 258_400, percentUsed: 62 },
+        tokens: { in: 3_739_570, out: 23_299 },
+      },
+    })).body.elements;
+    const footer = els.at(-1).content;
+
+    expect(footer).toContain('上下文 159.9K/258.4K (62%)');
+    // Reply-card footer (contextual card too) is context-only; token off-footer.
+    expect(footer).not.toContain('Token');
+    expect(footer).toContain('<at id=ou_x></at>');
+  });
+
   it('custom brand renders; default botmux omitted', () => {
     const els = JSON.parse(buildContextualReplyCard({
       title: 'T', assistantText: 'a', assistantLabel: 'Claude', recipientOpenId: 'ou_x', brand: 'Acme',
     })).body.elements;
     const last = els[els.length - 1];
-    expect(last.text_size).toBe('notation_small_v2');
+    expect(last.text_size).toBe('notation');
     expect(last.content).toContain('Acme');
     expect(last.content).not.toContain('botmux');
   });
@@ -891,7 +1658,104 @@ describe('buildContextualReplyCard footer brand', () => {
     const els = JSON.parse(buildContextualReplyCard({
       title: 'T', assistantText: 'a', assistantLabel: 'Claude', brand: '',
     })).body.elements;
-    expect(els.some((e: any) => e.text_size === 'notation_small_v2')).toBe(false);
+    expect(els.some((e: any) => e.element_id === 'botmux_reply_footer')).toBe(false);
     expect(JSON.stringify(els)).not.toContain('botmux');
+  });
+});
+
+describe('cardUsageFooterSegment — Claude Code statusline quota (ctx / 5h / 7d)', () => {
+  it('footer renders the plain-percentage form `ctx 23% · 5h 18% · 7d 5%` (no bars, no absolutes, no resets_at)', () => {
+    const seg = cardUsageFooterSegment(
+      {
+        context: null,
+        tokens: null,
+        quota: { contextPercent: 23, fiveHourPercent: 18, fiveHourResetsAtMs: 1_788_000_000_000, sevenDayPercent: 5, sevenDayResetsAtMs: 1_788_086_400_000 },
+      },
+      'zh',
+    );
+    expect(seg).toBe('ctx 23% · 5h 18% · 7d 5%');
+    // en 同值（纯文本标签两语言一致）
+    expect(cardUsageFooterSegment(
+      { context: null, tokens: null, quota: { contextPercent: 23, fiveHourPercent: 18, sevenDayPercent: 5 } },
+      'en',
+    )).toBe('ctx 23% · 5h 18% · 7d 5%');
+  });
+
+  it('quota overrides the transcript absolute form even when context tokens are present', () => {
+    // Claude Code 的 transcript 有 usedTokens 但没有窗口；statusline 有百分比 → 只渲染 ctx N%。
+    const seg = cardUsageFooterSegment(
+      { context: { usedTokens: 159_861 }, tokens: { in: 1, out: 2 }, quota: { contextPercent: 23, fiveHourPercent: 18, sevenDayPercent: 5 } },
+      'zh',
+    );
+    expect(seg).toBe('ctx 23% · 5h 18% · 7d 5%');
+    expect(seg).not.toContain('159.9K');
+    expect(seg).not.toContain('上下文');
+  });
+
+  it('omits 7d when only 5h is known; omits ctx when the statusline gave no context percent', () => {
+    expect(cardUsageFooterSegment(
+      { context: null, tokens: null, quota: { contextPercent: 23, fiveHourPercent: 18 } },
+      'zh',
+    )).toBe('ctx 23% · 5h 18%');
+    // 无 contextPercent（例如窗口已滚动只剩重置时间）→ 落回 transcript 绝对值分支
+    expect(cardUsageFooterSegment(
+      { context: { usedTokens: 159_861, windowTokens: 258_400, percentUsed: 62 }, tokens: null, quota: { sevenDayPercent: 5 } },
+      'zh',
+    )).toBe('ctx 62% · 7d 5%');
+    expect(cardUsageFooterSegment(
+      { context: { usedTokens: 159_861 }, tokens: null, quota: { sevenDayPercent: 5 } },
+      'zh',
+    )).toBe('上下文 159.9K · 7d 5%');
+    // quota 里一个可渲染字段都没有 → 与无 quota 相同
+    expect(cardUsageFooterSegment(
+      { context: null, tokens: null, quota: { fiveHourResetsAtMs: 1_788_000_000_000 } },
+      'zh',
+    )).toBeNull();
+  });
+
+  it('quota null / absent renders byte-identically to today', () => {
+    const base = { context: { usedTokens: 80_700, windowTokens: 258_400, percentUsed: 31 }, tokens: { in: 1_400_000, out: 7_800 } };
+    const today = cardUsageFooterSegment(base, 'zh');
+    expect(today).toBe('上下文 80.7K/258.4K (31%)');
+    expect(cardUsageFooterSegment({ ...base, quota: null }, 'zh')).toBe(today);
+    expect(cardUsageFooterSegment({ ...base, quota: undefined }, 'zh')).toBe(today);
+    const todayStreaming = cardUsageFooterSegment(base, 'zh', 'streaming');
+    expect(todayStreaming).toBe('上下文 80.7K/258.4K (31%) · 累计 ↑1.4M ↓7.8K');
+    expect(cardUsageFooterSegment({ ...base, quota: null }, 'zh', 'streaming')).toBe(todayStreaming);
+    // 卡片级：footer 元素逐字节相同
+    const cardWithout = buildMarkdownCard('hello', undefined, '', 'zh', undefined, 'filesystem', base);
+    const cardWithNull = buildMarkdownCard('hello', undefined, '', 'zh', undefined, 'filesystem', { ...base, quota: null });
+    expect(cardWithNull).toBe(cardWithout);
+  });
+
+  it('streaming variant keeps the three quota segments and appends 本轮 / 累计', () => {
+    const seg = cardUsageFooterSegment(
+      {
+        context: { usedTokens: 159_861 },
+        tokens: { in: 1_400_000, out: 7_800 },
+        turnTokens: { in: 5_000, out: 1_200 },
+        quota: { contextPercent: 23, fiveHourPercent: 18, sevenDayPercent: 5 },
+      },
+      'zh',
+      'streaming',
+    );
+    expect(seg).toBe('ctx 23% · 5h 18% · 7d 5% · 本轮 ↑5K ↓1.2K · 累计 ↑1.4M ↓7.8K');
+  });
+
+  it('compact hint fires from quota.contextPercent (transcript has no window)', () => {
+    const usage = { context: { usedTokens: 159_861 }, tokens: null, quota: { contextPercent: 91, fiveHourPercent: 18 } };
+    expect(contextOverCompactThreshold(usage, 90)).toBe(true);
+    expect(contextOverCompactThreshold(usage, 95)).toBe(false);
+    expect(cardUsageFooterSegment(usage, 'zh', 'streaming', { compactHintThreshold: 90 }))
+      .toBe('ctx 91% · 建议压缩 · 5h 18%');
+    expect(cardUsageFooterSegment(usage, 'zh', 'streaming', { compactHintThreshold: 95 }))
+      .toBe('ctx 91% · 5h 18%');
+  });
+
+  it('rounds and clamps quota percentages like the context percentage', () => {
+    expect(cardUsageFooterSegment(
+      { context: null, tokens: null, quota: { contextPercent: 23.6, fiveHourPercent: 140, sevenDayPercent: -1 } },
+      'zh',
+    )).toBe('ctx 24% · 5h 100%');
   });
 });

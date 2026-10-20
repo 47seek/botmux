@@ -45,6 +45,8 @@ function retryAction(): any {
 
 async function fresh() {
   vi.resetModules();
+  const sessionStore = await import('../src/services/session-store.js');
+  sessionStore.init('h1');
   const types = await import('../src/core/types.js');
   const registry = await import('../src/bot-registry.js');
   const handler = await import('../src/im/lark/card-handler.js');
@@ -57,6 +59,7 @@ beforeEach(() => {
   const cfg = join(dir, 'bots.json');
   writeFileSync(cfg, JSON.stringify([{ larkAppId: 'h1', larkAppSecret: 's', cliId: 'claude-code' }], null, 2));
   process.env.BOTS_CONFIG = cfg;
+  process.env.SESSION_DATA_DIR = dir;
   deps.activeSessions = new Map();
 });
 afterEach(() => { delete process.env.BOTS_CONFIG; vi.restoreAllMocks(); });
@@ -105,6 +108,21 @@ describe('card-handler voice_summary', () => {
     const idle = await handler.handleCardAction(voiceAction('om_card1'), deps, 'h1');
     expect(idle?.toast?.type).toBe('success');
     expect(send).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not consume the dedupe key when live IPC rejects the voice turn', async () => {
+    const { types, handler } = await fresh();
+    const send = vi.fn()
+      .mockImplementationOnce(() => { throw new Error('worker exited'); })
+      .mockImplementationOnce(() => {});
+    deps.activeSessions.set(types.sessionKey('om_root', 'h1'), fakeSession(send));
+
+    const failed = await handler.handleCardAction(voiceAction('om_retryable_voice'), deps, 'h1');
+    const retried = await handler.handleCardAction(voiceAction('om_retryable_voice'), deps, 'h1');
+
+    expect(failed?.toast?.type).toBe('warning');
+    expect(retried?.toast?.type).toBe('success');
+    expect(send).toHaveBeenCalledTimes(2);
   });
 
   it('a re-click while the voice is still generating (worker back to working) says "already", not "busy"', async () => {
@@ -176,6 +194,34 @@ describe('card-handler voice_summary', () => {
 });
 
 describe('card-handler retry_last_task', () => {
+  it('keeps retry eligibility and visible state unchanged when live IPC rejects acceptance', async () => {
+    const { types, handler } = await fresh();
+    const send = vi.fn()
+      .mockImplementationOnce(() => { throw new Error('worker exited'); })
+      .mockImplementationOnce(() => {});
+    const ds = fakeSession(send);
+    ds.lastCliInput = '<user_message>retry me</user_message>';
+    ds.lastUserPrompt = 'retry me';
+    ds.usageLimit = { retryReady: true, retryAtMs: 0, retryLabel: 'now' };
+    deps.activeSessions.set(types.sessionKey('om_root', 'h1'), ds);
+
+    await handler.handleCardAction(retryAction(), deps, 'h1');
+
+    expect(ds.usageLimit).toMatchObject({ retryReady: true, retryLabel: 'now' });
+    expect(ds.lastScreenStatus).toBe('idle');
+    expect(deps.sessionReply).toHaveBeenCalledWith(
+      'om_root',
+      expect.stringContaining('重试状态已失效'),
+      undefined,
+      'h1',
+    );
+
+    await handler.handleCardAction(retryAction(), deps, 'h1');
+    expect(send).toHaveBeenCalledTimes(2);
+    expect(ds.usageLimit).toBeUndefined();
+    expect(ds.lastScreenStatus).toBe('working');
+  });
+
   it('preserves the clean Codex App sidecar when retrying a completed turn', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-cardretry-clean-'));
     const cfg = join(dir, 'bots.json');
@@ -214,6 +260,12 @@ describe('card-handler retry_last_task', () => {
         additionalContext: ds.lastCodexAppInput.additionalContext,
       },
     });
-    expect(send.mock.calls[0][0].codexAppInput).not.toHaveProperty('clientUserMessageId');
+    // A replay must never reuse the completed native turn's routing id. The
+    // durable Codex App dispatcher assigns a fresh synthetic identity so this
+    // retry has its own ledger ownership and final attribution.
+    expect(send.mock.calls[0][0].codexAppInput.clientUserMessageId)
+      .toMatch(/^codex-app-dispatch-/);
+    expect(send.mock.calls[0][0].codexAppInput.clientUserMessageId).not.toBe('om_original');
+    expect(send.mock.calls[0][0].codexAppDispatchId).toEqual(expect.any(String));
   });
 });

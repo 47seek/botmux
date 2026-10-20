@@ -10,20 +10,35 @@
  * Run: pnpm vitest run test/dispatch.test.ts
  */
 import { describe, it, expect } from 'vitest';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { findAncestorSessionContext } from '../src/core/session-marker.js';
 import {
+  acceptedDispatchBotAppIds,
+  activeConversationBotOpenIds,
+  appendDispatchCompletionProtocol,
+  appendDispatchReportProtocol,
+  appendLegacyDispatchReportProtocol,
+  buildDispatchCompletionBrief,
+  stripDispatchCompletionProtocol,
+  buildProjectDispatchSyncAction,
   parseDispatchBotSpec,
   buildDispatchMessages,
   buildRepoPrimeText,
   buildReportContent,
+  findDispatchRegistryEntry,
   findSubBotTopic,
   eligibleAutoMentionAliases,
   offTopicSubBotTopic,
+  foldableChatSessionAppIds,
+  recordDispatchInputCommit,
+  resolveReportPlacement,
+  resolveReportRecipient,
+  resolveReportRecipientForSession,
   resolveReportTarget,
   resolveSendTarget,
+  threadRootForReachability,
 } from '../src/core/dispatch.js';
 
 describe('parseDispatchBotSpec', () => {
@@ -91,6 +106,103 @@ describe('buildDispatchMessages', () => {
 
   it('throws on an empty title', () => {
     expect(() => buildDispatchMessages({ title: '   ', brief: 'b', bots })).toThrow();
+  });
+});
+
+describe('buildProjectDispatchSyncAction', () => {
+  const input = {
+    dispatchRoot: 'om_existing', title: '', purpose: '', owners: ['worker-a'],
+    status: 'in_progress' as const, progress: 20,
+  };
+
+  it('omits lifecycle and owners when coordinating an existing topic', () => {
+    expect(buildProjectDispatchSyncAction({ ...input, existingDispatch: true })).toEqual({
+      action: 'dispatch', dispatchRoot: 'om_existing', title: '', purpose: '',
+    });
+  });
+
+  it('includes initial projection fields for a newly dispatched topic', () => {
+    expect(buildProjectDispatchSyncAction({ ...input, existingDispatch: false })).toEqual({
+      action: 'dispatch', dispatchRoot: 'om_existing', title: '', purpose: '',
+      owners: ['worker-a'], status: 'in_progress', progress: 20,
+    });
+  });
+});
+
+describe('dispatch completion switch wiring', () => {
+  it('keeps both existing report protocols available for the default path', () => {
+    expect(appendDispatchReportProtocol('本机任务', 'om_seed_exact'))
+      .toContain('botmux report --dispatch-root om_seed_exact');
+    expect(appendLegacyDispatchReportProtocol('兼容任务'))
+      .toContain('botmux report "子项目完成 + 产出位置/摘要"');
+    expect(() => appendDispatchReportProtocol('错误目标', 'oc_chat'))
+      .toThrow('valid om_ root id');
+  });
+
+  it('adds a same-topic botmux send copy after the report protocol', () => {
+    const plain = buildDispatchMessages({
+      title: '任务',
+      brief: '完成实现并自测',
+      bots: [{ openId: 'ou_assignee' }],
+    });
+    expect(plain.threadContent.flat().map(node => node.tag === 'text' ? node.text : '').join('\n'))
+      .not.toContain('botmux send');
+
+    const completion = appendDispatchCompletionProtocol(
+      appendDispatchReportProtocol('完成实现并自测', 'om_seed_exact'),
+    );
+    expect(completion).toContain('botmux report --dispatch-root om_seed_exact');
+    expect(completion).toContain('botmux send --no-mention');
+    expect(completion).toContain('除上述 botmux report 回报外');
+    expect(completion).toContain('不要 @ 主 bot，不要新开话题');
+  });
+
+  it.each([
+    { exact: false, send: false, exactReport: false, sameTopicSend: false },
+    { exact: false, send: true, exactReport: false, sameTopicSend: true },
+    { exact: true, send: false, exactReport: true, sameTopicSend: false },
+    { exact: true, send: true, exactReport: true, sameTopicSend: true },
+  ])('combines report and same-topic send protocols: %o', ({ exact, send, exactReport, sameTopicSend }) => {
+    const result = buildDispatchCompletionBrief({
+      brief: '完成实现并自测',
+      dispatchRootId: 'om_seed_exact',
+      exactReportRootEnabled: exact,
+      sameTopicSendEnabled: send,
+    });
+
+    expect(result.includes('botmux report --dispatch-root om_seed_exact')).toBe(exactReport);
+    expect(result.includes('botmux report "子项目完成 + 产出位置/摘要"')).toBe(!exactReport);
+    expect(result.includes('botmux send --no-mention')).toBe(sameTopicSend);
+  });
+
+  it('authenticates the exact report callback through daemon IPC', () => {
+    const source = readFileSync(new URL('../src/cli.ts', import.meta.url), 'utf8');
+    const start = source.indexOf('async function cmdReport');
+    const end = source.indexOf('\nasync function ', start + 1);
+    const report = source.slice(start, end);
+
+    expect(report).toContain('postCurrentSessionDaemonRoute({');
+    expect(report).toContain('path: REPORT_SESSION_RELAY_ROUTE');
+    expect(report).not.toContain("orchestrate-dispatch.json");
+  });
+
+  it('renders dispatch save feedback inside its own dashboard setting row', () => {
+    const source = readFileSync(new URL('../src/dashboard/web/roles-page.tsx', import.meta.url), 'utf8');
+    const injectStart = source.indexOf("tr('roles.injectModeLabel')");
+    const completionStart = source.indexOf("tr('roles.dispatchCompletionLabel')", injectStart);
+    const textareaStart = source.indexOf('<textarea', completionStart);
+    const injectRow = source.slice(injectStart, completionStart);
+    const completionRow = source.slice(completionStart, textareaStart);
+
+    expect(injectRow).toContain('<Flash flash={injectFlash} />');
+    expect(injectRow).not.toContain('dispatchCompletionFlash');
+    expect(completionRow).toContain('<Flash flash={dispatchCompletionFlash} />');
+  });
+
+  it('trails the marker so older cross-machine receivers keep the positional report text', () => {
+    const legacy = appendLegacyDispatchReportProtocol('跨机器任务');
+    expect(legacy).toContain('botmux report "子项目完成 + 产出位置/摘要" --legacy-dispatch');
+    expect(legacy).not.toContain('--dispatch-root');
   });
 });
 
@@ -190,6 +302,283 @@ describe('findSubBotTopic', () => {
   });
 });
 
+describe('activeConversationBotOpenIds', () => {
+  const botEntries = [
+    { larkAppId: 'cli_orchestrator', botName: 'AI Bear' },
+    { larkAppId: 'cli_reviewer', botName: 'TraeX' },
+  ];
+  const crossRef = {
+    'AI Bear': 'ou_orchestrator',
+    'TraeX': 'ou_reviewer',
+  };
+
+  it('finds a peer active in the current topic and excludes the same peer in another topic', () => {
+    const result = activeConversationBotOpenIds({
+      sessions: [
+        { status: 'active', scope: 'thread', chatId: 'oc_main', rootMessageId: 'om_current', larkAppId: 'cli_reviewer' },
+        { status: 'active', scope: 'thread', chatId: 'oc_main', rootMessageId: 'om_old', larkAppId: 'cli_reviewer' },
+      ],
+      targetChatId: 'oc_main',
+      outboundRootMessageId: 'om_current',
+      botEntries,
+      crossRef,
+    });
+    expect(result).toEqual(new Set(['ou_reviewer']));
+  });
+
+  it('does not trust a leftover chat session after the bot stops using a foldable mode', () => {
+    const result = activeConversationBotOpenIds({
+      sessions: [
+        { status: 'active', scope: 'chat', chatId: 'oc_main', rootMessageId: 'oc_main', larkAppId: 'cli_reviewer' },
+      ],
+      targetChatId: 'oc_main',
+      outboundRootMessageId: 'om_current',
+      foldableChatAppIds: new Set(),
+      botEntries,
+      crossRef,
+    });
+    expect(result).toEqual(new Set());
+  });
+
+  it('does not treat a peer active only in another topic as reachable here', () => {
+    const result = activeConversationBotOpenIds({
+      sessions: [
+        { status: 'active', scope: 'thread', chatId: 'oc_main', rootMessageId: 'om_old', larkAppId: 'cli_reviewer' },
+      ],
+      targetChatId: 'oc_main',
+      outboundRootMessageId: 'om_current',
+      botEntries,
+      crossRef,
+    });
+    expect(result).toEqual(new Set());
+  });
+
+  it('treats a same-chat chat-scope peer as reachable from a thread sender', () => {
+    const result = activeConversationBotOpenIds({
+      sessions: [
+        { status: 'active', scope: 'chat', chatId: 'oc_main', rootMessageId: 'oc_main', larkAppId: 'cli_reviewer' },
+        { status: 'active', scope: 'chat', chatId: 'oc_else', rootMessageId: 'oc_else', larkAppId: 'cli_orchestrator' },
+      ],
+      targetChatId: 'oc_main',
+      outboundRootMessageId: 'om_current',
+      foldableChatAppIds: new Set(['cli_reviewer']),
+      botEntries,
+      crossRef,
+    });
+    expect(result).toEqual(new Set(['ou_reviewer']));
+  });
+
+  it('treats a same-root thread peer as reachable from a chat-scope reply into that topic', () => {
+    const result = activeConversationBotOpenIds({
+      sessions: [
+        { status: 'active', scope: 'thread', chatId: 'oc_main', rootMessageId: 'om_current', larkAppId: 'cli_reviewer' },
+      ],
+      targetChatId: 'oc_main',
+      outboundRootMessageId: 'om_current',
+      botEntries,
+      crossRef,
+    });
+    expect(result).toEqual(new Set(['ou_reviewer']));
+  });
+
+  it('does not treat a thread peer as reachable from a plain chat send', () => {
+    const result = activeConversationBotOpenIds({
+      sessions: [
+        { status: 'active', scope: 'thread', chatId: 'oc_main', rootMessageId: 'om_current', larkAppId: 'cli_reviewer' },
+      ],
+      targetChatId: 'oc_main',
+      botEntries,
+      crossRef,
+    });
+    expect(result).toEqual(new Set());
+  });
+
+  it('does not treat a quoted root as entering a thread peer session', () => {
+    const quoteTarget = { mode: 'quote' as const, rootMessageId: 'om_current' };
+    const result = activeConversationBotOpenIds({
+      sessions: [
+        { status: 'active', scope: 'thread', chatId: 'oc_main', rootMessageId: 'om_current', larkAppId: 'cli_reviewer' },
+      ],
+      targetChatId: 'oc_main',
+      outboundRootMessageId: threadRootForReachability(quoteTarget),
+      botEntries,
+      crossRef,
+    });
+    expect(result).toEqual(new Set());
+  });
+
+  it('fails closed when multiple bot apps share the same display name', () => {
+    const result = activeConversationBotOpenIds({
+      sessions: [
+        { status: 'active', scope: 'thread', chatId: 'oc_main', rootMessageId: 'om_current', larkAppId: 'cli_same_1' },
+      ],
+      targetChatId: 'oc_main',
+      outboundRootMessageId: 'om_current',
+      botEntries: [
+        { larkAppId: 'cli_same_1', botName: 'Same' },
+        { larkAppId: 'cli_same_2', botName: 'Same' },
+      ],
+      crossRef: { Same: 'ou_same_2' },
+    });
+    expect(result).toEqual(new Set());
+  });
+
+  it('treats a non-array bot identity payload as empty instead of throwing', () => {
+    expect(activeConversationBotOpenIds({
+      sessions: [
+        { status: 'active', scope: 'thread', chatId: 'oc_main', rootMessageId: 'om_current', larkAppId: 'cli_reviewer' },
+      ],
+      targetChatId: 'oc_main',
+      outboundRootMessageId: 'om_current',
+      botEntries: {} as any,
+      crossRef,
+    })).toEqual(new Set());
+  });
+
+  it('ignores malformed elements inside a bot identity array', () => {
+    expect(activeConversationBotOpenIds({
+      sessions: [
+        { status: 'active', scope: 'thread', chatId: 'oc_main', rootMessageId: 'om_current', larkAppId: 'cli_reviewer' },
+      ],
+      targetChatId: 'oc_main',
+      outboundRootMessageId: 'om_current',
+      botEntries: [null, 1, {}, ...botEntries] as any,
+      crossRef,
+    })).toEqual(new Set(['ou_reviewer']));
+  });
+});
+
+describe('send-target reachability helpers', () => {
+  it('only exposes a root for a real thread send, not quote/plain delivery', () => {
+    expect(threadRootForReachability({ mode: 'thread', rootMessageId: 'om_thread' })).toBe('om_thread');
+    expect(threadRootForReachability({ mode: 'quote', rootMessageId: 'om_quote' })).toBeUndefined();
+    expect(threadRootForReachability({ mode: 'plain', chatId: 'oc_chat' })).toBeUndefined();
+  });
+
+  it('accepts only currently foldable ordinary-group chat sessions in the target chat', async () => {
+    const sessions = [
+      { status: 'active' as const, scope: 'chat' as const, chatId: 'oc_main', rootMessageId: 'oc_main', larkAppId: 'cli_chat' },
+      { status: 'active' as const, scope: 'chat' as const, chatId: 'oc_main', rootMessageId: 'oc_main', larkAppId: 'cli_new_topic' },
+      { status: 'active' as const, scope: 'chat' as const, chatId: 'oc_else', rootMessageId: 'oc_else', larkAppId: 'cli_elsewhere' },
+    ];
+    const modes = new Map([
+      ['cli_chat', 'chat' as const],
+      ['cli_new_topic', 'new-topic' as const],
+      ['cli_elsewhere', 'shared' as const],
+    ]);
+    expect(await foldableChatSessionAppIds({
+      sessions,
+      targetChatId: 'oc_main',
+      outboundMode: 'thread',
+      resolveMode: appId => modes.get(appId),
+      resolveChatMode: async () => 'group',
+    })).toEqual(new Set(['cli_chat']));
+  });
+
+  it('keeps chat-topic chat sessions reachable only for top-level-like delivery', async () => {
+    const sessions = [
+      { status: 'active' as const, scope: 'chat' as const, chatId: 'oc_main', rootMessageId: 'oc_main', larkAppId: 'cli_chat_topic' },
+    ];
+    const resolveMode = () => 'chat-topic' as const;
+    expect(await foldableChatSessionAppIds({
+      sessions,
+      targetChatId: 'oc_main',
+      outboundMode: 'plain',
+      resolveMode,
+      resolveChatMode: async () => 'group',
+    })).toEqual(new Set(['cli_chat_topic']));
+    expect(await foldableChatSessionAppIds({
+      sessions,
+      targetChatId: 'oc_main',
+      outboundMode: 'quote',
+      resolveMode,
+      resolveChatMode: async () => 'group',
+    })).toEqual(new Set(['cli_chat_topic']));
+    expect(await foldableChatSessionAppIds({
+      sessions,
+      targetChatId: 'oc_main',
+      outboundMode: 'thread',
+      resolveMode,
+      resolveChatMode: async () => 'group',
+    })).toEqual(new Set());
+  });
+
+  it('excludes isolated deferred schedule-run chat sessions from the ordinary routing slot', async () => {
+    expect(await foldableChatSessionAppIds({
+      sessions: [
+        {
+          status: 'active',
+          scope: 'chat',
+          chatId: 'oc_main',
+          rootMessageId: 'om_deferred',
+          larkAppId: 'cli_deferred',
+          deferredScheduleRun: { routingAnchor: 'schedule-run:1' },
+        },
+      ],
+      targetChatId: 'oc_main',
+      outboundMode: 'plain',
+      resolveMode: () => 'chat',
+      resolveChatMode: async () => 'group',
+    })).toEqual(new Set());
+  });
+
+  it('Plan B: a VC meeting-agent chat session IS foldable via the ordinary slot', async () => {
+    // Under Plan B the meeting agent is an ordinary chat-scope session, so a
+    // mention in its listener group must fold back into it like any other
+    // chat-scope peer — the vcMeetingReceiver marker is delivery metadata and
+    // no longer excludes the session from the foldable set.
+    expect(await foldableChatSessionAppIds({
+      sessions: [
+        {
+          status: 'active',
+          scope: 'chat',
+          chatId: 'oc_main',
+          rootMessageId: 'om_vc',
+          larkAppId: 'cli_vc',
+          vcMeetingReceiver: { meetingId: 'meeting-1' },
+        },
+      ],
+      targetChatId: 'oc_main',
+      outboundMode: 'plain',
+      resolveMode: () => 'chat',
+      resolveChatMode: async () => 'group',
+    })).toEqual(new Set(['cli_vc']));
+  });
+
+  it('fails closed after a regular group becomes a topic chat', async () => {
+    expect(await foldableChatSessionAppIds({
+      sessions: [
+        { status: 'active', scope: 'chat', chatId: 'oc_main', rootMessageId: 'oc_main', larkAppId: 'cli_stale' },
+      ],
+      targetChatId: 'oc_main',
+      outboundMode: 'plain',
+      resolveMode: () => 'chat',
+      resolveChatMode: async () => 'topic',
+    })).toEqual(new Set());
+  });
+
+  it('fails closed when the target bot reply mode or chat topology cannot be resolved', async () => {
+    expect(await foldableChatSessionAppIds({
+      sessions: [
+        { status: 'active', scope: 'chat', chatId: 'oc_main', rootMessageId: 'oc_main', larkAppId: 'cli_unknown' },
+      ],
+      targetChatId: 'oc_main',
+      outboundMode: 'plain',
+      resolveMode: () => { throw new Error('unknown bot'); },
+      resolveChatMode: async () => 'group',
+    })).toEqual(new Set());
+    expect(await foldableChatSessionAppIds({
+      sessions: [
+        { status: 'active', scope: 'chat', chatId: 'oc_main', rootMessageId: 'oc_main', larkAppId: 'cli_unknown' },
+      ],
+      targetChatId: 'oc_main',
+      outboundMode: 'plain',
+      resolveMode: () => 'chat',
+      resolveChatMode: async () => 'unknown',
+    })).toEqual(new Set());
+  });
+});
+
 describe('eligibleAutoMentionAliases', () => {
   const selfAliases = new Set<string>(['claude', 'claude-code']);
   const convo = new Set<string>(['cli_reviewer_in_topic']);
@@ -229,6 +618,17 @@ describe('offTopicSubBotTopic', () => {
     expect(offTopicSubBotTopic({ mentionOpenId: 'ou_subbot', quoteTargetSenderOpenId: 'ou_subbot', chatId: 'oc_main', registry, activeSeeds })).toBeNull();
   });
 
+  it('does not recommend an old dispatch topic when the bot is already active here', () => {
+    expect(offTopicSubBotTopic({
+      mentionOpenId: 'ou_subbot',
+      quoteTargetSenderOpenId: 'ou_human',
+      reachableOpenIds: new Set(['ou_subbot']),
+      chatId: 'oc_main',
+      registry,
+      activeSeeds,
+    })).toBeNull();
+  });
+
   it('allows a bot that is not a dispatched sub-bot', () => {
     expect(offTopicSubBotTopic({ mentionOpenId: 'ou_stranger', quoteTargetSenderOpenId: 'ou_human', chatId: 'oc_main', registry, activeSeeds })).toBeNull();
   });
@@ -247,7 +647,7 @@ describe('resolveReportTarget', () => {
     expect(r).toEqual({ orchChatId: 'oc_orch', orchScope: 'thread', orchRoot: 'om_root', orchOpenId: 'ou_orch' });
   });
 
-  it('CROSS-MACHINE: with no registry entry, derives from the session (chatId + chat-scope)', () => {
+  it('keeps the legacy no-registry coordinate fallback for compatibility callers', () => {
     const r = resolveReportTarget({ registryEntry: undefined, sessionChatId: 'oc_sub', creatorOpenId: 'ou_orch' });
     expect(r).toEqual({ orchChatId: 'oc_sub', orchScope: 'chat', orchRoot: '', orchOpenId: 'ou_orch' });
   });
@@ -256,6 +656,524 @@ describe('resolveReportTarget', () => {
     expect(resolveReportTarget({ creatorOpenId: 'c', ownerOpenId: 'o', quoteTargetSenderOpenId: 'q' }).orchOpenId).toBe('c');
     expect(resolveReportTarget({ ownerOpenId: 'o', quoteTargetSenderOpenId: 'q' }).orchOpenId).toBe('o');
     expect(resolveReportTarget({ quoteTargetSenderOpenId: 'q' }).orchOpenId).toBe('q');
+  });
+});
+
+describe('resolveReportRecipient', () => {
+  it('keeps the stable creator as recipient regardless of message placement', () => {
+    expect(resolveReportRecipient({
+      creatorOpenId: 'ou_reviewer',
+      ownerOpenId: 'ou_owner',
+      quoteTargetSenderOpenId: 'ou_latest_sender',
+    })).toBe('ou_reviewer');
+  });
+
+  it('skips empty legacy identity fields', () => {
+    expect(resolveReportRecipient({
+      creatorOpenId: '  ',
+      ownerOpenId: 'ou_owner',
+      quoteTargetSenderOpenId: 'ou_latest_sender',
+    })).toBe('ou_owner');
+  });
+});
+
+describe('resolveReportRecipientForSession', () => {
+  const reviewer = 'ou_reviewer';
+  const user = 'ou_user';
+  const source = {
+    sessionId: 'chat', larkAppId: 'cli_worker', chatId: 'oc_task',
+    rootMessageId: 'om_dispatch', scope: 'chat' as const, status: 'active',
+    creatorOpenId: reviewer, createdAt: '2026-08-07T07:30:00Z',
+  };
+  const current = {
+    ...source, sessionId: 'thread', rootMessageId: 'om_thread', scope: 'thread' as const,
+    creatorOpenId: user, ownerOpenId: user, createdAt: '2026-08-07T07:45:00Z',
+  };
+  const input = {
+    session: current, sessions: [source, current], knownPeerBotOpenIds: new Set([reviewer]),
+    recipientRoot: 'om_dispatch',
+  };
+
+  it('inherits the creator of the exact recipient root', () => {
+    expect(resolveReportRecipientForSession(input)).toEqual({
+      openId: reviewer, source: 'recipient-root-chat-creator', sourceSessionId: 'chat',
+    });
+  });
+
+  it('inherits the source creator for a legacy thread without scope', () => {
+    expect(resolveReportRecipientForSession({ ...input, session: { ...current, scope: undefined } }))
+      .toEqual({ openId: reviewer, source: 'recipient-root-chat-creator', sourceSessionId: 'chat' });
+  });
+
+  it('does not override a peer creator in the current thread', () => {
+    expect(resolveReportRecipientForSession({
+      ...input, session: { ...current, creatorOpenId: 'ou_current_peer' },
+      knownPeerBotOpenIds: new Set([reviewer, 'ou_current_peer']),
+    })).toEqual({ openId: 'ou_current_peer', source: 'session-creator' });
+  });
+
+  it.each([
+    { status: 'closed' }, { scope: 'thread' as const }, { scope: undefined }, { larkAppId: 'cli_other' },
+    { chatId: 'oc_other' }, { rootMessageId: 'om_other' },
+    { createdAt: current.createdAt }, { createdAt: '2026-08-08T00:00:00Z' },
+    { createdAt: 'invalid' }, { creatorOpenId: 'ou_human' }, { creatorOpenId: undefined },
+  ])('fails closed for an invalid explicit source: %j', overrides => {
+    expect(() => resolveReportRecipientForSession({ ...input, sessions: [{ ...source, ...overrides }, current] }))
+      .toThrow('--recipient-root');
+  });
+
+  it.each([
+    { status: 'closed' }, { scope: 'chat' as const }, { sessionId: undefined },
+    { larkAppId: undefined }, { chatId: undefined }, { createdAt: 'invalid' },
+  ])('fails closed for an invalid current session: %j', overrides => {
+    expect(() => resolveReportRecipientForSession({ ...input, session: { ...current, ...overrides } }))
+      .toThrow('--recipient-root');
+  });
+
+  it('keeps the session creator when no recipient root is supplied', () => {
+    expect(resolveReportRecipientForSession({ ...input, recipientRoot: undefined }))
+      .toEqual({ openId: user, source: 'session-creator' });
+  });
+
+  it.each(['', ' ', 'invalid', 'om_', `om_${'x'.repeat(129)}`, 'om_missing'])('fails closed for root %j', recipientRoot => {
+    expect(() => resolveReportRecipientForSession({ ...input, recipientRoot })).toThrow('--recipient-root');
+  });
+
+  it('requires sender-scoped peer evidence', () => {
+    expect(() => resolveReportRecipientForSession({ ...input, knownPeerBotOpenIds: new Set() }))
+      .toThrow('--recipient-root');
+  });
+
+  it.each([reviewer, 'ou_human'])('rejects structural ambiguity before verifying %s', creatorOpenId => {
+    expect(() => resolveReportRecipientForSession({ ...input, sessions: [source, { ...source, sessionId: 'other', creatorOpenId }, current] }))
+      .toThrow('--recipient-root');
+  });
+
+  it('rejects a missing explicit source even when the current creator is a peer', () => {
+    expect(() => resolveReportRecipientForSession({ ...input, sessions: [current], session: { ...current, creatorOpenId: reviewer } }))
+      .toThrow('--recipient-root');
+  });
+
+  it.each([
+    [{ creatorOpenId: ' creator ', ownerOpenId: 'owner' }, { openId: 'creator', source: 'session-creator' }],
+    [{ creatorOpenId: ' ', ownerOpenId: ' owner ' }, { openId: 'owner', source: 'session-owner' }],
+    [{ quoteTargetSenderOpenId: ' quote ' }, { openId: 'quote', source: 'quote-sender' }],
+    [{}, { source: 'none' }],
+  ])('preserves the historical fallback: %j', (session, expected) => {
+    expect(resolveReportRecipientForSession({ ...input, recipientRoot: undefined, session })).toEqual(expected);
+  });
+});
+
+describe('resolveReportPlacement', () => {
+  const base = {
+    chatScope: true,
+    chatId: 'oc_task',
+    rootMessageId: 'oc_task',
+    currentTurnId: 'om_turn_current',
+  };
+  const registryTarget = { mode: 'thread' as const, rootMessageId: 'om_orchestrator_topic' };
+
+  it('inherits a group-top-level turn as group top level', () => {
+    expect(resolveReportPlacement(base)).toEqual({
+      target: { mode: 'plain', chatId: 'oc_task' },
+      source: 'current-turn',
+    });
+  });
+
+  it('inherits the matching current turn topic', () => {
+    expect(resolveReportPlacement({
+      ...base,
+      replyTargetRootId: 'om_review_topic',
+      replyTargetTurnId: 'om_turn_current',
+    })).toEqual({
+      target: { mode: 'thread', rootMessageId: 'om_review_topic' },
+      source: 'current-turn',
+    });
+  });
+
+  it('preserves a matching quote-only turn target', () => {
+    expect(resolveReportPlacement({
+      ...base,
+      replyTargetRootId: 'om_quoted_message',
+      replyTargetTurnId: 'om_turn_current',
+      replyTargetQuoteOnly: true,
+    })).toEqual({
+      target: { mode: 'quote', rootMessageId: 'om_quoted_message' },
+      source: 'current-turn',
+    });
+  });
+
+  it('ignores a stale topic target from a different turn', () => {
+    expect(resolveReportPlacement({
+      ...base,
+      replyTargetRootId: 'om_stale_topic',
+      replyTargetTurnId: 'om_turn_old',
+    })).toEqual({
+      target: { mode: 'plain', chatId: 'oc_task' },
+      source: 'current-turn',
+    });
+  });
+
+  it('--into overrides a dispatch registry placement', () => {
+    expect(resolveReportPlacement({
+      ...base,
+      into: 'om_explicit_topic',
+      registryTarget,
+      legacyDispatch: true,
+    })).toEqual({
+      target: { mode: 'thread', rootMessageId: 'om_explicit_topic' },
+      source: 'explicit-into',
+    });
+  });
+
+  it('--top-level overrides a dispatch registry placement', () => {
+    expect(resolveReportPlacement({
+      ...base,
+      topLevel: true,
+      registryTarget,
+      legacyDispatch: true,
+    })).toEqual({
+      target: { mode: 'plain', chatId: 'oc_task' },
+      source: 'explicit-top-level',
+    });
+  });
+
+  it('preserves a dispatch registry placement when there is no explicit override', () => {
+    expect(resolveReportPlacement({
+      ...base,
+      registryTarget,
+    })).toEqual({
+      target: registryTarget,
+      source: 'dispatch-registry',
+    });
+  });
+
+  it('keeps same-machine legacy dispatch on its registry-backed orchestrator route', () => {
+    expect(resolveReportPlacement({
+      ...base,
+      legacyDispatch: true,
+      registryTarget,
+    })).toEqual({
+      target: registryTarget,
+      source: 'dispatch-registry',
+    });
+  });
+
+  it('keeps cross-machine legacy dispatch without a registry on the top-level fallback', () => {
+    expect(resolveReportPlacement({
+      ...base,
+      legacyDispatch: true,
+      replyTargetRootId: 'om_legacy_subtopic',
+      replyTargetTurnId: 'om_turn_current',
+    })).toEqual({
+      target: { mode: 'plain', chatId: 'oc_task' },
+      source: 'legacy-dispatch-fallback',
+    });
+  });
+
+  it('uses the durable session location only when there is no current turn position', () => {
+    expect(resolveReportPlacement({
+      chatScope: false,
+      chatId: 'oc_task',
+      rootMessageId: 'om_session_topic',
+    })).toEqual({
+      target: { mode: 'thread', rootMessageId: 'om_session_topic' },
+      source: 'session-default',
+    });
+  });
+});
+
+describe('findDispatchRegistryEntry', () => {
+  const registry = {
+    om_seed_old: { orchRoot: 'om_orch_old', orchSessionId: 's_old' },
+    om_seed_new: { orchRoot: 'om_orch_new', orchSessionId: 's_new' },
+  };
+
+  it('uses the thread root for a normal thread-scoped dispatched session', () => {
+    expect(findDispatchRegistryEntry({
+      registry,
+      sessionScope: 'thread',
+      rootMessageId: 'om_seed_new',
+    })).toEqual({
+      key: 'om_seed_new',
+      entry: registry.om_seed_new,
+    });
+  });
+
+  it('uses currentReplyTarget for a chat-scope session folded from a dispatch topic', () => {
+    expect(findDispatchRegistryEntry({
+      registry,
+      sessionScope: 'chat',
+      rootMessageId: 'oc_group',
+      currentReplyTargetRootId: 'om_seed_new',
+      currentReplyTargetTurnId: 'om_turn_current',
+      currentTurnId: 'om_turn_current',
+    })).toEqual({ key: 'om_seed_new', entry: registry.om_seed_new });
+  });
+
+  it('prefers the immutable turn root when the chat-scope session has advanced to a newer dispatch', () => {
+    expect(findDispatchRegistryEntry({
+      registry,
+      dispatchRootId: 'om_seed_old',
+      sessionScope: 'chat',
+      rootMessageId: 'oc_group',
+      currentReplyTargetRootId: 'om_seed_new',
+      currentReplyTargetTurnId: 'om_turn_new',
+      currentTurnId: 'om_turn_new',
+    })).toEqual({ key: 'om_seed_old', entry: registry.om_seed_old });
+  });
+
+  it('fails closed when an explicit turn root is absent instead of falling through to the latest alias', () => {
+    expect(findDispatchRegistryEntry({
+      registry,
+      dispatchRootId: 'om_seed_missing',
+      sessionScope: 'chat',
+      rootMessageId: 'oc_group',
+      currentReplyTargetRootId: 'om_seed_new',
+      currentReplyTargetTurnId: 'om_turn_current',
+      currentTurnId: 'om_turn_current',
+    })).toBeUndefined();
+  });
+
+  it('ignores a stale currentReplyTarget whose turn id does not match', () => {
+    expect(findDispatchRegistryEntry({
+      registry,
+      sessionScope: 'chat',
+      rootMessageId: 'oc_group',
+      currentReplyTargetRootId: 'om_seed_old',
+      currentReplyTargetTurnId: 'om_turn_old',
+      currentTurnId: 'om_turn_new',
+    })).toBeUndefined();
+  });
+
+  it('does not treat a chat-scope trace root as a dispatch route', () => {
+    expect(findDispatchRegistryEntry({
+      registry,
+      sessionScope: 'chat',
+      rootMessageId: 'om_seed_old',
+      currentTurnId: 'om_turn_new',
+    })).toBeUndefined();
+  });
+});
+
+describe('acceptedDispatchBotAppIds', () => {
+  const sentAt = Date.parse('2026-07-14T09:00:00.000Z');
+  const turnId = 'om_kickoff_current';
+  const workerPid = 12345;
+  const workerGeneration = 7;
+  const isWorkerAlive = (pid: number) => pid === workerPid;
+
+  it('accepts only exact current-turn input commits for thread and chat-scope sessions', () => {
+    expect(acceptedDispatchBotAppIds({
+      sessions: [
+        {
+          larkAppId: 'cli_thread', chatId: 'oc_target', rootMessageId: 'om_seed',
+          status: 'active', pid: workerPid, workerGeneration,
+          dispatchInputReceipts: {
+            [turnId]: {
+              rootMessageId: 'om_seed',
+              committedAt: '2026-07-14T09:00:01.000Z',
+              workerGeneration,
+            },
+          },
+        },
+        {
+          larkAppId: 'cli_chat', chatId: 'oc_target', rootMessageId: 'oc_target',
+          status: 'active', pid: workerPid, workerGeneration,
+          dispatchInputReceipts: {
+            [turnId]: {
+              rootMessageId: 'om_seed',
+              committedAt: '2026-07-14T09:00:02.000Z',
+              workerGeneration,
+            },
+          },
+        },
+      ],
+      targetAppIds: ['cli_thread', 'cli_chat'],
+      chatId: 'oc_target',
+      threadRootId: 'om_seed',
+      turnId,
+      notBeforeMs: sentAt,
+      isWorkerAlive,
+    })).toEqual(['cli_thread', 'cli_chat']);
+  });
+
+  it('rejects stale, closed, wrong-chat, unrelated-root, and wrong-turn receipts', () => {
+    expect(acceptedDispatchBotAppIds({
+      sessions: [
+        { larkAppId: 'cli_stale', chatId: 'oc_target', status: 'active', pid: workerPid, workerGeneration, dispatchInputReceipts: { [turnId]: { rootMessageId: 'om_seed', committedAt: '2026-07-14T08:00:00.000Z', workerGeneration } } },
+        { larkAppId: 'cli_closed', chatId: 'oc_target', status: 'closed', pid: workerPid, workerGeneration, dispatchInputReceipts: { [turnId]: { rootMessageId: 'om_seed', committedAt: '2026-07-14T09:00:01.000Z', workerGeneration } } },
+        { larkAppId: 'cli_wrong_chat', chatId: 'oc_other', status: 'active', pid: workerPid, workerGeneration, dispatchInputReceipts: { [turnId]: { rootMessageId: 'om_seed', committedAt: '2026-07-14T09:00:01.000Z', workerGeneration } } },
+        { larkAppId: 'cli_wrong_root', chatId: 'oc_target', status: 'active', pid: workerPid, workerGeneration, dispatchInputReceipts: { [turnId]: { rootMessageId: 'om_other', committedAt: '2026-07-14T09:00:01.000Z', workerGeneration } } },
+        { larkAppId: 'cli_wrong_turn', chatId: 'oc_target', status: 'active', pid: workerPid, workerGeneration, dispatchInputReceipts: { om_old: { rootMessageId: 'om_seed', committedAt: '2026-07-14T09:00:01.000Z', workerGeneration } } },
+      ],
+      targetAppIds: ['cli_stale', 'cli_closed', 'cli_wrong_chat', 'cli_wrong_root', 'cli_wrong_turn'],
+      chatId: 'oc_target',
+      threadRootId: 'om_seed',
+      turnId,
+      notBeforeMs: sentAt,
+      isWorkerAlive,
+    })).toEqual([]);
+  });
+
+  it('deduplicates requested app ids while preserving request order', () => {
+    expect(acceptedDispatchBotAppIds({
+      sessions: [{
+        larkAppId: 'cli_repo', chatId: 'oc_target', rootMessageId: 'om_seed',
+        status: 'active', pid: workerPid, workerGeneration,
+        dispatchInputReceipts: {
+          [turnId]: {
+            rootMessageId: 'om_seed',
+            committedAt: '2026-07-14T09:00:00.000Z',
+            workerGeneration,
+          },
+        },
+      }],
+      targetAppIds: ['cli_repo', 'cli_repo'],
+      chatId: 'oc_target',
+      threadRootId: 'om_seed',
+      turnId,
+      notBeforeMs: sentAt,
+      isWorkerAlive,
+    })).toEqual(['cli_repo']);
+  });
+
+  it('does not combine an old lastCliInput with a fresh alias when the current enqueue failed', () => {
+    expect(acceptedDispatchBotAppIds({
+      sessions: [{
+        larkAppId: 'cli_repo', chatId: 'oc_target', rootMessageId: 'oc_target',
+        status: 'active', lastCliInput: 'old task', pid: workerPid, workerGeneration,
+        currentReplyTarget: {
+          rootMessageId: 'om_seed',
+          turnId,
+          updatedAt: '2026-07-14T09:00:01.000Z',
+        },
+      }],
+      targetAppIds: ['cli_repo'],
+      chatId: 'oc_target',
+      threadRootId: 'om_seed',
+      turnId,
+      notBeforeMs: sentAt,
+      isWorkerAlive,
+    })).toEqual([]);
+  });
+
+  it('accepts only after the current turn is committed and rejects an unbound commit', () => {
+    const session = {
+      larkAppId: 'cli_repo',
+      chatId: 'oc_target',
+      rootMessageId: 'oc_target',
+      scope: 'chat' as const,
+      status: 'active',
+      pid: workerPid,
+      workerGeneration,
+      replyTargets: {
+        [turnId]: { rootMessageId: 'om_seed', updatedAt: '2026-07-14T09:00:01.000Z' },
+      },
+    };
+    expect(recordDispatchInputCommit(
+      session,
+      'om_unbound',
+      workerGeneration,
+      '2026-07-14T09:00:01.000Z',
+    )).toBe(false);
+    expect(acceptedDispatchBotAppIds({
+      sessions: [session],
+      targetAppIds: ['cli_repo'],
+      chatId: 'oc_target',
+      threadRootId: 'om_seed',
+      turnId,
+      notBeforeMs: sentAt,
+      isWorkerAlive,
+    })).toEqual([]);
+
+    expect(recordDispatchInputCommit(
+      session,
+      turnId,
+      workerGeneration,
+      '2026-07-14T09:00:01.000Z',
+    )).toBe(true);
+    expect(acceptedDispatchBotAppIds({
+      sessions: [session],
+      targetAppIds: ['cli_repo'],
+      chatId: 'oc_target',
+      threadRootId: 'om_seed',
+      turnId,
+      notBeforeMs: sentAt,
+      isWorkerAlive,
+    })).toEqual(['cli_repo']);
+  });
+
+  it('keeps a rootless ordinary chat-scope turn unbound instead of falling back to a stale session root', () => {
+    const session = {
+      larkAppId: 'cli_repo',
+      chatId: 'oc_target',
+      rootMessageId: 'om_stale_trace_root',
+      scope: 'chat' as const,
+      status: 'active',
+      pid: workerPid,
+      workerGeneration,
+    };
+
+    expect(recordDispatchInputCommit(
+      session,
+      turnId,
+      workerGeneration,
+      '2026-07-14T09:00:01.000Z',
+    )).toBe(false);
+    expect(session.dispatchInputReceipts).toBeUndefined();
+  });
+
+  it('rejects a receipt from the previous worker generation after replacement', () => {
+    const session = {
+      larkAppId: 'cli_repo',
+      chatId: 'oc_target',
+      rootMessageId: 'om_seed',
+      status: 'active',
+      pid: workerPid,
+      workerGeneration: 8,
+      dispatchInputReceipts: {
+        [turnId]: {
+          rootMessageId: 'om_seed',
+          committedAt: '2026-07-14T09:00:01.000Z',
+          workerGeneration: 7,
+        },
+      },
+    };
+    expect(acceptedDispatchBotAppIds({
+      sessions: [session],
+      targetAppIds: ['cli_repo'],
+      chatId: 'oc_target',
+      threadRootId: 'om_seed',
+      turnId,
+      notBeforeMs: sentAt,
+      isWorkerAlive,
+    })).toEqual([]);
+  });
+
+  it('rejects an otherwise exact receipt after the persisted worker has exited', () => {
+    expect(acceptedDispatchBotAppIds({
+      sessions: [{
+        larkAppId: 'cli_repo',
+        chatId: 'oc_target',
+        status: 'active',
+        pid: workerPid,
+        workerGeneration,
+        dispatchInputReceipts: {
+          [turnId]: {
+            rootMessageId: 'om_seed',
+            committedAt: '2026-07-14T09:00:01.000Z',
+            workerGeneration,
+          },
+        },
+      }],
+      targetAppIds: ['cli_repo'],
+      chatId: 'oc_target',
+      threadRootId: 'om_seed',
+      turnId,
+      notBeforeMs: sentAt,
+      isWorkerAlive: () => false,
+    })).toEqual([]);
   });
 });
 
@@ -297,5 +1215,24 @@ describe('botmux send turn marker context', () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+
+describe('zero-injection dispatch protocol removal', () => {
+  it('removes only the generated trailing protocol and preserves task bytes', () => {
+    const brief = '修复函数，保留正文中的 botmux report 和 <user_message>。';
+    for (const exactReportRootEnabled of [true, false]) {
+      for (const sameTopicSendEnabled of [true, false]) {
+        const content = buildDispatchCompletionBrief({ brief, dispatchRootId: 'om_task', exactReportRootEnabled, sameTopicSendEnabled });
+        expect(stripDispatchCompletionProtocol(content, 'om_task')).toBe(brief);
+        const richPost = content.split('\n').map(line => line.trim()).filter(Boolean).join('\n') + '\n分工：\n· Worker：修复';
+        expect(stripDispatchCompletionProtocol(richPost, 'om_task')).toBe(brief + '\n分工：\n· Worker：修复');
+
+      }
+    }
+    expect(stripDispatchCompletionProtocol(brief, 'om_task')).toBe(brief);
+    expect(stripDispatchCompletionProtocol(brief + '\n— 完成回报 —\n用户自己的约定', 'om_task'))
+      .toBe(brief + '\n— 完成回报 —\n用户自己的约定');
   });
 });

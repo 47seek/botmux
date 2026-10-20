@@ -14,7 +14,9 @@
  * (cli.ts) performs the actual sendMessage + replyMessage.
  */
 
-export { resolveSendTarget } from './reply-target.js';
+import { resolveSendTarget, type SessionReplyTarget } from './reply-target.js';
+
+export { resolveSendTarget };
 
 export interface DispatchBot {
   /** open_id as seen by the orchestrator's app (from <available_bots>). */
@@ -35,6 +37,118 @@ export interface DispatchMessages {
   threadContent: PostParagraph[];
   /** open_ids @-mentioned in the kickoff — the bots that will be triggered. */
   mentionedOpenIds: string[];
+}
+
+export type ProjectDispatchSyncStatus = 'pending' | 'in_progress' | 'blocked' | 'failed';
+
+export interface ProjectDispatchSyncAction {
+  action: 'dispatch';
+  dispatchRoot: string;
+  title: string;
+  purpose: string;
+  owners?: string[];
+  status?: ProjectDispatchSyncStatus;
+  progress?: number;
+}
+
+/**
+ * Build the project-card mutation that mirrors a dispatch.
+ *
+ * `--into` is coordination inside an existing workstream, not a fresh
+ * lifecycle event. It may rename the workstream explicitly, but must not
+ * revive completed work, reset progress, or clear the recorded owners.
+ */
+export function buildProjectDispatchSyncAction(input: {
+  existingDispatch: boolean;
+  dispatchRoot: string;
+  title: string;
+  purpose: string;
+  owners: string[];
+  status: ProjectDispatchSyncStatus;
+  progress: number;
+}): ProjectDispatchSyncAction {
+  const base: ProjectDispatchSyncAction = {
+    action: 'dispatch',
+    dispatchRoot: input.dispatchRoot,
+    title: input.title,
+    purpose: input.purpose,
+  };
+  return input.existingDispatch
+    ? base
+    : { ...base, owners: input.owners, status: input.status, progress: input.progress };
+}
+
+const DISPATCH_ROOT_ID_RE = /^om_[A-Za-z0-9_-]{1,128}$/;
+
+/**
+ * Compatibility protocol for legacy/cross-machine `--bot` dispatches.
+ *
+ * Keep the marker after the positional report text. Older receivers do not know
+ * this boolean flag, but their generic positional parser safely ignores an
+ * unknown trailing flag instead of consuming the report text as its value.
+ */
+export function appendLegacyDispatchReportProtocol(brief: string): string {
+  return brief.trimEnd()
+    + '\n\n— 完成回报 —\n'
+    + '干完后在本话题运行 `botmux report "子项目完成 + 产出位置/摘要" --legacy-dispatch` '
+    + '把结果回报给主编排会话；不要在本话题 @ 主bot（那会另起一个没有上下文的新会话）。';
+}
+
+/** Bind a stable local dispatch to its exact report destination. */
+export function appendDispatchReportProtocol(brief: string, dispatchRootId: string): string {
+  const root = dispatchRootId.trim();
+  if (!DISPATCH_ROOT_ID_RE.test(root)) throw new Error('dispatch report protocol requires a valid om_ root id');
+  return brief.trimEnd()
+    + '\n\n— 完成回报 —\n'
+    + `干完后在本话题运行 \`botmux report --dispatch-root ${root} "子项目完成 + 产出位置/摘要"\` `
+    + '把结果回报给原始主编排会话；不要在本话题 @ 主bot（那会另起一个没有上下文的新会话）。';
+}
+
+/** Additionally ask the assignee to leave a human-visible copy in the task topic. */
+export function appendDispatchCompletionProtocol(brief: string): string {
+  return brief.trimEnd()
+    + '\n\n— 原话题留档 —\n'
+    + '除上述 botmux report 回报外，完成后还需在收到任务的原话题运行 '
+    + '`botmux send --no-mention "子项目完成 + 产出位置/摘要"` '
+    + '额外留一份人可见的最终交付；不要 @ 主 bot，不要新开话题。';
+}
+
+export function buildDispatchCompletionBrief(input: {
+  brief: string;
+  dispatchRootId: string;
+  exactReportRootEnabled: boolean;
+  sameTopicSendEnabled: boolean;
+}): string {
+  const withReport = input.exactReportRootEnabled
+    ? appendDispatchReportProtocol(input.brief, input.dispatchRootId)
+    : appendLegacyDispatchReportProtocol(input.brief);
+  return input.sameTopicSendEnabled
+    ? appendDispatchCompletionProtocol(withReport)
+    : withReport;
+}
+
+/** Remove only our exact generated suffix, after the receiver has verified the
+ * dispatch binding. Never strip user-authored XML or arbitrary instructions. */
+export function stripDispatchCompletionProtocol(content: string, dispatchRoot: string): string {
+  const trimmed = content.trimEnd();
+  for (const exactReportRootEnabled of [true, false]) {
+    for (const sameTopicSendEnabled of [true, false]) {
+      const suffix = buildDispatchCompletionBrief({ brief: '', dispatchRootId: dispatchRoot,
+        exactReportRootEnabled, sameTopicSendEnabled });
+      // Rich-post parsing drops empty paragraphs and trims each line. Accept
+      // that exact representation too; an optional role footer is task data.
+      const postSuffix = '\n' + suffix.split('\n').map(line => line.trim()).filter(Boolean).join('\n');
+      for (const candidate of [suffix, postSuffix]) {
+        const start = trimmed.lastIndexOf(candidate);
+        if (start < 0) continue;
+        const tail = trimmed.slice(start + candidate.length);
+        if (tail === '' || /^\n{1,2}分工：\n(?:·[^\n]+(?:\n|$))+$/.test(tail)) {
+          return trimmed.slice(0, start) + tail;
+        }
+      }
+    }
+  }
+  return content;
 }
 
 /**
@@ -195,22 +309,229 @@ export function findSubBotTopic(input: {
   return null;
 }
 
+/** A quote reply references a root but does not enter that root's thread. */
+export function threadRootForReachability(target: SessionReplyTarget): string | undefined {
+  return target.mode === 'thread' ? target.rootMessageId : undefined;
+}
+
+type ReachabilitySession = {
+  status: 'active' | 'closed';
+  scope?: 'thread' | 'chat';
+  chatId: string;
+  rootMessageId: string;
+  larkAppId?: string;
+  deferredScheduleRun?: unknown;
+  vcMeetingReceiver?: unknown;
+};
+
 /**
- * Resolve where a `botmux report` should go + who to @, so report-back works
- * even when the orchestrator is on a DIFFERENT machine.
+ * Identify active chat sessions whose bot is still configured to fold a
+ * mention back into that shared session. Mode lookup failures fail closed.
+ */
+export async function foldableChatSessionAppIds(input: {
+  sessions: Iterable<ReachabilitySession>;
+  targetChatId: string;
+  outboundMode: SessionReplyTarget['mode'];
+  resolveMode: (larkAppId: string, chatId: string) => 'chat' | 'shared' | 'new-topic' | 'chat-topic' | undefined;
+  resolveChatMode: (chatId: string) => Promise<'group' | 'topic' | 'p2p' | 'unknown' | undefined>;
+}): Promise<Set<string>> {
+  const candidates = new Set<string>();
+  for (const session of input.sessions) {
+    if (session.status !== 'active'
+      || session.scope !== 'chat'
+      || !session.larkAppId
+      || session.chatId !== input.targetChatId
+      // A deferred scheduled run deliberately uses an isolated routing key and
+      // can never be reached through the ordinary (chatId, appId) slot. (A VC
+      // meeting agent is now an ordinary chat-scope session — Plan B — so it IS
+      // foldable and is intentionally NOT excluded here.)
+      || session.deferredScheduleRun) continue;
+    candidates.add(session.larkAppId);
+  }
+
+  const appIds = new Set<string>();
+  if (candidates.size === 0) return appIds;
+  // Topology belongs to the chat, not to an individual bot. Resolve it once
+  // through the sending bot's authenticated client.
+  let chatMode: 'group' | 'topic' | 'p2p' | 'unknown' | undefined;
+  try {
+    chatMode = await input.resolveChatMode(input.targetChatId);
+  } catch { /* lookup failure → retain advisory */ }
+  if (chatMode !== 'group') return appIds;
+
+  for (const larkAppId of candidates) {
+    try {
+      const mode = input.resolveMode(larkAppId, input.targetChatId);
+      // chat-topic reuses the chat session for top-level/quote delivery, but
+      // deliberately keeps a real Lark topic isolated. new-topic never folds
+      // a new mention back into a leftover chat session.
+      if (mode === 'chat'
+        || mode === 'shared'
+        || (mode === 'chat-topic' && input.outboundMode !== 'thread')) {
+        appIds.add(larkAppId);
+      }
+    } catch { /* unknown bot/mode → retain advisory */ }
+  }
+  return appIds;
+}
+
+/**
+ * Resolve sender-scoped open_ids for bots that already have an active session
+ * at the current conversation anchor. These peers are reachable here, so an
+ * older dispatch record for the same bot must not be presented as the target.
+ */
+export function activeConversationBotOpenIds(input: {
+  sessions: Iterable<ReachabilitySession>;
+  targetChatId: string;
+  outboundRootMessageId?: string;
+  foldableChatAppIds?: Set<string>;
+  botEntries: Array<{ larkAppId: string; botName: string | null }>;
+  crossRef: Record<string, string>;
+}): Set<string> {
+  const activeAppIds = new Set<string>();
+  for (const session of input.sessions) {
+    if (session.status !== 'active'
+      || !session.larkAppId
+      || session.chatId !== input.targetChatId) continue;
+    // A chat-scope peer is reachable from any message in the same group:
+    // mentions inside a topic fold back into that peer's shared chat session.
+    // A thread-scope peer is reachable only when this send actually lands in
+    // the same thread root.
+    const here = session.scope === 'chat'
+      ? input.foldableChatAppIds?.has(session.larkAppId) === true
+      : !!input.outboundRootMessageId
+        && session.rootMessageId === input.outboundRootMessageId;
+    if (here) activeAppIds.add(session.larkAppId);
+  }
+
+  const openIds = new Set<string>();
+  const entries = Array.isArray(input.botEntries)
+    ? input.botEntries.filter((entry): entry is { larkAppId: string; botName: string | null } =>
+        !!entry
+        && typeof entry === 'object'
+        && typeof entry.larkAppId === 'string'
+        && (entry.botName === null || typeof entry.botName === 'string'))
+    : [];
+  const crossRef = input.crossRef && typeof input.crossRef === 'object'
+    ? input.crossRef
+    : {};
+  for (const entry of entries) {
+    if (!entry.botName || !activeAppIds.has(entry.larkAppId)) continue;
+    // crossRef is keyed by display name. When several apps share that name,
+    // the value cannot prove which app it represents; fail closed and retain
+    // the old-topic hint instead of silencing it for the wrong bot.
+    const sameNameEntries = entries.filter(candidate =>
+      candidate.botName?.toLowerCase() === entry.botName!.toLowerCase());
+    if (sameNameEntries.length !== 1) continue;
+    const openId = crossRef[entry.botName];
+    if (typeof openId === 'string' && openId) openIds.add(openId);
+  }
+  return openIds;
+}
+
+/** Resolve the stable Review/orchestrator addressee independently of placement. */
+export function resolveReportRecipient(input: {
+  creatorOpenId?: string;
+  ownerOpenId?: string;
+  quoteTargetSenderOpenId?: string;
+}): string | undefined {
+  return [
+    input.creatorOpenId,
+    input.ownerOpenId,
+    input.quoteTargetSenderOpenId,
+  ].find(value => !!value?.trim())?.trim();
+}
+
+export interface ReportRecipientSession {
+  sessionId?: string;
+  larkAppId?: string;
+  chatId?: string;
+  rootMessageId?: string;
+  scope?: 'thread' | 'chat';
+  status?: string;
+  creatorOpenId?: string;
+  ownerOpenId?: string;
+  quoteTargetSenderOpenId?: string;
+  createdAt?: string;
+}
+
+export type ReportRecipientSource =
+  | 'recipient-root-chat-creator'
+  | 'session-creator'
+  | 'session-owner'
+  | 'quote-sender'
+  | 'none';
+
+export interface ResolvedReportRecipient {
+  openId?: string;
+  source: ReportRecipientSource;
+  sourceSessionId?: string;
+}
+
+export function resolveReportRecipientForSession(input: {
+  session: ReportRecipientSession;
+  sessions: ReportRecipientSession[];
+  knownPeerBotOpenIds: ReadonlySet<string>;
+  recipientRoot?: string;
+}): ResolvedReportRecipient {
+  const current = input.session;
+  const currentCreator = current.creatorOpenId?.trim();
+  if (input.recipientRoot !== undefined) {
+    if (!/^om_[A-Za-z0-9_-]{1,128}$/.test(input.recipientRoot)) {
+      throw new Error('--recipient-root 必须是有效的 om_ 消息 id。');
+    }
+    const currentCreatedAt = Date.parse(current.createdAt ?? '');
+    if ((current.scope ?? 'thread') !== 'thread'
+      || current.status !== 'active'
+      || !current.sessionId
+      || !current.larkAppId
+      || !current.chatId
+      || !Number.isFinite(currentCreatedAt)) {
+      throw new Error('--recipient-root 需要有效的 active thread 来源会话。');
+    }
+    // Count structural matches before checking peer identity so a peer+human ambiguity fails closed.
+    const candidates = input.sessions.filter(candidate => {
+      const candidateCreatedAt = Date.parse(candidate.createdAt ?? '');
+      return candidate.sessionId !== current.sessionId
+        && candidate.status === 'active'
+        && candidate.scope === 'chat'
+        && candidate.larkAppId === current.larkAppId
+        && candidate.chatId === current.chatId
+        && candidate.rootMessageId === input.recipientRoot
+        && Number.isFinite(candidateCreatedAt)
+        && candidateCreatedAt < currentCreatedAt;
+    });
+    if (candidates.length !== 1) {
+      throw new Error('--recipient-root 未匹配唯一的同应用、同群且严格更早的 active chat 会话。');
+    }
+    const candidateCreator = candidates[0].creatorOpenId?.trim();
+    if (!candidateCreator || !input.knownPeerBotOpenIds.has(candidateCreator)) {
+      throw new Error('--recipient-root 对应的 creator 不是当前应用已知的 peer。');
+    }
+    if (currentCreator && input.knownPeerBotOpenIds.has(currentCreator)) {
+      return { openId: currentCreator, source: 'session-creator' };
+    }
+    return {
+      openId: candidateCreator,
+      source: 'recipient-root-chat-creator',
+      sourceSessionId: candidates[0].sessionId,
+    };
+  }
+
+  if (currentCreator) return { openId: currentCreator, source: 'session-creator' };
+  const owner = current.ownerOpenId?.trim();
+  if (owner) return { openId: owner, source: 'session-owner' };
+  const quoteSender = current.quoteTargetSenderOpenId?.trim();
+  if (quoteSender) return { openId: quoteSender, source: 'quote-sender' };
+  return { source: 'none' };
+}
+
+/**
+ * Compatibility view of registry coordinates plus recipient.
  *
- * Same-machine: the dispatch registry (orchestrate-dispatch.json) is local, so
- * `registryEntry` carries the orchestrator's exact coords (incl. orchRoot for a
- * thread-scope orchestrator). Cross-machine: the foreign sub-bot's daemon never
- * wrote that registry, so `registryEntry` is undefined — but everything needed
- * for the common case is on the sub-bot's OWN session: the report goes top-level
- * into the chat the sub-topic lives in (= the orchestrator's chat) and @-s the
- * orchestrator (creatorOpenId, captured from the dispatch @). So we fall back to
- * `{ orchChatId: sessionChatId, orchScope: 'chat', orchRoot: '' }`.
- *
- * orchOpenId prefers `creatorOpenId` (stable, set on every session-creation path
- * incl. foreign-bot auto-create), then `ownerOpenId`, then the drifting
- * `quoteTargetSenderOpenId` as a last resort.
+ * `cmdReport` no longer treats these coordinates as the ordinary no-registry
+ * placement. It uses them only to preserve a matching dispatch route; otherwise
+ * {@link resolveReportPlacement} inherits the executing conversation turn.
  */
 export function resolveReportTarget(input: {
   registryEntry?: { orchChatId?: string; orchScope?: string; orchRoot?: string };
@@ -224,8 +545,237 @@ export function resolveReportTarget(input: {
     orchChatId: e?.orchChatId ?? input.sessionChatId,
     orchScope: e?.orchScope ?? 'chat',
     orchRoot: e?.orchRoot ?? '',
-    orchOpenId: input.creatorOpenId ?? input.ownerOpenId ?? input.quoteTargetSenderOpenId,
+    orchOpenId: resolveReportRecipient(input),
   };
+}
+
+export type ReportPlacementSource =
+  | 'explicit-into'
+  | 'explicit-top-level'
+  | 'dispatch-registry'
+  | 'legacy-dispatch-fallback'
+  | 'current-turn'
+  | 'session-default';
+
+/**
+ * Resolve only the visible placement of a `botmux report`.
+ *
+ * The report recipient is intentionally resolved separately by
+ * {@link resolveReportRecipient}: choosing where the message is shown must never
+ * change who is @-mentioned. Explicit placement wins, a dispatch registry keeps
+ * its existing orchestrator-return semantics, and an explicitly marked legacy
+ * cross-machine dispatch without a local registry keeps the old top-level
+ * compatibility fallback. Ordinary reports reuse the same turn-bound placement
+ * rules as `botmux send`.
+ */
+export function resolveReportPlacement(input: {
+  into?: string;
+  topLevel?: boolean;
+  registryTarget?: SessionReplyTarget;
+  legacyDispatch?: boolean;
+  chatScope: boolean;
+  chatId: string;
+  rootMessageId: string;
+  replyTargetRootId?: string;
+  replyTargetTurnId?: string;
+  replyTargetQuoteOnly?: boolean;
+  currentTurnId?: string;
+}): { target: SessionReplyTarget; source: ReportPlacementSource } {
+  if (input.into) {
+    return {
+      target: { mode: 'thread', rootMessageId: input.into },
+      source: 'explicit-into',
+    };
+  }
+  if (input.topLevel) {
+    return {
+      target: { mode: 'plain', chatId: input.chatId },
+      source: 'explicit-top-level',
+    };
+  }
+  if (input.registryTarget) {
+    return { target: input.registryTarget, source: 'dispatch-registry' };
+  }
+  if (input.legacyDispatch) {
+    return {
+      target: { mode: 'plain', chatId: input.chatId },
+      source: 'legacy-dispatch-fallback',
+    };
+  }
+  return {
+    target: resolveSendTarget({
+      topLevel: false,
+      chatScope: input.chatScope,
+      chatId: input.chatId,
+      rootMessageId: input.rootMessageId,
+      replyTargetRootId: input.replyTargetRootId,
+      replyTargetTurnId: input.replyTargetTurnId,
+      replyTargetQuoteOnly: input.replyTargetQuoteOnly,
+      currentTurnId: input.currentTurnId,
+    }),
+    source: input.currentTurnId ? 'current-turn' : 'session-default',
+  };
+}
+
+export interface DispatchRegistryEntry {
+  orchChatId?: string;
+  orchScope?: string;
+  orchRoot?: string;
+  orchAppId?: string;
+  orchSessionId?: string;
+  createdAt?: string;
+}
+
+/**
+ * Resolve the dispatch record for either a normal thread session or a
+ * regular-group chat-scope session folded from a dispatch topic.
+ *
+ * Folded sessions are keyed by chatId, while the registry is keyed by the seed
+ * message id. Their currentReplyTarget is usable only when it belongs to the
+ * CLI's executing turn. Historical replyThreadAliases deliberately do not
+ * participate: they have no turn id and could route a later ordinary report
+ * back into a stale dispatch.
+ */
+export function findDispatchRegistryEntry(input: {
+  registry: Record<string, DispatchRegistryEntry>;
+  dispatchRootId?: string;
+  sessionScope?: 'thread' | 'chat';
+  rootMessageId?: string;
+  currentReplyTargetRootId?: string;
+  currentReplyTargetTurnId?: string;
+  currentTurnId?: string;
+}): { key: string; entry: DispatchRegistryEntry } | undefined {
+  if (input.dispatchRootId) {
+    const entry = input.registry[input.dispatchRootId];
+    return entry ? { key: input.dispatchRootId, entry } : undefined;
+  }
+  const ordered: string[] = [];
+  const add = (value: string | undefined) => {
+    if (value && !ordered.includes(value)) ordered.push(value);
+  };
+  if (
+    input.currentTurnId
+    && input.currentReplyTargetTurnId === input.currentTurnId
+  ) {
+    add(input.currentReplyTargetRootId);
+  }
+  // Chat-scope rootMessageId is traceability metadata, not a routing anchor.
+  if (input.sessionScope !== 'chat') add(input.rootMessageId);
+  for (const key of ordered) {
+    const entry = input.registry[key];
+    if (entry) return { key, entry };
+  }
+  return undefined;
+}
+
+export interface DispatchAcceptanceSession {
+  larkAppId?: string;
+  chatId?: string;
+  scope?: 'thread' | 'chat';
+  pid?: number;
+  workerGeneration?: number;
+  rootMessageId?: string;
+  status?: string;
+  queued?: boolean;
+  createdAt?: string;
+  lastMessageAt?: string;
+  lastCliInput?: string;
+  currentReplyTarget?: { rootMessageId?: string; turnId?: string; updatedAt?: string };
+  replyTargets?: Record<string, { rootMessageId?: string; updatedAt?: string }>;
+  replyThreadAliases?: Record<string, { createdAt?: string; lastUsedAt?: string }>;
+  dispatchInputReceipts?: Record<string, {
+    rootMessageId?: string;
+    committedAt?: string;
+    workerGeneration?: number;
+  }>;
+}
+
+const MAX_DISPATCH_INPUT_RECEIPTS = 64;
+
+/**
+ * Persist the worker's exact input-queue commit against the immutable inbound
+ * turn and topic root. Returns false when the current session cannot prove the
+ * turn→root relation; callers must then fail closed and leave no receipt.
+ */
+export function recordDispatchInputCommit(
+  session: DispatchAcceptanceSession,
+  turnId: string,
+  workerGeneration: number,
+  committedAt = new Date().toISOString(),
+): boolean {
+  const exactTurnId = turnId.trim();
+  if (!exactTurnId) return false;
+  if (
+    !Number.isSafeInteger(workerGeneration)
+    || workerGeneration <= 0
+    || session.workerGeneration !== workerGeneration
+  ) return false;
+  const rootMessageId = session.replyTargets?.[exactTurnId]?.rootMessageId
+    ?? (session.currentReplyTarget?.turnId === exactTurnId
+      ? session.currentReplyTarget.rootMessageId
+      : undefined)
+    ?? (session.scope !== 'chat' ? session.rootMessageId : undefined);
+  if (!rootMessageId) return false;
+  const committedAtMs = Date.parse(committedAt);
+  if (!Number.isFinite(committedAtMs)) return false;
+
+  const receipts = { ...(session.dispatchInputReceipts ?? {}) };
+  receipts[exactTurnId] = { rootMessageId, committedAt, workerGeneration };
+  const ordered = Object.entries(receipts)
+    .sort((a, b) => {
+      const aMs = Date.parse(a[1].committedAt ?? '');
+      const bMs = Date.parse(b[1].committedAt ?? '');
+      return (Number.isFinite(bMs) ? bMs : Number.NEGATIVE_INFINITY)
+        - (Number.isFinite(aMs) ? aMs : Number.NEGATIVE_INFINITY);
+    })
+    .slice(0, MAX_DISPATCH_INPUT_RECEIPTS);
+  session.dispatchInputReceipts = Object.fromEntries(ordered);
+  return true;
+}
+
+/**
+ * Return the exact local Bot app identities whose persisted session state proves
+ * that a dispatch message reached the intended chat/topic after it was sent.
+ *
+ * A Lark send acknowledgement only proves transport acceptance. This second
+ * acknowledgement is deliberately based on the receiver daemon's own session
+ * store, and supports both normal thread sessions and regular-group chat-scope
+ * sessions that retain the dispatch root as a reply-thread alias.
+ */
+export function acceptedDispatchBotAppIds(input: {
+  sessions: Iterable<DispatchAcceptanceSession>;
+  targetAppIds: string[];
+  chatId: string;
+  threadRootId: string;
+  turnId: string;
+  notBeforeMs: number;
+  isWorkerAlive: (pid: number) => boolean;
+  clockSkewMs?: number;
+}): string[] {
+  const targets = [...new Set(input.targetAppIds.filter(Boolean))];
+  const accepted = new Set<string>();
+  const threshold = input.notBeforeMs - (input.clockSkewMs ?? 2_000);
+  for (const session of input.sessions) {
+    const appId = session.larkAppId;
+    if (!appId || !targets.includes(appId) || accepted.has(appId)) continue;
+    if (session.status === 'closed' || session.queued === true || session.chatId !== input.chatId) continue;
+    const workerPid = session.pid;
+    if (
+      typeof workerPid !== 'number'
+      || !Number.isSafeInteger(workerPid)
+      || workerPid <= 0
+      || !input.isWorkerAlive(workerPid)
+    ) continue;
+    const workerGeneration = session.workerGeneration;
+    if (!Number.isSafeInteger(workerGeneration) || (workerGeneration ?? 0) <= 0) continue;
+    const receipt = session.dispatchInputReceipts?.[input.turnId];
+    if (!receipt || receipt.rootMessageId !== input.threadRootId) continue;
+    if (receipt.workerGeneration !== workerGeneration) continue;
+    const committedAtMs = Date.parse(receipt.committedAt ?? '');
+    if (!Number.isFinite(committedAtMs) || committedAtMs < threshold) continue;
+    accepted.add(appId);
+  }
+  return targets.filter(appId => accepted.has(appId));
 }
 
 /**
@@ -234,20 +784,21 @@ export function resolveReportTarget(input: {
  * a dispatched sub-bot in an active topic that is NOT reachable in the current
  * conversation (so @-ing it here would spawn a context-less session), else null.
  *
- * The bot I'm replying to (`quoteTargetSenderOpenId`) is reachable right here, so
- * it's never treated as off-topic — that's the boundary that stops the guard from
- * blocking a normal reply to a bot conversing with me. Callers block (explicit
- * --mention) or drop (prose injection) on a non-null result, and skip the whole
- * check under `--anyway`.
+ * The bot I'm replying to (`quoteTargetSenderOpenId`) and bots in
+ * `reachableOpenIds` are reachable right here, so an unrelated older dispatch
+ * topic is never recommended for them.
  */
 export function offTopicSubBotTopic(input: {
   mentionOpenId: string;
   quoteTargetSenderOpenId?: string;
+  reachableOpenIds?: Set<string>;
   chatId: string;
   registry: Record<string, { orchChatId?: string; bots?: string[] }>;
   activeSeeds: Set<string>;
 }): string | null {
-  if (!input.mentionOpenId || input.mentionOpenId === input.quoteTargetSenderOpenId) return null;
+  if (!input.mentionOpenId
+    || input.mentionOpenId === input.quoteTargetSenderOpenId
+    || input.reachableOpenIds?.has(input.mentionOpenId)) return null;
   return findSubBotTopic({
     mentionOpenId: input.mentionOpenId,
     chatId: input.chatId,

@@ -8,7 +8,7 @@
  * 自带 action namespace（`v3_blocked_retry`），不与 gate 卡混用。纯函数，单测友好。
  */
 
-import { config } from '../../config.js';
+import { short, truncate, escapeMd, v3RunDetailUrl } from './v3-card-common.js';
 
 export const V3_BLOCKED_RETRY_ACTION = 'v3_blocked_retry';
 /** 运行时 human-ask 选项按钮的 action（与「重试」同卡不同 namespace）。 */
@@ -53,6 +53,7 @@ export interface V3BlockedCardInput {
   errorClass?: string;
   errorCode?: string;
   message?: string;
+  retryForbidden?: 'host-effect-uncertain' | 'revise-workflow-required';
   /** 省略则按 runId/nodeId/attemptId 推导（幂等校验用）。 */
   nonce?: string;
   webDetailUrl?: string;
@@ -73,10 +74,6 @@ export function v3BlockedCardNonce(runId: string, nodeId: string, attemptId: str
   return `v3blocked:${runId}:${nodeId}:${attemptId}`;
 }
 
-function v3RunDetailUrl(runId: string): string {
-  return `http://${config.dashboard.externalHost}:${config.dashboard.port}/#/v3/${encodeURIComponent(runId)}`;
-}
-
 export function buildV3BlockedCard(input: V3BlockedCardInput): string {
   const nonce = input.nonce ?? v3BlockedCardNonce(input.runId, input.nodeId, input.attemptId);
   const webDetailUrl = input.webDetailUrl ?? v3RunDetailUrl(input.runId);
@@ -89,7 +86,13 @@ export function buildV3BlockedCard(input: V3BlockedCardInput): string {
   if (answered) { title = `已回答：节点 ${input.nodeId}`; template = 'green'; }
   else if (ask) { title = `需要你拍板：节点 ${input.nodeId}`; template = 'blue'; }
   else if (retried) { title = `已重试：节点 ${input.nodeId}`; template = 'green'; }
-  else { title = `节点受阻：${input.nodeId}`; template = 'orange'; }
+  else if (input.retryForbidden === 'host-effect-uncertain') {
+    title = `外部效果待核实：${input.nodeId}`;
+    template = 'red';
+  } else if (input.retryForbidden === 'revise-workflow-required') {
+    title = `需要修订 Workflow：${input.nodeId}`;
+    template = 'red';
+  } else { title = `节点受阻：${input.nodeId}`; template = 'orange'; }
 
   const attemptNNN = input.attemptId.slice(input.attemptId.lastIndexOf('/') + 1);
   const elements: Array<Record<string, unknown>> = [
@@ -194,10 +197,33 @@ export function buildV3BlockedCard(input: V3BlockedCardInput): string {
             (retried.by ? ` · by ${escapeMd(short(retried.by, 20))}` : ''),
         },
       });
+    } else if (input.retryForbidden === 'host-effect-uncertain') {
+      elements.push({
+        tag: 'div',
+        text: {
+          tag: 'lark_md',
+          content:
+            '⚠️ 该 attempt 可能已产生外部副作用。请先在目标系统对账；为避免重复发送/创建，不提供普通重试。' +
+            ` P0 暂不支持手工补写 provider 回执，对账后请用 \`/workflow cancel ${escapeMd(input.runId)}\` 收口并保留审计记录。`,
+        },
+      });
+    } else if (input.retryForbidden === 'revise-workflow-required') {
+      elements.push({
+        tag: 'div',
+        text: {
+          tag: 'lark_md',
+          content:
+            '⛔ 公开产物契约与实际 Manifest 不一致，普通重试不会改变定义。' +
+            '请修订 Workflow 的 outputs / output key 后创建或发布新版本；当前 run 保留用于审计。',
+        },
+      });
     } else {
       elements.push({
         tag: 'div',
-        text: { tag: 'lark_md', content: '处理掉阻塞原因（如完成鉴权）后点重试，会以新 attempt 重跑该节点。' },
+        text: {
+          tag: 'lark_md',
+          content: '处理掉阻塞原因（如完成鉴权）后点重试，会以新 attempt 重跑该节点；为避免旧 worker 与重试重叠，进入受阻状态时被中止的并行节点也会重新执行。',
+        },
       });
       elements.push({
         tag: 'action',
@@ -224,7 +250,7 @@ export function buildV3BlockedCard(input: V3BlockedCardInput): string {
     actions: [
       {
         tag: 'button',
-        text: { tag: 'plain_text', content: 'Web 详情' },
+        text: { tag: 'plain_text', content: 'Web 详情（需登录）' },
         type: 'default',
         multi_url: {
           url: webDetailUrl, pc_url: webDetailUrl, android_url: webDetailUrl, ios_url: webDetailUrl,
@@ -240,16 +266,3 @@ export function buildV3BlockedCard(input: V3BlockedCardInput): string {
   });
 }
 
-function truncate(s: string, max: number): string {
-  if (s.length <= max) return s;
-  return `${s.slice(0, max)}…（截断，完整见 Web 详情）`;
-}
-
-function short(s: string, max: number): string {
-  return s.length <= max ? s : `${s.slice(0, max)}…`;
-}
-
-/** 转义 lark_md 里会被解析的字符，防 message 注入破坏卡片结构。 */
-function escapeMd(s: string): string {
-  return s.replace(/[\\*_~`\[\]]/g, (c) => `\\${c}`);
-}

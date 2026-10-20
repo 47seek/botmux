@@ -18,6 +18,25 @@ import { InflightInputTracker } from '../src/core/inflight-input-tracker.js';
 const item = (content: string, turnId?: string) => ({ content, turnId });
 
 describe('InflightInputTracker', () => {
+  it('retires an interrupted turn before CLI exit without dropping its next task', () => {
+    const tracker = new InflightInputTracker();
+    tracker.onWrite(item('interrupted', 'stop'));
+    tracker.onWrite(item('next task', 'next'));
+    tracker.retireTurn('stop');
+    expect(tracker.onCliExit()).toBe(1);
+    expect(tracker.takeCarryOver()).toEqual([item('next task', 'next')]);
+  });
+
+  it('retires an interrupted turn already moved to carry-over before restart', () => {
+    const tracker = new InflightInputTracker();
+    tracker.onWrite(item('interrupted', 'stop'));
+    tracker.onWrite(item('next task', 'next'));
+    tracker.onCliExit();
+    tracker.retireTurn('stop');
+    tracker.retireTurn('stop');
+    expect(tracker.takeCarryOver()).toEqual([item('next task', 'next')]);
+  });
+
   it('incident shape: write → CLI crash → respawn re-queues the lost input', () => {
     const t = new InflightInputTracker();
     t.onWrite(item('review PR #159', 'turn-1'));
@@ -39,6 +58,21 @@ describe('InflightInputTracker', () => {
     t.onWrite({ content: '<legacy />', turnId: 'om_1', codexAppInput });
     expect(t.onCliExit()).toBe(1);
     expect(t.takeCarryOver()).toEqual([{ content: '<legacy />', turnId: 'om_1', codexAppInput }]);
+  });
+
+  it('preserves logical content for a deferred transport command across crash replay', () => {
+    const t = new InflightInputTracker();
+    t.onWrite({
+      content: '/botmux-initial-prompt',
+      logicalContent: 'full original prompt',
+      turnId: 'om_1',
+    });
+    expect(t.onCliExit()).toBe(1);
+    expect(t.takeCarryOver()).toEqual([{
+      content: '/botmux-initial-prompt',
+      logicalContent: 'full original prompt',
+      turnId: 'om_1',
+    }]);
   });
 
   it('completed turn: idle clears in-flight, a later crash re-queues nothing', () => {
@@ -69,6 +103,24 @@ describe('InflightInputTracker', () => {
 
     expect(t.onCliExit(item => item.dispatchAttempt === undefined)).toBe(1);
     expect(t.takeCarryOver()).toEqual([{ content: 'ordinary IM', turnId: 'im-1' }]);
+  });
+
+  it('at-most-once (noReplay) input is NEVER carried over, but a plain sibling IS — per-item, not per-session', () => {
+    // codex #776 round-7 #1 + round-8: a keyed idempotency turn (dispatchAttempt
+    // undefined, so it would otherwise look like ordinary carry-over) is marked
+    // noReplay. The daemon terminalizes it to dispatch_unknown on CLI exit, so
+    // replaying it onto the auto-restarted CLI would run a turn the caller already
+    // saw failed. Round-8: the exclusion MUST be per-item — a plain (no-key)
+    // follow-up turn folded into the same http_async_ session via target.sessionId
+    // must SURVIVE the same CLI exit, not be dropped by a whole-session flag.
+    const t = new InflightInputTracker();
+    t.onWrite({ content: 'plain follow-up (same session, no key)', turnId: 'im-1' });
+    t.onWrite({ content: 'keyed async turn', turnId: 'trg_k', noReplay: true });
+
+    // Worker's real predicate: dispatchAttempt===undefined && !noReplay.
+    expect(t.onCliExit(item => item.dispatchAttempt === undefined && !item.noReplay)).toBe(1);
+    // The keyed at-most-once turn is dropped; the plain sibling is preserved for replay.
+    expect(t.takeCarryOver()).toEqual([{ content: 'plain follow-up (same session, no key)', turnId: 'im-1' }]);
   });
 
   it('preserves a clean explicit-IM envelope but leaves a clean durable replay to the receiver', () => {
@@ -109,6 +161,19 @@ describe('InflightInputTracker', () => {
 
     expect(t.onCliExit()).toBe(2);
     expect(t.takeCarryOver().map(i => i.content)).toEqual(['msg-1', 'msg-2']);
+  });
+
+  it('retires only an ambiguous write so a restart cannot blindly replay it', () => {
+    const t = new InflightInputTracker();
+    const ambiguous = item('possibly submitted', 'a');
+    const later = item('not attempted yet', 'b');
+    t.onWrite(ambiguous);
+    t.onWrite(later);
+
+    expect(t.retire(ambiguous)).toBe(true);
+    expect(t.retire(ambiguous)).toBe(false);
+    expect(t.onCliExit()).toBe(1);
+    expect(t.takeCarryOver()).toEqual([later]);
   });
 
   it('double exit before respawn keeps the earlier stash (appends, not replaces)', () => {

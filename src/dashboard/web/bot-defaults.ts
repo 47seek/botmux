@@ -1,4 +1,11 @@
 import { store } from './store.js';
+import type { CliRuntimeConfig as SharedCliRuntimeConfig } from '../../adapters/cli/runtime.js';
+import type { FeedbackPolicyLayer } from '../../services/feedback-policy-resolver.js';
+import type { ReplyStyleConfig } from '../../im/lark/reply-card-style.js';
+import type { AskOptionLayout } from '../../im/lark/ask-option-layout.js';
+import type { CodexReasoningEffort } from '../../services/codex-reasoning-effort.js';
+import type { CodexServiceTier } from '../../services/codex-service-tier.js';
+import type { StreamingCardButtonId } from '../../im/lark/streaming-card-buttons.js';
 
 export type CliOption = {
   id: string;
@@ -8,6 +15,9 @@ export type CliOption = {
   available?: boolean;
   command?: string;
   availabilityReason?: string;
+  cliLaunchMode?: 'forge-traex';
+  /** 静态模型候选（后端精选列表；不支持模型的 CLI 为 []）。live 探测结果走 /api/cli-options/models。 */
+  modelChoices?: readonly string[];
 };
 
 export type CliOptionsState = {
@@ -16,63 +26,208 @@ export type CliOptionsState = {
   ttadkModelSuggestions: string[];
 };
 
+export type ModelCapabilities = {
+  slug: string;
+  serviceTiers: string[];
+};
+
+/** Keep the browser payload contract tied to the daemon's canonical schema. */
+export type CliRuntimeConfig = SharedCliRuntimeConfig;
+export type CliRuntimeUpdateProvider = NonNullable<SharedCliRuntimeConfig['update']>['provider'];
+
+/** Browser contract: configured dimensions are custom; absence means pass-through. */
+export type NativeSubagentRuntimePolicy = {
+  model?: { mode: 'custom'; value: string };
+  reasoningEffort?: { mode: 'custom'; value: CodexReasoningEffort };
+};
+
 export type BotSubstituteTarget = {
   openId?: string;
   userId?: string;
   unionId?: string;
   email?: string;
   name?: string;
+  avatarUrl?: string;
 };
 
 export type BotSubstituteMode = {
   enabled: boolean;
   targets: BotSubstituteTarget[];
   disclosure: 'prefix' | 'none';
+  chats?: string[];
+  excludedChats?: string[];
+  replyMode?: 'thread' | 'quote';
+  disableControlCard?: boolean;
+  /** 话题群支持（缺省 true；显式 false 关）。 */
+  topicGroups?: boolean;
+  /** 话题里已有本 bot 活跃会话时是否仍触发替身（缺省 true）。 */
+  topicActiveSessionTrigger?: boolean;
 };
 
 export type BotDefaultsRow = {
   larkAppId: string;
   botName?: string;
   cliId?: string;
+  /** 租户品牌，决定飞书后台深链的 host（feishu.cn vs larksuite.com）。
+   *  缺省（旧 payload / 未注册）→ larkConsoleUrl 内 normalizeBrand 兜底 feishu。 */
+  brand?: string;
+  /** Absent/null is the built-in runtime. Older dashboard payloads omit it. */
+  cliRuntime?: CliRuntimeConfig | null;
+  /** Legacy path-only executable override, returned only by private Bot Defaults APIs. */
+  cliPathOverride?: string | null;
   wrapperCli?: string | null;
+  cliLaunchMode?: 'forge-traex' | null;
   model?: string;
+  modelBackendVariant?: 'standard' | 'max' | null;
+  reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
+  serviceTier?: CodexServiceTier;
+  nativeSubagentRuntime?: NativeSubagentRuntimePolicy;
+  /** dsh runner turn timeout (ms); rendered as a dsh-only field. */
+  turnTimeoutMs?: number;
+  /** dsh runtime variant: 'official' (JSON-RPC runner) or 'tui' (dsh-tui PTY). */
+  dshRuntime?: 'official' | 'tui' | null;
+  /** dsh profile name; rendered as a dsh-only field. */
+  dshProfile?: string | null;
   agentSelectionKey?: string;
+  /** CLI config profile dir (claude-code: CLAUDE_CONFIG_DIR); null/absent = CLI default. */
+  cliConfigDir?: string | null;
   defaultOncall?: { enabled?: boolean; workingDir?: string; since?: number };
   defaultWorkingDir?: string | null;
+  /** 「仓库选择卡片」形态的工作目录，与 defaultWorkingDir 互斥。 */
+  workingDir?: string | null;
   defaultWorkingDirAutoWorktree?: boolean;
   autoboundChatCount?: number;
   brandLabel?: string | null;
+  /** Sparse per-bot reply-card style override; null means all built-in defaults. */
+  replyStyle?: ReplyStyleConfig | null;
+  /** Per-bot ask option layout; null means the built-in compact default. */
+  askOptionLayout?: AskOptionLayout | null;
   sandbox?: boolean;
+  /** Tri-state sandbox selection ('off' absent historically → derive from sandbox). */
+  sandboxMode?: 'off' | 'oncall' | 'scratch' | null;
+  scratchStorage?: 'tmpfs' | 'disk' | null;
+  /** Whether the tmpfs/disk storage segmented control applies (Linux only;
+   *  macOS scratch is always APFS-clonefile backed). */
+  scratchStorageSelectable?: boolean;
+  scratchTmpfsSizeMb?: number | null;
+  scratchDenyPaths?: string[] | null;
+  /** Whether the scratch mode is available on this platform (Linux only). */
+  scratchSupported?: boolean;
+  codexAuthSync?: 'shared' | 'isolated';
+  /** Trigger-user CLI auth: null / absent = off (the historical behavior, where
+   *  CLI calls use whatever identity is logged in on the machine).
+   *  gitHost / gitTokenExchangeUrl have no editor in the UI — they round-trip
+   *  through the daemon's merge on PUT, so the page neither shows nor sends them. */
+  triggerUserAuth?: {
+    enabled: boolean;
+    tools: Array<'lark-cli' | 'bytedcli'>;
+    fallback: 'bot-identity' | 'none';
+    gitHost?: string;
+    gitTokenExchangeUrl?: string;
+  } | null;
+  /** lark-cli 应用绑定开关（默认开启）。默认开启以当前 Bot 应用凭证调用并支持 --profile 透传；设为 false 显式关闭。 */
+  larkToolBinding?: boolean;
+  /** Opt-in policy, configured for future sessions; absence retains legacy behavior. */
+  sandboxNetworkPolicy?: import('../../core/sandbox-network-policy.js').SandboxNetworkPolicy | null;
+  sandboxNetworkPolicyPlatform?: string | null;
+  /** Three-tier sandbox path whitelist (highest-precedence FsPolicy layer). */
+  sandboxPaths?: { readWrite: string[]; readOnly: string[]; deny: string[] } | null;
   /** Whether the unified file sandbox ALSO applies cross-bot read isolation for
    *  this bot's sessions — true when the CLI (claude/codex) + platform (macOS/Linux)
    *  + no wrapper can enforce it. Drives the capability label under the toggle. */
+  readIsolation?: boolean;
   readIsolationSupported?: boolean;
   backendType?: string | null;
+  /** daemon 的默认后端：`backendType` 没有覆盖时会话实际用它（见 effectiveBackendType）。 */
+  defaultBackendType?: string | null;
+  usageDisplay?: 'streaming' | 'footer' | 'off';
+  usageSupported?: boolean;
   disableStreamingCard?: boolean;
+  replyCardMode?: 'legacy' | 'unified';
+  hiddenStreamingCardButtons?: StreamingCardButtonId[];
+  pinStreamingCard?: boolean;
   silentTurnReactions?: boolean;
   codexAppCleanInput?: boolean;
+  codexBrowser?: boolean;
   writableTerminalLinkInCard?: boolean;
   privateCard?: boolean;
+  /** Bot-level master switch for the native CoT (thinking process) message.
+   *  Default ON — only an explicit false means disabled. */
+  cotEnabled?: boolean;
+  /** Whether each turn carries the `<sender>` speaker tag. Default ON — only an
+   *  explicit false means the tag is suppressed. */
+  senderTag?: boolean;
+  overloadAlert?: boolean;
   botToBotSameDir?: boolean;
+  quotaFallbackBot?: {
+    enabled: true;
+    targetAppId: string;
+    kinds: Array<'usage' | 'rate'>;
+    message: string;
+  } | null;
+  online?: boolean;
+  startupBlocked?: {
+    reason: 'quota_fallback_cycle';
+    cycle: string[];
+  };
   summaryRange?: { limit?: number; sinceHours?: number };
+  summaryMemory?: boolean;
+  summaryMemoryPath?: string;
   p2pMode?: string;
+  /** #794: per-turn 上下文注入方式。'auto' = 支持的 CLI 走 hook 注入；缺省/'off' = 内联。 */
+  envelopeInjection?: 'auto' | 'off' | null;
+  /** 最终回复投递方式的**生效值**（显式配置，否则按 CLI 缺省）。'transcript' = daemon
+   *  从 CLI 转写自动取最终回复，模型不再被要求 botmux send；'send' = 模型自己 botmux send。 */
+  topicUnavailablePolicy?: 'legacy' | 'stop';
+  replyDelivery?: 'send' | 'transcript' | null;
+  promptInjection?: 'default' | 'none';
+  /** 当前 cliId 的缺省投递方式；目前统一为 'send'。 */
+  replyDeliveryDefault?: 'send' | 'transcript';
+  /** 当前 cliId 是否有转写采集通道（claude-code / 结构化转写白名单）；false 时开关禁用。 */
+  replyDeliverySupported?: boolean;
   regularGroupReplyMode?: string;
   regularGroupMentionMode?: string;
   substituteMode?: BotSubstituteMode | null;
+  feedback?: FeedbackPolicyLayer | null;
+  oncallGroup?: import('../../services/oncall-group-policy.js').OncallGroupPolicy | null;
+  /** Codex App 无进展提醒（#1162）。null = 默认（开启，90s）。 */
+  noProgressNotify?: import('../../services/no-progress-notify-policy.js').NoProgressNotifyPolicy | null;
   docSubscribeDefaultMode?: string;
   maxLiveWorkers?: number | null;
+  idleSuspendMinutes?: number | null;
   logicalSessionCount?: number;
   residentSessionCount?: number;
   dormantSessionCount?: number;
+  sessionOwnerReminder?: {
+    enabled: boolean;
+    intervalMinutes: number;
+    text: string;
+    states: Array<'idle' | 'dormant' | 'pending_repo' | 'tui_prompt' | 'agent_attention' | 'limited'>;
+  } | null;
   startupCommands?: string;
+  customPassthroughCommands?: string;
+  canTalkDaemonCommands?: string;
   launchShell?: string;
   env?: string;
+  envKeys?: string[];
+  envPolicy?: { mode: 'inherit' | 'strict'; inherit?: string[] };
   riff?: Record<string, unknown> | null;
+  /** 被动入群时自动把 owner 拉进群。缺省 ON —— 只有显式 false 表示关闭。 */
+  autoInviteOwnerOnGroupAdd?: boolean;
   autoStartOnGroupJoin?: boolean;
   autoStartOnGroupJoinPrompt?: string;
+  autoStartOnGroupJoinSeed?: string;
+  /** 内置默认 seed 文案（按 bot locale），供留空时 placeholder 展示。 */
+  autoStartOnGroupJoinSeedDefault?: string;
+  groupJoinCommandEnabled?: boolean;
+  groupJoinCommand?: string;
   autoStartOnNewTopic?: boolean;
+  autoStartExcludedChats?: string[];
   autoGrantRequestCards?: boolean;
   restrictGrantCommands?: boolean;
+  p2pOpen?: boolean;
+  grantRequestToOwnerDm?: boolean;
+  grantDefaultDurationMs?: number | null;
   messageQuotaDefaultLimit?: number | null;
   skillInjectionSupport?: 'dynamic' | 'global' | 'none' | string;
   skillInjection?: 'global' | 'prompt' | 'off' | null | string;
@@ -92,7 +247,7 @@ export type LoadBotsResult = {
 export const fallbackCliOptions: CliOption[] = [
   { id: 'claude-code', label: 'Claude' },
   { id: 'codex', label: 'Codex' },
-  { id: 'traex', label: 'traex' },
+  { id: 'traex', label: 'TRAE CLI 2.0' },
 ];
 
 export const fallbackCliOptionsState: CliOptionsState = {
@@ -128,7 +283,167 @@ export function selectedCliOption(options: CliOption[], key: string): CliOption 
 
 export function modelSuggestionsForOption(opt: CliOption | undefined, cliState: CliOptionsState): string[] {
   if (opt?.gateway === 'ttadk' && opt.acceptsModel !== false) return cliState.ttadkModelSuggestions;
-  return [];
+  return [...(opt?.modelChoices ?? [])];
+}
+
+/**
+ * live 探测非空时以 runtime 目录为准；缺失或空时回退 static。纯函数，供单测。
+ */
+export function mergeModelCandidates(
+  staticChoices: readonly string[],
+  detected: readonly string[] | null | undefined,
+): string[] {
+  const primary = detected && detected.length > 0 ? detected : staticChoices;
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const item of primary) {
+    if (typeof item !== 'string' || seen.has(item)) continue;
+    seen.add(item);
+    out.push(item);
+  }
+  return out;
+}
+
+/**
+ * 按需探测某个 CLI 当前可用的模型列表（live 成功时权威，失败时回退静态）。
+ * fail-soft：任何错误（网络/404/400/形状异常）都返回 null，调用方回退静态候选。
+ */
+export async function fetchDetectedModels(
+  key: string,
+  appId?: string,
+): Promise<{
+  models: string[];
+  source: 'live' | 'static';
+  modelCapabilities?: ModelCapabilities[];
+  reasoningEffortsByModel?: Record<string, string[]>;
+} | null> {
+  try {
+    const query = new URLSearchParams({ key });
+    if (appId) query.set('bot', appId);
+    const r = await fetch(`/api/cli-options/models?${query.toString()}`);
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok || !body || !Array.isArray(body.models)) return null;
+    const models = body.models.filter((m: unknown): m is string => typeof m === 'string');
+    const source: 'live' | 'static' = body.source === 'live' ? 'live' : 'static';
+    const modelCapabilities = Array.isArray(body.modelCapabilities)
+      ? body.modelCapabilities.flatMap((item: unknown) => {
+          if (typeof item !== 'object' || item === null) return [];
+          const { slug, serviceTiers } = item as { slug?: unknown; serviceTiers?: unknown };
+          if (typeof slug !== 'string' || !Array.isArray(serviceTiers)) return [];
+          const tiers = serviceTiers.filter((tier): tier is string => typeof tier === 'string');
+          return [{ slug, serviceTiers: tiers }];
+        })
+      : undefined;
+    const reasoningEffortsByModel = body.reasoningEffortsByModel
+      && typeof body.reasoningEffortsByModel === 'object'
+      ? Object.fromEntries(Object.entries(body.reasoningEffortsByModel)
+        .filter(([, levels]) => Array.isArray(levels))
+        .map(([model, levels]) => [model, (levels as unknown[])
+          .filter((level): level is string => typeof level === 'string')]))
+      : undefined;
+    return {
+      models,
+      source,
+      ...(modelCapabilities ? { modelCapabilities } : {}),
+      ...(reasoningEffortsByModel ? { reasoningEffortsByModel } : {}),
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Fetch the list of available DSH profiles from the daemon.
+ * Returns an empty array on any error.
+ */
+export async function fetchDshProfiles(): Promise<string[]> {
+  try {
+    const r = await fetch('/api/dsh/profiles');
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok || !Array.isArray(body.profiles)) return [];
+    return body.profiles.filter((p: unknown): p is string => typeof p === 'string');
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Create a new DSH profile with the botmux default base plugins.
+ * Returns the created profile name, or null on error.
+ */
+export async function createDshProfile(name: string): Promise<string | null> {
+  try {
+    const r = await fetch('/api/dsh/profiles', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name }),
+    });
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok || typeof body.name !== 'string') return null;
+    return body.name;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Latest-wins guard for overlapping async refreshes. The Bot 配置 page fires an
+ * initial refresh on mount and another on every `bots.changed` SSE event; these
+ * can overlap, and a slow earlier `/api/bots` response arriving *after* a newer
+ * one ("后发先回") would otherwise clobber the fresher roster and re-hide a
+ * just-added bot. Each call bumps a monotonic counter and hands back a `commit`
+ * predicate that is only true while this call is still the newest — the caller
+ * gates BOTH its state write and its `loading=false` on it. Kept as a tiny
+ * pure factory so the race is unit-testable without a DOM.
+ */
+export function createRefreshGate(): { begin(): { commit(): boolean } } {
+  let latest = 0;
+  return {
+    begin() {
+      const seq = ++latest;
+      return { commit: () => seq === latest };
+    },
+  };
+}
+
+/**
+ * 「每个 key 只放行一次」闸门，给延迟加载的重型请求用。
+ *
+ * 场景：反馈设置区块需要 `memberBots`（只有 12.7MB 的完整矩阵有），而各 tab 是
+ * 用 `hidden` 隐藏而非条件卸载 —— 组件在任何 tab 下都 mount。把「是否激活」
+ * 加进 effect 依赖能避免未打开就拉，但副作用是**每次切回该 tab 都重跑**
+ * （cards → 别的 tab → 隔几秒回 cards，groups-api 的 3s 缓存已过期 ⟹ 又下载
+ * 12.7MB）。原语义是「每次 mount / 每个 botId 一次」，延迟加载不该把它放宽成
+ * 「每次回 tab 都拉」。
+ *
+ * `claim(key)` 只在该 key 尚未被认领时返回 true；`release(key)` 撤销认领，供
+ * 失败路径调用 —— 否则一次网络抖动会让该 bot 的列表永久空着。
+ *
+ * 注：当前调用点（`BotDefaultsCard` 带 `key={larkAppId:...}`）在切换 bot 时会
+ * 整体 remount，闸门随之新建，所以实际吃到的只有「同一 bot 二次激活」这一条；
+ * 按 key 而非布尔来记，是为了让「换 bot 必须重拉」在**不依赖父级 remount**时
+ * 也成立 —— 这条不变量不该悄悄挂在别处的 `key` 拼法上。
+ *
+ * 与 {@link createRefreshGate} 一样保持为纯工厂，好让「二次激活不重拉」不必起
+ * DOM 就能单测（仓库无 React 组件测试设施）。
+ */
+export function createOncePerKeyGate(): {
+  claim(key: string): boolean;
+  release(key: string): void;
+  claimed(key: string): boolean;
+} {
+  let current: string | null = null;
+  return {
+    claim(key) {
+      if (current === key) return false;
+      current = key;
+      return true;
+    },
+    release(key) {
+      if (current === key) current = null;
+    },
+    claimed: key => current === key,
+  };
 }
 
 export async function fetchBotDefaults(): Promise<LoadBotsResult> {
@@ -150,14 +465,72 @@ export async function fetchBotDefaults(): Promise<LoadBotsResult> {
   }
 }
 
+export type SubstituteTargetResolution = {
+  input?: string;
+  ok?: boolean;
+  openId?: string;
+  name?: string;
+  avatarUrl?: string;
+  reason?: 'cross_app_open_id' | 'not_visible' | 'resolve_failed' | 'unresolvable';
+};
+
+export async function resolveSubstituteTarget(
+  larkAppId: string,
+  target: BotSubstituteTarget,
+): Promise<{ ok: false; error: string } | { ok: true; resolution: SubstituteTargetResolution }> {
+  try {
+    const r = await fetch(`/api/bots/${encodeURIComponent(larkAppId)}/substitute-targets/resolve`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ target }),
+    });
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      return { ok: false, error: body?.error ? `HTTP ${r.status}: ${body.error}` : `HTTP ${r.status}` };
+    }
+    return { ok: true, resolution: body?.resolution ?? {} };
+  } catch (e: any) {
+    return { ok: false, error: e?.message ?? String(e) };
+  }
+}
+
+/** Machine-wide reply-card footer brand switch from GET /api/settings.
+ *  Fail-OPEN: any fetch/shape error returns true (per-bot editing stays usable)
+ *  rather than wrongly greying the field — the server is the enforcement point
+ *  anyway, this flag only drives the disabled UI state. */
+export async function fetchCardBrandLabelEnabled(): Promise<boolean> {
+  try {
+    const r = await fetch('/api/settings');
+    if (!r.ok) return true;
+    const body = await r.json().catch(() => ({}));
+    // Present even for tokenless public-readOnly visitors (not redacted).
+    return body?.settings?.cardBrandLabel !== false;
+  } catch {
+    return true;
+  }
+}
+
 export async function fetchCliOptions(): Promise<CliOptionsState> {
   try {
-    const r = await fetch('/api/cli-options');
+    // `?probe=none` 显式跳过开放平台登录态探测（一趟 1-4s 的实时飞书往返）。
+    // 本页的 CliOptionsState 不含 webSession 字段，付了钱也拿不到手。
+    //
+    // 之所以是「本页 opt-out」而不是「服务端默认不探测」：路由 chunk 带
+    // immutable 长缓存，dashboard 重启后已加载的旧 chunk 仍会请求裸端点；裸端点
+    // 一旦默认不探测，旧 chunk 会把「字段缺席」判成未登录、把用户推去扫码。
+    // 详见 dashboard.ts 里 /api/cli-options 的注释。
+    const r = await fetch('/api/cli-options?probe=none');
     const body = await r.json().catch(() => ({}));
     if (!r.ok || !Array.isArray(body?.options)) return fallbackCliOptionsState;
-    const options = body.options.filter((o: any): o is CliOption =>
-      o && typeof o.id === 'string' && typeof o.label === 'string',
-    );
+    const options: CliOption[] = body.options
+      .filter((o: any) => o && typeof o.id === 'string' && typeof o.label === 'string')
+      .map((o: any) => ({
+        ...o,
+        // 容错：缺失/非数组 → []，候选合并走 mergeModelCandidates。
+        modelChoices: Array.isArray(o.modelChoices)
+          ? o.modelChoices.filter((m: unknown): m is string => typeof m === 'string')
+          : [],
+      }));
     const ttadkModelDefault = typeof body.ttadkModelDefault === 'string' && body.ttadkModelDefault.trim()
       ? body.ttadkModelDefault.trim()
       : fallbackCliOptionsState.ttadkModelDefault;

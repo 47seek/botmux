@@ -22,9 +22,16 @@ import {
   jsonlContainsFingerprint,
   extractLastAssistantTurn,
   isMeaningfulUserEvent,
+  isScheduledTurnStartEvent,
+  cronCreateToolUseIds,
+  cronCreateAcks,
   readFirstEventTimestamp,
   findJsonlsContainingExactContent,
   splitTranscriptEventsByCutoff,
+  isTranscriptRateLimitEvent,
+  classifyClaudeTerminalEvent,
+  isSyntheticNoModelReplyEvent,
+  apiErrorMessageText,
   type TranscriptEvent,
 } from '../src/services/claude-transcript.js';
 
@@ -130,6 +137,249 @@ describe('pickAssistantTextEvents', () => {
       { type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'no-uuid' }] } },
     ];
     expect(pickAssistantTextEvents(events)).toEqual([]);
+  });
+
+  it('drops the rate_limit API-error record so its text is not forwarded as a reply', () => {
+    // rate_limit is surfaced as a `limited` state, not an assistant answer.
+    const events: TranscriptEvent[] = [
+      { type: 'assistant', uuid: 'rl', isApiErrorMessage: true, error: 'rate_limit', apiErrorStatus: 429, message: { role: 'assistant', content: [{ type: 'text', text: "You've hit your session limit · resets 10:40pm" }] } },
+    ];
+    expect(pickAssistantTextEvents(events)).toEqual([]);
+  });
+
+  it('drops non-rate API-error text because structured terminal handling owns it', () => {
+    const events: TranscriptEvent[] = [
+      { type: 'assistant', uuid: 'se', isApiErrorMessage: true, error: 'server_error', message: { role: 'assistant', content: [{ type: 'text', text: 'API Error: 500 internal' }] } },
+    ];
+    expect(pickAssistantTextEvents(events)).toEqual([]);
+  });
+});
+
+describe('isTranscriptRateLimitEvent', () => {
+  it('is true for a rate_limit error record', () => {
+    const ev: TranscriptEvent = { type: 'assistant', uuid: 'r', error: 'rate_limit', apiErrorStatus: 429, isApiErrorMessage: true, message: { role: 'assistant', content: [{ type: 'text', text: "You've hit your session limit · resets 10:40pm" }] } };
+    expect(isTranscriptRateLimitEvent(ev)).toBe(true);
+  });
+
+  it('is true when only apiErrorStatus is 429 (defensive)', () => {
+    const ev: TranscriptEvent = { type: 'assistant', uuid: 'r2', apiErrorStatus: 429, isApiErrorMessage: true, message: { role: 'assistant', content: [] } };
+    expect(isTranscriptRateLimitEvent(ev)).toBe(true);
+  });
+
+  it('is false for a normal assistant reply', () => {
+    const ev: TranscriptEvent = { type: 'assistant', uuid: 'ok', message: { role: 'assistant', content: [{ type: 'text', text: 'here is your answer' }] } };
+    expect(isTranscriptRateLimitEvent(ev)).toBe(false);
+  });
+
+  it('is false for other API errors (server_error, auth, terms-400)', () => {
+    for (const error of ['server_error', 'authentication_failed', 'unknown', 'invalid_request']) {
+      const ev: TranscriptEvent = { type: 'assistant', uuid: 'e', error, isApiErrorMessage: true, message: { role: 'assistant', content: [{ type: 'text', text: 'API Error' }] } };
+      expect(isTranscriptRateLimitEvent(ev), `error=${error}`).toBe(false);
+    }
+  });
+
+  it('is false for the system/turn_duration terminal marker', () => {
+    const ev: TranscriptEvent = { type: 'system', subtype: 'turn_duration', uuid: 'td' };
+    expect(isTranscriptRateLimitEvent(ev)).toBe(false);
+  });
+
+  it('apiErrorMessageText recovers the human retry clock from the record text', () => {
+    const ev: TranscriptEvent = { type: 'assistant', uuid: 'r', error: 'rate_limit', message: { role: 'assistant', content: [{ type: 'text', text: "You've hit your session limit · resets 10:40pm (America/Los_Angeles)" }] } };
+    expect(apiErrorMessageText(ev)).toContain('resets 10:40pm');
+  });
+});
+
+describe('synthetic no-model-reply records', () => {
+  // Byte-shape of a record observed in a live Claude Code 2.1.263 transcript:
+  // the bridge resumed a turn that had been cut mid-flight, wrote an `isMeta`
+  // user "Continue from where you left off." and this assistant placeholder
+  // with the same timestamp, and never called the model (no `requestId`,
+  // usage all zero). The Lark message that started the turn got no answer.
+  function syntheticNoReply(extra: Record<string, unknown> = {}): TranscriptEvent {
+    return {
+      type: 'assistant',
+      uuid: 'a6e59f9c-8ca4-4907-bc62-b9ae78206e37',
+      timestamp: '2026-09-08T10:56:21.981Z',
+      isApiErrorMessage: false,
+      message: {
+        role: 'assistant',
+        model: '<synthetic>',
+        stop_reason: 'stop_sequence',
+        content: [{ type: 'text', text: 'No response requested.' }],
+      },
+      ...extra,
+    } as TranscriptEvent;
+  }
+
+  it('recognises the placeholder by model, not by text', () => {
+    expect(isSyntheticNoModelReplyEvent(syntheticNoReply())).toBe(true);
+    expect(isSyntheticNoModelReplyEvent(syntheticNoReply({
+      message: { role: 'assistant', model: '<synthetic>', stop_reason: 'stop_sequence', content: [{ type: 'text', text: 'anything' }] },
+    }))).toBe(true);
+  });
+
+  it('leaves API-error records to the API-error classifier', () => {
+    const apiErr = syntheticNoReply({ isApiErrorMessage: true, error: 'unknown' });
+    expect(isSyntheticNoModelReplyEvent(apiErr)).toBe(false);
+    expect(classifyClaudeTerminalEvent(apiErr)).toEqual({
+      status: 'ambiguous', errorCode: 'provider_unknown_error', retryable: false,
+    });
+  });
+
+  it('a real model reply of the same shape is still a completed turn', () => {
+    const real = syntheticNoReply({
+      requestId: 'req_011CN',
+      message: { role: 'assistant', model: 'claude-opus-4-8', stop_reason: 'end_turn', content: [{ type: 'text', text: 'done' }] },
+    });
+    expect(isSyntheticNoModelReplyEvent(real)).toBe(false);
+    expect(classifyClaudeTerminalEvent(real)).toEqual({ status: 'completed' });
+  });
+
+  it('classifies the placeholder as a retryable failure, never as completed', () => {
+    expect(classifyClaudeTerminalEvent(syntheticNoReply())).toEqual({
+      status: 'failed', errorCode: 'provider_no_model_reply', retryable: true,
+    });
+  });
+
+  it('ignores sidechain and non-assistant records', () => {
+    expect(isSyntheticNoModelReplyEvent(syntheticNoReply({ type: 'user', message: { role: 'user', model: '<synthetic>', content: 'x' } }))).toBe(false);
+    expect(classifyClaudeTerminalEvent(syntheticNoReply({ isSidechain: true }))).toBeUndefined();
+  });
+});
+
+describe('classifyClaudeTerminalEvent', () => {
+  it('classifies the observed unknown + unexpected EOF fixture as retryable failure', () => {
+    const ev: TranscriptEvent = {
+      type: 'assistant',
+      uuid: 'fixture-error',
+      isApiErrorMessage: true,
+      error: 'unknown',
+      message: {
+        role: 'assistant',
+        stop_reason: 'stop_sequence',
+        content: [{ type: 'text', text: 'API Error: provider disconnected: unexpected EOF' }],
+      },
+    };
+
+    expect(classifyClaudeTerminalEvent(ev)).toEqual({
+      status: 'failed',
+      errorCode: 'provider_unexpected_eof',
+      retryable: true,
+    });
+  });
+
+  it.each([
+    ['authentication_failed', undefined, 'API Error: authentication failed', 'provider_authentication_failed'],
+    ['invalid_request', 400, 'API Error: invalid request', 'provider_invalid_request'],
+    ['permission_error', 403, 'API Error: permission denied', 'provider_permission_denied'],
+    ['unknown', 404, 'API Error: endpoint not found', 'provider_invalid_request'],
+  ])('classifies %s as non-retryable', (error, apiErrorStatus, text, errorCode) => {
+    const ev: TranscriptEvent = {
+      type: 'assistant',
+      uuid: `non-retry-${error}`,
+      isApiErrorMessage: true,
+      error,
+      apiErrorStatus,
+      message: {
+        role: 'assistant',
+        stop_reason: 'stop_sequence',
+        content: [{ type: 'text', text }],
+      },
+    };
+
+    expect(classifyClaudeTerminalEvent(ev)).toEqual({
+      status: 'failed',
+      errorCode,
+      retryable: false,
+    });
+  });
+
+  it('does not promote an unrecognized unknown API error into an automatic retry', () => {
+    const ev: TranscriptEvent = {
+      type: 'assistant',
+      uuid: 'unknown-other',
+      isApiErrorMessage: true,
+      error: 'unknown',
+      message: {
+        role: 'assistant',
+        stop_reason: 'stop_sequence',
+        content: [{ type: 'text', text: 'API Error: something unfamiliar happened' }],
+      },
+    };
+
+    expect(classifyClaudeTerminalEvent(ev)).toEqual({
+      status: 'ambiguous',
+      errorCode: 'provider_unknown_error',
+      retryable: false,
+    });
+  });
+
+  it('does not let transient-looking text override an explicit auth failure', () => {
+    const ev: TranscriptEvent = {
+      type: 'assistant',
+      uuid: 'auth-eof',
+      isApiErrorMessage: true,
+      error: 'authentication_failed',
+      apiErrorStatus: 401,
+      message: {
+        role: 'assistant',
+        stop_reason: 'stop_sequence',
+        content: [{ type: 'text', text: 'authentication failed after unexpected EOF' }],
+      },
+    };
+
+    expect(classifyClaudeTerminalEvent(ev)).toEqual({
+      status: 'failed',
+      errorCode: 'provider_authentication_failed',
+      retryable: false,
+    });
+  });
+
+  it('keeps 429 on the existing rate-limit path instead of ordinary recovery', () => {
+    const ev: TranscriptEvent = {
+      type: 'assistant',
+      uuid: 'rate-limit',
+      isApiErrorMessage: true,
+      error: 'rate_limit',
+      apiErrorStatus: 429,
+      message: {
+        role: 'assistant',
+        stop_reason: 'stop_sequence',
+        content: [{ type: 'text', text: 'rate limited' }],
+      },
+    };
+
+    expect(classifyClaudeTerminalEvent(ev)).toEqual({
+      status: 'rate_limited',
+      errorCode: 'provider_rate_limited',
+      retryable: false,
+    });
+  });
+
+  it.each([
+    ['server_error', 524, 'API Error: upstream timed out'],
+    ['unknown', undefined, 'API Error: 厂商资源问题断连：http2: client connection lost'],
+    ['unknown', undefined, 'API Error: Connection closed mid-response. The response above may be incomplete.'],
+    ['unknown', undefined, 'API Error: InternalServerException: Try your request again.'],
+  ])('classifies verified transient provider shape %s/%s as retryable', (error, apiErrorStatus, text) => {
+    const ev: TranscriptEvent = {
+      type: 'assistant',
+      uuid: `transient-${error}-${apiErrorStatus ?? 'none'}`,
+      isApiErrorMessage: true,
+      error,
+      apiErrorStatus,
+      message: {
+        role: 'assistant',
+        stop_reason: 'stop_sequence',
+        content: [{ type: 'text', text }],
+      },
+    };
+
+    expect(classifyClaudeTerminalEvent(ev)).toEqual({
+      status: 'failed',
+      errorCode: 'provider_server_error',
+      retryable: true,
+    });
   });
 });
 
@@ -851,6 +1101,128 @@ describe('isMeaningfulUserEvent', () => {
   });
   it('rejects assistant-role events', () => {
     expect(isMeaningfulUserEvent(assistantEv('hi'))).toBe(false);
+  });
+});
+
+describe('isScheduledTurnStartEvent', () => {
+  const fire = (extra: Record<string, unknown> = {}): TranscriptEvent =>
+    userEv('cron prompt', {
+      isMeta: true,
+      turnOrigin: 'scheduled',
+      scheduledTaskId: 'task-1',
+      scheduledFireId: 'fire-uuid-1',
+      ...extra,
+    });
+  it('recognises a real CronCreate fire record', () => {
+    expect(isScheduledTurnStartEvent(fire())).toBe(true);
+  });
+  it('stays excluded from meaningful human input (no fingerprint bind)', () => {
+    expect(isMeaningfulUserEvent(fire())).toBe(false);
+  });
+  it('rejects a plain isMeta record without turnOrigin scheduled', () => {
+    expect(isScheduledTurnStartEvent(userEv('x', { isMeta: true }))).toBe(false);
+  });
+  it('rejects turnOrigin scheduled without a fire id', () => {
+    expect(isScheduledTurnStartEvent(
+      userEv('x', { isMeta: true, turnOrigin: 'scheduled' }),
+    )).toBe(false);
+  });
+  it('rejects sidechain / compact records', () => {
+    expect(isScheduledTurnStartEvent(fire({ isSidechain: true }))).toBe(false);
+    expect(isScheduledTurnStartEvent(fire({ isCompactSummary: true }))).toBe(false);
+  });
+  it('rejects assistant / nullish events', () => {
+    expect(isScheduledTurnStartEvent(assistantEv('hi'))).toBe(false);
+    expect(isScheduledTurnStartEvent(null)).toBe(false);
+    expect(isScheduledTurnStartEvent(undefined)).toBe(false);
+  });
+
+  // Legacy fire records (Claude Code ≤2.1.280) carry no turnOrigin; they mark
+  // the prompt with promptSource:"system". The predicate must accept that
+  // shape while staying strict about isMeta and the mandatory fire id.
+  it('recognises a LEGACY fire: isMeta + promptSource system, no turnOrigin', () => {
+    const legacy = userEv('cron prompt', {
+      isMeta: true,
+      promptSource: 'system',
+      scheduledTaskId: 'task-1',
+      scheduledFireId: 'fire-legacy-1',
+    });
+    expect(isScheduledTurnStartEvent(legacy)).toBe(true);
+  });
+  it('rejects a turnOrigin other than scheduled even with a fire id', () => {
+    expect(isScheduledTurnStartEvent(fire({ turnOrigin: 'human' }))).toBe(false);
+  });
+  it('rejects a non-isMeta record even when promptSource is system and a fire id exists', () => {
+    const sneaky = userEv('cron prompt', {
+      promptSource: 'system',
+      scheduledFireId: 'fire-x',
+    });
+    expect(isScheduledTurnStartEvent(sneaky)).toBe(false);
+  });
+  it('rejects a legacy-shaped isMeta+system record without a fire id', () => {
+    expect(isScheduledTurnStartEvent(
+      userEv('x', { isMeta: true, promptSource: 'system' }),
+    )).toBe(false);
+  });
+  it('requires promptSource system for a legacy (no-turnOrigin) isMeta record', () => {
+    expect(isScheduledTurnStartEvent(
+      userEv('x', { isMeta: true, scheduledFireId: 'fire-y' }),
+    )).toBe(false);
+  });
+});
+
+describe('cronCreateToolUseIds / cronCreateAcks', () => {
+  const callEv = (blockId: string, name = 'CronCreate'): TranscriptEvent => ({
+    type: 'assistant',
+    uuid: `call-${blockId}`,
+    message: { role: 'assistant', content: [{ type: 'tool_use', id: blockId, name }] as any },
+  } as TranscriptEvent);
+  const resultEv = (blockId: string, text: string): TranscriptEvent => ({
+    type: 'user',
+    uuid: `res-${blockId}`,
+    message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: blockId, content: text }] as any },
+  } as TranscriptEvent);
+
+  it('collects CronCreate tool_use block ids and ignores other tools', () => {
+    expect(cronCreateToolUseIds(callEv('b1'))).toEqual(['b1']);
+    expect(cronCreateToolUseIds(callEv('b2', 'Read'))).toEqual([]);
+    expect(cronCreateToolUseIds(assistantEv('hi'))).toEqual([]);
+    expect(cronCreateToolUseIds(null)).toEqual([]);
+  });
+
+  it('parses the recurring and one-shot ack task ids using REAL CLI wording', () => {
+    const recurring = resultEv('b1', 'Scheduled recurring job 08e02324 (7,37 * * * *). Use CronDelete to cancel sooner.');
+    // Real one-shot success text uses TASK, not job (Claude Code 2.1.276/2.1.284).
+    const oneshotTask = resultEv('b2', 'Scheduled one-shot task bf15f538 (34 18 20 9 *). Use CronDelete to cancel sooner.');
+    expect(cronCreateAcks(recurring)).toEqual([{ toolUseId: 'b1', taskId: '08e02324' }]);
+    expect(cronCreateAcks(oneshotTask)).toEqual([{ toolUseId: 'b2', taskId: 'bf15f538' }]);
+  });
+
+  it('still accepts the older "one-shot job" wording and rejects lookalikes', () => {
+    const oneshotLegacy = resultEv('b3', 'Scheduled one-shot job abc_12-3 (2026-10-01 ...). Use CronDelete to cancel sooner.');
+    expect(cronCreateAcks(oneshotLegacy)).toEqual([{ toolUseId: 'b3', taskId: 'abc_12-3' }]);
+    // A different noun must not match (defence in depth beyond the pending gate).
+    expect(cronCreateAcks(resultEv('b4', 'Scheduled one-shot thing 02b077c4 (x)'))).toEqual([]);
+    expect(cronCreateAcks(resultEv('b5', 'Scheduled recurring task 02b077c4 (x)'))).toEqual([]);
+  });
+
+  it('ignores unrelated tool_results and array-of-block content', () => {
+    expect(cronCreateAcks(resultEv('b1', 'tool ran successfully'))).toEqual([]);
+    const arrayContent: TranscriptEvent = {
+      type: 'user',
+      uuid: 'res-x',
+      message: {
+        role: 'user',
+        content: [{
+          type: 'tool_result',
+          tool_use_id: 'b9',
+          content: [{ type: 'text', text: 'Scheduled recurring job de137a7b (x).' }],
+        }] as any,
+      },
+    } as TranscriptEvent;
+    expect(cronCreateAcks(arrayContent)).toEqual([{ toolUseId: 'b9', taskId: 'de137a7b' }]);
+    expect(cronCreateAcks(assistantEv('hi'))).toEqual([]);
+    expect(cronCreateAcks(null)).toEqual([]);
   });
 });
 

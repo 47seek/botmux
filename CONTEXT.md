@@ -19,12 +19,31 @@ _Avoid_: agent, app
 A continuing conversation between one chat anchor and one **Agent CLI**.
 _Avoid_: thread, task
 
+**Sender Identity**:
+The best-effort identity of the person or Bot that authored one inbound chat
+message. It follows each message turn rather than being fixed to a **Session**;
+multiple senders may therefore appear in one Session. Human sender identity may
+include an app-scoped open ID, display name, and email when the chat platform
+makes them available. Missing optional fields never block message delivery.
+_Avoid_: session owner, card recipient
+
 **Token Usage**:
 Token counts reported by an **Agent CLI** or its persisted transcript for a
 **Session**. Token In is the Agent CLI's native input-side total, including
 cache read/create tokens when the CLI reports them; Token Out is the native
 output-side total. Botmux does not estimate token counts from message text.
 _Avoid_: token estimate, cost estimate
+
+**Context Usage**:
+The latest valid context-window measurement reported by an **Agent CLI** or its
+persisted transcript. It may decrease after compaction and is never derived
+from cumulative **Token Usage**. The window size and percentage are shown only
+when the Agent CLI provides enough native data; missing measurements are
+omitted from card footers rather than inferred from the model name.
+Each Bot may set `showUsageInCardFooter: false` to hide both Context Usage and
+Token Usage from ordinary reply-card footers. This is a display preference
+only; Usage Ledger accounting and other usage consumers remain active.
+_Avoid_: cumulative context, estimated context window
 
 **Usage Ledger**:
 Append-only daily JSONL files under `~/.botmux/usage/` recording per-turn
@@ -48,5 +67,5 @@ route that reply back to the same Agent CLI conversation."
 
 Dev: "Cursor did not expose Token Usage for this Session."
 
-Domain expert: "Then botmux should say the Token Usage is unavailable, not guess
-from the visible text."
+Domain expert: "Then botmux should omit Token Usage from the card footer, not
+guess from the visible text."

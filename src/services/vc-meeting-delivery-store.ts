@@ -26,12 +26,14 @@ import { logger } from '../utils/logger.js';
 import type {
   VcMeetingConsumerManagedSink,
   VcMeetingConsumerProfileFilter,
+  VcMeetingListenerOutputPlacement,
 } from '../types.js';
 import {
   normalizeVcMeetingMemberPolicy,
   vcMeetingCanonicalStringListsEqual,
   vcMeetingMemberFilterEquals,
 } from './vc-meeting-member-policy.js';
+import type { VcMeetingListenerOutputProtocol } from './vc-meeting-listener-output-protocol.js';
 import { normalizeVcMeetingProfileInstructions } from './vc-meeting-profile-instructions.js';
 
 const DIR_NAME = 'vc-meeting-delivery';
@@ -72,9 +74,12 @@ export interface VcMeetingMemberProjectionInput {
   joinedAtIngestSeq: number;
   receiverSessionId: string;
   outputChatId: string;
+  /** Omitted by pre-feature callers and normalized to `auto`. */
+  outputPlacement?: VcMeetingListenerOutputPlacement;
 }
 
-export interface VcMeetingMemberProjectionRecord extends VcMeetingMemberProjectionInput {
+export interface VcMeetingMemberProjectionRecord extends Omit<VcMeetingMemberProjectionInput, 'outputPlacement'> {
+  outputPlacement: VcMeetingListenerOutputPlacement;
   createdAt: number;
   updatedAt: number;
 }
@@ -122,6 +127,10 @@ export interface VcMeetingDeliveryReceiptRecord {
    * attempt loud (or the reverse). Older WIP records may omit this field;
    * readers fail closed to `silent`. */
   responseMode?: VcMeetingResponseMode;
+  /** Listener-chat presentation frozen with the logical delivery. */
+  outputPlacement?: VcMeetingListenerOutputPlacement;
+  /** Old receipts omit this and retain their historical plain final output. */
+  listenerOutputProtocol?: VcMeetingListenerOutputProtocol;
   /** Sink-owner authorization generation frozen when this logical delivery
    * is first accepted. Projection updates must not let an old source turn
    * inherit authority from a later owner generation. Older WIP receipts may
@@ -188,6 +197,8 @@ export interface VcMeetingDeliveryAcceptInput extends VcMeetingMemberKey {
   toSeq: number;
   final?: boolean;
   responseMode: VcMeetingResponseMode;
+  outputPlacement?: VcMeetingListenerOutputPlacement;
+  listenerOutputProtocol?: VcMeetingListenerOutputProtocol;
   receiverBootId: string;
 }
 
@@ -287,6 +298,7 @@ function normalizePersistedProjectionPolicies(state: VcMeetingDeliveryStateFile)
       }
       if (normalizedInstructions.instructions === undefined) delete projection.instructions;
       else projection.instructions = normalizedInstructions.instructions;
+      projection.outputPlacement ??= 'auto';
       const policy = normalizeVcMeetingMemberPolicy({
         memberId: projection.memberId,
         role: projection.role,
@@ -404,7 +416,8 @@ function projectionContentEquals(
     && a.sinkOwnerGeneration === b.sinkOwnerGeneration
     && a.joinedAtIngestSeq === b.joinedAtIngestSeq
     && a.receiverSessionId === b.receiverSessionId
-    && a.outputChatId === b.outputChatId;
+    && a.outputChatId === b.outputChatId
+    && (a.outputPlacement ?? 'auto') === (b.outputPlacement ?? 'auto');
 }
 
 /**
@@ -436,6 +449,7 @@ export function applyVcMeetingMemberProjection(
 ): VcMeetingProjectionResult {
   const normalizedInstructions = normalizeVcMeetingProfileInstructions(input.instructions);
   if (!normalizedInstructions.ok) return { ok: false, reason: 'invalid' };
+  input = { ...input, outputPlacement: input.outputPlacement ?? 'auto' };
   const policy = normalizeVcMeetingMemberPolicy({
     memberId: input.memberId,
     role: input.role,
@@ -463,6 +477,7 @@ export function applyVcMeetingMemberProjection(
     || !Number.isInteger(input.joinedAtIngestSeq) || input.joinedAtIngestSeq < 0
     || !(['active', 'paused', 'removed'] as const).includes(input.status)
     || !(['silent', 'listener_thread'] as const).includes(input.responseMode)
+    || !(['auto', 'chat', 'topic'] as const).includes(input.outputPlacement!)
     || !policy
   ) {
     return { ok: false, reason: 'invalid' };
@@ -593,6 +608,7 @@ export function applyVcMeetingMemberProjection(
 
     const record: VcMeetingMemberProjectionRecord = {
       ...input,
+      outputPlacement: input.outputPlacement ?? 'auto',
       createdAt: prior?.createdAt ?? now,
       updatedAt: now,
     };
@@ -651,6 +667,11 @@ export function acceptVcMeetingDelivery(
     || !Number.isInteger(input.fromSeq) || input.fromSeq < 1
     || !Number.isInteger(input.toSeq) || input.toSeq < input.fromSeq
     || (input.responseMode !== 'silent' && input.responseMode !== 'listener_thread')
+    || (input.outputPlacement !== undefined
+      && !(['auto', 'chat', 'topic'] as const).includes(input.outputPlacement))
+    || (input.listenerOutputProtocol !== undefined
+      && input.listenerOutputProtocol !== 'plain'
+      && input.listenerOutputProtocol !== 'decision_v1')
   ) {
     return { kind: 'conflict', reason: 'invalid' };
   }
@@ -823,6 +844,8 @@ export function acceptVcMeetingDelivery(
       toSeq: input.toSeq,
       final: input.final === true,
       responseMode: input.responseMode,
+      outputPlacement: input.outputPlacement ?? projection.outputPlacement ?? 'auto',
+      listenerOutputProtocol: input.listenerOutputProtocol ?? 'plain',
       sinkOwnerGeneration: projection.sinkOwnerGeneration,
       status: 'accepted',
       receiverBootId: input.receiverBootId,
@@ -1325,6 +1348,59 @@ export function listActiveVcMeetingDeliveriesForSession(
     || a.memberKey.memberId.localeCompare(b.memberKey.memberId)
     || a.memberKey.memberEpoch - b.memberKey.memberEpoch
     || a.receipt.deliveryKey.localeCompare(b.receipt.deliveryKey));
+}
+
+/**
+ * Most-recent authorizable delivery receipt for a receiver session, INCLUDING a
+ * just-`completed` one. Unlike listActiveVcMeetingDeliveriesForSession (which
+ * skips terminal receipts), this returns the latest `dispatched` OR `completed`
+ * receipt by updatedAt.
+ *
+ * Why it exists: the in-meeting managed-output CLI (request-output) normally
+ * carries the LIVE turn's origin (turnId/dispatchAttempt) from the process-tree
+ * marker. But a meeting agent frequently decides to speak AFTER the delivery
+ * turn has gone idle — at which point the live marker's turn fields are cleared,
+ * so the CLI has no origin to send and the daemon's durable authorization
+ * fallback cannot fire. This lets the CLI recover the delivery identity of the
+ * turn it just processed from the durable ledger (keyed only by sessionId), so
+ * the daemon can re-authorize in-meeting output against the completed receipt
+ * (evaluateVcMeetingManagedSend with allowTerminalReceipt + forInMeetingOutput).
+ * Read-only; failed/abandoned/ambiguous receipts are never returned.
+ */
+export function latestVcMeetingDeliveryForSession(
+  dataDir: string,
+  receiverSessionId: string,
+): VcMeetingDeliveryLookupResult | undefined {
+  if (!receiverSessionId.trim()) return undefined;
+  const dir = join(dataDir, DIR_NAME);
+  if (!existsSync(dir)) return undefined;
+
+  let best: VcMeetingDeliveryLookupResult | undefined;
+  for (const name of readdirSync(dir)) {
+    if (!name.endsWith('.json')) continue;
+    const state = readStateFile(join(dir, name));
+    if (!state) continue;
+    for (const stream of Object.values(state.streams)) {
+      if (stream.receiverSessionId !== receiverSessionId) continue;
+      for (const receipt of Object.values(stream.receipts)) {
+        // Only receipts the daemon could still authorize in-meeting output for.
+        if (receipt.status !== 'dispatched' && receipt.status !== 'completed') continue;
+        if (best && receipt.updatedAt <= best.receipt.updatedAt) continue;
+        best = {
+          memberKey: {
+            listenerAppId: stream.listenerAppId,
+            meetingId: stream.meetingId,
+            memberId: stream.memberId,
+            memberEpoch: stream.memberEpoch,
+          },
+          receiverSessionId: stream.receiverSessionId,
+          receipt,
+          receiverCommittedThrough: stream.receiverCommittedThrough,
+        };
+      }
+    }
+  }
+  return best;
 }
 
 /**

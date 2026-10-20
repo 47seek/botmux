@@ -1,25 +1,68 @@
 # 多 CLI 适配器
 
-botmux 通过适配器桥接不同 CLI，`bots.json` 里用 `cliId` 选择。一键切换，进程隔离。
+botmux 通过适配器桥接不同 CLI / Agent，`bots.json` 里用 `cliId` 选择，一键切换。**本地适配器各自运行进程**（默认 tmux 后端下可 `tmux attach` 进真进程；显式 pty/zellij/herdr 后端另说）；也有少数通过 API / 远端接入的 Agent（如 Mira、riff），不是本地进程。
 
-## 支持的 CLI
+**适用**：想换底层 CLI、或接一个新工具时查 `cliId` 和它是否吃 `model` 参数。
+**不适用**：严格兼容 Codex 的独立发行版、或套 wrapper / 网关（ccr、aiden x claude 等）不需要新适配器——分别见下方 [Codex 兼容发行版](#codex-兼容发行版) 与 [套 wrapper / 网关接入](#套-wrapper--网关接入)。
 
-| `cliId` | CLI | 支持 model 参数 |
-|---------|-----|:--:|
-| `claude-code` | Claude Code（默认） | ✅ |
-| `codex` | Codex | ✅ |
-| `codex-app` | Codex App | |
-| `cursor` | Cursor（cursor-agent） | ✅ |
-| `gemini` | Gemini | ✅ |
-| `opencode` | OpenCode | ✅ |
-| `coco` | CoCo / Trae（需 ≥ 0.120.32） | ✅ |
-| `aiden` | Aiden | |
-| `antigravity` | Antigravity（agy） | |
-| `hermes` | Hermes | |
-| `copilot` | GitHub Copilot（copilot） | ✅ |
-| `kiro-cli` | Kiro（kiro-cli） | |
+## 支持的 CLI / Agent
 
-> 还有社区贡献的 MTR、ttadk、Mira 等接入方式。`model` 字段只对支持模型参数的适配器生效，其它会忽略。
+下表为当前内置适配器（`cliId` 的**权威事实源**是 [`src/adapters/cli/registry.ts`](https://github.com/deepcoldy/botmux/blob/master/src/adapters/cli/registry.ts)，随版本增减）：
+
+| `cliId` | CLI / Agent | 接入方式 | 支持 `model` |
+|---------|-----|-----|:--:|
+| `claude-code` | Claude Code（默认） | 本地进程 | ✅ |
+| `codex` | Codex CLI | 本地进程 | ✅ |
+| `codex-app` | Codex App | 本地进程（app-server 协议） | |
+| `gemini` | Gemini | 本地进程 | ✅ |
+| `cursor` | Cursor（cursor-agent） | 本地进程 | ✅ |
+| `opencode` | OpenCode | 本地进程 | ✅ |
+| `opencode2` | OpenCode 2（beta，`opencode2`） | 本地进程 | |
+| `antigravity` | Antigravity（agy） | 本地进程 | |
+| `copilot` | GitHub Copilot | 本地进程 | ✅ |
+| `grok` | Grok（grok-cli） | 本地进程 | ✅ |
+| `kimi` | Kimi Code | 本地进程 | ✅ |
+| `kiro-cli` | Kiro | 本地进程 | |
+| `pi` | Pi | 本地进程 | |
+| `oh-my-pi` | Oh-My-Pi（Pi fork） | 本地进程 | ✅ |
+| `aiden` | Aiden | 本地进程 | |
+| `coco` | CoCo / Trae（需 ≥ 0.120.32） | 本地进程 | ✅ |
+| `traex` | TRAE CLI（traex） | 本地进程 | ✅ |
+| `mtr` | MTR | 本地进程 | |
+| `hermes` | Hermes | 本地进程 | |
+| `genius` | Genius | 本地进程 | ✅ |
+| `seed` | Seed（Claude Code fork） | 本地进程 | ✅ |
+| `relay` | Relay（Seed 新版） | 本地进程 | ✅ |
+| `mira` | Mira APP | API / 远端 | |
+| `mir` | Mir CLI（本地 mircli + MCP bridge） | 本地进程 | |
+| `riff` | riff | 云 Agent（API） | |
+| `dsh` | DeepSeek Harness（dsh CLI） | 本地进程（SDK JSON-RPC） | ✅ |
+
+> `model` 字段只对支持模型参数的适配器生效，其它忽略。Mir CLI 的额外前置（登录 / miramcp）见下方专节。
+
+## Pi 执行过程气泡
+
+使用 `cliId: "pi"` 的机器人会将 Pi 已写入会话记录的思考文本、执行说明、工具调用和结果显示在飞书执行过程气泡中。工具节点展示命令或文件路径，结束时随当前回合收尾；最终答复仍通过回复消息发送。
+
+默认开启，沿用 `cotEnabled` 和群内 `/cot on`、`/cot off` 开关；`/cot show` 可在当前回合中显示已累计的过程。
+
+更新以 Pi 完整消息落盘为粒度：工具调用在执行前出现，结果在工具结束后出现；不逐 token 显示尚未落盘的内容。历史记录不会重放到新回合的气泡里。
+
+## DeepSeek Harness（dsh）
+
+`cliId: "dsh"` 通过内置 runner 驱动本机的 `dsh` CLI（[deepseek-harness](https://github.com/deepseekai/deepseek-harness)），走 `dsh --profile <name>` 的 SDK JSON-RPC 协议。前置条件：
+
+1. `dsh` 在 PATH 上（或用 `cliPathOverride` 指定路径）。**升级注意**：这里需要的是 npm 包 `@deepseek-ai/dsh` 提供的 `dsh` 命令；早期版本依赖的是 Python wheel 里的 `dsh-jsonrpc-agent`，若 PATH 上只有旧命令，升级后会报「找不到命令」。
+2. 已通过原生 `dsh` CLI 完成配置（默认 `$DSH_HOME/settings.yaml` + `$DSH_HOME/.credentials.yaml`；未设置 `DSH_HOME` 时为 `~/.dsh/...`）。
+3. 目标 profile（默认 `botmux`，可用 per-bot 的 `dshProfile` 覆盖）位于 `$DSH_HOME/profiles/<name>/`（默认 `~/.dsh/profiles/<name>/`）。**首次使用无需手工创建**：profile 不存在时 botmux 会落盘骨架（`package.json` + 空 `cordis.yml` + `cordis.patch.yml`）并调 `dsh plugin add` 安装依赖。要增删社区插件或换 LLM provider，直接编辑该 profile 的 `cordis.patch.yml`——botmux 只在文件缺失时创建，不会覆盖已有内容。`DSH_HOME` 只能在 daemon 进程环境配置，per-bot `env.DSH_HOME` 会被拒绝，避免 profile 路径分裂。
+
+runner 读取 `$DSH_HOME/settings.yaml` 的 `agent-default-model`（provider + model）传给 initialize RPC；插件组合由 profile 的 `cordis.patch.yml` 完全控制，runner 不再生成 cordis.yml。
+
+编辑 `cordis.patch.yml` 时注意两种条目语义不同：`- insert: [...]` 是**插入**新插件；裸 `- id: X`（没有 `insert`）是覆盖**已存在**插件的配置，目标 id 不存在时会被静默跳过。botmux 生成的默认 patch 只 insert `dsh-base` 缺少的 `sdk-jsonrpc-server`，其余能力沿用 `dsh-base`，并 disable 掉 headless 下会阻塞启动的 Web GUI 插件。
+
+会话 JSONL 落在 `$DSH_HOME/sessions/botmux/`（默认 `~/.dsh/sessions/botmux/`）；同一 runner 连接内多轮，daemon 重启后开新会话（不续上下文）。`dshRuntime: "tui"` 的 TUI 自身状态仍使用 `~/.dsh-tui`。
+
+`ask_user_question` 通过 botmux 生成的临时 DSH profile patch 接入飞书 ask 卡片：official runner 直接注入 bridge；`dshRuntime: "tui"` 通过 dsh-tui wrapper patch 包住原生 question provider，优先飞书作答、不可表示时回退原生 TUI。若线上需要关闭，可设置 `BOTMUX_DSH_ASK_BRIDGE=0` 后重启会话。
 
 ## Mir CLI 与 MCP Bridge
 
@@ -55,6 +98,14 @@ mircli mcp status
 MIRCLI_AUTO_START_MIRAMCP=0 botmux start
 ```
 
+## Codex 兼容发行版
+
+BotMux 把“协议能力”和“发行版身份”分开：`cliId: "codex"` 选择 Codex 协议适配器，`cliRuntime` 选择真正运行、独立发版的二进制。这样兼容分支可以复用模型参数、resume、空闲检测与受控 RPC，而不会被当成官方 Codex 检查版本。
+
+适合 `cliRuntime` 的 CLI 必须是**严格兼容分支**：接受 BotMux 传给 Codex 的参数，保留相同的交互状态和 rollout / resume 语义，并使用兼容的认证 / home 布局。如果它修改了参数、TUI 状态机、会话存储或协议，就应贡献一个真实适配器，而不是声明兼容。
+
+完整配置与更新 provider 说明见 [`bots.json` 的 Codex 兼容发行版章节](/bots-json#codex-兼容发行版)。Dashboard 的 Bot 默认设置也可以配置并预检 runtime。旧 `cliPathOverride` 继续兼容，但不会自动开启需要明确兼容声明的 Codex RPC 能力。
+
 ## 套 wrapper / 网关接入
 
 很多场景下你不是直接跑原生 CLI，而是套一层网关 / 路由（内网代理 + SSO、模型路由等），比如 `ccr`、`ttadk`、`aiden x claude`、`aiden x codex`。这时**不需要新适配器**：`cliId` 仍填底层真实 CLI（`claude-code` / `codex` …），只把启动入口换成一个 **wrapper 脚本**，用 `cliPathOverride` 指过去（`botmux setup` 编辑机器人时的「CLI 可执行文件路径覆盖」就是填它）。
@@ -79,8 +130,25 @@ MIRCLI_AUTO_START_MIRAMCP=0 botmux start
 1. `src/adapters/cli/` 下新建文件，实现 `CliAdapter` 接口
 2. `src/adapters/cli/types.ts` 的 `CliId` 联合类型加新 ID
 3. `src/adapters/cli/registry.ts` 加 import / switch case / export
-4. `src/worker.ts` 的 `CLI_DISPLAY_NAMES`、`card-builder.ts` 的 `cliDisplayNames` 加显示名
+4. `src/adapters/cli/display-names.ts` 的 `CLI_DISPLAY_NAMES` 加显示名（卡片、worker、setup / dashboard 共用）
 5. `src/cli.ts` setup 交互菜单加选项
 6. 更新 README
 
 详见 [CONTRIBUTING.md](https://github.com/deepcoldy/botmux/blob/master/CONTRIBUTING.md)。
+
+## Codex App 原生提问
+
+Botmux 管理的 `codex-app` 会话，以及启用 app-server RPC 的 `codex` 会话，会把原生 `request_user_input` 转成飞书问答卡片。用户选择或在当前会话文字作答后，答案按原问题 ID 回传给同一个原生轮次，无需新发一轮提示。TRAE RPC 也使用同一桥接。
+
+- 一次请求里的多个问题保留为同一批问题，选项说明随问题展示；推荐文案不会被自动当成答案。
+- 原生纯文本题会显示为等待文字回复的卡片；含纯文本题的整批问题统一通过会话文字回复作答。直接文字答复作为整批问题的答案回传；不要把未提交的选项当作已回答。
+- 复用现有 Ask 的会话路由和答复权限。等待最多一小时；发卡失败、超时、卡片失效或无法表达的问题会中断原轮次，避免空答案使 Agent 继续执行。
+- 原轮次结束、进程退出或会话关闭后，会取消等待；迟到答复不再回传。daemon 重启时此类原生请求不自动重试或恢复。
+- 选择题要求至少两个选项；秘密输入题和畸形问题会明确失败，整批不做部分回答。不要在聊天中输入密码等秘密。
+- Workflow 子任务仍使用 `humanGate` / decision 节点。无飞书传输的 API-only 会话、普通终端粘贴模式，以及 App 历史查看服务不走此问答桥接。
+
+验证时，在普通 Codex App 会话中让模型用原生 `request_user_input` 问一个选择题，确认飞书卡片能收到问题，提交后同一轮继续并能复述所选答案。原生工具是否可用仍由 Codex 的版本和运行模式决定。
+
+卡片结构示意（由实际卡片 JSON 本地渲染，尚未进行真人飞书点击验收）：
+
+![Codex native user input card preview](/img/codex-native-user-input-preview.png)

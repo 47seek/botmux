@@ -1,5 +1,15 @@
 import type { CliId } from '../adapters/cli/types.js';
+import { CLI_DISPLAY_NAMES } from '../adapters/cli/display-names.js';
+import {
+  normalizeCliRuntimeConfig,
+  type CliRuntimeConfig,
+} from '../adapters/cli/runtime.js';
 import { sanitizePerBotEnv } from '../core/per-bot-env.js';
+import {
+  normalizeCliLaunchMode,
+  validateCliLaunchModeConfig,
+  type CliLaunchMode,
+} from '../core/cli-launch-mode.js';
 
 export const CLI_ID_CHOICES: Record<string, CliId> = {
   '1': 'claude-code',
@@ -28,41 +38,26 @@ export const CLI_ID_CHOICES: Record<string, CliId> = {
   '22': 'grok',
   '23': 'kiro-cli',
   '24': 'riff',
+  '25': 'reasonix',
+  '26': 'opencode2',
+  // 新增 CLI 一律追加到尾部：序号是脚本化 setup（非 TTY 管道喂数字）的稳定接口，
+  // 插位会让老脚本静默选错 CLI。
+  '27': 'dsh',
+  // 上游 #858 先占用了 27（dsh），mojo 顺延到 28：序号是脚本化 setup 的稳定
+  // 接口，插位会让老脚本静默选错 CLI（见本表顶部约定）。mojo 已三次让位
+  // （25→reasonix、26→opencode2、27→dsh）。
+  '28': 'mojo',
+  '29': 'ebsd',
+  // minimax 的 '30' 已随 v3.21.0 正式发布，序号不能移位。
+  '30': 'minimax',
+  // 新增 CLI 一律追加到尾部：序号是脚本化 setup（非 TTY 管道喂数字）的稳定接口，
+  // 插位会让老脚本静默选错 CLI。
+  '31': 'mimocode',
+  '32': 'remote-runner',
 };
 
 const VALID_CLI_IDS: ReadonlySet<string> = new Set(Object.values(CLI_ID_CHOICES));
 
-/**
- * CLI 展示名. 与 worker.ts 的 CLI_DISPLAY_NAMES / card-builder.ts 的
- * cliDisplayNames 保持一致——这三处是已知的展示名复制点 (见 CLAUDE.md
- * "添加新 CLI 适配器" 清单), 新增 CLI 时一并更新.
- */
-const CLI_DISPLAY_LABELS: Record<CliId, string> = {
-  'claude-code': 'Claude',
-  'aiden': 'Aiden',
-  'coco': 'CoCo',
-  'codex': 'Codex',
-  'cursor': 'Cursor',
-  'gemini': 'Gemini',
-  'genius': 'Genius',
-  'opencode': 'OpenCode',
-  'antigravity': 'Antigravity',
-  'mtr': 'MTR',
-  'hermes': 'Hermes',
-  'codex-app': 'Codex App',
-  'mira': 'Mira',
-  'seed': 'Seed',
-  'traex': 'TRAE',
-  'pi': 'Pi',
-  'copilot': 'Copilot',
-  'oh-my-pi': 'Oh My Pi',
-  'relay': 'Relay',
-  'mir': 'Mir CLI',
-  'kimi': 'Kimi',
-  'grok': 'Grok Build',
-  'kiro-cli': 'Kiro',
-  'riff': 'Riff',
-};
 
 /**
  * 有序 CLI 选项 (id + 展示名), 顺序与 setup 交互菜单 (CLI_ID_CHOICES 序号)
@@ -70,7 +65,7 @@ const CLI_DISPLAY_LABELS: Record<CliId, string> = {
  * 列表. 单一事实源: CLI_ID_CHOICES 的值序.
  */
 export const CLI_OPTIONS: ReadonlyArray<{ id: CliId; label: string }> =
-  Object.values(CLI_ID_CHOICES).map(id => ({ id, label: CLI_DISPLAY_LABELS[id] ?? id }));
+  Object.values(CLI_ID_CHOICES).map(id => ({ id, label: CLI_DISPLAY_NAMES[id] ?? id }));
 
 /**
  * 把 setup 里"CLI 适配器"那一格的原始输入解析成合法的 CliId.
@@ -96,15 +91,76 @@ export function resolveCliId(input: string | undefined): CliId | undefined {
 const FULL_EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 /**
+ * 手机号 allowedUsers 条目。飞书 batch_get_id 的 `mobiles` 字段：中国大陆号
+ * 可直接填 11 位（无需 +86）；非大陆号必须带 `+` 国家/地区码。为避免把邮箱
+ * 前缀/随手输入误判成手机号，规则收紧为二选一：
+ *   - `+` 开头的 E.164：`+` 后跟 6–15 位数字（E.164 规范上限 15 位，如
+ *     +14155550123、+8613011112222、+123456789012345）
+ *   - 纯 11 位大陆号，以 1 开头（如 13011112222）
+ * 允许中间出现空格/连字符，判定前先归一化掉。
+ */
+const MOBILE_RE = /^(?:\+\d{6,15}|1\d{10})$/;
+
+/** 去掉手机号里的空格与连字符（用户可能填 "+86 130-1111-2222"），便于校验/解析。 */
+export function normalizeMobileEntry(entry: string): string {
+  return entry.trim().replace(/[\s-]/g, '');
+}
+
+/** 是否是手机号形式的 allowedUsers 条目（已归一化空格/连字符后判定）。 */
+export function isMobileEntry(entry: string): boolean {
+  return MOBILE_RE.test(normalizeMobileEntry(entry));
+}
+
+/**
+ * 手机号规范化匹配键：把一个已归一化的手机号折叠成**唯一**的 E.164 数字键，用于
+ * 把飞书 `batch_get_id` 响应里回带的号码对回本地请求的号码。请求侧和响应侧都过
+ * 本函数，键相等即同一号码。
+ *
+ * 规则（**不能像早期实现那样无脑剥 `+` 再一律当中国裸号**——那会让美国 `+1 3XX…`
+ * 与中国裸号 `13X…` 折叠成同键，把 owner 绑到错的人 / 顶掉另一个 owner）：
+ *   - `+` 开头：`+` 是权威国家码，直接剥掉 `+` 得到「国家码+号码」的 E.164 数字串
+ *     （`+8613011112222`→`8613011112222`，`+14155550123`→`14155550123`）。
+ *   - 无 `+` 的纯 11 位、以 1 开头：按配置契约（MOBILE_RE：裸号只接受中国 11 位）
+ *     判定为中国大陆号，补 `86`（`13011112222`→`8613011112222`），从而与带 `+86`
+ *     的请求/响应对齐。
+ *   - 其它（已带 `86` 前缀等）：原样。
+ *
+ * 安全取舍：若飞书对海外号回带时**丢掉了 `+`**，海外裸号会被误判成中国号而与请求
+ * 不等 → 判 definitive miss（owner 用邮箱/union_id 兜底），这是 fail-closed 的**漏配**；
+ * 绝不会把两个不同的人折叠成同一 owner（那才是危险的错配）。宁可漏配不可错配。
+ */
+export function canonicalMobileKey(normalized: string): string {
+  if (normalized.startsWith('+')) return normalized.slice(1);
+  if (/^1\d{10}$/.test(normalized)) return '86' + normalized; // 中国大陆裸号 → 补国家码
+  return normalized;
+}
+
+/**
+ * 单个 allowedUsers 条目是否需要「启动/刷新时经飞书 contact API 解析成本 app
+ * 的 open_id」。运行时权限（canTalk/canOperate）只认原生 ou_，故 email / union_id
+ * (on_) / 手机号 / 甚至字面 ou_（要做跨 app 诊断）都要走一次解析；只有无法寻址
+ * 的裸串（邮箱前缀等）不需要。
+ *
+ * 这是解析闸的**唯一真源**——daemon 启动闸、throw 兜底、allowed-users-apply 的
+ * needsContactResolve 全都调它，避免「新增一种身份格式后各处平行谓词漏改」导致
+ * 该格式在入口校验通过、却在某个解析闸被静默跳过（手机号 owner 冷启动自锁即
+ * 此类 bug）。新增身份格式时**只改这里**。
+ */
+export function entryNeedsContactResolve(entry: string): boolean {
+  return entry.includes('@') || entry.startsWith('on_') || entry.startsWith('ou_') || isMobileEntry(entry);
+}
+
+/**
  * 合法的 allowedUsers 条目：
  *   - on_xxx  union_id  — 跨应用稳定，推荐
  *   - 完整邮箱          — 人类可读，推荐
+ *   - 手机号            — 大陆号直填 11 位；海外号带 + 区号。适合无企业邮箱的个人用户
  *   - ou_xxx  open_id   — 仅对签发该 ID 的同一应用有效，不推荐跨 bot 复用
- * 裸邮箱前缀（如 "alice"）不合法：解析器只认 ou_/on_ 或完整邮箱。
+ * 裸邮箱前缀（如 "alice"）不合法：解析器只认 ou_/on_、完整邮箱或手机号。
  */
 export function isValidAllowedUserEntry(entry: string): boolean {
   const s = entry.trim();
-  return s.startsWith('ou_') || s.startsWith('on_') || FULL_EMAIL_RE.test(s);
+  return s.startsWith('ou_') || s.startsWith('on_') || FULL_EMAIL_RE.test(s) || isMobileEntry(s);
 }
 
 /** 返回非法的 allowedUsers 条目（既不是 ou_ 也不是完整邮箱，典型是裸邮箱前缀）。 */
@@ -127,6 +183,13 @@ export interface BotConfigEditInput {
   cliChoice?: string;
   cliPathOverride?: string;
   /**
+   * Structured compatible-runtime edit. Three states:
+   *   - undefined -> preserve current value
+   *   - object    -> validate/set it and write an equal legacy path shadow
+   *   - null      -> clear it and its equal legacy path shadow
+   */
+  cliRuntime?: CliRuntimeConfig | null;
+  /**
    * 通用启动前缀（如 "aiden x claude"）。三态：
    *   - undefined → 不动
    *   - string    → 设置（空串 / "-" 视为清空）
@@ -135,6 +198,13 @@ export interface BotConfigEditInput {
    * 避免 bot-config-editor 反向依赖 cli-selection（会成循环 import）。
    */
   wrapperCli?: string | null;
+  /**
+   * 特殊启动模式（如 Forge x TraeX）。三态：
+   *   - undefined → 不动
+   *   - 'forge-traex' → 设置
+   *   - null → 清空
+   */
+  cliLaunchMode?: CliLaunchMode | null;
   /**
    * Model 字段三态语义（setup 不再交互式询问 model，此字段仅由切换 CLI 时的
    * 强制清空逻辑设 null；改 model 走 /config 卡片或手动编辑 bots.json）：
@@ -160,6 +230,8 @@ export interface BotConfigEditInput {
    *   - '' / '-' → 清空（回到默认 ON）
    */
   showInTeam?: string;
+  /** UI 语言：zh 或 en；'-' 或 null 清空。 */
+  lang?: string | null;
 }
 
 /**
@@ -341,6 +413,109 @@ export function parseBotSelection(
   return byProcessName >= 0 ? byProcessName : undefined;
 }
 
+/**
+ * 克隆时**不**复制的字段。分两类：
+ *  - 进程/激活态：`name` 是 pm2 进程名（启动期绑定），`apiOnly` 与四个
+ *    `activation*` 是上一次 onboarding 的中间态，复制过去会让新 Bot 以别人的
+ *    生命周期状态起步；`displayName` 复制会让名册里两个 Bot 同名难以区分。
+ *  - 实例态：按 **源应用的 chat_id / open_id** 建 key 的授权、绑定与账本。
+ *    chat_id 是租户级共享的，把它们带进新应用既无意义（多为死条目），又会
+ *    产生意外行为——例如 `oncallChats` 让新 Bot 在源绑定过的群里直接被
+ *    talk + 自动开工，`defaultOncallAutoboundChats` 则相反，会让该群的自动
+ *    绑定被误判成「已花掉」而不触发。`quotaFallbackBot` 也是源 Bot 的交接
+ *    拓扑；复制到目标 Bot 可能变成自指或错误链路，必须由目标单独配置。
+ *
+ * 单一真源：回归测试直接 import 本常量，避免测试再抄一份清单后与实现漂移
+ * （新增实例态字段时两边都不报警）。新增此类字段请加在这里。
+ */
+export const CLONE_EXCLUDED_KEYS = [
+  'apiOnly',
+  'name',
+  'displayName',
+  'messageListeners',
+  'globalMessageListener',
+  'groupMessageListenerOverrides',
+  'oncallChats',
+  'defaultOncallAutoboundChats',
+  'allowedChatGroups',
+  'chatGrants',
+  'globalGrants',
+  'quotaState',
+  'grantExpiryState',
+  'sessionGroup',
+  'chatReplyModes',
+  'chatSoloGroupMentionBypass',
+  'chatFeedbackPolicies',
+  'noCardChats',
+  'quotaFallbackBot',
+  'activationPending',
+  'activationDeactivating',
+  'activationStarting',
+  'activationCommitted',
+] as const;
+
+/**
+ * 目标应用自己的身份字段：克隆后必须从 target 恢复。target 没有该字段时**删除**
+ * （而不是留下 source 的值）——`ou_` open_id 与 app secret 都是 app-scoped，
+ * 跨应用复制会把 owner 锁在门外。见 setup/owner-identity.ts。
+ */
+export const CLONE_IDENTITY_KEYS = [
+  'larkAppId',
+  'larkAppSecret',
+  'brand',
+  'allowedUsers',
+  'ownerOpenId',
+] as const;
+
+const CLONE_LAUNCH_MODE_KEYS = [
+  'wrapperCli',
+  'cliLaunchMode',
+  'cliRuntime',
+  'cliPathOverride',
+] as const;
+
+/**
+ * 把源 Bot 的行为配置覆盖到刚创建的目标 Bot，同时保留目标应用自己的身份。
+ * Dashboard 与 CLI clone 共用这里，避免两条入口各维护一份排除字段。
+ */
+export function cloneBotConfig(
+  source: Record<string, any>,
+  target: Record<string, any>,
+): Record<string, any> {
+  const cloned: Record<string, any> = { ...target, ...source };
+
+  for (const key of CLONE_EXCLUDED_KEYS) {
+    delete cloned[key];
+  }
+
+  for (const key of CLONE_IDENTITY_KEYS) {
+    if (Object.prototype.hasOwnProperty.call(target, key) && target[key] !== undefined) {
+      cloned[key] = target[key];
+    } else {
+      delete cloned[key];
+    }
+  }
+
+  for (const key of CLONE_LAUNCH_MODE_KEYS) {
+    if (!Object.prototype.hasOwnProperty.call(source, key)) delete cloned[key];
+  }
+
+  return cloned;
+}
+
+/** 只允许 daemon 已认证的 source open_id 进入共享的跨应用 owner 归一化。 */
+export function cloneOwnerEntries(
+  source: Record<string, any>,
+  sourceAppId?: string,
+  sourceOwnerOpenId?: string,
+): string[] {
+  const managedOwner = sourceAppId === source.larkAppId ? sourceOwnerOpenId : undefined;
+  if (!Array.isArray(source.allowedUsers)) return [];
+  return source.allowedUsers.filter((entry: unknown): entry is string => (
+    typeof entry === 'string' && (!entry.startsWith('ou_') || entry === managedOwner)
+  ));
+}
+
 export function removeBotConfig<T extends { larkAppId?: string; name?: unknown }>(
   bots: T[],
   selection: string,
@@ -374,7 +549,53 @@ export function applyBotConfigEdits<T extends Record<string, any>>(
   const cliId = resolveCliId(input.cliChoice);
   if (cliId) out.cliId = cliId;
 
-  applyOptionalString(out, 'cliPathOverride', input.cliPathOverride);
+  // The edit API keeps one explicit executable source. Persisted structured
+  // runtimes additionally carry an equal cliPathOverride shadow so rolling
+  // back to a pre-cliRuntime BotMux still launches the same distribution.
+  // Interactive setup always supplies the path prompt as a string; an empty
+  // answer means "preserve", not "replace the structured runtime with its
+  // legacy shadow". Only a non-empty value (including "-" for clear) is an
+  // actual path edit.
+  const cliPathOverrideEdited = input.cliPathOverride !== undefined
+    && input.cliPathOverride.trim().length > 0;
+  if (input.cliRuntime !== undefined && input.cliRuntime !== null && cliPathOverrideEdited) {
+    throw new Error('cliRuntime conflicts with cliPathOverride; configure only one executable source');
+  }
+  const explicitlySettingRuntime = input.cliRuntime !== undefined && input.cliRuntime !== null;
+  if (input.cliRuntime === null) {
+    const oldRuntimeExecutable = out.cliRuntime && typeof out.cliRuntime === 'object'
+      ? out.cliRuntime.executable
+      : undefined;
+    delete out.cliRuntime;
+    if (oldRuntimeExecutable && out.cliPathOverride === oldRuntimeExecutable) delete out.cliPathOverride;
+  } else if (input.cliRuntime !== undefined) {
+    out.cliRuntime = normalizeCliRuntimeConfig(input.cliRuntime, 'cliRuntime');
+    out.cliPathOverride = out.cliRuntime.executable;
+  }
+  if (cliPathOverrideEdited) {
+    applyOptionalString(out, 'cliPathOverride', input.cliPathOverride);
+    delete out.cliRuntime;
+  }
+
+  // The first supported custom-runtime family is Codex. Switching a bot to a
+  // different adapter must not strand a stale Codex distribution descriptor
+  // that a later edit or old client could accidentally revive.
+  if (out.cliId !== 'codex') {
+    if (explicitlySettingRuntime) throw new Error('cliRuntime is currently supported only for cliId "codex"');
+    const oldRuntimeExecutable = out.cliRuntime && typeof out.cliRuntime === 'object'
+      ? out.cliRuntime.executable
+      : undefined;
+    delete out.cliRuntime;
+    if (oldRuntimeExecutable && out.cliPathOverride === oldRuntimeExecutable) delete out.cliPathOverride;
+  }
+
+  if (out.cliRuntime) {
+    out.cliRuntime = normalizeCliRuntimeConfig(out.cliRuntime, 'cliRuntime');
+    if (out.cliPathOverride !== undefined && out.cliPathOverride !== out.cliRuntime.executable) {
+      throw new Error('cliPathOverride must exactly match cliRuntime.executable when both are present');
+    }
+    out.cliPathOverride = out.cliRuntime.executable;
+  }
 
   // wrapperCli 三态：null = 清空，string = 设置（空 / "-" 也清空），undefined = 不动。
   if (input.wrapperCli === null) {
@@ -382,8 +603,39 @@ export function applyBotConfigEdits<T extends Record<string, any>>(
   } else if (typeof input.wrapperCli === 'string') {
     const v = input.wrapperCli.trim();
     if (!v || v === '-') delete out.wrapperCli;
-    else out.wrapperCli = v;
+    else {
+      out.wrapperCli = v;
+      delete out.cliLaunchMode;
+    }
   }
+
+  if (input.cliLaunchMode === null) {
+    delete out.cliLaunchMode;
+  } else if (input.cliLaunchMode !== undefined) {
+    const mode = normalizeCliLaunchMode(input.cliLaunchMode);
+    if (mode) {
+      out.cliLaunchMode = mode;
+      delete out.wrapperCli;
+      if (input.cliRuntime === null && !cliPathOverrideEdited) {
+        delete out.cliPathOverride;
+      }
+    }
+  }
+  if (out.cliRuntime && out.wrapperCli) {
+    throw new Error('cliRuntime cannot be combined with wrapperCli');
+  }
+  if (out.cliLaunchMode !== undefined) {
+    out.cliLaunchMode = normalizeCliLaunchMode(out.cliLaunchMode);
+  }
+  validateCliLaunchModeConfig({
+    cliId: out.cliId,
+    cliLaunchMode: out.cliLaunchMode,
+    wrapperCli: out.wrapperCli,
+    cliRuntime: out.cliRuntime,
+    cliPathOverride: out.cliPathOverride,
+    sandbox: out.sandbox,
+    readIsolation: out.readIsolation,
+  });
 
   // Model 字段：null = 清空，string = 设置，undefined = 不动。
   if (input.model === null) {
@@ -400,8 +652,8 @@ export function applyBotConfigEdits<T extends Record<string, any>>(
     if (backendType === '-') {
       delete out.backendType;
     } else if (backendType) {
-      if (backendType !== 'pty' && backendType !== 'tmux' && backendType !== 'herdr' && backendType !== 'zellij' && backendType !== 'riff') {
-        throw new Error(`backendType must be "pty", "tmux", "herdr", "zellij", or "riff": ${backendType}`);
+      if (backendType !== 'pty' && backendType !== 'tmux' && backendType !== 'herdr' && backendType !== 'zellij' && backendType !== 'zmx' && backendType !== 'riff' && backendType !== 'mojo' && backendType !== 'remote-runner') {
+        throw new Error(`backendType must be "pty", "tmux", "herdr", "zellij", "zmx", "riff", "mojo", or "remote-runner": ${backendType}`);
       }
       out.backendType = backendType;
     }
@@ -419,7 +671,7 @@ export function applyBotConfigEdits<T extends Record<string, any>>(
       const invalid = findInvalidAllowedUserEntries(entries);
       if (invalid.length > 0) {
         throw new Error(
-          `allowedUsers 条目必须是完整邮箱（如 alice@example.com）或 open_id（ou_xxx），不能是邮箱前缀: ${invalid.join(', ')}`,
+          `allowedUsers 条目必须是完整邮箱（如 alice@example.com）、手机号（大陆号直填 11 位，海外号带 + 区号）、union_id（on_xxx）或 open_id（ou_xxx），不能是邮箱前缀: ${invalid.join(', ')}`,
         );
       }
       out.allowedUsers = entries;
@@ -437,6 +689,19 @@ export function applyBotConfigEdits<T extends Record<string, any>>(
 
   // 平台团队展示默认 ON → 只把显式 false 落盘。
   applyOptionalBoolean(out, 'showInTeam', input.showInTeam, true);
+
+  if (input.lang !== undefined) {
+    if (input.lang === null || input.lang.trim() === '-') {
+      delete out.lang;
+    } else {
+      const v = input.lang.trim().toLowerCase();
+      if (v === 'zh' || v === 'en') {
+        out.lang = v;
+      } else {
+        throw new Error(`lang must be "zh" or "en": ${input.lang}`);
+      }
+    }
+  }
 
   return normalizeBotConfig(out) as T;
 }

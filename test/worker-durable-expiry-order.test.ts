@@ -8,7 +8,7 @@ import { describe, expect, it } from 'vitest';
 const workerSource = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
 
 describe('worker durable lease expiry ordering', () => {
-  it('removes exact queued attempt N behind an ordinary current turn before ACKing', () => {
+  it('durably retires exact queued attempt N behind an ordinary current turn before ACKing', () => {
     const start = workerSource.indexOf("case 'expire_durable_turn':");
     const end = workerSource.indexOf("case 'reset_ambiguous_receiver':", start);
     expect(start).toBeGreaterThanOrEqual(0);
@@ -16,20 +16,26 @@ describe('worker durable lease expiry ordering', () => {
     const branch = workerSource.slice(start, end);
 
     const currentExact = branch.indexOf('const currentExact = durableTurnInFlight');
-    const pendingLoop = branch.indexOf('for (let i = pendingMessages.length - 1; i >= 0; i--)');
-    const exactTurn = branch.indexOf('item.turnId === msg.turnId', pendingLoop);
-    const exactAttempt = branch.indexOf('item.dispatchAttempt === msg.dispatchAttempt', pendingLoop);
-    const remove = branch.indexOf('pendingMessages.splice(i, 1)', pendingLoop);
-    const pendingAck = branch.indexOf("acknowledge('queued_removed');", remove);
+    const pendingCount = branch.indexOf('const removedPending = pendingMessages.filter(');
+    const retire = branch.indexOf('await retireCodexAppDispatchForDurableReplay(', pendingCount);
+    const pendingAck = branch.indexOf("acknowledge('queued_removed');", retire);
     const noProof = branch.indexOf('withholding ACK for daemon fencing', pendingAck);
 
     expect(currentExact).toBeGreaterThanOrEqual(0);
-    expect(pendingLoop).toBeGreaterThan(currentExact);
-    expect(exactTurn).toBeGreaterThan(pendingLoop);
-    expect(exactAttempt).toBeGreaterThan(exactTurn);
-    expect(remove).toBeGreaterThan(exactAttempt);
-    expect(pendingAck).toBeGreaterThan(remove);
+    expect(pendingCount).toBeGreaterThan(currentExact);
+    expect(retire).toBeGreaterThan(pendingCount);
+    expect(pendingAck).toBeGreaterThan(retire);
     expect(noProof).toBeGreaterThan(pendingAck);
+
+    const retireStart = workerSource.indexOf('async function retireCodexAppDispatchForDurableReplay(');
+    const retireEnd = workerSource.indexOf('\nfunction ', retireStart + 1);
+    const retireHelper = workerSource.slice(retireStart, retireEnd);
+    const persist = retireHelper.indexOf("requestCodexAppDispatchTransition('cancel'");
+    const localQueueCancel = retireHelper.indexOf('codexAppTurnDispatchQueue.cancelExact(', persist);
+    const localPendingRemove = retireHelper.indexOf('pendingMessages.splice(index, 1)', persist);
+    expect(persist).toBeGreaterThanOrEqual(0);
+    expect(localQueueCancel).toBeGreaterThan(persist);
+    expect(localPendingRemove).toBeGreaterThan(persist);
   });
 
   it('ACKs active exact expiry only after synchronous owned-CLI restart fencing', () => {
@@ -37,11 +43,13 @@ describe('worker durable lease expiry ordering', () => {
     const end = workerSource.indexOf("case 'reset_ambiguous_receiver':", start);
     const branch = workerSource.slice(start, end);
     const exactBranch = branch.indexOf('if (currentExact)');
-    const restart = branch.indexOf("restartCliProcess('durable lease expiry'", exactBranch);
+    const retire = branch.indexOf('await retireCodexAppDispatchForDurableReplay(', exactBranch);
+    const restart = branch.indexOf("restartCliProcess('durable lease expiry'", retire);
     const ack = branch.indexOf("acknowledge('cli_fenced');", restart);
 
     expect(exactBranch).toBeGreaterThanOrEqual(0);
-    expect(restart).toBeGreaterThan(exactBranch);
+    expect(retire).toBeGreaterThan(exactBranch);
+    expect(restart).toBeGreaterThan(retire);
     expect(ack).toBeGreaterThan(restart);
   });
 
@@ -53,14 +61,20 @@ describe('worker durable lease expiry ordering', () => {
     const rawArm = restart.indexOf('rawInputRestartGate = true;', arm);
     const revoke = restart.indexOf('revokeManagedTurnOriginForRestart();', rawArm);
     const destroy = restart.indexOf('destroySession?.()', arm);
-    const kill = restart.indexOf('killCli({ preservePending: opts.preservePending });', destroy);
-    const spawn = restart.indexOf("spawnCli({ ...lastInitConfig, resume: true, prompt: '' });", destroy);
+    const kill = restart.indexOf(
+      'killCli({\n        preservePending: opts.preservePending,\n        preservePolicyCapability: true,',
+      destroy,
+    );
+    const spawn = restart.indexOf('await spawnCli(restartCfg, { pluginGenerationPrepared: rpcPluginGenerationPrepared });', destroy);
     const release = restart.indexOf('cliRestartInProgress = false;', spawn);
     const riffRawRelease = restart.indexOf(
-      "if (effectiveBackendType === 'riff' && isPromptReady) releaseRawInputRestartGate();",
+      // Widened from a riff-only check to every remote backend (riff / mojo):
+      // both mark themselves prompt-ready inside spawnCli(), so both need the
+      // raw-input fence released here rather than at a later markPromptReady().
+      "if (isRemoteBackendType(effectiveBackendType) && isPromptReady) releaseRawInputRestartGate();",
       release,
     );
-    const wake = restart.indexOf('void flushPending();', riffRawRelease);
+    const guardedWake = restart.indexOf('if (isPromptReady) void flushPending();', riffRawRelease);
 
     expect(restartStart).toBeGreaterThanOrEqual(0);
     expect(restartEnd).toBeGreaterThan(restartStart);
@@ -73,7 +87,19 @@ describe('worker durable lease expiry ordering', () => {
     expect(spawn).toBeGreaterThan(kill);
     expect(release).toBeGreaterThan(spawn);
     expect(riffRawRelease).toBeGreaterThan(release);
-    expect(wake).toBeGreaterThan(riffRawRelease);
+    // A replacement CoCo/Codex process may exist before its TUI input box
+    // exists. Restart completion must not use type-ahead to flush into that
+    // startup window; only a prompt already observed during the restart fence
+    // needs an explicit wake after the fence drops. Assert the wake exists AND
+    // that every flushPending() the restart closure runs is the guarded
+    // `if (isPromptReady)` form — never a bare re-kick that would type-ahead
+    // into the not-yet-ready TUI. Counting both guards against a future edit
+    // reintroducing an unguarded flush anywhere in the closure.
+    expect(guardedWake).toBeGreaterThan(riffRawRelease);
+    const totalFlushes = restart.match(/void flushPending\(\);/g)?.length ?? 0;
+    const guardedFlushes = restart.match(/if \(isPromptReady\) void flushPending\(\);/g)?.length ?? 0;
+    expect(totalFlushes).toBeGreaterThan(0);
+    expect(guardedFlushes).toBe(totalFlushes);
 
     const promptStart = workerSource.indexOf('function markPromptReady(): void');
     const promptEnd = workerSource.indexOf('\nfunction persistCliSessionId(', promptStart);
@@ -99,10 +125,12 @@ describe('worker durable lease expiry ordering', () => {
     const rawStart = workerSource.indexOf("case 'raw_input':");
     const rawEnd = workerSource.indexOf("case 'rename_session':", rawStart);
     const rawInput = workerSource.slice(rawStart, rawEnd);
+    // PR #441 起入队条件还含注入围栏（injectionFlushing / barrier）——本测试只钉
+    // restart/rename 三因子仍在场且顺序不变，不钉整行。
     const rawGate = rawInput.indexOf(
-      'if (cliRestartInProgress || rawInputRestartGate || sessionRenameInFlight)',
+      'if (cliRestartInProgress || rawInputRestartGate || sessionRenameInFlight()',
     );
-    const rawQueue = rawInput.indexOf('pendingRawInputs.push(msg)', rawGate);
+    const rawQueue = rawInput.indexOf('freshnessInputQueue.enqueueRaw(msg)', rawGate);
     const rawDeliver = rawInput.indexOf('await deliverRawInput(msg)', rawQueue);
     expect(rawGate).toBeGreaterThanOrEqual(0);
     expect(rawQueue).toBeGreaterThan(rawGate);
@@ -113,8 +141,9 @@ describe('worker durable lease expiry ordering', () => {
     const killEnd = workerSource.indexOf('async function restartCliProcess(', killStart);
     const killCli = workerSource.slice(killStart, killEnd);
     for (const clear of [
-      'currentBotmuxTurnId = undefined;',
-      'currentBotmuxDispatchAttempt = undefined;',
+      // V3: turn + attempt are cleared together through the single capture
+      // identity writer (which also announces the cleared identity).
+      'setCaptureIdentity(undefined, undefined);',
       'currentVcMeetingImTurnOrigin = undefined;',
     ]) {
       expect(killCli).toContain(clear);
@@ -134,14 +163,17 @@ describe('worker durable lease expiry ordering', () => {
     const terminalStart = workerSource.indexOf('function emitTurnTerminal(');
     const terminalEnd = workerSource.indexOf('\nfunction workerIpcPayload(', terminalStart);
     const terminal = workerSource.slice(terminalStart, terminalEnd);
-    expect(terminal).toContain('revokeManagedTurnOriginForTerminal(turnId, dispatchAttempt);');
-    expect(terminal.indexOf('revokeManagedTurnOriginForTerminal(turnId, dispatchAttempt);'))
+    expect(terminal).toContain("releaseActiveTurnAuthority('turn_terminal', { turnId, dispatchAttempt });");
+    expect(terminal.indexOf("releaseActiveTurnAuthority('turn_terminal', { turnId, dispatchAttempt });"))
       .toBeLessThan(terminal.indexOf("type: 'turn_terminal'"));
 
     const flushStartForRotation = workerSource.indexOf('async function flushPending(): Promise<void>');
     const flushEndForRotation = workerSource.indexOf('\nfunction sendToPty(', flushStartForRotation);
     const flushForRotation = workerSource.slice(flushStartForRotation, flushEndForRotation);
-    const assignNextTurn = flushForRotation.indexOf('currentBotmuxTurnId = item.turnId;');
+    // V3: bound through the single capture identity writer.
+    const assignNextTurn = flushForRotation.indexOf(
+      'item.turnCallerOpenId ?? item.trustedCaller?.requestUserOpenId',
+    );
     const republish = flushForRotation.indexOf('publishSandboxRelayCapability();', assignNextTurn);
     expect(assignNextTurn).toBeGreaterThanOrEqual(0);
     expect(republish).toBeGreaterThan(assignNextTurn);

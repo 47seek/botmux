@@ -102,6 +102,18 @@ describe('skill injection-mode resolution', () => {
   describe('shouldInstallGlobalSkills (per shared dir, union across bots)', () => {
     const codexSkillsDir = () => createCliAdapterSync('codex').skillsDir!;
 
+    it('zero-injection bots do not install global skills, while another bot sharing the directory still can', () => {
+      const sub = { larkAppId: 'sub', larkAppSecret: 'secret', cliId: 'traex', promptInjection: 'none', skillInjection: 'global' };
+      const lead = { larkAppId: 'lead', larkAppSecret: 'secret', cliId: 'coco', skillInjection: 'global' };
+      const skillsDir = createCliAdapterSync('traex').skillsDir!;
+      writeBots([sub], home);
+      expect(shouldInstallGlobalSkills(skillsDir)).toBe(false);
+      writeBots([sub, lead], home);
+      expect(shouldInstallGlobalSkills(skillsDir)).toBe(true);
+      writeBots([sub, { ...lead, skillInjection: 'prompt' }], home);
+      expect(shouldInstallGlobalSkills(skillsDir)).toBe(false);
+    });
+
     it('false when every bot on the dir is prompt/off', () => {
       writeBots([codexBot({ skillInjection: 'prompt' })], home);
       expect(shouldInstallGlobalSkills(codexSkillsDir())).toBe(false);
@@ -127,22 +139,28 @@ describe('skill injection-mode resolution', () => {
 
 describe('resolveSkillInjectionSupport (dashboard control class)', () => {
   it('classifies the whole CLI matrix by capability', () => {
-    // claude-family (incl. the relay/seed forks) → dynamic --plugin-dir injection
-    for (const id of ['claude-code', 'seed', 'relay'] as const) {
+    // claude-family (incl. the relay/seed forks), cursor, pi, oh-my-pi → dynamic --plugin-dir / --skill injection
+    for (const id of ['claude-code', 'seed', 'relay', 'cursor', 'pi', 'oh-my-pi'] as const) {
       expect(resolveSkillInjectionSupport(id)).toBe('dynamic');
     }
     // global skills-dir CLIs → the global|prompt|off knob applies
-    for (const id of ['codex', 'gemini', 'opencode', 'cursor', 'coco', 'traex', 'pi', 'oh-my-pi', 'mtr', 'kiro-cli', 'genius', 'grok'] as const) {
+    for (const id of ['codex', 'gemini', 'opencode', 'coco', 'traex', 'mtr', 'kiro-cli', 'genius', 'grok'] as const) {
       expect(resolveSkillInjectionSupport(id)).toBe('global');
     }
     // no skill mechanism → control hidden
-    for (const id of ['antigravity', 'aiden', 'hermes', 'mir', 'mira', 'codex-app'] as const) {
+    for (const id of ['antigravity', 'aiden', 'hermes', 'ebsd', 'mir', 'mira', 'codex-app'] as const) {
       expect(resolveSkillInjectionSupport(id)).toBe('none');
     }
   });
 });
 
 describe('built-in skill catalog', () => {
+  function innerText(block: string): string {
+    const match = block.match(/^<botmux_builtin_skills>\n([\s\S]*)\n<\/botmux_builtin_skills>$/);
+    expect(match).not.toBeNull();
+    return match![1];
+  }
+
   it('lists the unconditional built-ins plus ask when the CLI has no hook', () => {
     const entries = builtinSkillEntries({ asksViaHook: false, whiteboardEnabled: false });
     const names = entries.map((e) => e.name);
@@ -179,13 +197,40 @@ describe('built-in skill catalog', () => {
     const block = buildBuiltinSkillCatalogBlock(entries);
     expect(block.startsWith('<botmux_builtin_skills>')).toBe(true);
     expect(block.trimEnd().endsWith('</botmux_builtin_skills>')).toBe(true);
-    expect(block).toContain('botmux skill show <name>');
+    expect(block).toContain('botmux skill show &lt;name&gt;');
     expect(block).toContain('- botmux-send:');
     expect(block).toContain('首次复杂飞书发送前读取');
     expect(block).toContain('JSON.stringify');
     expect(block).toContain('JSON 转义产生的 \\n 当字面量');
     // The compact prompt description must not replace the full/native metadata.
     expect(entries.find((e) => e.name === 'botmux-send')?.description).toContain('向飞书话题发送消息');
+  });
+
+  it('adds the persistent-schedule boundary only to Remote Runner catalogs', () => {
+    const entries = builtinSkillEntries({ asksViaHook: false, whiteboardEnabled: false });
+    const remote = buildBuiltinSkillCatalogBlock(entries, 'en', { remoteRunner: true });
+    const local = buildBuiltinSkillCatalogBlock(entries, 'en');
+
+    expect(remote).toContain('temporary Remote Runner environment');
+    expect(remote).toContain('MUST use the persistent `botmux schedule`');
+    expect(remote).toContain('cron_create');
+    expect(local).not.toContain('temporary Remote Runner environment');
+    expect(local).not.toContain('cron_create');
+  });
+
+  it('keeps catalog prose as escaped text instead of nested XML-like tags', () => {
+    for (const locale of [undefined, 'en'] as const) {
+      const block = buildBuiltinSkillCatalogBlock([{
+        name: 'botmux-fixture',
+        description: 'Use <fixture> & keep going.',
+        content: '',
+      }], locale);
+
+      expect(innerText(block)).not.toMatch(/[<>]/);
+      expect(block).toContain('&lt;botmux_routing&gt;');
+      expect(block).toContain('botmux skill show &lt;name&gt;');
+      expect(block).toContain('Use &lt;fixture&gt; &amp; keep going.');
+    }
   });
 
   it('renders an empty block for no entries', () => {
@@ -206,6 +251,18 @@ describe('built-in skill catalog', () => {
     expect(zh).toContain('botmux --help');
     expect(builtinSkillHelpPointer('en')).toContain('botmux --help');
   });
+
+  it('keeps prompt/off help prose as escaped text instead of nested XML-like tags', () => {
+    const zh = builtinSkillHelpPointer();
+    const en = builtinSkillHelpPointer('en');
+
+    expect(innerText(zh)).not.toMatch(/[<>]/);
+    expect(innerText(en)).not.toMatch(/[<>]/);
+    expect(zh).toContain('&lt;botmux_routing&gt;');
+    expect(zh).toContain('botmux &lt;子命令&gt; --help');
+    expect(en).toContain('&lt;botmux_routing&gt;');
+    expect(en).toContain('botmux &lt;cmd&gt; --help');
+  });
 });
 
 describe('buildNewTopicPrompt built-in skill delivery (codex)', () => {
@@ -223,11 +280,16 @@ describe('buildNewTopicPrompt built-in skill delivery (codex)', () => {
   });
 
   const prompt = () => buildNewTopicPrompt('hi', 'sess-1', 'codex');
+  const remotePrompt = () => buildNewTopicPrompt(
+    'hi', 'sess-remote', 'remote-runner', undefined, undefined, undefined, undefined, undefined,
+    { name: 'Bot', openId: 'ou_bot' }, 'en', undefined,
+    { larkAppId: APP, chatId: 'oc_remote', sessionBackendType: 'remote-runner' },
+  );
 
   it('prompt mode (default) inlines complex send discovery plus additional skills', () => {
     const p = prompt();
     expect(p).toContain('<botmux_builtin_skills>');
-    expect(p).toContain('botmux skill show <name>');
+    expect(p).toContain('botmux skill show &lt;name&gt;');
     expect(p).toContain('- botmux-schedule:');
     expect(p).toContain('- botmux-send:');
     expect(p).toContain('首次复杂飞书发送前读取');
@@ -259,6 +321,18 @@ describe('buildNewTopicPrompt built-in skill delivery (codex)', () => {
     expect(p).not.toContain('botmux --help');
     expect(p).not.toContain('- botmux-send:');
   });
+
+  it.each(['off', 'global'] as const)(
+    'Remote Runner forces only the schedule metadata even when builtin injection is %s',
+    mode => {
+      writeConfig({ skills: { builtinInjection: mode } });
+      const p = remotePrompt();
+      expect(p).toContain('- botmux-schedule:');
+      expect(p).toContain('temporary Remote Runner environment');
+      expect(p).not.toContain('- botmux-send:');
+      expect(p).not.toContain('- botmux-ask:');
+    },
+  );
 });
 
 describe('botmux skills injection (machine-wide setter)', () => {

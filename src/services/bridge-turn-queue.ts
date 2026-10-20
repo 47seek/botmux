@@ -32,8 +32,16 @@ import {
   normaliseForFingerprint,
   isMeaningfulUserEvent,
   isMeaningfulQueuedCommand,
+  isScheduledTurnStartEvent,
+  cronCreateToolUseIds,
+  cronCreateAcks,
+  isPureToolResultUserEvent,
   extractTurnStartText,
   isClaudeTurnTerminalEvent,
+  isTranscriptRateLimitEvent,
+  isSyntheticNoModelReplyEvent,
+  classifyClaudeTerminalEvent,
+  type ClaudeTerminalOutcome,
   type TranscriptEvent,
 } from './claude-transcript.js';
 
@@ -56,17 +64,39 @@ export interface BridgePendingTurn {
    * never settle from screen-idle alone; worker terminal emission requires
    * this bit (or an explicit failure/exit path outside the queue). */
   terminalObserved?: boolean;
+  /** Structured execution result. This is independent from whether transcript
+   * fallback text is visible or suppressed by a prior `botmux send`. */
+  terminalOutcome?: Exclude<ClaudeTerminalOutcome, { status: 'rate_limited' }>;
+  /** Structured 429 observed for this turn. It remains owned by the existing
+   * limited/reset path and must not be converted into ordinary ambiguity when
+   * the following turn_duration closes the transcript boundary. */
+  rateLimited?: boolean;
   /** Set when this turn was synthesised from a local-terminal user event
    *  (no matching Lark fingerprint). Causes the worker emit path to format
    *  the Lark message with both user text and assistant text under a
    *  "🖥️ 终端本地对话" header — otherwise the user would see an orphan
    *  reply with no prompt for context. Lark-driven turns keep this unset. */
   isLocal?: boolean;
+  /** Set for a turn opened by Claude Code's BUILT-IN scheduler
+   *  (CronCreate): the opening user record is `isMeta:true` with
+   *  `turnOrigin:"scheduled"`. Such a turn stays `isLocal` (no Lark
+   *  fingerprint, no CoT card, no durable journal), but unlike terminal
+   *  typing its final answer is auto-forwarded to the originating Lark
+   *  thread — the fire was scheduled on the user's behalf. Explicit
+   *  `botmux send` dedup and BOTMUX_NOTHING_TO_SEND silence still apply. */
+  isScheduled?: boolean;
+  /** Lark turn id this scheduled turn's final should anchor to (chat-scope
+   *  topic routing). Captured as the latest marked Lark turn at fire time.
+   *  Unused in thread scope, where the session root is the anchor. */
+  replyAnchorTurnId?: string;
   /** Transcript uuid of the user event that started this turn. Stored for
    *  local turns so emit can fetch the user-typed content from the source
    *  jsonl alongside the assistant uuids. Lark turns don't need it because
    *  the user content is already known on the daemon side. */
   userUuid?: string;
+  /** A late text block after an empty terminal still belongs to the same
+   * native local input; reuse its captured reply address. */
+  replyContextTurnId?: string;
   /** A short substring of the Lark message that we expect to find inside
    *  the next matching `user` event's content. When set, only a user event
    *  whose stringified content contains this fingerprint is allowed to
@@ -93,6 +123,13 @@ export interface BridgePendingTurn {
    *  the turn — short fingerprints ("hello", "test") would otherwise risk
    *  matching pre-existing user lines in unrelated sibling jsonls. */
   markTimeMs?: number;
+  /** Set when this mark was re-created from the durable turn journal after a
+   *  worker/daemon restart interrupted the turn. The emit path prefixes the
+   *  delivered fallback with an "interrupted by restart" notice so the user
+   *  can tell a recovered partial answer from a live one. */
+  restoredFromJournal?: boolean;
+  /** Observed at least one non-error assistant event (including tool calls). */
+  hasAssistantActivity?: boolean;
 }
 
 /** Trim a Lark message into a stable fingerprint. Keeps a leading window
@@ -106,10 +143,105 @@ export function makeFingerprint(message: string, len = 30): string | undefined {
   return collapsed.substring(0, len);
 }
 
+/** Minimum tail length (normalised chars) required for a truncation-proof
+ *  match. A non-trivial length floor so a very short surviving tail can't
+ *  coincide with an unrelated short local prompt. This is a length gate, NOT a
+ *  uniqueness/entropy claim — the actual proof is the SUFFIX anchor below. */
+const TRUNCATION_MATCH_MIN_CHARS = 16;
+
+/** Capability-agnostic proof that a recorded transcript user line is THIS
+ *  turn's user event even though its head-substring fingerprint didn't match.
+ *
+ *  claude-code TRUNCATES the leading envelope lines (`<user_message>` +
+ *  `<botmux_task …>`) when persisting the user turn, so the head fingerprint is
+ *  gone — but the surviving text is exactly the TAIL of what we sent, i.e. a
+ *  contiguous SUFFIX of the mark's full normalised content. We anchor the proof
+ *  to that observed invariant with `endsWith`, NOT a loose `includes`: an
+ *  interior substring (a command like `run pnpm test --project unit`, or the
+ *  bare closing tags `</botmux_task> </user_message>`) that happens to appear
+ *  in the middle of the task body is NOT a suffix, so a Web Terminal operator
+ *  typing such a phrase can't spoof this and steal the pending durable mark
+ *  (the interior-substring false-match codex demonstrated on PR #724). Length
+ *  (16) is a floor, not the proof — the suffix anchor is. Proof is by CONTENT
+ *  shape, not session type (apiOnly/adopt), so it holds regardless of whether
+ *  the session can mint a Web Terminal write token.
+ *
+ *  `recordedNorm` and `markContentNorm` are both already normaliseForFingerprint'd.
+ *  Guards: require a real mark content, a recorded tail of at least
+ *  TRUNCATION_MATCH_MIN_CHARS, and a strict suffix match.
+ *
+ *  NOTE: if a future claude-code build stops truncating at the head (recorded
+ *  line no longer a suffix of what we sent), this correctly returns false and
+ *  the turn falls back to local-synth — never a wrong-mark bind. Re-proving a
+ *  non-suffix truncation would need a truncation-surviving turn nonce/closing
+ *  marker, not a relaxed substring test. */
+export function isTruncatedMatch(recordedNorm: string, markContentNorm?: string): boolean {
+  if (!markContentNorm || markContentNorm.length === 0) return false;
+  if (recordedNorm.length < TRUNCATION_MATCH_MIN_CHARS) return false;
+  return markContentNorm.endsWith(recordedNorm);
+}
+
+/** How a transcript user/queued-command record bound a pending Lark turn.
+ *  `fullContentMatch` is true only when the record's normalised text contains
+ *  the ENTIRE normalised marked content — the one binding strong enough to
+ *  prove that this exact input (envelope included) entered the conversation.
+ *  Fingerprint-prefix and truncation binds remain attribution heuristics. */
+export interface BridgeTurnStartEvidence {
+  fullContentMatch: boolean;
+  sourceJsonlPath?: string;
+}
+
 export class BridgeTurnQueue {
+  constructor(
+    private readonly onLocalTurnStarted?: (turn: BridgePendingTurn) => void,
+    /** Fired ONCE per CronCreate call, when its tool_result ack resolves the
+     *  scheduled task id: hands the worker the (taskId → create-time topic
+     *  anchor) pair so it can persist it across worker restarts. `undefined`
+     *  anchor means the task was created with no Lark context (local turn). */
+    private readonly onScheduledTaskAnchored?: (taskId: string, anchor: string | undefined) => void,
+    /** Fired when a pending Lark turn is started by a transcript record, with
+     *  the strength of that binding. Durable receipts must only act on
+     *  `fullContentMatch`. */
+    private readonly onLarkTurnStarted?: (turn: BridgePendingTurn, evidence: BridgeTurnStartEvidence) => void,
+  ) {}
   private seen = new Set<string>();
   private queue: BridgePendingTurn[] = [];
   private collecting: BridgePendingTurn | null = null;
+  private lastLocalTurnId?: string;
+  /** Turn id of the most recent Lark turn that actually STARTED (its user
+   *  event arrived and fingerprint-bound a mark). Used as the create-time
+   *  anchor when a CronCreate call is not itself inside a Lark or scheduled
+   *  turn. Only updated at bind time — a queued-but-unstarted mark from
+   *  another topic must NOT move it before that turn has really begun. */
+  private lastLarkTurnId?: string;
+  /** CronCreate tool_use block ids awaiting their tool_result ack, each
+   *  carrying the Lark anchor captured at the moment of the CALL. The
+   *  scheduled task id only comes back in the ack text, at which point the
+   *  anchor is filed under it in {@link scheduledTaskAnchors}. */
+  private pendingCronCreates = new Map<string, string | undefined>();
+  /** scheduledTaskId → Lark topic anchor captured when the task was CREATED.
+   *  Fires of a KNOWN task anchor here (a stored `undefined` means "created
+   *  from a local turn, no topic"), NOT to whatever topic is current at fire
+   *  time. An UNKNOWN task (no CronCreate/ack observed this process and
+   *  nothing restored) gets NO anchor — never a later topic's anchor, which
+   *  would route cross-topic after a restart. Restored by the worker from the
+   *  durable anchor store on startup. */
+  private scheduledTaskAnchors = new Map<string, string | undefined>();
+  /** Lark turns removed by the head-of-line drop, awaiting journal cleanup by
+   *  the worker. This queue is pure (no fs), so it cannot clear the durable
+   *  journal itself — it reports, the worker retires. Same contract as
+   *  `pruneExpired`'s return value, just accumulated because the drop happens
+   *  deep inside ingest() rather than at an explicit call boundary. */
+  private droppedNeedingJournalClear: BridgePendingTurn[] = [];
+
+  /** Hand over (and forget) the turns dropped head-of-line since the last
+   *  call. The worker drains this after every ingest and clears each one's
+   *  journal entry; leaving them would let a later restart re-mark a turn
+   *  that can never complete. */
+  takeDroppedNeedingJournalClear(): BridgePendingTurn[] {
+    if (this.droppedNeedingJournalClear.length === 0) return [];
+    return this.droppedNeedingJournalClear.splice(0);
+  }
 
   /** Register events as historical — their uuids are now considered seen
    *  but no attribution happens. Used at attach time to baseline. */
@@ -133,6 +265,7 @@ export class BridgeTurnQueue {
     markTimeMs: number = Date.now(),
     contentNormalized?: string,
     dispatchAttempt?: number,
+    opts?: { restoredFromJournal?: boolean },
   ): string {
     this.queue.push({
       turnId,
@@ -142,6 +275,7 @@ export class BridgeTurnQueue {
       contentFingerprint,
       contentNormalized,
       markTimeMs,
+      ...(opts?.restoredFromJournal ? { restoredFromJournal: true } : {}),
     });
     return turnId;
   }
@@ -150,6 +284,7 @@ export class BridgeTurnQueue {
    *  reliably attribute future events (e.g. baseline raced with a turn
    *  already in flight) and wants to clear the slate. */
   clearPending(): BridgePendingTurn[] {
+    this.lastLocalTurnId = undefined;
     const dropped = this.queue.splice(0);
     if (this.collecting && dropped.includes(this.collecting)) this.collecting = null;
     return dropped;
@@ -204,13 +339,33 @@ export class BridgeTurnQueue {
    *  were originally observed in. Without this, a sessionId rotation
    *  between ingest and emit would silently drop the reply, since the
    *  global current jsonl path would no longer contain those uuids. */
-  ingest(events: TranscriptEvent[], sourceJsonlPath?: string): void {
+  ingest(
+    events: TranscriptEvent[],
+    sourceJsonlPath?: string,
+    /** Cosmetic side-channel observer: called at the moment an event is
+     *  attributed to a turn (the then-collecting turn) for
+     *    - every non-sidechain, non-error assistant event, and
+     *    - every non-sidechain pure-tool_result user event (intra-turn tool
+     *      output — skipped by turn-start handling but part of the turn).
+     *  Used by the worker to extract thinking/tool entries for the native
+     *  CoT message. Must never mutate the queue or influence attribution. */
+    onAssistantAttributed?: (ev: TranscriptEvent, turn: BridgePendingTurn) => void,
+  ): void {
     for (const ev of events) {
       const uuid = ev.uuid;
       if (!uuid || this.seen.has(uuid)) continue;
       this.seen.add(uuid);
       const role = ev.message?.role ?? ev.type;
       if (role === 'user') {
+        // Built-in CronCreate fire: isMeta + turnOrigin:"scheduled". It is
+        // NOT a meaningful human event (fingerprint matching must never bind a
+        // pending Lark mark to the scheduler's prompt), but it DOES open a
+        // real model turn whose final belongs in the originating Lark thread.
+        // Handle it before the isMeaningfulUserEvent filter below.
+        if (isScheduledTurnStartEvent(ev)) {
+          this.handleScheduledTurnStart(uuid, ev, sourceJsonlPath);
+          continue;
+        }
         // Skip ALL non-meaningful user events: tool_result (intra-turn
         // machinery), `<command-name>/clear</command-name>` and other
         // slash-command wrappers (Claude rewrites them after /clear /
@@ -221,7 +376,25 @@ export class BridgeTurnQueue {
         // assistant text after them, and (b) let a synthetic line that
         // accidentally contains the fingerprint substring start the
         // wrong turn.
-        if (!isMeaningfulUserEvent(ev)) continue;
+        // Resolve CronCreate acks BEFORE the meaningful/non-meaningful split.
+        // Real acks are pure tool_result batches (non-meaningful), but if a
+        // future build appends a text block to the same event it becomes
+        // meaningful and would otherwise skip ack pairing. The handler is
+        // idempotent (a paired call is deleted immediately) and gated on a
+        // pending CronCreate tool_use id, so calling it on every user event
+        // is safe and cheap.
+        this.handleCronCreateAcks(ev);
+        if (!isMeaningfulUserEvent(ev)) {
+          // Pure tool_result events are intra-turn tool output — never a
+          // turn boundary, but the CoT observer wants them for the tool
+          // timeline of the currently-collecting turn.
+          if (this.collecting && onAssistantAttributed
+            && (ev as any).isSidechain !== true
+            && isPureToolResultUserEvent(ev.message?.content)) {
+            try { onAssistantAttributed(ev, this.collecting); } catch { /* cosmetic channel — never break attribution */ }
+          }
+          continue;
+        }
         this.handleTurnStart(uuid, ev, sourceJsonlPath);
       } else if (ev.type === 'attachment' && ev.attachment?.type === 'queued_command') {
         // Type-ahead path: Claude writes `attachment(queued_command)` the
@@ -237,6 +410,73 @@ export class BridgeTurnQueue {
         this.handleTurnStart(uuid, ev, sourceJsonlPath);
       } else if (role === 'assistant') {
         if ((ev as any).isSidechain === true) continue;
+        // Capture CronCreate calls with the topic anchor of the turn that is
+        // running them: when the ack returns the task id, fires of that task
+        // route back to THIS topic even if other topics receive messages
+        // before the first fire.
+        for (const toolUseId of cronCreateToolUseIds(ev)) {
+          // Anchor precedence: a Lark turn currently running → that turn;
+          // a scheduled turn currently running → its own inherited topic
+          // anchor (a task (re)created during a scheduled run belongs in that
+          // same topic); otherwise the latest started Lark turn; else none.
+          const anchor = this.collecting && !this.collecting.isLocal
+            ? this.collecting.turnId
+            : this.collecting?.isScheduled
+              ? this.collecting.replyAnchorTurnId
+              : this.lastLarkTurnId;
+          this.pendingCronCreates.set(toolUseId, anchor);
+        }
+        // The rate_limit API-error record (isApiErrorMessage + error:'rate_limit')
+        // is type:"assistant" with a human text block, but it is not a model
+        // reply — the worker surfaces it as a `limited` state via
+        // isTranscriptRateLimitEvent. Skip attribution so its text isn't leaked
+        // to Lark as a final_output. We intentionally do NOT set terminalObserved
+        // here: a rate-limited turn produced no real answer, so let the normal
+        // terminal marker (or retry) close it.
+        //
+        // Every API-error record is execution metadata, never a model answer.
+        // Its structured terminal outcome is retained below; user visibility
+        // and bounded retry are owned by the worker/daemon, respectively.
+        if (isTranscriptRateLimitEvent(ev)) {
+          if (this.collecting) this.collecting.rateLimited = true;
+          continue;
+        }
+        const terminalOutcome = classifyClaudeTerminalEvent(ev);
+        // The `<synthetic>` no-model-reply placeholder (see
+        // isSyntheticNoModelReplyEvent) takes the same exit as an API error:
+        // its "No response requested." text must not become the turn's reply,
+        // it must not synthesise a headless local turn, and the turn closes
+        // with the retryable failure the classifier produced. The exit is
+        // shared; the assignment below is NOT - see the two branches.
+        if (ev.isApiErrorMessage === true || isSyntheticNoModelReplyEvent(ev)) {
+          if (this.collecting && terminalOutcome?.status !== 'rate_limited') {
+            // The two signals that share this exit are NOT of equal authority,
+            // so they do not share an assignment operator (maintainer ruling on
+            // PR #1330):
+            if (ev.isApiErrorMessage === true) {
+              // An API-error line is authoritative execution metadata. When the
+              // connection drops mid-response, Claude force-closes the stream
+              // with an `end_turn` record whose text is a half-finished
+              // sentence, and that record has already written `completed` here.
+              // Letting the error win is what keeps the turn `failed` +
+              // retryable, which is the only thing ordinary-turn-recovery acts
+              // on (`status !== 'failed' || retryable !== true` → no
+              // continuation). Unconditional assignment, therefore.
+              this.collecting.terminalOutcome = terminalOutcome;
+            } else {
+              // The `<synthetic>` placeholder is the WEAKEST terminal signal
+              // there is - no model call happened at all (no requestId, usage
+              // all zero). It must not downgrade an already-`completed` turn:
+              // `emitReadyTurns` (`status !== 'completed' → continue`) would
+              // then withhold the real answer text AND let the daemon post a
+              // failure card for a turn that had in fact been answered. With no
+              // earlier terminal outcome it still records the failure.
+              this.collecting.terminalOutcome ??= terminalOutcome;
+            }
+            this.collecting.terminalObserved = true;
+          }
+          continue;
+        }
         const hasVisibleText = assistantHasVisibleText(ev.message?.content);
         if (hasVisibleText && !this.collecting) {
           // Headless local turn: an assistant boundary arrived without any
@@ -253,6 +493,7 @@ export class BridgeTurnQueue {
             started: true,
             isLocal: true,
             userUuid: undefined,
+            replyContextTurnId: this.lastLocalTurnId,
             assistantUuids: [],
             sourceJsonlPath,
             markTimeMs: Date.now(),
@@ -261,18 +502,145 @@ export class BridgeTurnQueue {
           if (insertAt === -1) this.queue.push(headless);
           else this.queue.splice(insertAt, 0, headless);
           this.collecting = headless;
+          this.onLocalTurnStarted?.(headless);
+        }
+        if (this.collecting) {
+          this.collecting.hasAssistantActivity = true;
         }
         if (hasVisibleText) this.collecting?.assistantUuids.push(uuid);
+        if (this.collecting && onAssistantAttributed) {
+          try { onAssistantAttributed(ev, this.collecting); } catch { /* cosmetic channel — never break attribution */ }
+        }
         if (isClaudeTurnTerminalEvent(ev) && this.collecting) {
           this.collecting.terminalObserved = true;
+          if (terminalOutcome?.status !== 'rate_limited') {
+            this.collecting.terminalOutcome ??= terminalOutcome;
+          }
         }
       } else if (isClaudeTurnTerminalEvent(ev)) {
         // Claude normally writes this as `system/turn_duration` immediately
-        // after the final assistant line. It is a second marker for the same
-        // logical boundary; setting a bit is naturally idempotent.
-        if (this.collecting) this.collecting.terminalObserved = true;
+        // after the final assistant line. A local transcript can legitimately
+        // contain visible text with `stop_reason:null`; the duration marker is
+        // still authoritative proof that the turn completed. Keep a previously
+        // classified API failure, but otherwise use the same completed default
+        // as the next-turn-start compatibility boundary below.
+        if (this.collecting) {
+          this.collecting.terminalObserved = true;
+          if (!this.collecting.rateLimited) {
+            this.collecting.terminalOutcome ??= { status: 'completed' };
+          }
+        }
       }
     }
+  }
+
+  /** Pair CronCreate tool_result acks with their earlier tool_use calls and
+   *  file the call-time topic anchor under the scheduled task id.
+   *
+   *  Must-fix: only accept an ack whose tool_use_id matches a PENDING
+   *  CronCreate call. An unrelated Read/Bash tool_result whose text merely
+   *  CONTAINS the literal "Scheduled recurring job task-A …" (e.g. grepping a
+   *  log) must not overwrite task-A's anchor — without the has() check it
+   *  would be filed under undefined and reroute A's next fire to the wrong
+   *  topic. */
+  private handleCronCreateAcks(ev: TranscriptEvent): void {
+    for (const ack of cronCreateAcks(ev)) {
+      if (!this.pendingCronCreates.has(ack.toolUseId)) continue;
+      const anchor = this.pendingCronCreates.get(ack.toolUseId);
+      this.pendingCronCreates.delete(ack.toolUseId);
+      this.scheduledTaskAnchors.set(ack.taskId, anchor);
+      try { this.onScheduledTaskAnchored?.(ack.taskId, anchor); } catch { /* observer only */ }
+    }
+  }
+
+  /** Restore task→anchor pairs from the worker's durable store after a
+   *  restart. Does not overwrite a pair established THIS process (a live
+   *  re-create wins over stale disk), and never creates an anchor for a task
+   *  the store doesn't know. */
+  restoreScheduledTaskAnchors(restored: ReadonlyMap<string, string | undefined>): void {
+    for (const [taskId, anchor] of restored) {
+      if (!this.scheduledTaskAnchors.has(taskId)) {
+        this.scheduledTaskAnchors.set(taskId, anchor);
+      }
+    }
+  }
+
+  /** Test/inspection helper: the anchor recorded for a known task. */
+  scheduledTaskAnchor(taskId: string): string | undefined {
+    return this.scheduledTaskAnchors.get(taskId);
+  }
+
+  /** Full taskId → create-time turnId snapshot (undefined anchor renders as
+   *  null), used to sync the durable map to the daemon so it can pin the
+   *  referenced replyTargets records against its 32-entry eviction. */
+  scheduledTaskAnchorsSnapshot(): Array<{ taskId: string; turnId: string | null }> {
+    return [...this.scheduledTaskAnchors.entries()]
+      .map(([taskId, turnId]) => ({ taskId, turnId: turnId ?? null }));
+  }
+
+  /** Built-in CronCreate fire handler. Like a local-terminal turn it matches
+   *  no Lark fingerprint, but it is user-scheduled rather than ambient typing,
+   *  so the worker forwards its final (isScheduled) and anchors the reply to
+   *  the topic captured when THIS task was created. Pending Lark marks stay
+   *  unstarted — the scheduler's prompt must never fingerprint-bind them. */
+  private handleScheduledTurnStart(uuid: string, ev: TranscriptEvent, sourceJsonlPath?: string): void {
+    // Same transcript-order closeout as a real turn start.
+    if (this.collecting && !this.collecting.terminalObserved) {
+      if (this.collecting.dispatchAttempt !== undefined || this.collecting.hasAssistantActivity) {
+        this.collecting.terminalObserved = true;
+        this.collecting = null;
+      }
+    }
+    if (this.collecting
+      && !this.collecting.terminalObserved
+      && this.collecting.assistantUuids.length === 0
+      && !this.collecting.hasAssistantActivity) {
+      const idx = this.queue.indexOf(this.collecting);
+      if (idx >= 0) this.queue.splice(idx, 1);
+      if (!this.collecting.isLocal) this.droppedNeedingJournalClear.push(this.collecting);
+      this.collecting = null;
+    }
+    const tsParsed = ev.timestamp ? Date.parse(ev.timestamp) : NaN;
+    const eventTimeMs = Number.isFinite(tsParsed) ? tsParsed : Date.now();
+    // scheduledFireId is unique per fire and always present; fall back to the
+    // record uuid only defensively.
+    const fireId = typeof ev.scheduledFireId === 'string' && ev.scheduledFireId
+      ? ev.scheduledFireId
+      : uuid;
+    // Route to the topic captured when THIS task was created. The anchor is
+    // taken STRICTLY from the task map (live CronCreate/ack or restored from
+    // the durable store). An unknown task — no create/ack observed this
+    // process and nothing restored — gets NO anchor: borrowing lastLarkTurnId
+    // here would route a pre-attach task into whatever topic happened to be
+    // most recent, which after a worker restart is exactly the cross-topic
+    // leak this class guards against. The worker omits replyTurnId and the
+    // daemon falls back to its default routing.
+    const taskId = typeof ev.scheduledTaskId === 'string' && ev.scheduledTaskId
+      ? ev.scheduledTaskId
+      : undefined;
+    const anchor = taskId && this.scheduledTaskAnchors.has(taskId)
+      ? this.scheduledTaskAnchors.get(taskId)
+      : undefined;
+    const scheduledTurn: BridgePendingTurn = {
+      turnId: `scheduled-${fireId}`,
+      started: true,
+      isLocal: true,
+      isScheduled: true,
+      replyAnchorTurnId: anchor,
+      // Inherit the previous local turn's reply context (zero-injection
+      // sessions capture it daemon-side via terminal_turn_started).
+      replyContextTurnId: this.lastLocalTurnId,
+      userUuid: uuid,
+      assistantUuids: [],
+      sourceJsonlPath,
+      markTimeMs: eventTimeMs,
+    };
+    const insertAt = this.queue.findIndex(t => !t.started);
+    if (insertAt === -1) this.queue.push(scheduledTurn);
+    else this.queue.splice(insertAt, 0, scheduledTurn);
+    this.collecting = scheduledTurn;
+    this.lastLocalTurnId = scheduledTurn.turnId;
+    this.onLocalTurnStarted?.(scheduledTurn);
   }
 
   /** Shared turn-start handler. Called for both `role:user` and
@@ -298,39 +666,71 @@ export class BridgeTurnQueue {
     // JSONL variants that omitted the explicit final marker, without trusting
     // the TUI's prompt-looking screen. Keep the turn queued so an empty/silent
     // durable delivery still produces its terminal receipt.
-    if (this.collecting?.dispatchAttempt !== undefined && !this.collecting.terminalObserved) {
-      this.collecting.terminalObserved = true;
-      this.collecting = null;
+    if (this.collecting && !this.collecting.terminalObserved) {
+      if (this.collecting.dispatchAttempt !== undefined || this.collecting.hasAssistantActivity) {
+        this.collecting.terminalObserved = true;
+        this.collecting = null;
+      }
     }
     // Head-of-line block drop: previous turn never produced any visible
-    // assistant text and a new meaningful turn-start has arrived → Claude
+    // assistant text or assistant activity and a new meaningful turn-start has arrived → Claude
     // is single-threaded over the PTY, so the old turn will never get
     // text. Applies to both Lark and local turns.
     if (this.collecting
       && !this.collecting.terminalObserved
-      && this.collecting.assistantUuids.length === 0) {
+      && this.collecting.assistantUuids.length === 0
+      && !this.collecting.hasAssistantActivity) {
       const idx = this.queue.indexOf(this.collecting);
       if (idx >= 0) this.queue.splice(idx, 1);
+      // This turn will never reach drainEmittable, which is where the worker
+      // retires its durable journal entry. Record it so the worker can clear
+      // the journal here too — otherwise the entry survives, and every later
+      // restart re-marks it and replays the same stretch of transcript. That
+      // is not hypothetical: one entry was restored on six consecutive
+      // restarts, twice resurfacing a hours-old provider error as a fresh
+      // 「本轮执行失败」card. Local turns are skipped: they are synthesised by
+      // this queue and never had a journal entry to begin with.
+      if (!this.collecting.isLocal) this.droppedNeedingJournalClear.push(this.collecting);
       this.collecting = null;
     }
     const tsParsed = ev.timestamp ? Date.parse(ev.timestamp) : NaN;
     const eventTimeMs = Number.isFinite(tsParsed) ? tsParsed : Date.now();
     const next = this.queue.find(t => !t.started);
     let consumedNext = false;
+    let fullContentMatch = false;
     if (next) {
       if (next.contentFingerprint) {
         // Both sides normalised (whitespace-collapsed + trimmed) before
         // the substring check so a transcript line that preserved newlines
         // still matches a fingerprint built from the same text.
         const userText = normaliseForFingerprint(extractTurnStartText(ev));
+        fullContentMatch = !!next.contentNormalized && userText.includes(next.contentNormalized);
         if (userText.includes(next.contentFingerprint)) {
           next.started = true;
           if (!next.sourceJsonlPath) next.sourceJsonlPath = sourceJsonlPath;
           next.markTimeMs = eventTimeMs;
           this.collecting = next;
           consumedNext = true;
+        } else if (isTruncatedMatch(userText, next.contentNormalized)) {
+          // TRUNCATION-PROOF bind (capability-agnostic — see isTruncatedMatch).
+          // The head-substring fingerprint didn't match because claude-code
+          // TRUNCATES the leading envelope lines (`<user_message>` +
+          // `<botmux_task …>`) when persisting the user turn. But the recorded
+          // line is PROVABLY this turn's user event: its normalised text is a
+          // non-trivial contiguous substring of the FULL marked content
+          // (`contentNormalized`), i.e. exactly the surviving tail of what we
+          // sent. This does NOT guess from session type (apiOnly/adopt) —
+          // unrelated local terminal input like `pwd` is not a substring of the
+          // marked API/Lark prompt, so it can never steal the durable mark
+          // (the write-terminal race codex flagged on PR #724).
+          next.started = true;
+          if (!next.sourceJsonlPath) next.sourceJsonlPath = sourceJsonlPath;
+          next.markTimeMs = eventTimeMs;
+          this.collecting = next;
+          consumedNext = true;
         }
-        // Mismatch falls through to local-turn synthesis below.
+        // Otherwise (no fingerprint match, not a provable truncation) falls
+        // through to local-turn synthesis below (adopt) or is skipped (managed).
       } else {
         // Legacy mark() with no fingerprint — start on the next turn-start.
         next.started = true;
@@ -340,11 +740,20 @@ export class BridgeTurnQueue {
         consumedNext = true;
       }
     }
+    if (consumedNext && next) {
+      this.onLarkTurnStarted?.(next, { fullContentMatch, ...(sourceJsonlPath ? { sourceJsonlPath } : {}) });
+    }
     if (!consumedNext) {
-      // Local-terminal input (or a queued_command whose prompt didn't
-      // match any pending Lark fingerprint). Synthesise a started turn
-      // ahead of any unstarted Lark turn so chronological order matches
-      // transcript order at emit time.
+      // The user event neither fingerprint-matched nor proved a truncation of a
+      // pending durable mark. Treat it as local-terminal input: synthesise a
+      // started local turn ahead of any unstarted turn so chronological order
+      // matches transcript order at emit time. This is SAFE regardless of
+      // session type — it never steals a pending durable mark (the mark stays
+      // unstarted, to be bound by its real user line). Restoring the original
+      // pre-PR behavior here (no session-type gate) is what keeps codex's
+      // requirement: a genuine local turn on a normal managed writable terminal
+      // still emits and is not silently dropped. The mark-stealing bug lived in
+      // the fingerprint-MISMATCH bind above, now gated on the truncation proof.
       const localTurn: BridgePendingTurn = {
         turnId: `local-${uuid}`,
         started: true,
@@ -358,6 +767,14 @@ export class BridgeTurnQueue {
       if (insertAt === -1) this.queue.push(localTurn);
       else this.queue.splice(insertAt, 0, localTurn);
       this.collecting = localTurn;
+      this.lastLocalTurnId = localTurn.turnId;
+      this.onLocalTurnStarted?.(localTurn);
+    } else {
+      // A real Lark mark bound to its user event: it becomes the topic anchor
+      // for any CronCreate task scheduled inside the turn and for fires whose
+      // create/ack state is unavailable.
+      this.lastLarkTurnId = this.collecting?.turnId;
+      this.lastLocalTurnId = undefined;
     }
   }
 

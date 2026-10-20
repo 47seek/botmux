@@ -32,8 +32,36 @@ export function runSkillSessionCommand(
   if (sub === 'show') {
     const name = args[1];
     if (!name) return { code: 2, stdout: '', stderr: 'usage: botmux skill show <name>\n' };
-    const builtin = builtinSkillContent(name);
+    // An observe-only adopt pane is an already-running external process: it
+    // deliberately receives neither BotMux session env nor skill injection.
+    // Only trust a reply-style snapshot when all three worker-owned markers are
+    // present; otherwise a global/native loader must render the stable default
+    // guide instead of inheriting an unrelated ambient BOTMUX_REPLY_STYLE.
+    const hasSessionReplyStyleSnapshot = !!env.BOTMUX_SESSION_ID
+      && !!env.BOTMUX_LARK_APP_ID
+      && Object.prototype.hasOwnProperty.call(env, 'BOTMUX_REPLY_STYLE');
+    const builtinEnv = name === 'botmux-send' && !hasSessionReplyStyleSnapshot
+      ? { ...env, BOTMUX_REPLY_STYLE: undefined }
+      : env;
+    const builtin = builtinSkillContent(name, builtinEnv);
     if (builtin) return { code: 0, stdout: builtin.endsWith('\n') ? builtin : builtin + '\n', stderr: '' };
+  }
+  if (sub === 'resources') {
+    const name = args[1];
+    if (!name) return { code: 2, stdout: '', stderr: 'usage: botmux skill resources <name>\n' };
+    // Built-ins are generated in-memory and currently have no sidecar files.
+    // They remain valid skills even when the session has no user-skill
+    // manifest, so enumerate their empty resource set instead of reporting a
+    // misleading "skill manifest not found" error.
+    if (builtinSkillContent(name, env)) return { code: 0, stdout: '\n', stderr: '' };
+  }
+  if (sub === 'read') {
+    const name = args[1];
+    const path = args[2];
+    if (!name || !path) return { code: 2, stdout: '', stderr: 'usage: botmux skill read <name> <path>\n' };
+    if (builtinSkillContent(name, env)) {
+      return { code: 1, stdout: '', stderr: `built-in skill ${name} has no resources\n` };
+    }
   }
   const sessionId = sessionIdFromEnv(env);
   if (!sessionId) return { code: 2, stdout: '', stderr: 'missing BOTMUX_SESSION_ID\n' };

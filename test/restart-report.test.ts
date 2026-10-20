@@ -1,13 +1,19 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { countActiveSessionsOnDisk } from '../src/services/session-store.js';
-import { buildRestartReportText, sendRestartReportIfPending } from '../src/core/restart-report.js';
-import { writeRestartIntentTo, restartIntentPathIn } from '../src/services/restart-intent-store.js';
+import { seedPersistedSessionRows, sessionStorePath } from './helpers/session-store-disk.js';
+import { buildRestartReportText, sendRestartReportIfPending, fetchChangelog } from '../src/core/restart-report.js';
+import {
+  commitRestartIntentAttemptTo,
+  restartIntentPathIn,
+  writeRestartAttemptIntentTo,
+  writeRestartIntentTo,
+} from '../src/services/restart-intent-store.js';
 
-function writeSessions(dir: string, name: string, sessions: Record<string, { status: string }>) {
-  writeFileSync(join(dir, name), JSON.stringify(sessions));
+function writeSessions(dir: string, appId: string, sessions: Record<string, { status: string }>) {
+  seedPersistedSessionRows(dir, appId, sessions);
 }
 
 describe('countActiveSessionsOnDisk', () => {
@@ -15,11 +21,10 @@ describe('countActiveSessionsOnDisk', () => {
   beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'botmux-sess-')); });
   afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
 
-  it('counts active sessions across all bots’ session files', () => {
-    writeSessions(dir, 'sessions-cli_a.json', { s1: { status: 'active' }, s2: { status: 'closed' }, s3: { status: 'active' } });
-    writeSessions(dir, 'sessions-cli_b.json', { s4: { status: 'active' } });
-    writeSessions(dir, 'sessions.json', { s5: { status: 'active' }, s6: { status: 'closed' } });
-    expect(countActiveSessionsOnDisk(dir)).toBe(4);
+  it('counts active sessions across every bot’s session store', () => {
+    writeSessions(dir, 'cli_a', { s1: { status: 'active' }, s2: { status: 'closed' }, s3: { status: 'active' } });
+    writeSessions(dir, 'cli_b', { s4: { status: 'active' } });
+    expect(countActiveSessionsOnDisk(dir)).toBe(3);
   });
 
   it('returns 0 for an empty / missing data dir', () => {
@@ -27,10 +32,14 @@ describe('countActiveSessionsOnDisk', () => {
     expect(countActiveSessionsOnDisk(join(dir, 'nope'))).toBe(0);
   });
 
-  it('ignores non-session files and corrupt session files', () => {
-    writeSessions(dir, 'sessions-cli_a.json', { s1: { status: 'active' } });
-    writeFileSync(join(dir, 'schedules.json'), JSON.stringify({ x: { status: 'active' } })); // not a session file
-    writeFileSync(join(dir, 'sessions-bad.json'), '{corrupt');
+  it('ignores unrelated files, frozen pre-SQLite JSON and corrupt stores', () => {
+    writeSessions(dir, 'cli_a', { s1: { status: 'active' } });
+    writeFileSync(join(dir, 'schedules.json'), JSON.stringify({ x: { status: 'active' } })); // not a session store
+    // A frozen pre-SQLite JSON is an import source, not a store: counting it
+    // would double-count every row its .db already holds.
+    writeFileSync(join(dir, 'sessions-cli_a.json'), JSON.stringify({ s1: { status: 'active' } }));
+    mkdirSync(join(dir, 'session-stores', 'bad'), { recursive: true });
+    writeFileSync(sessionStorePath(dir, 'bad'), '{corrupt');
     expect(countActiveSessionsOnDisk(dir)).toBe(1);
   });
 });
@@ -99,6 +108,21 @@ describe('buildRestartReportText', () => {
     expect(md).toContain('2.64.0');
     expect(md).toContain('2.65.0');
   });
+
+  it('rollback restart reports the old→new delta without a changelog', () => {
+    const md = buildRestartReportText({
+      kind: 'rollback',
+      version: '3.0.0',
+      sessionCount: 0,
+      oldVersion: '3.1.0',
+      newVersion: '3.0.0',
+      changelog: 'must not be shown',
+    });
+    expect(md).toContain('已回退并重启');
+    expect(md).toContain('3.1.0');
+    expect(md).toContain('3.0.0');
+    expect(md).not.toContain('must not be shown');
+  });
 });
 
 describe('sendRestartReportIfPending', () => {
@@ -129,7 +153,7 @@ describe('sendRestartReportIfPending', () => {
 
   it('consumes a fresh intent and DMs the owner a card with the session count + dashboard link', async () => {
     writeRestartIntentTo(dir, { kind: 'manual', at: new Date(T0).toISOString() });
-    writeFileSync(join(dir, 'sessions-cli_primary.json'), JSON.stringify({ s1: { status: 'active' }, s2: { status: 'active' } }));
+    seedPersistedSessionRows(dir, 'cli_primary', { s1: { status: 'active' }, s2: { status: 'active' } });
     const { w, sent } = fakeWiring();
 
     await sendRestartReportIfPending(w);
@@ -155,11 +179,141 @@ describe('sendRestartReportIfPending', () => {
     expect(existsSync(restartIntentPathIn(dir))).toBe(false); // still consumed (no retry storm)
   });
 
+  it('consumes the intent but skips the DM when restart notifications are disabled', async () => {
+    writeRestartIntentTo(dir, { kind: 'manual', at: new Date(T0).toISOString() });
+    const log = vi.fn();
+    const { w, sent } = fakeWiring({ notifyOnRestart: false, log });
+
+    await sendRestartReportIfPending(w);
+
+    expect(sent).toHaveLength(0);
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('notifyOnRestart=false'));
+    expect(existsSync(restartIntentPathIn(dir))).toBe(false); // consumed so it cannot leak into a later restart
+  });
+
   it('fires at most once — a second call after consume sends nothing', async () => {
     writeRestartIntentTo(dir, { kind: 'manual', at: new Date(T0).toISOString() });
     const { w, sent } = fakeWiring();
     await sendRestartReportIfPending(w);
     await sendRestartReportIfPending(w);
     expect(sent).toHaveLength(1);
+  });
+
+  it('atomically reclaims a commit that lands after the prepared observation', async () => {
+    writeRestartAttemptIntentTo(
+      dir,
+      { kind: 'manual', at: new Date(T0).toISOString() },
+      T0,
+      'attempt-full-fleet',
+    );
+    const wait = vi.fn(async () => {
+      expect(commitRestartIntentAttemptTo(dir, 'attempt-full-fleet')).toBe(true);
+    });
+    const { w, sent } = fakeWiring({
+      wait,
+      preparedCommitWaitMs: 100,
+    });
+
+    await sendRestartReportIfPending(w);
+
+    expect(wait).toHaveBeenCalledOnce();
+    expect(sent).toHaveLength(1);
+    expect(existsSync(restartIntentPathIn(dir))).toBe(false);
+  });
+
+  it('keeps following a durable prepared intent past the legacy 45s window until commit', async () => {
+    writeRestartAttemptIntentTo(
+      dir,
+      { kind: 'manual', at: new Date(T0).toISOString() },
+      T0,
+      'attempt-slow-full-fleet',
+    );
+    let elapsedMs = 0;
+    let committed = false;
+    const wait = vi.fn(async (delayMs: number) => {
+      elapsedMs += delayMs;
+      if (!committed && elapsedMs > 45_000) {
+        committed = commitRestartIntentAttemptTo(dir, 'attempt-slow-full-fleet');
+      }
+    });
+    const { w, sent } = fakeWiring({
+      now: () => T0 + elapsedMs,
+      wait,
+    });
+
+    await sendRestartReportIfPending(w);
+
+    expect(elapsedMs).toBeGreaterThan(45_000);
+    expect(committed).toBe(true);
+    expect(sent).toHaveLength(1);
+    expect(existsSync(restartIntentPathIn(dir))).toBe(false);
+  });
+
+  it('stops following a prepared intent when its durable freshness expires', async () => {
+    writeRestartAttemptIntentTo(
+      dir,
+      { kind: 'manual', at: new Date(T0).toISOString() },
+      T0,
+      'attempt-stuck',
+    );
+    let nowMs = T0;
+    const wait = vi.fn(async () => { nowMs = T0 + 10 * 60_000 + 1; });
+    const { w, sent } = fakeWiring({
+      now: () => nowMs,
+      wait,
+    });
+
+    await sendRestartReportIfPending(w);
+
+    expect(wait).toHaveBeenCalledOnce();
+    expect(sent).toHaveLength(0);
+    expect(existsSync(restartIntentPathIn(dir))).toBe(false);
+  });
+});
+
+describe('fetchChangelog', () => {
+  it('adds GitHub bearer auth when githubToken is configured', async () => {
+    let auth: string | null = null;
+    const notes = await fetchChangelog('2.85.1', {
+      auth: { env: { GITHUB_TOKEN: ' ghp_secret ' }, envFilePath: null },
+      fetchImpl: async (_input, init) => {
+        const headers = init?.headers as Record<string, string> | undefined;
+        auth = headers?.Authorization ?? headers?.authorization ?? null;
+        return { ok: true, json: async () => ({ body: 'notes' }) } as Response;
+      },
+    });
+    expect(notes).toBe('notes');
+    expect(auth).toBe('Bearer ghp_secret');
+  });
+
+  it('omits GitHub bearer auth when githubToken is blank', async () => {
+    let auth: string | null = 'present';
+    await fetchChangelog('2.85.1', {
+      auth: { env: { GITHUB_TOKEN: '   ' }, envFilePath: null },
+      fetchImpl: async (_input, init) => {
+        const headers = init?.headers as Record<string, string> | undefined;
+        auth = headers?.Authorization ?? headers?.authorization ?? null;
+        return { ok: true, json: async () => ({ body: 'notes' }) } as Response;
+      },
+    });
+    expect(auth).toBeNull();
+  });
+
+  it('uses env-file auth fallback when process env is unset', async () => {
+    let auth: string | null = null;
+    await fetchChangelog('2.85.1', {
+      auth: {
+        env: {},
+        envFilePath: '/tmp/global.env',
+        fileExists: () => true,
+        readTextFile: () => 'GITHUB_TOKEN=ghp_from_file\n',
+      },
+      fetchImpl: async (_input, init) => {
+        const headers = init?.headers as Record<string, string> | undefined;
+        auth = headers?.Authorization ?? headers?.authorization ?? null;
+        return { ok: true, json: async () => ({ body: 'notes' }) } as Response;
+      },
+    });
+    expect(auth).toBe('Bearer ghp_from_file');
   });
 });

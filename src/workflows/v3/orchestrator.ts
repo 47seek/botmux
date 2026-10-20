@@ -14,8 +14,7 @@
  */
 
 import { isLoopNode, loopInstanceId, topologicalOrder, type V3Dag, type V3Node } from './dag.js';
-import type { V3RunFailureReason } from './journal.js';
-import type { V3LoopRef } from './journal.js';
+import type { V3LoopRef, V3RunFailureReason } from './event-contract.js';
 
 // ─── Run state (materialized from the journal by state.ts) ──────────────────
 
@@ -39,6 +38,9 @@ export interface V3NodeState {
    *  gate transitions the node straight to `failed` (set by the runtime), so
    *  this flag only ever records the approved case. */
   gateCleared?: boolean;
+  /** Host-only: the frozen input approved by this gate. It must match the
+   * prepared sidecar before the runtime may publish hostEffectIntent. */
+  approvedHostInput?: { attemptId: string; approvalDigest: string; inputHash: string };
   /** The current live runtime instance of this DEFINITION node (`A#002`).
    *  Set on dispatch; cleared when a revisit supersedes it (the node then
    *  re-dispatches a fresh instance).  Absent on the pre-instance-layer path
@@ -139,7 +141,8 @@ export type V3Action =
  *
  * Ordering follows topological order so callers see deps-ready nodes first.
  * Fail-fast: the moment any node is `failed`, the only action is
- * `completeRunFailed` (in-flight peers are torn down by the runtime / cancel).
+ * `completeRunFailed` (the runtime's attempt-quiescence barrier tears down and
+ * proves close for every in-flight peer before publishing the run terminal).
  * When no dispatch is possible and nothing is pending, the run is complete.
  */
 export function decideNext(

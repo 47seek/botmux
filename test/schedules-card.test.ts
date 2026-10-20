@@ -388,8 +388,8 @@ describe('buildSchedulesDetailCard (slice 2a)', () => {
     expect(json).toContain('sch_detail_123');
   });
 
-  it('renders pause + resume + delivery + back buttons (all 4 present, invoker_open_id bound)', () => {
-    const detail = detailFor({ id: 'sch_btns', enabled: true });
+  it('renders pause + resume + execution-position + back buttons', () => {
+    const detail = detailFor({ id: 'sch_btns', enabled: true, scope: 'chat', rootMessageId: 'om_root' });
     const json = buildSchedulesDetailCard(detail, baseOpts);
     const parsed = JSON.parse(json);
     const actionRow = (parsed.elements as any[]).find((e: any) => e.tag === 'action');
@@ -401,29 +401,41 @@ describe('buildSchedulesDetailCard (slice 2a)', () => {
     expect(pause).toBeDefined();
     expect(resume).toBeDefined();
     expect(delivery).toBeDefined();
+    expect(delivery.text.content).toBe('改为每次新话题');
+    expect(delivery.value.target_position).toBe('new-topic');
     expect(back).toBeDefined();
     expect(pause.value.schedule_id).toBe('sch_btns');
     expect(resume.value.schedule_id).toBe('sch_btns');
-    expect(delivery.value.schedule_id).toBe('sch_btns');
-    expect(delivery.value.target_delivery).toBe('new-topic');
     expect(pause.value.invoker_open_id).toBe(INVOKER);
     expect(resume.value.invoker_open_id).toBe(INVOKER);
-    expect(delivery.value.invoker_open_id).toBe(INVOKER);
     expect(back.value.invoker_open_id).toBe(INVOKER);
   });
 
-  it('delivery=origin → shows current delivery and use-new-topic button', () => {
-    const detail = detailFor({ id: 'sch_origin', deliver: 'origin' });
+  it('chat scope → shows group top-level execution and cycles to a fresh topic', () => {
+    const detail = detailFor({ id: 'sch_origin', deliver: 'origin', scope: 'chat', rootMessageId: 'om_root' });
     const json = buildSchedulesDetailCard(detail, baseOpts);
-    expect(json).toContain('投递：原话题');
-    expect(json).toContain('改为每次新话题');
+    expect(json).toContain('执行位置：群消息顶层');
+    const parsed = JSON.parse(json);
+    const actionRow = (parsed.elements as any[]).find((e: any) => e.tag === 'action');
+    const delivery = (actionRow.actions as any[]).find(
+      (a: any) => a.value?.action === SCHEDULES_ACTION_DELIVERY,
+    );
+    expect(delivery).toMatchObject({ value: { target_position: 'new-topic' } });
+    expect(delivery.disabled).toBeUndefined();
+    expect(delivery.text.content).toBe('改为每次新话题');
+  });
+
+  it('silent task keeps its execution position and has no delivery conflict note', () => {
+    const detail = detailFor({ id: 'sch_silent', deliver: 'origin', scope: 'chat', rootMessageId: 'om_root', silent: true } as any);
+    const json = buildSchedulesDetailCard(detail, baseOpts);
     const parsed = JSON.parse(json);
     const actionRow = (parsed.elements as any[]).find((e: any) => e.tag === 'action');
     const delivery = (actionRow.actions as any[]).find(
       (a: any) => a.value?.action === SCHEDULES_ACTION_DELIVERY,
     );
     expect(delivery.disabled).not.toBe(true);
-    expect(delivery.value.target_delivery).toBe('new-topic');
+    expect(json).toContain('执行位置：群消息顶层');
+    expect(json).not.toContain('静默任务不能切换');
   });
 
   it('scope=global → detail shows owning bot and chat', () => {
@@ -437,31 +449,113 @@ describe('buildSchedulesDetailCard (slice 2a)', () => {
     expect(json).toContain('所属：zkd-codex-bot · oc\\\\_global\\\\_chat');
   });
 
-  it('delivery=new-topic → shows current delivery and use-origin button', () => {
-    const detail = detailFor({ id: 'sch_new_topic', deliver: 'new-topic' });
+  it('explicit retained topic → shows topic execution and cycles to group top level', () => {
+    const detail = detailFor({
+      id: 'sch_topic',
+      executionPosition: 'topic',
+      scope: 'thread',
+      rootMessageId: 'om_root',
+    });
     const json = buildSchedulesDetailCard(detail, baseOpts);
-    expect(json).toContain('投递：每次新话题');
-    expect(json).toContain('改为原话题');
+    expect(json).toContain('执行位置：话题下执行');
     const parsed = JSON.parse(json);
     const actionRow = (parsed.elements as any[]).find((e: any) => e.tag === 'action');
     const delivery = (actionRow.actions as any[]).find(
       (a: any) => a.value?.action === SCHEDULES_ACTION_DELIVERY,
     );
-    expect(delivery.disabled).not.toBe(true);
-    expect(delivery.value.target_delivery).toBe('origin');
+    expect(delivery).toBeDefined();
+    expect(delivery.text.content).toBe('改为群消息顶层');
+    expect(delivery.value.target_position).toBe('top-level');
   });
 
-  it('delivery=local → shows local mode and disables delivery switch', () => {
-    const detail = detailFor({ id: 'sch_local', deliver: 'local' });
+  it('fresh topic → shows the custom title and offers settling into the dedicated-task topic', () => {
+    const detail = detailFor({
+      id: 'sch_fresh_topic',
+      executionPosition: 'new-topic',
+      topicTitle: '每日巡检结果',
+      rootMessageId: 'om_root',
+    });
     const json = buildSchedulesDetailCard(detail, baseOpts);
-    expect(json).toContain('投递：本地不发送');
-    expect(json).toContain('本地投递模式不支持在卡片中切换');
+    expect(json).toContain('执行位置：每次新话题');
+    expect(json).toContain('新话题标题：每日巡检结果');
+    const parsed = JSON.parse(json);
+    const actionRow = (parsed.elements as any[]).find((e: any) => e.tag === 'action');
+    const delivery = (actionRow.actions as any[]).find(
+      (a: any) => a.value?.action === SCHEDULES_ACTION_DELIVERY,
+    );
+    // Cycle step: fresh topic → the task's own dedicated topic. The retained
+    // root must never pull the toggle back into the originating topic.
+    expect(delivery.text.content).toBe('改为专属话题');
+    expect(delivery.value.target_position).toBe('task');
+  });
+
+  it('rootless dedicated task → shows the dedicated placement, its title, and parks at top level', () => {
+    const detail = detailFor({
+      id: 'sch_task',
+      executionPosition: 'task',
+      scope: 'thread',
+      topicTitle: '服务巡检',
+    });
+    const json = buildSchedulesDetailCard(detail, baseOpts);
+    expect(json).toContain('执行位置：专属话题（本任务独立）');
+    expect(json).toContain('新话题标题：服务巡检');
+    const parsed = JSON.parse(json);
+    const actionRow = (parsed.elements as any[]).find((e: any) => e.tag === 'action');
+    const delivery = (actionRow.actions as any[]).find(
+      (a: any) => a.value?.action === SCHEDULES_ACTION_DELIVERY,
+    );
+    expect(delivery).toBeDefined();
+    expect(delivery.text.content).toBe('改为群消息顶层');
+    expect(delivery.value.target_position).toBe('top-level');
+    expect(delivery.disabled).toBeUndefined();
+  });
+
+  it('materialized dedicated task renders like an ordinary topic thread', () => {
+    const detail = detailFor({
+      id: 'sch_task_done',
+      executionPosition: 'task',
+      scope: 'thread',
+      rootMessageId: 'om_task_root',
+    });
+    const json = buildSchedulesDetailCard(detail, baseOpts);
+    expect(json).toContain('执行位置：话题下执行');
+    expect(json).not.toContain('专属话题');
+    const parsed = JSON.parse(json);
+    const actionRow = (parsed.elements as any[]).find((e: any) => e.tag === 'action');
+    const delivery = (actionRow.actions as any[]).find(
+      (a: any) => a.value?.action === SCHEDULES_ACTION_DELIVERY,
+    );
+    expect(delivery.value.target_position).toBe('top-level');
+  });
+
+  it('multi-chat fresh-topic task disables the dedicated-topic step with a reason note', () => {
+    const detail = detailFor({
+      id: 'sch_task_multi',
+      executionPosition: 'new-topic',
+      scope: 'chat',
+      chatIds: ['oc_a', 'oc_b'],
+    });
+    const json = buildSchedulesDetailCard(detail, baseOpts);
     const parsed = JSON.parse(json);
     const actionRow = (parsed.elements as any[]).find((e: any) => e.tag === 'action');
     const delivery = (actionRow.actions as any[]).find(
       (a: any) => a.value?.action === SCHEDULES_ACTION_DELIVERY,
     );
     expect(delivery.disabled).toBe(true);
+    expect(delivery.value.target_position).toBe('task');
+    expect(json).toContain('专属话题仅支持单个群聊的定时任务');
+  });
+
+  it('delivery=local → shows local mode without a delivery switch', () => {
+    const detail = detailFor({ id: 'sch_local', deliver: 'local' });
+    const json = buildSchedulesDetailCard(detail, baseOpts);
+    expect(json).toContain('执行位置：本地不发送');
+    const parsed = JSON.parse(json);
+    const actionRow = (parsed.elements as any[]).find((e: any) => e.tag === 'action');
+    const delivery = (actionRow.actions as any[]).find(
+      (a: any) => a.value?.action === SCHEDULES_ACTION_DELIVERY,
+    );
+    expect(delivery).toBeUndefined();
   });
 
   it('enabled=true → pause enabled / resume disabled with alreadyEnabled note', () => {
@@ -1166,18 +1260,38 @@ describe('handleSchedulesCardAction', () => {
     });
   });
 
-  // ─── Slice 2b: DELIVERY (origin ↔ new-topic) ─────────────────────────
+  // ─── Slice 2b: execution position (topic → top-level → fresh topic) ──
   describe('action=dash_schedules_delivery', () => {
     function makeDeliveryDeps(
       scheduleId = 'sch_a',
-      deliver: ScheduleCardTaskInput['deliver'] = 'origin',
+      initialOverrides: Partial<ScheduleCardTaskInput> = {},
       postResp?: { status: number; body?: any },
       postRefetchTasks?: ScheduleCardTaskInput[],
     ) {
-      const initial = [task({ id: scheduleId, name: 'delivery me', deliver })];
+      const initial = [task({
+        id: scheduleId,
+        name: 'delivery me',
+        deliver: 'origin',
+        scope: 'thread',
+        executionPosition: 'topic',
+        rootMessageId: 'om_root',
+        ...initialOverrides,
+      })];
+      const current = initial[0].executionPosition
+        ?? (initial[0].scope === 'thread' ? 'topic' : 'top-level');
+      // Cycle default for body-less legacy toggles; modern cards POST an exact
+      // target and the daemon echoes it.
+      const responsePosition = current === 'topic'
+        ? 'top-level'
+        : current === 'top-level'
+          ? 'new-topic'
+          : current === 'new-topic' ? 'task' : 'top-level';
       let getCalls = 0;
+      let appliedPosition: string = responsePosition;
+      const scopeForPosition = (position: string) =>
+        position === 'topic' || position === 'task' ? 'thread' : 'chat';
       const requestSpy = vi.fn(async (req: any) => {
-        if (req.method === 'GET' && req.path === '/__daemon/schedules-list') {
+        if (req.method === 'GET' && (req.path === '/__daemon/schedules-list' || req.path === '/__daemon/schedules-list?scope=global')) {
           getCalls += 1;
           if (getCalls === 1) return { status: 200, body: { schedules: initial }, raw: '' };
           return {
@@ -1185,30 +1299,22 @@ describe('handleSchedulesCardAction', () => {
             body: {
               schedules: postRefetchTasks ?? initial.map(t => ({
                 ...t,
-                deliver: t.deliver === 'new-topic' ? 'origin' : 'new-topic',
-              })),
-            },
-            raw: '',
-          };
-        }
-        if (req.method === 'GET' && req.path === '/__daemon/schedules-list?scope=global') {
-          getCalls += 1;
-          if (getCalls === 1) return { status: 200, body: { schedules: initial }, raw: '' };
-          return {
-            status: 200,
-            body: {
-              schedules: postRefetchTasks ?? initial.map(t => ({
-                ...t,
-                deliver: t.deliver === 'new-topic' ? 'origin' : 'new-topic',
+                scope: scopeForPosition(appliedPosition),
+                executionPosition: appliedPosition,
               })),
             },
             raw: '',
           };
         }
         if (req.method === 'POST' && req.path.startsWith('/__daemon/schedules/')) {
+          const posted = (req.body as { executionPosition?: string } | undefined)?.executionPosition;
+          if (posted) appliedPosition = posted;
           return postResp ?? {
             status: 200,
-            body: { ok: true, deliver: deliver === 'new-topic' ? 'origin' : 'new-topic' },
+            body: {
+              ok: true,
+              executionPosition: appliedPosition,
+            },
             raw: '',
           };
         }
@@ -1223,56 +1329,118 @@ describe('handleSchedulesCardAction', () => {
       };
     }
 
-    it('origin → POST delivery + refetch, card shows new-topic state', async () => {
-      const deps = makeDeliveryDeps('sch_a', 'origin');
+    it('topic → group top-level round-trips and rebuilds the selected position', async () => {
+      const deps = makeDeliveryDeps('sch_a');
       const r = await handleSchedulesCardAction(
         makeAction({
           action: SCHEDULES_ACTION_DELIVERY,
           invoker_open_id: INVOKER,
           schedule_id: 'sch_a',
-          target_delivery: 'new-topic',
+          target_position: 'top-level',
         }),
         LARK_APP_ID, deps,
       );
       expect(deps.requestSpy.mock.calls[0][0]).toEqual({ method: 'GET', path: '/__daemon/schedules-list' });
       expect(deps.requestSpy.mock.calls[1][0]).toEqual(
-        expect.objectContaining({ method: 'POST', path: '/__daemon/schedules/sch_a/delivery' }),
+        expect.objectContaining({
+          method: 'POST',
+          path: '/__daemon/schedules/sch_a/delivery',
+          body: { executionPosition: 'top-level' },
+        }),
       );
       expect(deps.requestSpy.mock.calls[2][0]).toEqual({ method: 'GET', path: '/__daemon/schedules-list' });
       expect(r.toast).toBeUndefined();
       const cardJson = JSON.stringify(r.card?.data);
-      expect(cardJson).toContain('投递：每次新话题');
-      expect(cardJson).toContain('改为原话题');
+      expect(cardJson).toContain('执行位置：群消息顶层');
+      expect(cardJson).toContain('改为每次新话题');
     });
 
-    it('new-topic → POST delivery + refetch, card shows origin state', async () => {
-      const deps = makeDeliveryDeps('sch_a', 'new-topic');
+    it('group top-level → fresh topic round-trips and rebuilds the selected position', async () => {
+      const deps = makeDeliveryDeps('sch_a', { scope: 'chat', executionPosition: 'top-level' });
       const r = await handleSchedulesCardAction(
         makeAction({
           action: SCHEDULES_ACTION_DELIVERY,
           invoker_open_id: INVOKER,
           schedule_id: 'sch_a',
-          target_delivery: 'origin',
+          target_position: 'new-topic',
         }),
         LARK_APP_ID, deps,
       );
       expect(deps.requestSpy.mock.calls[1][0]).toEqual(
-        expect.objectContaining({ method: 'POST', path: '/__daemon/schedules/sch_a/delivery' }),
+        expect.objectContaining({
+          method: 'POST',
+          path: '/__daemon/schedules/sch_a/delivery',
+          body: { executionPosition: 'new-topic' },
+        }),
       );
       expect(r.toast).toBeUndefined();
       const cardJson = JSON.stringify(r.card?.data);
-      expect(cardJson).toContain('投递：原话题');
-      expect(cardJson).toContain('改为每次新话题');
+      expect(cardJson).toContain('执行位置：每次新话题');
+      // The next cycle step after a fresh topic is the dedicated per-task
+      // topic, never a retained (potentially adopted) topic root.
+      expect(cardJson).toContain('改为专属话题');
     });
 
-    it('scope=global → GET/POST/refetch all keep ?scope=global', async () => {
-      const deps = makeDeliveryDeps('sch_a', 'origin');
+    it('fresh topic → dedicated task round-trips and rebuilds the rootless task card', async () => {
+      const deps = makeDeliveryDeps(
+        'sch_a',
+        { scope: 'chat', executionPosition: 'new-topic' },
+        undefined,
+        [task({
+          id: 'sch_a',
+          name: 'delivery me',
+          deliver: 'origin',
+          scope: 'thread',
+          executionPosition: 'task',
+        })],
+      );
       const r = await handleSchedulesCardAction(
         makeAction({
           action: SCHEDULES_ACTION_DELIVERY,
           invoker_open_id: INVOKER,
           schedule_id: 'sch_a',
-          target_delivery: 'new-topic',
+          target_position: 'task',
+        }),
+        LARK_APP_ID, deps,
+      );
+      expect(deps.requestSpy.mock.calls[1][0]).toEqual(
+        expect.objectContaining({
+          method: 'POST',
+          path: '/__daemon/schedules/sch_a/delivery',
+          body: { executionPosition: 'task' },
+        }),
+      );
+      expect(r.toast).toBeUndefined();
+      const cardJson = JSON.stringify(r.card?.data);
+      expect(cardJson).toContain('执行位置：专属话题（本任务独立）');
+      expect(cardJson).toContain('改为群消息顶层');
+    });
+
+    it('fresh topic → retained topic round-trips and rebuilds the selected position', async () => {
+      const deps = makeDeliveryDeps('sch_a', { scope: 'chat', executionPosition: 'new-topic' });
+      const r = await handleSchedulesCardAction(
+        makeAction({
+          action: SCHEDULES_ACTION_DELIVERY,
+          invoker_open_id: INVOKER,
+          schedule_id: 'sch_a',
+          target_position: 'topic',
+        }),
+        LARK_APP_ID, deps,
+      );
+      expect(r.toast).toBeUndefined();
+      const cardJson = JSON.stringify(r.card?.data);
+      expect(cardJson).toContain('执行位置：话题下执行');
+      expect(cardJson).toContain('改为群消息顶层');
+    });
+
+    it('scope=global → GET/POST/refetch all keep ?scope=global', async () => {
+      const deps = makeDeliveryDeps('sch_a');
+      const r = await handleSchedulesCardAction(
+        makeAction({
+          action: SCHEDULES_ACTION_DELIVERY,
+          invoker_open_id: INVOKER,
+          schedule_id: 'sch_a',
+          target_position: 'top-level',
           dashboard_scope: 'global',
         }),
         LARK_APP_ID, deps,
@@ -1285,31 +1453,36 @@ describe('handleSchedulesCardAction', () => {
       ]);
     });
 
-    it('snapshot already at target → toast alreadyNewTopic, POST 0 times', async () => {
-      const deps = makeDeliveryDeps('sch_a', 'new-topic');
+    it('snapshot already at fresh-topic target → toast alreadyNewTopic, POST 0 times', async () => {
+      const deps = makeDeliveryDeps('sch_a', { scope: 'chat', executionPosition: 'new-topic' });
       const r = await handleSchedulesCardAction(
         makeAction({
           action: SCHEDULES_ACTION_DELIVERY,
           invoker_open_id: INVOKER,
           schedule_id: 'sch_a',
-          target_delivery: 'new-topic',
+          target_position: 'new-topic',
         }),
         LARK_APP_ID, deps,
       );
-      expect(r.toast?.content).toContain('已是每次新话题投递');
+      expect(r.toast?.content).toContain('已设置为每次新话题执行');
       expect(r.card).toBeUndefined();
       const postCalls = deps.requestSpy.mock.calls.filter((c: any[]) => (c[0] as any).method === 'POST');
       expect(postCalls.length).toBe(0);
     });
 
     it('snapshot local → toast local disabled, POST 0 times', async () => {
-      const deps = makeDeliveryDeps('sch_a', 'local');
+      const deps = makeDeliveryDeps('sch_a', {
+        deliver: 'local',
+        scope: 'chat',
+        executionPosition: undefined,
+        rootMessageId: undefined,
+      });
       const r = await handleSchedulesCardAction(
         makeAction({
           action: SCHEDULES_ACTION_DELIVERY,
           invoker_open_id: INVOKER,
           schedule_id: 'sch_a',
-          target_delivery: 'new-topic',
+          target_position: 'new-topic',
         }),
         LARK_APP_ID, deps,
       );
@@ -1320,13 +1493,13 @@ describe('handleSchedulesCardAction', () => {
     });
 
     it('invalid target_delivery → invalid_action toast, no GET/POST', async () => {
-      const deps = makeDeliveryDeps('sch_a', 'origin');
+      const deps = makeDeliveryDeps('sch_a');
       const r = await handleSchedulesCardAction(
         makeAction({
           action: SCHEDULES_ACTION_DELIVERY,
           invoker_open_id: INVOKER,
           schedule_id: 'sch_a',
-          target_delivery: 'local',
+          target_position: 'local',
         }),
         LARK_APP_ID, deps,
       );
@@ -1336,13 +1509,13 @@ describe('handleSchedulesCardAction', () => {
     });
 
     it('POST 500 → toast delivery_failed, no card', async () => {
-      const deps = makeDeliveryDeps('sch_a', 'origin', { status: 500, body: { error: 'delivery_boom' } });
+      const deps = makeDeliveryDeps('sch_a', {}, { status: 500, body: { error: 'delivery_boom' } });
       const r = await handleSchedulesCardAction(
         makeAction({
           action: SCHEDULES_ACTION_DELIVERY,
           invoker_open_id: INVOKER,
           schedule_id: 'sch_a',
-          target_delivery: 'new-topic',
+          target_position: 'top-level',
         }),
         LARK_APP_ID, deps,
       );
@@ -1352,13 +1525,13 @@ describe('handleSchedulesCardAction', () => {
     });
 
     it('POST 200 with ok=false → toast delivery_failed, no refetch or success redraw', async () => {
-      const deps = makeDeliveryDeps('sch_a', 'origin', { status: 200, body: { ok: false, error: 'local_not_toggleable' } });
+      const deps = makeDeliveryDeps('sch_a', {}, { status: 200, body: { ok: false, error: 'local_not_toggleable' } });
       const r = await handleSchedulesCardAction(
         makeAction({
           action: SCHEDULES_ACTION_DELIVERY,
           invoker_open_id: INVOKER,
           schedule_id: 'sch_a',
-          target_delivery: 'new-topic',
+          target_position: 'top-level',
         }),
         LARK_APP_ID, deps,
       );
@@ -1368,19 +1541,19 @@ describe('handleSchedulesCardAction', () => {
       expect(deps.requestSpy.mock.calls.map((c: any[]) => c[0].method)).toEqual(['GET', 'POST']);
     });
 
-    it('refetch missing after successful POST → fallback synth renders target delivery', async () => {
-      const deps = makeDeliveryDeps('sch_a', 'origin', { status: 200, body: { ok: true, deliver: 'new-topic' } }, []);
+    it('refetch missing after a cached callback → fallback keeps captured position', async () => {
+      const deps = makeDeliveryDeps('sch_a', {}, { status: 200, body: { ok: true, executionPosition: 'top-level' } }, []);
       const r = await handleSchedulesCardAction(
         makeAction({
           action: SCHEDULES_ACTION_DELIVERY,
           invoker_open_id: INVOKER,
           schedule_id: 'sch_a',
-          target_delivery: 'new-topic',
+          target_position: 'top-level',
         }),
         LARK_APP_ID, deps,
       );
       expect(r.toast).toBeUndefined();
-      expect(JSON.stringify(r.card?.data)).toContain('投递：每次新话题');
+      expect(JSON.stringify(r.card?.data)).toContain('执行位置：群消息顶层');
     });
   });
 

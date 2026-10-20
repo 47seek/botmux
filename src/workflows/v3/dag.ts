@@ -3,8 +3,8 @@
  *
  * The v3 runtime (LLM-driven workflow) loads a hand-written `dag.json`,
  * validates it, and walks it in topological order with deps gating.  This
- * module is the *schema half* of the engine: pure data + validation, no IO
- * side effects beyond reading the file in `loadDag`.
+ * module is the *schema half* of the engine: pure data + validation. Node.js
+ * filesystem loading lives in `dag-loader.ts`.
  *
  * Deliberately standalone from v0.2's `definition.ts` — v3 nodes are a much
  * smaller surface (goal / host, no loop / decision / fanout) and coupling the
@@ -12,7 +12,11 @@
  * `docs/design/2026-06-01-v3-mvp-engine-split.md` §3 for the authored shape.
  */
 
-import { readFileSync } from 'node:fs';
+import { collectV3HostBindingRefs, V3HostBindingError } from './host-bindings.js';
+import {
+  normalizeArtifactOutputs,
+  type V3ArtifactOutputs,
+} from './artifact-contract-declarations.js';
 
 // ─── Schema ──────────────────────────────────────────────────────────────
 
@@ -31,6 +35,12 @@ import { readFileSync } from 'node:fs';
 export type V3NodeType = 'goal' | 'host' | 'loop';
 
 export const NODE_KINDS: readonly V3NodeType[] = ['goal', 'host', 'loop'];
+
+/** First host slice: every registered executor is side-effecting and must be
+ * approved against its frozen runtime input. Keep this list in lockstep with
+ * the shared host-executor registry. */
+export const V3_HOST_EXECUTORS = ['feishu-send', 'feishu-reply', 'botmux-schedule'] as const;
+export type V3HostExecutorName = typeof V3_HOST_EXECUTORS[number];
 
 /** Default per-node wall-clock budget when a node omits `timeoutSec`.
  *  Generous on purpose: completion is detected by the manifest watcher
@@ -76,6 +86,8 @@ export interface V3InputRef {
    *  at dispatch time is surfaced to the agent via `GoalInputs.omitted`
    *  (reason 'selectorMiss') — absence reads as a contract gap, not silence. */
   select?: { name?: string; path?: string };
+  /** schemaVersion 2 stable public-output key. */
+  output?: string;
 }
 
 /**
@@ -111,21 +123,17 @@ export type V3TriggerRule = 'all_success' | 'one_success' | { quorum: number };
 
 /**
  * Per-node capability override (P2, edge-activation follow-up).  Merged onto
- * the bot's frozen `BotSnapshot` at dispatch time — the node can RESTRICT or
- * redirect, never escalate:
+ * the bot's frozen `BotSnapshot` at dispatch time:
  *   - `model` picks a different model for THIS node (cost control: cheap
  *     models for research nodes, strong models for code nodes);
- *   - `permissionMode:'restricted'` forces the CLI's permission bypass OFF for
- *     this node.  There is deliberately NO 'bypass' value — a node on a
- *     restricted bot cannot grant itself what the bot does not have (the
- *     no-escalation red line is structural, not a runtime check);
  *   - `systemPromptAppend` adds node-specific instructions to the goal file.
+ * Permission is deliberately not overridable: every workflow worker requires
+ * CLI bypass permission, and bots configured to disable it are rejected.
  * `toolsSubset` is deferred — it needs a per-CLI capability matrix across the
  * daemon init/worker/adapter chain (P2b).
  */
 export interface V3CapabilityOverride {
   model?: string;
-  permissionMode?: 'inherit' | 'restricted';
   systemPromptAppend?: string;
 }
 
@@ -247,6 +255,8 @@ export interface V3Node {
   override?: V3CapabilityOverride;
   /** Upstream products to thread in as inputs (every `from` ⊆ `depends`). */
   inputs: V3InputRef[];
+  /** schemaVersion 2 public products addressable by downstream output keys. */
+  outputs?: V3ArtifactOutputs;
   /** Wall-clock budget in seconds; falls back to DEFAULT_NODE_TIMEOUT_SEC. */
   timeoutSec?: number;
   /** Optional human approval gate, evaluated *before* the node's work runs. */
@@ -262,6 +272,12 @@ export interface V3Node {
    *  validateDag enforces every entry is an ANCESTOR (transitive `depends`),
    *  so a revisit can never create a forward jump or a cycle in the run. */
   revisitTo?: string[];
+
+  // ── host-only fields (type === 'host') ──
+  /** Deterministic executor invoked by the host runtime (never an LLM). */
+  executor?: V3HostExecutorName;
+  /** Frozen before the runtime gate; supports typed host bindings. */
+  input?: unknown;
 
   // ── loop-only fields (type === 'loop'; see V3LoopNode) ──
   /** Hard iteration bound; the loop blocks (recoverable, human can grant +1)
@@ -296,6 +312,20 @@ export function isGoalNode(node: V3Node): node is V3GoalNode {
   return node.type === 'goal' && typeof node.goal === 'string' && node.goal.length > 0;
 }
 
+export interface V3HostNode extends V3Node {
+  type: 'host';
+  executor: V3HostExecutorName;
+  input: unknown;
+  humanGate: V3HumanGate;
+}
+
+export function isHostNode(node: V3Node): node is V3HostNode {
+  return node.type === 'host' &&
+    typeof node.executor === 'string' &&
+    (V3_HOST_EXECUTORS as readonly string[]).includes(node.executor) &&
+    node.humanGate !== null;
+}
+
 /** A `V3Node` narrowed to a loop node — validateDag guarantees every loop
  *  field is present and normalized (output defaulted to exit.node, feedback
  *  defaulted to `[]`). */
@@ -325,6 +355,8 @@ export function loopInstanceId(loopId: string, iteration: number, bodyNodeId: st
 }
 
 export interface V3Dag {
+  /** Missing means legacy v1. Newly authored DAGs use schemaVersion 2. */
+  schemaVersion?: 1 | 2;
   /** Stable id for this run; used as the runDir name, so path-segment safe. */
   runId: string;
   nodes: V3Node[];
@@ -342,7 +374,8 @@ export class DagValidationError extends Error {
 }
 
 /** Node ids and runId double as filesystem path segments under the runDir. */
-const SEGMENT_RE = /^[A-Za-z0-9._-]+$/;
+export const V3_DAG_SEGMENT_RE = /^[A-Za-z0-9._-]+$/;
+const SEGMENT_RE = V3_DAG_SEGMENT_RE;
 
 function isObject(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null && !Array.isArray(v);
@@ -354,7 +387,7 @@ function isObject(v: unknown): v is Record<string, unknown> {
  * returns a normalized dag (defaults filled, `humanGate: undefined` → `null`).
  *
  * Checks: runId shape; non-empty unique path-safe node ids; known `type`;
- * `goal` non-empty for goal nodes; `host` rejected (executor not yet built);
+ * `goal` non-empty for goal nodes; host executor/input/gate policy;
  * `depends` reference existing nodes, no self-dep, no dup `from` (P0: one
  * edge per (from,to)); edge predicates validated against the SOURCE's
  * resultSchema (goal-with-schema sources only); `triggerRule` shape/bounds;
@@ -366,6 +399,10 @@ export function validateDag(raw: unknown): V3Dag {
 
   if (!isObject(raw)) {
     throw new DagValidationError(['root must be a JSON object']);
+  }
+  const schemaVersion = raw.schemaVersion === undefined ? 1 : raw.schemaVersion;
+  if (schemaVersion !== 1 && schemaVersion !== 2) {
+    problems.push(`schemaVersion must be 1 or 2 (got ${JSON.stringify(raw.schemaVersion)})`);
   }
   if (typeof raw.runId !== 'string' || !SEGMENT_RE.test(raw.runId)) {
     problems.push(`runId must be a path-safe string matching ${SEGMENT_RE} (got ${JSON.stringify(raw.runId)})`);
@@ -403,11 +440,6 @@ export function validateDag(raw: unknown): V3Dag {
       problems.push(`node "${id}".type must be one of ${NODE_KINDS.join(' | ')} (got ${JSON.stringify(type)})`);
       continue;
     }
-    if (type === 'host') {
-      problems.push(`node "${id}": type "host" is reserved but not yet executable in MVP — use "goal"`);
-      continue;
-    }
-
     const depends = normDepends(n.depends, `node "${id}"`, problems, { ownerId: id, list: pendingWhens });
     const fromList = depends.map((d) => d.from);
     if (fromList.includes(id)) problems.push(`node "${id}" depends on itself`);
@@ -415,10 +447,10 @@ export function validateDag(raw: unknown): V3Dag {
 
     const triggerRule = normTriggerRule(n.triggerRule, depends.length, `node "${id}"`, problems);
 
-    const inputs = normInputs(n.inputs, id, problems);
+    const inputs = normInputs(n.inputs, id, problems, schemaVersion === 2 ? 2 : 1);
 
     if (type === 'loop') {
-      const loopFields = normLoopFields(n, id, problems);
+      const loopFields = normLoopFields(n, id, problems, schemaVersion === 2 ? 2 : 1);
       if (loopFields) {
         nodes.push({
           id,
@@ -435,6 +467,90 @@ export function validateDag(raw: unknown): V3Dag {
       continue;
     }
 
+    if (type === 'host') {
+      if (n.outputs !== undefined) problems.push(`host node "${id}".outputs is not supported`);
+      if (n.goal !== undefined) problems.push(`host node "${id}".goal is not supported`);
+      if (n.bot !== undefined) problems.push(`host node "${id}".bot is not supported — host nodes do not spawn a CLI`);
+      if (n.override !== undefined) problems.push(`host node "${id}".override is not supported`);
+      if (n.revisitTo !== undefined) problems.push(`host node "${id}".revisitTo is not supported`);
+      if (n.resultSchema !== undefined) {
+        problems.push(`host node "${id}".resultSchema is not supported — host output uses the trusted executor result contract`);
+      }
+      if (inputs.length > 0) {
+        problems.push(`host node "${id}".inputs must be empty — use typed bindings in host input`);
+      }
+      // `undefined` is the normalized/default all-success rule (and is the
+      // only legal representation for a root node with no incoming edges).
+      // Reject only an explicitly different trigger policy.
+      if (triggerRule !== undefined && triggerRule !== 'all_success') {
+        problems.push(
+          `host node "${id}".triggerRule must be "all_success"; ` +
+          'P0 host bindings do not accept skipped/omitted dependencies',
+        );
+      }
+      const executor = typeof n.executor === 'string' ? n.executor : '';
+      if (!(V3_HOST_EXECUTORS as readonly string[]).includes(executor)) {
+        problems.push(
+          `host node "${id}".executor must be one of ${V3_HOST_EXECUTORS.join(' | ')} ` +
+          `(got ${JSON.stringify(n.executor)})`,
+        );
+      }
+      if (!Object.prototype.hasOwnProperty.call(n, 'input')) {
+        problems.push(`host node "${id}".input is required`);
+      } else {
+        validateHostInputShape(executor as V3HostExecutorName, n.input, id, problems);
+        try {
+          collectV3HostBindingRefs(n.input);
+        } catch (err) {
+          problems.push(
+            `host node "${id}".input is invalid: ${err instanceof V3HostBindingError ? err.message : String(err)}`,
+          );
+        }
+      }
+      if (n.timeoutSec !== undefined) {
+        problems.push(
+          `host node "${id}".timeoutSec is not supported — abandoning an in-flight provider call would make its effect outcome unknown`,
+        );
+      }
+      const humanGate = normHumanGate(n.humanGate, `host node "${id}"`, problems);
+      if (!humanGate) {
+        problems.push(
+          `host node "${id}" must declare a humanGate; v3 P0 does not allow ungated external side effects`,
+        );
+      } else {
+        // Host gates authorize an external side effect. Do not inherit the
+        // generic gate's legacy "first option means approve" fallback: it can
+        // turn a button labelled `reject` into an approve action. P0 requires
+        // the reserved choices to have explicit, invariant semantics.
+        if (!humanGate.options?.includes('approve')) {
+          problems.push(
+            `host node "${id}".humanGate.options must include "approve" explicitly; ` +
+            'host side effects cannot use an implicit first-option approval',
+          );
+        }
+        if (
+          humanGate.approveOptions?.length !== 1 ||
+          humanGate.approveOptions[0] !== 'approve'
+        ) {
+          problems.push(
+            `host node "${id}".humanGate.approveOptions must be exactly ["approve"]; ` +
+            'custom-labelled choices cannot authorize a host side effect',
+          );
+        }
+      }
+      nodes.push({
+        id,
+        type,
+        executor: executor as V3HostExecutorName,
+        input: n.input,
+        depends,
+        triggerRule,
+        inputs: [],
+        humanGate,
+      });
+      continue;
+    }
+
     if (typeof n.goal !== 'string' || n.goal.trim() === '') {
       problems.push(`goal node "${id}".goal must be a non-empty string`);
     }
@@ -448,6 +564,12 @@ export function validateDag(raw: unknown): V3Dag {
     const override = normOverride(n.override, `node "${id}"`, problems);
 
     const revisitTo = normRevisitTo(n.revisitTo, id, problems);
+    if (schemaVersion !== 2 && n.outputs !== undefined) {
+      problems.push(`goal node "${id}".outputs requires schemaVersion 2`);
+    }
+    const outputs = schemaVersion === 2
+      ? normalizeArtifactOutputs(n.outputs, `goal node "${id}"`, problems)
+      : undefined;
 
     nodes.push({
       id,
@@ -458,6 +580,7 @@ export function validateDag(raw: unknown): V3Dag {
       triggerRule,
       override,
       inputs,
+      outputs,
       timeoutSec,
       humanGate,
       resultSchema,
@@ -475,6 +598,37 @@ export function validateDag(raw: unknown): V3Dag {
         problems.push(`node "${node.id}".inputs references unknown node "${inp.from}"`);
       } else if (!node.depends.some((d) => d.from === inp.from)) {
         problems.push(`node "${node.id}".inputs.from "${inp.from}" must also be in depends`);
+      } else if (inp.output !== undefined) {
+        const source = nodes.find((candidate) => candidate.id === inp.from);
+        const outputs = source?.type === 'loop'
+          ? source.body?.nodes.find((bodyNode) => bodyNode.id === source.output?.from)?.outputs
+          : source?.outputs;
+        if (!outputs || !Object.prototype.hasOwnProperty.call(outputs, inp.output)) {
+          problems.push(
+            `node "${node.id}".inputs output ${JSON.stringify(inp.output)} is not declared by source "${inp.from}"`,
+          );
+        }
+      }
+    }
+    if (node.type === 'host') {
+      try {
+        for (const ref of collectV3HostBindingRefs(node.input)) {
+          if (ref.kind !== 'result') continue;
+          if (!ids.has(ref.nodeId)) {
+            problems.push(`host node "${node.id}".input references unknown result node "${ref.nodeId}"`);
+          } else if (!node.depends.some((dep) => dep.from === ref.nodeId)) {
+            problems.push(
+              `host node "${node.id}".input result source "${ref.nodeId}" must also be in depends`,
+            );
+          } else if (!node.depends.some((dep) => dep.from === ref.nodeId && dep.when === undefined)) {
+            problems.push(
+              `host node "${node.id}".input result source "${ref.nodeId}" must use an unconditional depends edge; ` +
+              'P0 host bindings do not accept omitted conditional inputs',
+            );
+          }
+        }
+      } catch {
+        // Per-node validation already reports the malformed binding.
       }
     }
     // revisitTo: each target must exist AND be a (transitive) ANCESTOR of this
@@ -496,11 +650,29 @@ export function validateDag(raw: unknown): V3Dag {
     }
   }
 
+  // Revisit can replay an entire downstream cone. External effects are not
+  // replay-safe under a fresh attempt/idempotency key, so P0 forbids a host in
+  // any cone that a goal is allowed to revisit.
+  for (const requester of nodes) {
+    for (const target of requester.revisitTo ?? []) {
+      const cone = downstreamCone(target, nodes);
+      for (const nodeId of cone) {
+        if (nodeByIdUnsafe(nodes, nodeId)?.type === 'host') {
+          problems.push(
+            `node "${requester.id}".revisitTo "${target}" would replay host node "${nodeId}"; ` +
+            'host nodes are not allowed in a revisit cone',
+          );
+        }
+      }
+    }
+  }
+
   // Edge-predicate validation (design §2): the source must be a goal node
   // declaring a resultSchema — loop sources are forbidden in P0 (a loop's
   // outward manifest belongs to its output-projection body node; put an
-  // explicit verifier goal after the loop instead), and host sources are
-  // unreachable (host itself is rejected above).  The predicate reuses the
+  // explicit verifier goal after the loop instead). Host sources are also
+  // forbidden because their fixed receipt schema has no authored resultSchema.
+  // The predicate reuses the
   // loop-exit validator: declared + required key, exactly one operator,
   // type-compatible, enum-reconciled.
   const nodeById = new Map(nodes.map((nn) => [nn.id, nn]));
@@ -541,11 +713,87 @@ export function validateDag(raw: unknown): V3Dag {
 
   if (problems.length > 0) throw new DagValidationError(problems);
 
-  const dag: V3Dag = { runId: raw.runId as string, nodes };
+  const dag: V3Dag = {
+    ...(raw.schemaVersion !== undefined ? { schemaVersion: schemaVersion as 1 | 2 } : {}),
+    runId: raw.runId as string,
+    nodes,
+  };
   // Cycle detection: topologicalOrder throws on a cycle.  Run it here so
   // loadDag rejects a cyclic DAG up front rather than mid-run.
   topologicalOrder(dag);
   return dag;
+}
+
+function validateHostInputShape(
+  executor: V3HostExecutorName,
+  input: unknown,
+  nodeId: string,
+  problems: string[],
+): void {
+  if (!isObject(input) || Object.prototype.hasOwnProperty.call(input, '$ref')) {
+    problems.push(`host node "${nodeId}".input must be an object with explicit executor fields`);
+    return;
+  }
+  const shape: Record<V3HostExecutorName, { required: string[]; allowed: string[] }> = {
+    'feishu-send': {
+      required: ['larkAppId', 'chatId', 'content'],
+      allowed: ['larkAppId', 'chatId', 'content', 'msgType'],
+    },
+    'feishu-reply': {
+      required: ['larkAppId', 'rootMessageId', 'content'],
+      allowed: ['larkAppId', 'rootMessageId', 'content', 'msgType', 'replyInThread'],
+    },
+    'botmux-schedule': {
+      required: ['name', 'schedule', 'prompt', 'workingDir', 'chatId', 'chatType', 'larkAppId'],
+      allowed: [
+        'name', 'schedule', 'prompt', 'workingDir', 'chatId',
+        'chatType', 'rootMessageId', 'scope', 'larkAppId', 'ownerOpenId', 'repeat', 'deliver',
+      ],
+    },
+  };
+  const expected = shape[executor];
+  if (!expected) return;
+  for (const field of expected.required) {
+    if (!Object.prototype.hasOwnProperty.call(input, field)) {
+      problems.push(`host node "${nodeId}".input.${field} is required for ${executor}`);
+    }
+  }
+  for (const field of Object.keys(input)) {
+    if (!expected.allowed.includes(field)) {
+      problems.push(`host node "${nodeId}".input.${field} is not supported by ${executor}`);
+    }
+  }
+  const identity: Record<string, string> =
+    executor === 'feishu-send' ? { larkAppId: 'larkAppId', chatId: 'chatId' }
+    : executor === 'feishu-reply' ? { larkAppId: 'larkAppId', rootMessageId: 'rootMessageId' }
+    : { larkAppId: 'larkAppId', chatId: 'chatId', chatType: 'chatType' };
+  if (executor === 'botmux-schedule' && Object.prototype.hasOwnProperty.call(input, 'rootMessageId')) {
+    identity.rootMessageId = 'rootMessageId';
+  }
+  if (
+    executor === 'botmux-schedule' &&
+    Object.prototype.hasOwnProperty.call(input, 'deliver') &&
+    input.deliver !== 'origin' &&
+    input.deliver !== 'new-topic'
+  ) {
+    problems.push(
+      `host node "${nodeId}".input.deliver must be "origin" or "new-topic"; ` +
+      'v3 P0 does not support local-only schedule delivery',
+    );
+  }
+  for (const [field, contextName] of Object.entries(identity)) {
+    const value = input[field];
+    if (
+      !isObject(value) ||
+      Object.keys(value).length !== 1 ||
+      value.$ref !== `context.${contextName}`
+    ) {
+      problems.push(
+        `host node "${nodeId}".input.${field} must be exact ` +
+        `{ "$ref": "context.${contextName}" }; IM host effects cannot target another bot/chat`,
+      );
+    }
+  }
 }
 
 function normHumanGate(raw: unknown, where: string, problems: string[]): V3HumanGate | null {
@@ -637,15 +885,6 @@ function parseUniqueStringList(
     values.push(item);
   }
   return problems.some((p) => p.startsWith(where)) ? undefined : values;
-}
-
-function normStringArray(v: unknown, where: string, problems: string[]): string[] {
-  if (v === undefined) return [];
-  if (!Array.isArray(v) || v.some((x) => typeof x !== 'string')) {
-    problems.push(`${where} must be an array of strings`);
-    return [];
-  }
-  return v as string[];
 }
 
 /** An edge predicate parked during the per-node pass: validated against the
@@ -755,9 +994,8 @@ function normTriggerRule(
 /**
  * Validate the per-node capability override (P2).  Fail-loud on unknown keys
  * (incl. the deferred `toolsSubset` — better an explicit "not yet" than a
- * field the runtime silently ignores).  `permissionMode` has no 'bypass'
- * value BY CONSTRUCTION — the no-escalation red line lives in the type, not
- * in a runtime check.
+ * field the runtime silently ignores). Permissions are not part of this
+ * object: workflow workers always require CLI bypass permission.
  */
 function normOverride(
   v: unknown,
@@ -769,11 +1007,16 @@ function normOverride(
     problems.push(`${where}.override must be an object`);
     return undefined;
   }
-  const known = new Set(['model', 'permissionMode', 'systemPromptAppend']);
+  const known = new Set(['model', 'systemPromptAppend']);
   const extra = Object.keys(v).filter((k) => !known.has(k));
   if (extra.length > 0) {
-    const hint = extra.includes('toolsSubset') ? ' (toolsSubset is deferred — P2b)' : '';
-    problems.push(`${where}.override has unsupported key(s): ${extra.join(', ')}${hint} (allowed: model, permissionMode, systemPromptAppend)`);
+    const hints: string[] = [];
+    if (extra.includes('toolsSubset')) hints.push('toolsSubset is deferred — P2b');
+    if (extra.includes('permissionMode')) {
+      hints.push('permissionMode was removed — v3 workflow workers always require CLI bypass; delete this key');
+    }
+    const hint = hints.length > 0 ? ` (${hints.join('; ')})` : '';
+    problems.push(`${where}.override has unsupported key(s): ${extra.join(', ')}${hint} (allowed: model, systemPromptAppend)`);
     return undefined;
   }
   const out: V3CapabilityOverride = {};
@@ -783,13 +1026,6 @@ function normOverride(
       return undefined;
     }
     out.model = v.model.trim();
-  }
-  if (v.permissionMode !== undefined) {
-    if (v.permissionMode !== 'inherit' && v.permissionMode !== 'restricted') {
-      problems.push(`${where}.override.permissionMode must be 'inherit' | 'restricted' (there is no 'bypass' — a node can only reduce privilege)`);
-      return undefined;
-    }
-    out.permissionMode = v.permissionMode;
   }
   if (v.systemPromptAppend !== undefined) {
     if (
@@ -803,7 +1039,7 @@ function normOverride(
     out.systemPromptAppend = v.systemPromptAppend;
   }
   if (Object.keys(out).length === 0) {
-    problems.push(`${where}.override must set at least one of model / permissionMode / systemPromptAppend`);
+    problems.push(`${where}.override must set at least one of model / systemPromptAppend`);
     return undefined;
   }
   return out;
@@ -860,6 +1096,26 @@ function ancestorsOf(nodeId: string, nodes: V3Node[]): Set<string> {
   return seen;
 }
 
+function downstreamCone(nodeId: string, nodes: V3Node[]): Set<string> {
+  const seen = new Set<string>([nodeId]);
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const node of nodes) {
+      if (seen.has(node.id)) continue;
+      if (node.depends.some((dep) => seen.has(dep.from))) {
+        seen.add(node.id);
+        changed = true;
+      }
+    }
+  }
+  return seen;
+}
+
+function nodeByIdUnsafe(nodes: V3Node[], nodeId: string): V3Node | undefined {
+  return nodes.find((node) => node.id === nodeId);
+}
+
 /**
  * Validate + normalize a loop node's composite fields.  Self-contained: the
  * body is its own little DAG (goal nodes only, internal refs, acyclic), and
@@ -871,6 +1127,7 @@ function normLoopFields(
   n: Record<string, unknown>,
   id: string,
   problems: string[],
+  schemaVersion: 1 | 2,
 ): Pick<V3LoopNode, 'maxIterations' | 'body' | 'exit' | 'feedback' | 'output' | 'onExhausted' | 'sessionPolicy'> | undefined {
   const where = `loop node "${id}"`;
   const before = problems.length;
@@ -949,10 +1206,16 @@ function normLoopFields(
     const bFromList = bdepends.map((d) => d.from);
     if (bFromList.includes(bid)) problems.push(`${where}.body node "${bid}" depends on itself`);
     if (new Set(bFromList).size !== bFromList.length) problems.push(`${where}.body node "${bid}".depends has duplicates`);
-    const binputs = normInputs(b.inputs, `${id}.body.${bid}`, problems);
+    const binputs = normInputs(b.inputs, `${id}.body.${bid}`, problems, schemaVersion);
     const btimeout = normTimeoutSec(b.timeoutSec, `${where}.body node "${bid}"`, problems);
     const bschema = normResultSchema(b.resultSchema, `${id}.body.${bid}`, problems);
     const boverride = normOverride(b.override, `${where}.body node "${bid}"`, problems);
+    if (schemaVersion !== 2 && b.outputs !== undefined) {
+      problems.push(`${where}.body node "${bid}".outputs requires schemaVersion 2`);
+    }
+    const boutputs = schemaVersion === 2
+      ? normalizeArtifactOutputs(b.outputs, `${where}.body node "${bid}"`, problems)
+      : undefined;
     bodyNodes.push({
       id: bid,
       type: 'goal',
@@ -961,6 +1224,7 @@ function normLoopFields(
       depends: bdepends,
       override: boverride,
       inputs: binputs,
+      outputs: boutputs,
       timeoutSec: btimeout,
       humanGate: null,
       resultSchema: bschema,
@@ -976,6 +1240,14 @@ function normLoopFields(
         problems.push(`${where}.body node "${bn.id}".inputs references unknown body node "${inp.from}"`);
       } else if (!bn.depends.some((d) => d.from === inp.from)) {
         problems.push(`${where}.body node "${bn.id}".inputs.from "${inp.from}" must also be in depends`);
+      } else if (inp.output !== undefined) {
+        const source = bodyNodes.find((candidate) => candidate.id === inp.from);
+        if (!source?.outputs || !Object.prototype.hasOwnProperty.call(source.outputs, inp.output)) {
+          problems.push(
+            `${where}.body node "${bn.id}".inputs output ${JSON.stringify(inp.output)} ` +
+            `is not declared by source "${inp.from}"`,
+          );
+        }
       }
     }
   }
@@ -1236,7 +1508,7 @@ function normResultSchema(v: unknown, id: string, problems: string[]): V3ResultS
   return schema;
 }
 
-function normInputs(v: unknown, id: string, problems: string[]): V3InputRef[] {
+function normInputs(v: unknown, id: string, problems: string[], schemaVersion: 1 | 2): V3InputRef[] {
   if (v === undefined) return [];
   if (!Array.isArray(v)) {
     problems.push(`node "${id}".inputs must be an array`);
@@ -1249,9 +1521,29 @@ function normInputs(v: unknown, id: string, problems: string[]): V3InputRef[] {
       problems.push(`node "${id}".inputs[${j}] must be { from: <nodeId>, select? }`);
       continue;
     }
-    const extra = Object.keys(inp).filter((k) => k !== 'from' && k !== 'select');
+    const extra = Object.keys(inp).filter((k) => k !== 'from' && k !== 'select' && k !== 'output');
     if (extra.length > 0) {
-      problems.push(`node "${id}".inputs[${j}] has unsupported key(s): ${extra.join(', ')} (allowed: from, select)`);
+      problems.push(`node "${id}".inputs[${j}] has unsupported key(s): ${extra.join(', ')} (allowed: from, select/output)`);
+      continue;
+    }
+    if (schemaVersion === 2) {
+      if (inp.select !== undefined) {
+        problems.push(`node "${id}".inputs[${j}].select is legacy-only; schemaVersion 2 must use output`);
+        continue;
+      }
+      if (inp.output === undefined) {
+        out.push({ from: inp.from });
+        continue;
+      }
+      if (typeof inp.output !== 'string' || !SEGMENT_RE.test(inp.output)) {
+        problems.push(`node "${id}".inputs[${j}].output must be a stable key matching ${SEGMENT_RE}`);
+        continue;
+      }
+      out.push({ from: inp.from, output: inp.output });
+      continue;
+    }
+    if (inp.output !== undefined) {
+      problems.push(`node "${id}".inputs[${j}].output requires schemaVersion 2`);
       continue;
     }
     if (inp.select === undefined) {
@@ -1280,27 +1572,6 @@ function normInputs(v: unknown, id: string, problems: string[]): V3InputRef[] {
     });
   }
   return out;
-}
-
-// ─── Loader ─────────────────────────────────────────────────────────────
-
-/** Read + JSON.parse + validate a `dag.json` at `path`.  Throws
- *  `DagValidationError` on a malformed graph and a plain `Error` on read /
- *  parse failure (so callers can distinguish "bad file" from "bad graph"). */
-export function loadDag(path: string): V3Dag {
-  let raw: string;
-  try {
-    raw = readFileSync(path, 'utf-8');
-  } catch (err) {
-    throw new Error(`v3: cannot read dag.json at ${path}: ${err instanceof Error ? err.message : String(err)}`);
-  }
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(raw);
-  } catch (err) {
-    throw new Error(`v3: dag.json at ${path} is not valid JSON: ${err instanceof Error ? err.message : String(err)}`);
-  }
-  return validateDag(parsed);
 }
 
 // ─── Topological order ─────────────────────────────────────────────────

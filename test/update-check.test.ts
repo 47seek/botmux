@@ -1,12 +1,23 @@
 import { describe, expect, it } from 'vitest';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import {
   parseVersion,
   isStableVersion,
+  isCanonicalStableVersion,
   compareVersions,
   isNewerVersion,
   selectReleasesSince,
   fetchLatestVersion,
+  selectRollbackVersions,
+  fetchRollbackVersions,
   fetchReleasesSince,
+  normalizeRegistryBase,
+  registryLatestUrl,
+  registryPackumentUrl,
+  resolveNpmRegistryBase,
+  spawnNpmConfigRegistry,
 } from '../src/core/update-check.js';
 
 describe('parseVersion', () => {
@@ -30,6 +41,18 @@ describe('isStableVersion', () => {
     expect(isStableVersion('2.85.1')).toBe(true);
     expect(isStableVersion('2.85.1-canary.0')).toBe(false);
     expect(isStableVersion('nope')).toBe(false);
+  });
+});
+
+describe('isCanonicalStableVersion', () => {
+  it('accepts only canonical X.Y.Z package versions', () => {
+    expect(isCanonicalStableVersion('3.0.0')).toBe(true);
+    expect(isCanonicalStableVersion('v3.0.0')).toBe(false);
+    expect(isCanonicalStableVersion('03.0.0')).toBe(false);
+    expect(isCanonicalStableVersion('3.0.0-canary.0')).toBe(false);
+    expect(isCanonicalStableVersion('3.0.0 ')).toBe(false);
+    expect(isCanonicalStableVersion('file:../botmux')).toBe(false);
+    expect(isCanonicalStableVersion('9007199254740992.0.0')).toBe(false);
   });
 });
 
@@ -112,16 +135,176 @@ function jsonResponse(status: number, body: unknown): Response {
   return { ok: status >= 200 && status < 300, status, json: async () => body } as unknown as Response;
 }
 
+describe('normalizeRegistryBase', () => {
+  it('normalizes trailing slash, trims, strips matching quotes', () => {
+    expect(normalizeRegistryBase('https://mirror.example.com')).toBe('https://mirror.example.com/');
+    expect(normalizeRegistryBase('https://mirror.example.com/')).toBe('https://mirror.example.com/');
+    expect(normalizeRegistryBase('  https://mirror.example.com/\n')).toBe('https://mirror.example.com/');
+    expect(normalizeRegistryBase('"https://mirror.example.com"')).toBe('https://mirror.example.com/');
+    expect(normalizeRegistryBase('https://proxy.example.com/npm/')).toBe('https://proxy.example.com/npm/');
+  });
+  it('takes the last http(s) line — wrapper shims may print banners before the value', () => {
+    expect(normalizeRegistryBase('nvm shim banner v1.2.3\nhttps://mirror.example.com\n')).toBe('https://mirror.example.com/');
+    expect(normalizeRegistryBase('https://first.example.com\nnot a url\n')).toBe('https://first.example.com/');
+    // Direction lock: with TWO valid http(s) lines the LAST one wins — a
+    // from-the-front scan (the tempting wrong direction) returns the first.
+    expect(normalizeRegistryBase('https://first.example.com\nhttps://last.example.com\n')).toBe('https://last.example.com/');
+  });
+  it('null on non-http(s) garbage (never a fetch target)', () => {
+    expect(normalizeRegistryBase('')).toBeNull();
+    expect(normalizeRegistryBase('not a url')).toBeNull();
+    expect(normalizeRegistryBase('javascript:alert(1)')).toBeNull();
+    expect(normalizeRegistryBase('ftp://example.com')).toBeNull();
+  });
+});
+
+describe('registryLatestUrl / registryPackumentUrl', () => {
+  it('builds the packument URLs from a base with or without slash', () => {
+    expect(registryLatestUrl('https://mirror.example.com/')).toBe('https://mirror.example.com/botmux/latest');
+    expect(registryLatestUrl('https://mirror.example.com')).toBe('https://mirror.example.com/botmux/latest');
+    expect(registryPackumentUrl('https://mirror.example.com/')).toBe('https://mirror.example.com/botmux');
+    expect(registryPackumentUrl('https://mirror.example.com')).toBe('https://mirror.example.com/botmux');
+  });
+});
+
 describe('fetchLatestVersion', () => {
+  // registry is pinned so the tests never spawn `npm config get registry`.
   it('returns the registry version', async () => {
-    const v = await fetchLatestVersion({ fetchImpl: async () => jsonResponse(200, { version: '2.85.1' }) });
+    const v = await fetchLatestVersion({ registry: 'https://registry.npmjs.org/', fetchImpl: async () => jsonResponse(200, { version: '2.85.1' }) });
     expect(v).toBe('2.85.1');
   });
   it('null on non-200 / malformed / unparseable / throw', async () => {
-    expect(await fetchLatestVersion({ fetchImpl: async () => jsonResponse(503, {}) })).toBeNull();
-    expect(await fetchLatestVersion({ fetchImpl: async () => jsonResponse(200, {}) })).toBeNull();
-    expect(await fetchLatestVersion({ fetchImpl: async () => jsonResponse(200, { version: 'latest' }) })).toBeNull();
-    expect(await fetchLatestVersion({ fetchImpl: async () => { throw new Error('offline'); } })).toBeNull();
+    expect(await fetchLatestVersion({ registry: 'https://registry.npmjs.org/', fetchImpl: async () => jsonResponse(503, {}) })).toBeNull();
+    expect(await fetchLatestVersion({ registry: 'https://registry.npmjs.org/', fetchImpl: async () => jsonResponse(200, {}) })).toBeNull();
+    expect(await fetchLatestVersion({ registry: 'https://registry.npmjs.org/', fetchImpl: async () => jsonResponse(200, { version: 'latest' }) })).toBeNull();
+    expect(await fetchLatestVersion({ registry: 'https://registry.npmjs.org/', fetchImpl: async () => { throw new Error('offline'); } })).toBeNull();
+  });
+  it('queries the configured registry — the same source npm install resolves through', async () => {
+    let seen = '';
+    // `unknown` param: assignable to typeof fetch regardless of lib typings.
+    const fetchImpl = async (url: unknown) => { seen = String(url); return jsonResponse(200, { version: '2.85.1' }); };
+    const v = await fetchLatestVersion({ registry: 'https://mirror.example.com', fetchImpl });
+    expect(v).toBe('2.85.1');
+    expect(seen).toBe('https://mirror.example.com/botmux/latest');
+  });
+  it('falls back to the public registry when the configured value is garbage', async () => {
+    let seen = '';
+    const fetchImpl = async (url: unknown) => { seen = String(url); return jsonResponse(200, { version: '2.85.1' }); };
+    await fetchLatestVersion({ registry: 'garbage', fetchImpl });
+    expect(seen).toBe('https://registry.npmjs.org/botmux/latest');
+  });
+});
+
+describe('resolveNpmRegistryBase cache policy', () => {
+  // Mutates the module-level cache in a fixed sequence from a clean start
+  // (no other test caches a successful read), so it must stay one `it`.
+  it('falls back on failure WITHOUT caching, then caches the first success for the process lifetime', async () => {
+    // 1. Failed read → public fallback, and the failure must not be cached…
+    expect(await resolveNpmRegistryBase(async () => '')).toBe('https://registry.npmjs.org/');
+    // 2. …because the next call retries and picks up the real config.
+    expect(await resolveNpmRegistryBase(async () => 'nvm banner\nhttps://cache-check.example.com\n')).toBe('https://cache-check.example.com/');
+    // 3. A successful read IS cached — a later config change is not re-read.
+    expect(await resolveNpmRegistryBase(async () => 'https://other.example.com/')).toBe('https://cache-check.example.com/');
+  });
+});
+
+describe('spawnNpmConfigRegistry hang resistance', () => {
+  // Real-spawn regression test for the wrapper-shim hang: the shim prints the
+  // value and exits, leaving a 60s grandchild holding the inherited stdout
+  // pipe — 'close' never fires. On the pre-fix code this promise hangs until
+  // the vitest timeout (red); the exit-grace settle resolves ~1s after the
+  // shim exits with the full output (green).
+  (process.platform === 'win32' ? it.skip : it)('settles when a shim leaves a pipe-holding grandchild', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-npm-shim-'));
+    const shim = join(dir, 'npm');
+    const pidFile = join(dir, 'grandchild.pid');
+    writeFileSync(shim, '#!/bin/sh\n'
+      + 'echo "https://hang-check.example.com"\n'
+      + 'sleep 60 &\n'
+      + `echo $! > "${pidFile}"\n`
+      + 'exit 0\n', { mode: 0o755 });
+    const oldPath = process.env.PATH;
+    process.env.PATH = `${dir}:${oldPath}`;
+    try {
+      const started = Date.now();
+      const raw = await spawnNpmConfigRegistry();
+      const elapsed = Date.now() - started;
+      expect(raw).toBe('https://hang-check.example.com\n');
+      // Grace path (~1s), not the 5s kill path and not a hang.
+      expect(elapsed).toBeLessThan(4_000);
+    } finally {
+      process.env.PATH = oldPath;
+      // Read the pid file in finally so the grandchild is cleaned up even
+      // when an assertion above failed (that's exactly the regression case).
+      try { process.kill(Number(readFileSync(pidFile, 'utf8').trim()), 'SIGKILL'); } catch { /* already gone */ }
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 15_000);
+});
+
+describe('rollback versions', () => {
+  const packument = {
+    versions: {
+      '2.84.0': { version: '2.84.0' },
+      '2.85.0': { version: '2.85.0' },
+      '2.85.1-canary.0': { version: '2.85.1-canary.0' },
+      '2.85.1': { version: '2.85.1' },
+      '3.0.0': { version: '3.0.0' },
+    },
+    time: {
+      '2.84.0': '2026-06-18T00:00:00Z',
+      '2.85.0': '2026-06-19T00:00:00Z',
+      '2.85.1': '2026-06-20T00:00:00Z',
+      '3.0.0': '2026-06-21T00:00:00Z',
+    },
+  };
+
+  it('selects only older stable versions, newest first, with publish dates', () => {
+    expect(selectRollbackVersions(packument, '3.0.0', 2)).toEqual([
+      { version: '2.85.1', publishedAt: '2026-06-20T00:00:00Z' },
+      { version: '2.85.0', publishedAt: '2026-06-19T00:00:00Z' },
+    ]);
+  });
+
+  it('does not offer the current, newer, or prerelease versions', () => {
+    expect(selectRollbackVersions(packument, '2.85.1').map(item => item.version)).toEqual(['2.85.0', '2.84.0']);
+  });
+
+  it('keeps a published version when its date is missing', () => {
+    expect(selectRollbackVersions({ versions: { '2.85.0': { version: '2.85.0' } } }, '3.0.0')).toEqual([
+      { version: '2.85.0', publishedAt: null },
+    ]);
+  });
+
+  it('rejects a packument entry whose manifest version does not match its key', () => {
+    expect(selectRollbackVersions({ versions: { '2.85.0': { version: 'file:../botmux' } } }, '3.0.0')).toEqual([]);
+  });
+
+  it('fetches and filters the registry packument', async () => {
+    const out = await fetchRollbackVersions('3.0.0', {
+      fetchImpl: async () => jsonResponse(200, packument),
+      max: 1,
+    });
+    expect(out).toEqual({
+      ok: true,
+      versions: [{ version: '2.85.1', publishedAt: '2026-06-20T00:00:00Z' }],
+    });
+  });
+
+  it('rollback packument stays PUBLIC — same source the pinned rollback install resolves from', async () => {
+    let seen = '';
+    const fetchImpl = async (url: unknown) => { seen = String(url); return jsonResponse(200, packument); };
+    await fetchRollbackVersions('3.0.0', { fetchImpl });
+    expect(seen).toBe('https://registry.npmjs.org/botmux');
+  });
+
+  it('reports registry and malformed-response failures', async () => {
+    expect(await fetchRollbackVersions('3.0.0', { fetchImpl: async () => jsonResponse(503, {}) }))
+      .toEqual({ ok: false, versions: [] });
+    expect(await fetchRollbackVersions('3.0.0', { fetchImpl: async () => jsonResponse(200, {}) }))
+      .toEqual({ ok: false, versions: [] });
+    expect(await fetchRollbackVersions('3.0.0', { fetchImpl: async () => { throw new Error('offline'); } }))
+      .toEqual({ ok: false, versions: [] });
   });
 });
 
@@ -132,6 +315,51 @@ describe('fetchReleasesSince', () => {
     expect(out.ok).toBe(true);
     expect(out.releases.map(r => r.version)).toEqual(['2.85.1']);
   });
+
+  it('adds GitHub bearer auth when githubToken is configured', async () => {
+    let auth: string | null = null;
+    await fetchReleasesSince('2.85.0', {
+      auth: { env: { GITHUB_TOKEN: ' ghp_secret ' }, envFilePath: null },
+      fetchImpl: async (_input, init) => {
+        const headers = init?.headers as Record<string, string> | undefined;
+        auth = headers?.Authorization ?? headers?.authorization ?? null;
+        return jsonResponse(200, []);
+      },
+    });
+    expect(auth).toBe('Bearer ghp_secret');
+  });
+
+  it('omits GitHub bearer auth when githubToken is blank', async () => {
+    let auth: string | null = 'present';
+    await fetchReleasesSince('2.85.0', {
+      auth: { env: { GITHUB_TOKEN: '   ' }, envFilePath: null },
+      fetchImpl: async (_input, init) => {
+        const headers = init?.headers as Record<string, string> | undefined;
+        auth = headers?.Authorization ?? headers?.authorization ?? null;
+        return jsonResponse(200, []);
+      },
+    });
+    expect(auth).toBeNull();
+  });
+
+  it('uses env-file auth fallback when process env is unset', async () => {
+    let auth: string | null = null;
+    await fetchReleasesSince('2.85.0', {
+      auth: {
+        env: {},
+        envFilePath: '/tmp/global.env',
+        fileExists: () => true,
+        readTextFile: () => 'GITHUB_TOKEN=ghp_from_file\n',
+      },
+      fetchImpl: async (_input, init) => {
+        const headers = init?.headers as Record<string, string> | undefined;
+        auth = headers?.Authorization ?? headers?.authorization ?? null;
+        return jsonResponse(200, []);
+      },
+    });
+    expect(auth).toBe('Bearer ghp_from_file');
+  });
+
   it('ok:true with an empty list when already latest (genuinely empty)', async () => {
     const out = await fetchReleasesSince('2.85.1', { fetchImpl: async () => jsonResponse(200, [{ tag_name: 'v2.85.1' }]) });
     expect(out).toMatchObject({ ok: true, releases: [] });

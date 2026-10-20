@@ -50,6 +50,9 @@ describe('buildArchitectGoal', () => {
     expect(goal).toContain('/r/spec.md');
     expect(goal).toContain('dag.json');
     expect(goal).toContain('architect-notes.md');
+    expect(goal).toContain('$BOTMUX_GOAL_OUTPUT_DIR');
+    expect(goal).toContain('$BOTMUX_GOAL_MANIFEST_PATH');
+    expect(goal).toMatch(/relative to.*BOTMUX_GOAL_OUTPUT_DIR/i);
     expect(goal).toContain('Do not start or run the workflow');
     expect(goal).toContain('The host will validate dag.json');
   });
@@ -73,18 +76,21 @@ describe('buildArchitectGoal', () => {
     expect(goal).toContain('every value reaches some sink');
   });
 
-  // NOTE (codex nit #18): this asserts the architect PROMPT *teaches* the
-  // capability/override rules — it is NOT proof that downgrade is *enforced*.
-  // The actual enforcement is tested elsewhere: validateDag (dag.ts suite,
-  // type-level "no bypass") + runtime wiring (v3-runtime.test.ts asserts the
-  // restricted snapshot reaches `req.botSnapshot.disableCliBypass`).
-  it('teaches per-node capability override: model 改道 / restricted 降权 / 无 bypass', () => {
+  it('teaches per-node capability override while fixing permission posture to bypass', () => {
     const goal = buildArchitectGoal('/r/spec.md', '/r/spec.json');
     expect(goal).toContain('Per-node capability override');
-    expect(goal).toContain('never escalate');
-    expect(goal).toContain('permissionMode: "restricted"');
-    expect(goal).toContain('NO "bypass" value');
+    expect(goal).toContain('every workflow worker requires CLI bypass permissions');
+    expect(goal).toContain('never emit `permissionMode`');
     expect(goal).toContain('systemPromptAppend');
+  });
+
+  it('只生成 schemaVersion 2，并用稳定 output key 编排公开产物', () => {
+    const goal = buildArchitectGoal('/r/spec.md', '/r/spec.json');
+    expect(goal).toContain('"schemaVersion": 2');
+    expect(goal).toContain('"outputs"');
+    expect(goal).toContain('"output": "<stable-output-key>"');
+    expect(goal).toContain('Do not emit legacy `select.name` or `select.path`');
+    expect(goal).toContain('artifact contract table');
   });
 });
 

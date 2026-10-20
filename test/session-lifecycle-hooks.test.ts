@@ -47,6 +47,9 @@ vi.mock('../src/config.js', () => ({
 }));
 
 vi.mock('../src/services/session-store.js', () => ({
+  registerSessionBridgeSendMarkerCleanupFence: vi.fn(),
+  cleanupSessionBridgeSendMarkers: vi.fn(),
+  cleanupSessionBridgeSendMarkersNow: vi.fn(),
   closeSession: vi.fn(),
   updateSession: vi.fn(),
   updateSessionPid: vi.fn(),
@@ -103,7 +106,15 @@ import {
   emitSessionStateTransitionHook,
   setSessionLifecycleShutdown,
 } from '../src/services/session-lifecycle-hooks.js';
-import { initWorkerPool, __testOnly_setupWorkerHandlers } from '../src/core/worker-pool.js';
+import {
+  detachWorkerForTransfer,
+  updateCodexAppEffort,
+  initWorkerPool,
+  __testOnly_setupWorkerHandlers,
+} from '../src/core/worker-pool.js';
+import { dashboardEventBus } from '../src/core/dashboard-events.js';
+import { getBot } from '../src/bot-registry.js';
+import * as sessionStore from '../src/services/session-store.js';
 import type { DaemonSession } from '../src/core/types.js';
 
 function makeFakeWorker() {
@@ -290,32 +301,123 @@ describe('worker-pool lifecycle hook integration', () => {
     }));
   });
 
-  it('emits session.requires_attention from tui_prompt and user_notify IPC', async () => {
+  it('mutes only the Lark push for codex_app_no_progress when the live bot opts out', async () => {
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const botWith = (noProgressNotify?: { enabled: boolean }) => ({
+      config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code', ...(noProgressNotify ? { noProgressNotify } : {}) },
+      resolvedAllowedUsers: [],
+      botOpenId: 'ou_bot',
+      botName: 'TestBot',
+    });
+    const restoreGetBot = vi.mocked(getBot).mockImplementation(() => botWith() as never);
+
     const worker = makeFakeWorker();
     const ds = makeDs({ worker });
     __testOnly_setupWorkerHandlers(ds, worker);
 
-    worker.emit('message', {
-      type: 'tui_prompt',
-      description: 'Approve command?',
-      options: [{ text: 'Yes', selected: false }],
-      multiSelect: false,
-    });
+    // Muted: the attention hook still fires, but no Lark reply is sent.
+    vi.mocked(getBot).mockImplementation(() => botWith({ enabled: false }) as never);
+    worker.emit('message', { type: 'user_notify', kind: 'codex_app_no_progress', message: 'nudge stalled' });
+    await flush();
+    expect(emitHookEventMock).toHaveBeenCalledWith('session.requires_attention', expect.objectContaining({
+      reason: 'user_notify',
+      message: 'nudge stalled',
+    }));
+    expect(sessionReply).not.toHaveBeenCalled();
+
+    // Unmuted (config read is live): the same nudge goes through.
+    vi.mocked(getBot).mockImplementation(() => botWith({ enabled: true }) as never);
+    worker.emit('message', { type: 'user_notify', kind: 'codex_app_no_progress', message: 'nudge delivered' });
+    await flush();
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+
+    // Plain user_notify without the kind is never affected by the opt-out.
+    vi.mocked(getBot).mockImplementation(() => botWith({ enabled: false }) as never);
+    worker.emit('message', { type: 'user_notify', message: 'unrelated warning' });
+    await flush();
+    expect(sessionReply).toHaveBeenCalledTimes(2);
+
+    restoreGetBot.mockRestore();
+  });
+
+  it('emits session.requires_attention from user_notify IPC', async () => {
+    const worker = makeFakeWorker();
+    const ds = makeDs({ worker });
+    __testOnly_setupWorkerHandlers(ds, worker);
+
     worker.emit('message', { type: 'user_notify', message: 'Need manual input' });
     await flush();
 
-    expect(emitHookEventMock).toHaveBeenCalledWith('session.requires_attention', expect.objectContaining({
-      reason: 'tui_prompt',
-      description: 'Approve command?',
-      optionsCount: 1,
-    }));
     expect(emitHookEventMock).toHaveBeenCalledWith('session.requires_attention', expect.objectContaining({
       reason: 'user_notify',
       message: 'Need manual input',
     }));
   });
 
-  it('does not emit lifecycle hooks for receiver TUI, notifications, status, or exit', async () => {
+  it('routes accepted steer feedback to its exact turn without raising attention', async () => {
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const worker = makeFakeWorker();
+    const ds = makeDs({ worker });
+    __testOnly_setupWorkerHandlers(ds, worker);
+
+    worker.emit('message', {
+      type: 'steer_accepted',
+      appTurnId: 'app-turn-accepted',
+      turnId: 'om_exact_steer_message',
+    });
+    await flush();
+
+    expect(sessionReply).toHaveBeenCalledWith(
+      'om_root',
+      '收到，引导成功',
+      'text',
+      'app_test',
+      'om_exact_steer_message',
+      { sourceSessionId: 'sid-lifecycle-test' },
+    );
+    expect(emitHookEventMock).not.toHaveBeenCalledWith(
+      'session.requires_attention',
+      expect.anything(),
+    );
+  });
+
+  it('ignores accepted steer feedback from a replaced worker generation', async () => {
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const worker = makeFakeWorker();
+    const replacement = makeFakeWorker();
+    const ds = makeDs({ worker: replacement });
+    __testOnly_setupWorkerHandlers(ds, worker);
+
+    worker.emit('message', {
+      type: 'steer_accepted',
+      appTurnId: 'app-turn-stale',
+      turnId: 'om_stale',
+    });
+    await flush();
+
+    expect(sessionReply).not.toHaveBeenCalled();
+    expect(emitHookEventMock).not.toHaveBeenCalled();
+  });
+
+  it('does not emit lifecycle hooks for receiver notifications, status, or exit', async () => {
     const worker = makeFakeWorker();
     const ds = makeDs({ worker, lastScreenStatus: 'working' });
     ds.session.vcMeetingReceiver = {
@@ -326,12 +428,6 @@ describe('worker-pool lifecycle hook integration', () => {
     };
     __testOnly_setupWorkerHandlers(ds, worker);
 
-    worker.emit('message', {
-      type: 'tui_prompt',
-      description: 'Approve meeting action?',
-      options: [{ text: 'Yes', selected: false }],
-      multiSelect: false,
-    });
     worker.emit('message', { type: 'user_notify', message: 'meeting-derived diagnostic' });
     worker.emit('message', { type: 'screen_update', content: 'transcript', status: 'idle' });
     worker.emit('exit', 1);
@@ -352,6 +448,186 @@ describe('worker-pool lifecycle hook integration', () => {
       reason: 'exit_code_1',
       code: 1,
     }));
+  });
+
+  it('reconciles a remote rebuild when its backend exits after worker ready', async () => {
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const worker = makeFakeWorker();
+    const ds = makeDs({ worker });
+    ds.session.cliId = 'remote-runner';
+    ds.session.backendType = 'remote-runner';
+    const reconcile = vi.fn(() => true);
+    __testOnly_setupWorkerHandlers(ds, worker, {
+      ready: true,
+      failureNotified: false,
+      onRemoteBackendStartupExit: reconcile,
+    } as any);
+
+    worker.emit('message', {
+      type: 'claude_exit',
+      code: 1,
+      signal: null,
+    });
+    await flush();
+
+    expect(reconcile).toHaveBeenCalledTimes(1);
+    expect(worker.kill).toHaveBeenCalledWith('SIGTERM');
+    expect(ds.worker).toBeNull();
+    expect(sessionReply).not.toHaveBeenCalled();
+  });
+
+  it('disarms remote rebuild reconciliation after backend state is durable', async () => {
+    const worker = makeFakeWorker();
+    const ds = makeDs({ worker });
+    ds.session.cliId = 'remote-runner';
+    ds.session.backendType = 'remote-runner';
+    ds.session.remoteBackendState = {
+      version: 1,
+      provider: 'reference',
+      generation: 2,
+    };
+    const reconcile = vi.fn(() => true);
+    const startupState = {
+      ready: true,
+      failureNotified: false,
+      onRemoteBackendStartupExit: reconcile,
+    };
+    __testOnly_setupWorkerHandlers(ds, worker, startupState as any);
+
+    worker.emit('message', {
+      type: 'remote_backend_state',
+      state: {
+        version: 1,
+        provider: 'reference',
+        generation: 3,
+        remoteSessionId: 'replacement',
+      },
+    });
+    await flush();
+
+    expect(ds.session.remoteBackendState?.generation).toBe(3);
+    expect(startupState.onRemoteBackendStartupExit).toBeUndefined();
+    expect(reconcile).not.toHaveBeenCalled();
+  });
+
+  it('keeps remote rebuild reconciliation armed for the initial same-generation state replay', async () => {
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const worker = makeFakeWorker();
+    const ds = makeDs({ worker });
+    ds.session.cliId = 'remote-runner';
+    ds.session.backendType = 'remote-runner';
+    ds.session.remoteBackendState = {
+      version: 1,
+      provider: 'reference',
+      generation: 2,
+    };
+    const reconcile = vi.fn(() => true);
+    const startupState = {
+      ready: true,
+      failureNotified: false,
+      onRemoteBackendStartupExit: reconcile,
+    };
+    __testOnly_setupWorkerHandlers(ds, worker, startupState as any);
+
+    worker.emit('message', {
+      type: 'remote_backend_state',
+      state: {
+        version: 1,
+        provider: 'reference',
+        generation: 2,
+      },
+    });
+    await flush();
+
+    expect(startupState.onRemoteBackendStartupExit).toBe(reconcile);
+    expect(reconcile).not.toHaveBeenCalled();
+
+    worker.emit('message', {
+      type: 'claude_exit',
+      code: 1,
+      signal: null,
+    });
+    await flush();
+
+    expect(reconcile).toHaveBeenCalledTimes(1);
+    expect(worker.kill).toHaveBeenCalledWith('SIGTERM');
+    expect(ds.worker).toBeNull();
+    expect(sessionReply).not.toHaveBeenCalled();
+  });
+
+  it('clears the persisted terminal port and Dashboard proxy state on worker exit', () => {
+    const worker = makeFakeWorker();
+    const ds = makeDs({ worker, workerPort: 9999 });
+    ds.session.webPort = 9999;
+    __testOnly_setupWorkerHandlers(ds, worker);
+
+    worker.emit('exit', 1);
+
+    expect(ds.workerPort).toBe(null);
+    expect(ds.session.webPort).toBeUndefined();
+    expect(sessionStore.updateSession).toHaveBeenCalledWith(ds.session);
+    expect(dashboardEventBus.publish).toHaveBeenCalledWith({
+      type: 'session.update',
+      body: {
+        sessionId: 'sid-lifecycle-test',
+        patch: { webPort: null, workerPid: null },
+      },
+    });
+  });
+
+  it('suppresses external exit events for an intentional transfer detach', async () => {
+    const onWorkerExit = vi.fn();
+    initWorkerPool({
+      sessionReply: vi.fn(async () => 'om_reply'),
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+      onWorkerExit,
+    });
+    const worker = makeFakeWorker();
+    worker.connected = true;
+    worker.exitCode = null;
+    worker.signalCode = null;
+    worker.send = vi.fn((
+      message: { type: string; requestId?: string },
+      callback?: (error: Error | null) => void,
+    ) => {
+      callback?.(null);
+      if (message.type !== 'detach_for_transfer') return;
+      queueMicrotask(() => {
+        worker.emit('message', {
+          type: 'transfer_detached',
+          requestId: message.requestId,
+        });
+        worker.exitCode = 0;
+        worker.emit('exit', 0, null);
+      });
+    });
+    const ds = makeDs({ worker, lastScreenStatus: 'idle' });
+    __testOnly_setupWorkerHandlers(ds, worker);
+
+    await expect(detachWorkerForTransfer(ds, { timeoutMs: 100 })).resolves.toBe(true);
+
+    expect(onWorkerExit).not.toHaveBeenCalled();
+    expect(emitHookEventMock).not.toHaveBeenCalledWith(
+      'session.exit',
+      expect.anything(),
+    );
+    expect(dashboardEventBus.publish).not.toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'session.exited' }),
+    );
   });
 
   it('forwards exact durable_expiry_ready evidence with worker generation', async () => {
@@ -383,5 +659,81 @@ describe('worker-pool lifecycle hook integration', () => {
       workerGeneration: 1,
       disposition: 'queued_removed',
     });
+  });
+});
+
+describe('Codex App effort IPC', () => {
+  it('correlates the receipt while keeping a busy business turn intact', async () => {
+    const worker = makeFakeWorker();
+    const ds = makeDs({ worker, workerReady: true, cliReady: true, lastScreenStatus: 'working' });
+    ds.session.cliId = 'codex-app';
+    const before = { ...ds };
+    const pending = updateCodexAppEffort(ds, 'high');
+    const request = worker.send.mock.calls[0][0];
+    expect(request).toMatchObject({ type: 'codex_app_effort', effort: 'high' });
+    worker.emit('message', { type: 'codex_app_effort_result', requestId: 'another-request', status: 'error' });
+    expect(worker.listenerCount('message')).toBe(1);
+    worker.emit('message', { type: 'codex_app_effort_result', requestId: request.requestId, status: 'applied' });
+    expect(await pending).toMatchObject({ status: 'applied' });
+    expect(worker.listenerCount('message')).toBe(0);
+    expect(worker.listenerCount('exit')).toBe(0);
+    expect(worker.send).toHaveBeenCalledTimes(1);
+    expect(ds).toEqual(before);
+  });
+
+  it.each(['timeout', 'exit', 'replacement'] as const)('cleans up on %s without accepting a stale success', async mode => {
+    vi.useFakeTimers();
+    try {
+      const worker = makeFakeWorker();
+      const ds = makeDs({ worker, workerReady: true, cliReady: true });
+      ds.session.cliId = 'codex-app';
+      const pending = updateCodexAppEffort(ds, 'high', 100);
+      const request = worker.send.mock.calls[0][0];
+      if (mode === 'timeout') await vi.advanceTimersByTimeAsync(100);
+      else if (mode === 'exit') worker.emit('exit', 1);
+      else {
+        ds.worker = makeFakeWorker();
+        worker.emit('message', { type: 'codex_app_effort_result', requestId: request.requestId, status: 'applied' });
+      }
+      expect(await pending).toEqual({ status: 'error' });
+      expect(worker.listenerCount('message')).toBe(0);
+      expect(worker.listenerCount('exit')).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it.each(['codex-app', 'codex'] as const)('uses the frozen %s CLI before session and init config', async cliId => {
+    const worker = makeFakeWorker();
+    const ds = makeDs({ worker, workerReady: true, cliReady: true });
+    ds.session.cliId = cliId === 'codex-app' ? 'codex' : 'codex-app';
+    ds.initConfig = { cliId: ds.session.cliId } as NonNullable<DaemonSession['initConfig']>;
+    ds.session.cliLaunchSnapshot = {
+      version: 1, state: 'pending', entryId: cliId, cliId, cliRuntime: null,
+      cliPathOverride: null, wrapperCli: null, model: null, reasoningEffort: null,
+      launchShell: null, startupCommands: [],
+    };
+    const pending = updateCodexAppEffort(ds, 'high');
+    if (cliId === 'codex-app') {
+      const request = worker.send.mock.calls[0][0];
+      worker.emit('message', {
+        type: 'codex_app_effort_result', requestId: request.requestId,
+        status: 'future_only', reason: 'step_model_switching_disabled',
+      });
+      expect(await pending).toMatchObject({ status: 'future_only', reason: 'step_model_switching_disabled' });
+    } else {
+      expect(await pending).toEqual({ status: 'unavailable' });
+      expect(worker.send).not.toHaveBeenCalled();
+    }
+  });
+
+  it('rejects unready and ordinary CLI sessions before sending', async () => {
+    const worker = makeFakeWorker();
+    const ds = makeDs({ worker, workerReady: true, cliReady: true });
+    expect(await updateCodexAppEffort(ds, 'high')).toEqual({ status: 'unavailable' });
+    ds.session.cliId = 'codex-app';
+    ds.cliReady = false;
+    expect(await updateCodexAppEffort(ds, 'high')).toEqual({ status: 'unavailable' });
+    expect(worker.send).not.toHaveBeenCalled();
   });
 });

@@ -32,12 +32,11 @@ async function copyStatic() {
   await Promise.all([
     cp(join(webSrc, 'index.html'), join(outDir, 'index.html')),
     cp(join(webSrc, 'style.css'), join(outDir, 'style.css')),
+    cp(join(webSrc, 'design-tokens.css'), join(outDir, 'design-tokens.css')),
     cp(join(webSrc, 'brand-logo.png'), join(outDir, 'brand-logo.png')),
     cp(join(webSrc, 'favicon.png'), join(outDir, 'favicon.png')),
     cp(join(webSrc, 'apple-touch-icon.png'), join(outDir, 'apple-touch-icon.png')),
-    cp(join(webSrc, 'terminal-replay.html'), join(outDir, 'terminal-replay.html')),
     copyIfExists(join(webSrc, 'skins'), join(outDir, 'skins'), { recursive: true }),
-    copyIfExists(join(webSrc, 'game'), join(outDir, 'game'), { recursive: true }),
   ]);
 }
 

@@ -1,5 +1,6 @@
 import { readdirSync, readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
+import { cssRuleBody } from './helpers/css-rule.js';
 
 function dashboardSource(file: string): string {
   return readFileSync(new URL(`../src/dashboard/web/${file}`, import.meta.url), 'utf8');
@@ -18,10 +19,15 @@ describe('dashboard master feature integration', () => {
     const messages = dashboardSource('i18n.ts');
 
     expect(types).toContain('codexAppCleanInput?: boolean');
-    expect(page).toContain('<CodexAppDisplaySection bot={bot} putCardPref={putCardPref} />');
+    expect(page).toContain('<CodexAppDisplaySection bot={bot} putCardPref={putCardPref} patchBot={patchBot} />');
     expect(page).toContain('dataAction="toggle-codex-app-clean-input"');
     expect(messages).toContain('默认关闭，保持原有兼容行为');
     expect(messages).toContain('still reach the model, but move to hidden context');
+    // #1162: the no-progress nudge toggle + threshold input stay wired in too.
+    expect(types).toContain('noProgressNotify?: import(\'../../services/no-progress-notify-policy.js\').NoProgressNotifyPolicy | null');
+    expect(page).toContain('dataAction="toggle-codex-app-no-progress"');
+    expect(page).toContain('data-action="save-no-progress-timeout"');
+    expect(page).toContain('/no-progress-notify`');
   });
 
   it('keeps substitute mode configurable from the React bot defaults page', () => {
@@ -32,6 +38,8 @@ describe('dashboard master feature integration', () => {
     expect(page).toContain('<SubstituteModeSection bot={bot} patchBot={patchBot} />');
     expect(page).toContain('/substitute-mode`');
     expect(page).toContain('dataAction="toggle-substitute-mode"');
+    expect(page).toContain('dataAction="toggle-substitute-topic-groups"');
+    expect(page).toContain('dataAction="toggle-substitute-topic-active"');
     expect(page).toContain('data-input="substituteTargets"');
     expect(page).toContain('data-action="add-substitute-target"');
     expect(page).toContain('data-action="remove-substitute-target"');
@@ -86,7 +94,9 @@ describe('dashboard master feature integration', () => {
     // DropdownMenu is shared by Bots, Roles, Settings, and Sessions. Its disabled
     // appearance belongs to the shared selector rather than a page-specific override.
     expect(css).toContain('.sect-sort-menu.is-disabled > summary,');
-    expect(css).toMatch(/\.sect-sort-menu\.is-disabled > summary:hover \{[\s\S]*?cursor: not-allowed;[\s\S]*?opacity: 0\.62;/);
+    const disabledSummary = cssRuleBody(css, '.sect-sort-menu.is-disabled > summary:hover');
+    expect(disabledSummary).toMatch(/cursor:\s*not-allowed;/);
+    expect(disabledSummary).toMatch(/opacity:\s*0\.62;/);
     expect(css).not.toContain('.kanban-team-menu.is-disabled > summary');
   });
 
