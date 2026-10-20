@@ -239,6 +239,10 @@ export interface BytedCliIdentity extends TurnBound {
   cloudJwt: string;
   /** Optional: only present once a Codebase JWT has been minted for this person. */
   codeJwt?: string;
+  /** Optional Codebase user for git Author/Committer attribution. Same source
+   *  as the DevMind reported user id, keeping commit and report identity equal. */
+  codebaseUsername?: string;
+  codebaseEmail?: string;
   /** See {@link LarkCliIdentity.openId}. */
   openId?: string;
 }
@@ -292,6 +296,12 @@ const TURN_VAR = 'BOTMUX_IDENTITY_TURN';
 /** Open id these credentials act for. Compared with the worker's live-turn
  *  caller when the turn ids disagree: equal principals keep the credential. */
 const OPEN_ID_VAR = 'BOTMUX_IDENTITY_OPEN_ID';
+/** Codebase user of the published identity, consumed by the login-shell shim to
+ *  export per-turn GIT_AUTHOR/COMMITTER so commit attribution follows the
+ *  sender. Mirrors the DevMind reported user id (both come from
+ *  `bytedcli codebase user get`). */
+export const CODEBASE_USERNAME_VAR = 'BOTMUX_CODEBASE_USERNAME';
+export const CODEBASE_EMAIL_VAR = 'BOTMUX_CODEBASE_EMAIL';
 /** Per-person HOME for the device-code lark-cli identity. Scoped to the child
  *  exec only — the wrapper sets it inline, never inheriting a parent value. */
 const HOME_VAR = 'BOTMUX_IDENTITY_HOME';
@@ -337,6 +347,8 @@ export function renderIdentityEnv(identity: CliIdentity): string {
   } else {
     pairs.push([MODE_VAR, 'user'], ['BYTEDCLI_USER_CLOUD_JWT', identity.cloudJwt]);
     if (identity.codeJwt) pairs.push(['BYTEDCLI_USER_CODE_JWT', identity.codeJwt]);
+    if (identity.codebaseUsername) pairs.push([CODEBASE_USERNAME_VAR, identity.codebaseUsername]);
+    if (identity.codebaseEmail) pairs.push([CODEBASE_EMAIL_VAR, identity.codebaseEmail]);
   }
   if (identity.turnId) pairs.push([TURN_VAR, identity.turnId]);
   if ('openId' in identity && identity.openId) pairs.push([OPEN_ID_VAR, identity.openId]);
@@ -789,6 +801,95 @@ export function renderGitAskpassScript(bytedcliPath: string, exchangeUrl?: strin
 /** Filename of the git askpass helper inside a session's wrapper dir. */
 export const GIT_ASKPASS_BASENAME = 'botmux-git-askpass';
 
+/** Git subcommands that create commits. These must never run without the
+ *  sender's identity, or the commit is mis-attributed to the machine. Read-only
+ *  and index subcommands are left alone so a turn lacking identity can still
+ *  inspect a repo; network commands are independently fail-closed by the
+ *  per-turn credential helper. */
+const GIT_COMMIT_SUBCOMMANDS = new Set([
+  'commit', 'merge', 'rebase', 'cherry-pick', 'revert', 'am', 'apply',
+]);
+
+/**
+ * Render the managed `git` wrapper.
+ *
+ * Closes the last attribution gap: askpass/insteadOf already make a *push*
+ * authenticate as the sender, but the commit's Author/Committer were still
+ * whatever the agent or the machine's config set. This wrapper resolves the
+ * CURRENT turn's validated identity through the same runner as the other
+ * wrappers, exports GIT_AUTHOR/COMMITTER from the Codebase user (identical to
+ * the DevMind reported user id), then execs the real git.
+ *
+ * No identity + a commit-creating/push command ⇒ refused (exit 77); read-only
+ * commands pass through untouched.
+ */
+export function renderGitWrapperScript(
+  realGitPath: string,
+  identityResolver: readonly string[],
+): string {
+  const resolve = [...identityResolver, 'bytedcli'].map(shellSingleQuote).join(' ');
+  return [
+    '#!/bin/sh',
+    '# botmux trigger-user git wrapper — generated, do not edit.',
+    '# Run git with the CURRENT turn sender as Author/Committer.',
+    '# Transport auth (HTTPS + per-turn Codebase JWT) is inherited from',
+    '# GIT_CONFIG_*/GIT_ASKPASS in the session environment.',
+    '',
+    '# Find the subcommand, skipping global options that take a value.',
+    '__botmux_sub=""; __botmux_skip=0',
+    'for __botmux_a in "$@"; do',
+    '  if [ "$__botmux_skip" = 1 ]; then __botmux_skip=0; continue; fi',
+    '  case "$__botmux_a" in',
+    '    -C|--git-dir|--work-tree|--namespace|-c|--config-env) __botmux_skip=1; continue ;;',
+    '    -*) continue ;;',
+    '    *) __botmux_sub="$__botmux_a"; break ;;',
+    '  esac',
+    'done',
+    '__botmux_needs_identity=0',
+    'case "$__botmux_sub" in',
+    [...GIT_COMMIT_SUBCOMMANDS].map(s => `  ${s}) __botmux_needs_identity=1 ;;`).join('\n'),
+    '  push) __botmux_needs_identity=1 ;;',
+    'esac',
+    '',
+    '# Resolve the validated, current-turn credential path (fail closed).',
+    `__botmux_cred="$(${resolve})" || {`,
+    '  if [ "$__botmux_needs_identity" = 1 ]; then',
+    "    echo 'botmux: git 操作需要本轮发起人的身份，但当前没有可用凭证，命令未执行。请发送 /login bytedcli 完成授权后重试。' >&2",
+    '    exit 77',
+    '  fi',
+    `  exec ${shellSingleQuote(realGitPath)} "$@"`,
+    '}',
+    "if [ -n \"$__botmux_cred\" ] && [ -f \"$__botmux_cred\" ]; then . \"$__botmux_cred\"; fi",
+    'if [ "${BOTMUX_IDENTITY_MODE:-}" != "user" ] || [ -z "${BOTMUX_CODEBASE_USERNAME:-}" ]; then',
+    '  if [ "$__botmux_needs_identity" = 1 ]; then',
+    "    echo 'botmux: git 提交/推送身份缺失或与本轮发起人不匹配，命令未执行。' >&2",
+    '    exit 77',
+    '  fi',
+    `  exec ${shellSingleQuote(realGitPath)} "$@"`,
+    'fi',
+    'export GIT_AUTHOR_NAME="$BOTMUX_CODEBASE_USERNAME"',
+    'export GIT_AUTHOR_EMAIL="${BOTMUX_CODEBASE_EMAIL:-$BOTMUX_CODEBASE_USERNAME@bytedance.com}"',
+    'export GIT_COMMITTER_NAME="$BOTMUX_CODEBASE_USERNAME"',
+    'export GIT_COMMITTER_EMAIL="$GIT_AUTHOR_EMAIL"',
+    `exec ${shellSingleQuote(realGitPath)} "$@"`,
+    '',
+  ].join('\n');
+}
+
+/** Install the managed `git` wrapper into the session wrapper dir. The dir is
+ *  already first on PATH, so `git` resolves here for the session only. */
+export function installGitWrapper(
+  binDir: string,
+  realGitPath: string | null,
+  identityResolver: readonly string[] | undefined,
+): string | null {
+  if (!realGitPath || !identityResolver) return null;
+  mkdirSync(binDir, { recursive: true });
+  const path = join(binDir, 'git');
+  atomicWriteFileSync(path, renderGitWrapperScript(realGitPath, identityResolver), { mode: 0o755 });
+  return path;
+}
+
 /**
  * Install the git askpass helper next to the tool wrappers.
  *
@@ -860,10 +961,21 @@ export function findRealToolBinary(
   pathValue: string | undefined,
   excludeDirs: readonly string[] = [],
 ): string | null {
+  return findRealToolBinaryOnPath(pathValue, excludeDirs, tool);
+}
+
+/** Locate an executable `name` on PATH, skipping excluded dirs and any botmux
+ *  cli-identity carve. Generic over the tool name so non-wrapped commands
+ *  (e.g. `git`) can resolve their real binary too. */
+export function findRealToolBinaryOnPath(
+  pathValue: string | undefined,
+  excludeDirs: readonly string[] = [],
+  name = 'git',
+): string | null {
   const excluded = new Set(excludeDirs.filter(Boolean));
   for (const dir of (pathValue ?? '').split(delimiter)) {
     if (!dir || excluded.has(dir) || isCliIdentityPath(dir)) continue;
-    const candidate = join(dir, tool);
+    const candidate = join(dir, name);
     try {
       accessSync(candidate, constants.X_OK);
       return candidate;
@@ -980,6 +1092,11 @@ export function prepareTriggerUserCliEnv(
         // ~/.gitconfig is never touched.
         if (policy.gitHost) {
           Object.assign(childEnv, gitIdentityConfigEnv(askpass, policy.gitHost));
+          // The managed `git` wrapper makes Author/Committer follow the sender
+          // (the askpass only covers the push transport). Resolve the real git
+          // binary while excluding this wrapper dir so it cannot self-exec.
+          const realGit = findRealToolBinaryOnPath(childEnv.PATH, [wrapperDir]);
+          installGitWrapper(wrapperDir, realGit, identityResolver);
           log(`[trigger-user-auth] git pushes to ${policy.gitHost} authenticate as the acting user`);
         } else {
           log('[trigger-user-auth] git askpass installed; set triggerUserAuth.gitHost to also force HTTPS for a code host');

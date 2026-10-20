@@ -36,6 +36,8 @@ import {
   renderGitAskpassScript,
   installGitAskpass,
   gitIdentityConfigEnv,
+  renderGitWrapperScript,
+  installGitWrapper,
 } from '../src/core/cli-identity.js';
 
 let dir: string;
@@ -55,6 +57,19 @@ describe('renderIdentityEnv', () => {
     const body = renderIdentityEnv({ tool: 'bytedcli', cloudJwt: 'a.b.c' });
     expect(body).toContain("BYTEDCLI_USER_CLOUD_JWT='a.b.c'");
     expect(body).not.toContain('BYTEDCLI_USER_CODE_JWT');
+  });
+
+  it('publishes the Codebase user for git/DevMind attribution only when resolved', () => {
+    const withUser = renderIdentityEnv({
+      tool: 'bytedcli', cloudJwt: 'a.b.c',
+      codebaseUsername: 'lizongquan.1', codebaseEmail: 'lizongquan.1@bytedance.com',
+    });
+    expect(withUser).toContain("BOTMUX_CODEBASE_USERNAME='lizongquan.1'");
+    expect(withUser).toContain("BOTMUX_CODEBASE_EMAIL='lizongquan.1@bytedance.com'");
+
+    const without = renderIdentityEnv({ tool: 'bytedcli', cloudJwt: 'a.b.c' });
+    expect(without).not.toContain('BOTMUX_CODEBASE_USERNAME');
+    expect(without).not.toContain('BOTMUX_CODEBASE_EMAIL');
   });
 
   it('refuses a value carrying a line break rather than silently truncating it', () => {
@@ -1057,6 +1072,99 @@ describe('gitIdentityConfigEnv', () => {
 });
 
 
+describe('renderGitWrapperScript / installGitWrapper', () => {
+  // Resolver the wrapper invokes: echoes a credential path supplied via env.
+  const resolver = ['/bin/sh', '-c', 'printf %s "$FAKE_CRED"'];
+
+  const writeCred = (bin: string, body: string): string => {
+    mkdirSync(bin, { recursive: true });
+    const cred = join(bin, 'cred.env');
+    writeFileSync(cred, body, { mode: 0o600 });
+    return cred;
+  };
+
+  const runWrapper = (bin: string, args: string[], realGit: string, extra: NodeJS.ProcessEnv = {}) => {
+    installGitWrapper(bin, realGit, resolver);
+    const exe = join(bin, 'git');
+    try {
+      return {
+        status: 0 as number | null,
+        out: execFileSync(exe, args, {
+          env: { PATH: '/usr/bin:/bin', FAKE_CRED: join(bin, 'cred.env'), ...extra },
+          encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+        }),
+      };
+    } catch (e) {
+      const err = e as { status: number | null; stdout?: string; stderr?: string };
+      return { status: err.status, out: `${err.stdout ?? ''}${err.stderr ?? ''}` };
+    }
+  };
+
+  it('exports the sender as Author/Committer for a commit, and leaks no JWT', () => {
+    const bin = join(dir, 'bin');
+    const cred = writeCred(bin, [
+      "BOTMUX_IDENTITY_MODE='user'",
+      "BOTMUX_CODEBASE_USERNAME='lizongquan.1'",
+      "BOTMUX_CODEBASE_EMAIL='lizongquan.1@bytedance.com'",
+      "BYTEDCLI_USER_CLOUD_JWT='secret-cloud'",
+    ].join('\n'));
+    // GIT_* are exported (children see them); the JWT is a non-exported shell
+    // var from sourcing, so the exec'd child must NOT inherit it.
+    const r = runWrapper(bin,
+      ['sh', '-c', 'printf "%s|%s|%s" "$GIT_AUTHOR_NAME" "$GIT_COMMITTER_EMAIL" "${BYTEDCLI_USER_CLOUD_JWT:-none}"'],
+      '/usr/bin/env');
+    expect(r.status).toBe(0);
+    expect(r.out).toBe('lizongquan.1|lizongquan.1@bytedance.com|none');
+    // the wrapper itself never embeds the credential path or token
+    expect(readFileSync(join(bin, 'git'), 'utf8')).not.toContain(cred);
+    expect(readFileSync(join(bin, 'git'), 'utf8')).not.toContain('secret-cloud');
+  });
+
+  it('defaults the email from the username when absent', () => {
+    const bin = join(dir, 'bin');
+    writeCred(bin, "BOTMUX_IDENTITY_MODE='user'\nBOTMUX_CODEBASE_USERNAME='someone'");
+    const r = runWrapper(bin, ['sh', '-c', 'printf %s "$GIT_AUTHOR_EMAIL"'], '/usr/bin/env');
+    expect(r.status).toBe(0);
+    expect(r.out).toBe('someone@bytedance.com');
+  });
+
+  it('refuses a commit without a user identity (exit 77) but passes read-only through', () => {
+    const bin = join(dir, 'bin');
+    writeCred(bin, "BOTMUX_IDENTITY_MODE='bot'");
+    // Stub real git: succeeds so we can observe the passthrough branch.
+    const stub = join(dir, 'real-git');
+    writeFileSync(stub, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+    expect(runWrapper(bin, ['commit', '-m', 'x'], stub).status).toBe(IDENTITY_DENIED_EXIT_CODE);
+    expect(runWrapper(bin, ['status'], stub).status).toBe(0);
+  });
+
+  it('refuses a push when no credential can be resolved, even with options first', () => {
+    const bin = join(dir, 'bin');
+    installGitWrapper(bin, '/usr/bin/env', ['/bin/sh', '-c', 'exit 1']);
+    const exe = join(bin, 'git');
+    const run = () => execFileSync(exe, ['-C', '/tmp', 'push', 'origin'], {
+      env: { PATH: '/usr/bin:/bin' }, stdio: ['ignore', 'ignore', 'ignore'],
+    });
+    let code: number | null = null;
+    try { run(); } catch (e) { code = (e as { status: number | null }).status; }
+    expect(code).toBe(IDENTITY_DENIED_EXIT_CODE);
+  });
+  it('installGitWrapper returns null without a real git or resolver', () => {
+    const bin = join(dir, 'bin');
+    expect(installGitWrapper(bin, null, resolver)).toBeNull();
+    expect(installGitWrapper(bin, '/usr/bin/git', undefined)).toBeNull();
+  });
+
+  it('script includes the real git path and guarded subcommands', () => {
+    const body = renderGitWrapperScript('/usr/local/bin/git', resolver);
+    expect(body).toContain("exec '/usr/local/bin/git'");
+    for (const sub of ['commit', 'merge', 'rebase', 'cherry-pick', 'push']) {
+      expect(body).toContain(`${sub}) __botmux_needs_identity=1`);
+    }
+  });
+});
+
+
 describe('tool-owning process identity environment', () => {
   it('intercepts login-shell commands before viewer startup, then follows each turn and revocation', () => {
     const bin = join(dir, 'real-bin');
@@ -1083,5 +1191,46 @@ describe('tool-owning process identity environment', () => {
     const env = { PATH: '/usr/bin:/bin' };
     prepareTriggerUserCliEnv(env, dir, SESSION, undefined, () => {});
     expect(env).toEqual({ PATH: '/usr/bin:/bin' });
+  });
+
+  it('installs the managed git wrapper (and transport env) when gitHost is set', () => {
+    const bin = join(dir, 'real-bin');
+    mkdirSync(bin);
+    // a real git on PATH so the wrapper resolves an exec target that is not itself
+    writeFileSync(join(bin, 'bytedcli'), '#!/bin/sh\ntrue\n', { mode: 0o755 });
+    const systemBin = join(dir, 'system');
+    mkdirSync(systemBin);
+    writeFileSync(join(systemBin, 'git'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+    const env: NodeJS.ProcessEnv = { HOME: dir, PATH: `${bin}:${systemBin}:/usr/bin:/bin` };
+    prepareTriggerUserCliEnv(
+      env, dir, SESSION,
+      { enabled: true, tools: ['bytedcli'], fallback: 'none', gitHost: 'code.example.com' },
+      () => {},
+      { appId: 'cli_app', ipcPort: 1 },
+    );
+    const wrapper = join(dir, 'cli-identity', `${SESSION}.bin`, 'git');
+    expect(existsSync(wrapper)).toBe(true);
+    // wrapper dir is first on PATH, so `git` resolves to the managed wrapper
+    expect((env.PATH ?? '').split(':')[0]).toContain(SESSION);
+    expect(env.GIT_ASKPASS).toBeTruthy();
+    // insteadOf + helper are injected via GIT_CONFIG_* (transport attribution)
+    expect(Number(env.GIT_CONFIG_COUNT)).toBeGreaterThan(0);
+  });
+
+  it('does not install a git wrapper without gitHost', () => {
+    const bin = join(dir, 'real-bin');
+    mkdirSync(bin);
+    writeFileSync(join(bin, 'bytedcli'), '#!/bin/sh\ntrue\n', { mode: 0o755 });
+    const systemBin = join(dir, 'system');
+    mkdirSync(systemBin);
+    writeFileSync(join(systemBin, 'git'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+    const env: NodeJS.ProcessEnv = { HOME: dir, PATH: `${bin}:${systemBin}:/usr/bin:/bin` };
+    prepareTriggerUserCliEnv(
+      env, dir, SESSION,
+      { enabled: true, tools: ['bytedcli'], fallback: 'none' },
+      () => {},
+      { appId: 'cli_app', ipcPort: 1 },
+    );
+    expect(existsSync(join(dir, 'cli-identity', `${SESSION}.bin`, 'git'))).toBe(false);
   });
 });

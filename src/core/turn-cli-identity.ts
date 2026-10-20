@@ -15,7 +15,7 @@ import { resolveUserToken, lookupAuthorizedUserName } from '../utils/user-token.
 import { t } from '../i18n/index.js';
 import type { Locale } from '../i18n/index.js';
 import { normalizeBrand } from '../im/lark/lark-hosts.js';
-import { beginBytedcliLogin, mintBytedcliJwts } from '../services/bytedcli-auth.js';
+import { beginBytedcliLogin, mintBytedcliJwts, mintCodebaseIdentity } from '../services/bytedcli-auth.js';
 import { resolveLarkCliHomeForTurn, beginLarkCliLogin } from '../services/lark-cli-auth.js';
 import type { BotConfig } from '../bot-registry.js';
 import { isLarkToolBound } from './lark-tool-binding.js';
@@ -372,5 +372,23 @@ async function resolveIdentityFor(
   // falling back to the machine's own SSO session.
   const jwts = await mintBytedcliJwts(senderOpenId);
   if (!jwts) return null;
-  return { tool: 'bytedcli', cloudJwt: jwts.cloudJwt, ...(jwts.codeJwt ? { codeJwt: jwts.codeJwt } : {}) };
+  // Resolve the Codebase user for git Author/Committer attribution. Optional:
+  // a failure here must not deny the turn (bytedcli calls and push transport
+  // still work). Same call the DevMind hook uses, so commit name == report id.
+  let codebaseUsername: string | undefined;
+  let codebaseEmail: string | undefined;
+  try {
+    const cb = await mintCodebaseIdentity(senderOpenId);
+    codebaseUsername = cb?.username;
+    codebaseEmail = cb?.email;
+  } catch {
+    codebaseUsername = undefined;
+  }
+  return {
+    tool: 'bytedcli',
+    cloudJwt: jwts.cloudJwt,
+    ...(jwts.codeJwt ? { codeJwt: jwts.codeJwt } : {}),
+    ...(codebaseUsername ? { codebaseUsername } : {}),
+    ...(codebaseEmail ? { codebaseEmail } : {}),
+  };
 }

@@ -373,3 +373,40 @@ async function mintJwts(openId: string): Promise<BytedcliJwts | null> {
   }
   return { cloudJwt, ...(codeJwt ? { codeJwt } : {}) };
 }
+
+export interface CodebaseIdentity {
+  /** Codebase Username; the same value DevMind reports as AI_CODE_REPORT_USER_ID. */
+  username: string;
+  email: string;
+}
+
+/**
+ * Resolve the sender's Codebase user (username + email) for git commit
+ * attribution. Runs under the sender's per-person HOME, so the result is the
+ * acting user's, never the machine account's.
+ *
+ * Best-effort and optional: git transport attribution (the Codebase JWT) works
+ * without it; only the Author/Committer name/email degrade. A failure therefore
+ * returns null instead of denying the turn.
+ *
+ * Sourced from `codebase user get` on purpose: the DevMind contribution hook
+ * resolves its reported user id with the exact same call, so the name on the
+ * commit and the id in the report are literally identical.
+ */
+export async function mintCodebaseIdentity(openId: string): Promise<CodebaseIdentity | null> {
+  if (!await readLoginState(openId)) return null;
+  const res = await runAsUser(openId, ['-j', 'codebase', 'user', 'get']);
+  if (!res.ok || !res.stdout.trim()) return null;
+  try {
+    const parsed = JSON.parse(res.stdout) as {
+      data?: { User?: { Username?: string; Email?: string } };
+    };
+    const user = parsed.data?.User;
+    const username = user?.Username?.trim();
+    const email = user?.Email?.trim();
+    if (!username) return null;
+    return { username, email: email || `${username}@bytedance.com` };
+  } catch {
+    return null;
+  }
+}
