@@ -3005,7 +3005,8 @@ export async function handleCommand(
               || current.pendingCodexAppText !== undefined
               || (current.pendingAttachments?.length ?? 0) > 0
               || (current.pendingFollowUps?.length ?? 0) > 0
-              || current.pendingChatContext !== undefined;
+              || current.pendingChatContext !== undefined
+              || current.pendingGroupJoinContext !== undefined;
             let wrappedInput: { content: string; codexAppInput?: CodexAppTurnInput } | undefined;
             if (hasBufferedInput) {
               const { buildNewTopicCliInput: buildInput, ensureSessionWhiteboard, getAvailableBots } = await import('./session-manager.js');
@@ -3039,6 +3040,7 @@ export async function handleCommand(
                   codexAppFollowUps: current.pendingCodexAppFollowUps,
                   codexAppFollowUpContexts: current.pendingCodexAppFollowUpContexts,
                   chatContext: current.pendingChatContext,
+                  groupJoinContext: current.pendingGroupJoinContext,
                   // Pending repo selection still owns the original fresh
                   // launch; the paired forkWorker call does not resume.
                   larkToolResume: false,
@@ -3078,7 +3080,10 @@ export async function handleCommand(
             forkWorker(
               current,
               pendingRawInput ? '' : (wrappedInput ?? ''),
-              !emptyStart && !pendingRawInput && pendingTurnId ? { turnId: pendingTurnId } : false,
+              !emptyStart && !pendingRawInput && pendingTurnId ? {
+                turnId: pendingTurnId,
+                ...(current.pendingTrustedCaller ? { trustedCaller: current.pendingTrustedCaller } : {}),
+              } : false,
             );
             current.pendingRepo = false;
             current.pendingRepoCommitInFlight = true;
@@ -3097,6 +3102,8 @@ export async function handleCommand(
             current.pendingCodexAppApplicationContext = undefined;
             current.pendingCodexAppMessageContext = undefined;
             current.pendingChatContext = undefined;
+            current.pendingGroupJoinContext = undefined;
+            current.pendingTrustedCaller = undefined;
             current.pendingAttachments = undefined;
             current.pendingMentions = undefined;
             current.pendingSubstituteTrigger = undefined;

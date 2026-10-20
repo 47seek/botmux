@@ -601,7 +601,8 @@ export async function commitRepoSelection(
         (ds.pendingPrompt?.trim().length ?? 0) > 0 ||
         (ds.pendingAttachments?.length ?? 0) > 0 ||
         (ds.pendingFollowUps?.length ?? 0) > 0 ||
-        ds.pendingChatContext !== undefined;
+        ds.pendingChatContext !== undefined ||
+        ds.pendingGroupJoinContext !== undefined;
       const availableBots = needsPromptContext
         ? await getAvailableBots(ds.larkAppId, ds.chatId)
         : [];
@@ -620,7 +621,8 @@ export async function commitRepoSelection(
         ds.pendingCodexAppText !== undefined ||
         (ds.pendingAttachments?.length ?? 0) > 0 ||
         (ds.pendingFollowUps?.length ?? 0) > 0 ||
-        ds.pendingChatContext !== undefined;
+        ds.pendingChatContext !== undefined ||
+        ds.pendingGroupJoinContext !== undefined;
       // Nothing to submit at all (session created by a bare `/repo`, i.e. the
       // message IS the command). Boot the CLI idle instead of burning an empty
       // `<user_message>` opening on it, and mark the session so the user's NEXT
@@ -652,6 +654,7 @@ export async function commitRepoSelection(
               codexAppFollowUps: ds.pendingCodexAppFollowUps,
               codexAppFollowUpContexts: ds.pendingCodexAppFollowUpContexts,
               chatContext: ds.pendingChatContext,
+              groupJoinContext: ds.pendingGroupJoinContext,
               // Repo selection commits the original fresh launch. Restoring
               // the pending card does not turn it into a CLI resume.
               larkToolResume: false,
@@ -699,7 +702,10 @@ export async function commitRepoSelection(
       forkWorker(
         ds,
         prompt,
-        !emptyStart && !pendingRawInput && pendingTurnId ? { turnId: pendingTurnId } : false,
+        !emptyStart && !pendingRawInput && pendingTurnId ? {
+          turnId: pendingTurnId,
+          ...(ds.pendingTrustedCaller ? { trustedCaller: ds.pendingTrustedCaller } : {}),
+        } : false,
       );
       ds.pendingRepo = false;
       // A queued activation owns the route through its adapter-level ACK. Every
@@ -716,6 +722,8 @@ export async function commitRepoSelection(
       ds.pendingCodexAppApplicationContext = undefined;
       ds.pendingCodexAppMessageContext = undefined;
       ds.pendingChatContext = undefined;
+      ds.pendingGroupJoinContext = undefined;
+      ds.pendingTrustedCaller = undefined;
       ds.pendingAttachments = undefined;
       ds.pendingMentions = undefined;
       ds.pendingSubstituteTrigger = undefined;
