@@ -281,7 +281,8 @@ import {
   setCodexAppThreadName,
 } from './services/codex-app-threads.js';
 import { buildBotmuxLarkNativeSessionTitle } from './core/session-title.js';
-import { CODEX_CAPACITY_ERROR_CODE, CODEX_AUTH_ERROR_CODE, CODEX_CONNECTION_ERROR_CODE, CODEX_INVALID_REQUEST_ERROR_CODE, CODEX_UPSTREAM_ERROR_CODE, drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, findCodexRolloutSetByPid, codexHistorySidIsOwned, splitCodexEventsByCutoff, extractLastCodexTurn, codexSessionIdFromRolloutPath, isCodexRateLimitEvent, codexSessionsRootFromRolloutPath, scanCodexThreadSettings, readLatestCodexRuntime, type CodexBridgeEvent, type CodexDrainResult } from './services/codex-transcript.js';
+import { CODEX_CAPACITY_ERROR_CODE, CODEX_AUTH_ERROR_CODE, CODEX_CONNECTION_ERROR_CODE, CODEX_INVALID_REQUEST_ERROR_CODE, CODEX_UPSTREAM_ERROR_CODE, drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, findCodexRolloutSetByPid, codexHistorySidIsOwned, splitCodexEventsByCutoff, extractLastCodexTurn, codexGenerationSessionIdFromRolloutPath, isCodexRateLimitEvent, codexSessionsRootFromRolloutPath, scanCodexThreadSettings, readLatestCodexRuntime, type CodexBridgeEvent, type CodexDrainResult } from './services/codex-transcript.js';
+import { codexConsumedRolloutEvents, codexEventsWithStableIds } from './services/codex-rollout-replay.js';
 import { PI_CREDENTIAL_ERROR_CODE } from './services/pi-transcript.js';
 import { CodexServiceTierTracker, resolveCodexServiceTierSnapshot } from './services/codex-service-tier.js';
 import { validateCodexServiceTier } from './services/codex-service-tier-catalog.js';
@@ -8205,6 +8206,12 @@ function structuredBridgeIngestPath(
       flushTrailingFinal: opts.flushOmpTrailingFinal || opts.flushAntigravityTrailingFinal,
     });
     if (spec.stateCommit === 'drain') structuredBridgeDriverState = result.state;
+    if (structuredBridgeIs('codex')) {
+      // Codex resume can copy the whole conversation into a new generation
+      // file; content-addressed ids let the queue dedup copied history across
+      // files without losing a live terminal. See codex-rollout-replay.
+      result.events = codexEventsWithStableIds(path, result.events);
+    }
     return result;
   }
   if (structuredBridgeIs('hermes')) {
@@ -8362,6 +8369,7 @@ function codexBridgeStartTimer(): void {
       maybeFollowTraexSessionRotationViaPid();
       maybeFollowOmpTranscriptRotation();
       maybeFollowEbsdTranscriptRotation();
+      maybeFollowCodexRolloutRotation();
       if (!codexBridgeRolloutPath) {
         // Late-attach: cliSessionId (writeInput / daemon probe) then adopt
         // pid. Path lookup is centralized in resolveFileBridgePath so
@@ -8385,7 +8393,7 @@ function codexBridgeStartTimer(): void {
         const codexAttachGated = structuredBridgeIs('codex') && lastInitConfig?.adoptMode && path && currentCodexObservedPid();
         const traexAttachGated = structuredBridgeIs('traex') && lastInitConfig?.adoptMode && path && currentTraexObservedPid();
         const attachOk = codexAttachGated
-          ? (() => { const sid = codexSessionIdFromRolloutPath(path!); return !!sid && codexHistorySidOwnedByCurrentPid(sid); })()
+          ? (() => { const sid = codexGenerationSessionIdFromRolloutPath(path!); return !!sid && codexHistorySidOwnedByCurrentPid(sid); })()
           : traexAttachGated
             ? (() => { const sid = traexSessionIdFromRolloutPath(path!); return !!sid && traexHistorySidOwnedByCurrentPid(sid); })()
             : true;
@@ -8393,7 +8401,7 @@ function codexBridgeStartTimer(): void {
           if (codexAdoptPendingPid && (lastInitConfig?.cliId === 'codex' || lastInitConfig?.cliId === 'traex')) {
             const discoveredSessionId = structuredBridgeIs('traex')
               ? traexSessionIdFromRolloutPath(path)
-              : codexSessionIdFromRolloutPath(path);
+              : codexGenerationSessionIdFromRolloutPath(path);
             if (discoveredSessionId) persistCliSessionId(discoveredSessionId);
           }
           codexBridgePendingSessionId = undefined;
@@ -9054,8 +9062,11 @@ function codexBridgeNotifyCliSessionId(cliSessionId: string): void {
     // is submitted — so there is no post-ingest window in which a legitimate
     // terminal is appended to the old path and lost.
     if (structuredBridgeIs('codex')) {
-      const currentSid = codexSessionIdFromRolloutPath(codexBridgeRolloutPath);
-      if (currentSid?.toLowerCase() === cliSessionId.toLowerCase()) return;
+      const currentSid = codexGenerationSessionIdFromRolloutPath(codexBridgeRolloutPath);
+      if (currentSid?.toLowerCase() === cliSessionId.toLowerCase()) {
+        maybeFollowCodexRolloutRotation(true);
+        return;
+      }
       // Ownership gate: only re-attach to a session id THIS pid actually holds
       // open (admits the real parent+sibling multi-rollout case, rejects a
       // foreign id from another pane's identical-text history line). Fail
@@ -9367,6 +9378,32 @@ function maybeFollowEbsdTranscriptRotation(): void {
   log(`ebsd transcript rotated: ${codexBridgeRolloutPath} → ${next}`);
   ebsdRetiredTranscriptPaths.add(retired);
   codexBridgeDetachFile();
+  codexBridgeAttach(next, 'fresh-empty');
+}
+
+/** Follow a new file for the already-bound native session, including local
+ * resume/App-Server rotations that produce no writeInput notification. */
+let codexRolloutLastCheckedAtMs = 0;
+function maybeFollowCodexRolloutRotation(fresh = false): void {
+  if (!structuredBridgeIs('codex') || !codexBridgeRolloutPath) return;
+  if (rpcTranscriptIngestBlockedByAwaitingActivation(rpcTurnsAwaitingActivation.keys())) return;
+  const now = Date.now();
+  if (!fresh && now - codexRolloutLastCheckedAtMs < 5_000) return;
+  codexRolloutLastCheckedAtMs = now;
+  const sid = codexGenerationSessionIdFromRolloutPath(codexBridgeRolloutPath);
+  if (!sid) return;
+  const next = resolveFileBridgePath('codex', { sessionId: sid });
+  if (!next || next === codexBridgeRolloutPath) return;
+  // Reuse only the already-bound sid. Its initial/different-session ownership
+  // gates still apply; a shared App-Server may hold the new fd instead of the
+  // observed frontend, so do not demand a new frontend fd for this same sid.
+  if (codexGenerationSessionIdFromRolloutPath(next)?.toLowerCase() !== sid.toLowerCase()) return;
+  codexBridgeIngest();
+  codexBridgeQueue.absorb(codexConsumedRolloutEvents(codexBridgeRolloutPath, codexBridgeOffset));
+  log(`Codex rollout rotated for ${sid}: ${codexBridgeRolloutPath} → ${next}`);
+  codexBridgeDetachFile();
+  // Keep collecting/pending turns and ingest the new generation from zero:
+  // stable event ids suppress copied history without discarding a live final.
   codexBridgeAttach(next, 'fresh-empty');
 }
 
