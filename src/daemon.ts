@@ -758,6 +758,8 @@ let vcMeetingTerminalReconciler: VcMeetingTerminalReconciler | undefined;
 import { isBotMentioned, getGroupStats, probeBotOpenId, createLarkEventDispatcherRuntime, startLarkEventDispatcher, markForwardFollowupsSessionsReady, writeBotInfoFile, canOperate, canRunDaemonCommand, evaluateTalk, evaluateBotTalk, evaluateAskAnswerTalk, askCustomReplyCandidate, grantCommandRestriction, isKnownPeerBot, resolveSiblingBotNameByUnionId, checkRequiredScopes, ensureVcMeetingEventsSubscribed, ensureMessageUpdatedEventSubscribed, ensureMessageRecalledEventSubscribed, type RoutingContext, type TalkEvaluation, type DocCommentContext, type EventHandlers, type LarkEventDispatcherRuntime } from './im/lark/event-dispatcher.js';
 import { commitDocCommentPollCursor, docCommentThreadAnchor, getDocSubscription, isDocNativeWatchSubscription, isPollingDocTriggerMode, listAllDocSubscriptions, normalizeDocNativeWatchSubscription, putDocSubscription, recordDocWatchActivity, removeDocSubscription, settleDocCommentWsDelivery, type DocSubscription } from './services/doc-subs-store.js';
 import { BOT_REPLY_SENTINEL, subscribeDocFile, unsubscribeDocFile, addCommentReactionChecked, removeCommentReaction, hasBotSentinel, isBotAuthoredReply, listDocComments, polledReplyTriggerAllowed, type DocCommentReactionIdentity } from './im/lark/doc-comment.js';
+import { classifyLarkError } from './im/lark/error-classify.js';
+import { ListenerCircuitBreaker } from './services/listener-circuit-breaker.js';
 import { learnFromMentions, getIdentity, resolveSender, flushIdentityCacheSync, type ResolvedSender } from './im/lark/identity-cache.js';
 import { normalizeBrand } from './im/lark/lark-hosts.js';
 import { buildDocCommentTurnInput, buildDocWatchWarmupTurnInput } from './core/doc-comment-prompt.js';
@@ -28951,6 +28953,12 @@ function handleChatModeConverted(chatId: string, larkAppId: string): boolean {
 export const __testOnly_handleChatModeConverted = handleChatModeConverted;
 
 let docCommentPollRunning = false;
+// 永久失败文档（失权/删除）的 per-file 熔断；探测节拍 10 分钟，跨 daemon 重启
+// 不持久化（重启后重新计数，可接受——3 次连续 4xx 即再次熔断）。
+const docCommentPollCircuits = new ListenerCircuitBreaker({
+  permanentThreshold: 3,
+  probeIntervalMs: 10 * 60_000,
+});
 
 async function retryPendingDocCommentDeliveries(
   larkAppId: string,
@@ -29029,13 +29037,19 @@ async function pollWatchedDocComments(larkAppId: string): Promise<void> {
     const pendingRetry = await retryPendingDocCommentDeliveries(larkAppId);
     const subs = listAllDocSubscriptions(config.session.dataDir, larkAppId)
       .filter(sub => sub.managedBy === 'watch-comment' && isPollingDocTriggerMode(sub.commentTriggerMode));
+    // 永久失权/删除的文档熔断后，每 10 分钟只探测一次，避免 5s 节拍对死文档空转。
+    const liveKeys = new Set(subs.map(sub => `${larkAppId}:${sub.fileToken}`));
+    docCommentPollCircuits.prune(liveKeys);
     for (const snapshot of subs) {
+      const circuitKey = `${larkAppId}:${snapshot.fileToken}`;
+      if (!docCommentPollCircuits.shouldPoll(circuitKey)) continue;
       try {
         if (pendingRetry.blockedFiles.has(snapshot.fileToken)) continue;
         const comments = await listDocComments(larkAppId, {
           fileToken: snapshot.fileToken,
           fileType: snapshot.fileType,
         });
+        docCommentPollCircuits.recordSuccess(circuitKey); // 文档可达：若此前在熔断则自动恢复
         const latest = latestDocCommentPollCursor(comments);
         const current = getDocSubscription(config.session.dataDir, larkAppId, snapshot.fileToken);
         if (!current || current.managedBy !== 'watch-comment' || !isPollingDocTriggerMode(current.commentTriggerMode)) continue;
@@ -29136,6 +29150,17 @@ async function pollWatchedDocComments(larkAppId: string): Promise<void> {
         // 应用身份读不到这篇文档（权限撤销 / 文档被删 / 网络）——功能「配着」却从此
         // 一条都不触发，是 owner 最需要在界面上看到的静默故障。
         recordDocWatchActivity(config.session.dataDir, larkAppId, snapshot.fileToken, { outcome: 'poll-failed', error: message });
+        // 永久错误（403 失权 / 文档 404 / 业务码 1254xxx）连续命中即熔断，
+        // 不再每 5s 空转；瞬时网络错误不熔断，下一拍继续。
+        const classified = classifyLarkError(err);
+        if (classified.classification === 'permanent'
+          && docCommentPollCircuits.recordPermanent(circuitKey)) {
+          logger.warn(`[doc-comment-poll] circuit OPEN file=${snapshot.fileToken.slice(0, 12)} code=${classified.larkCode ?? classified.httpStatus ?? '?'}`);
+          recordDocWatchActivity(config.session.dataDir, larkAppId, snapshot.fileToken, {
+            outcome: 'poll-circuit-open',
+            error: `permanent ${classified.larkCode ?? classified.httpStatus ?? ''} ${message}`.slice(0, 300),
+          });
+        }
       }
     }
   } finally {
