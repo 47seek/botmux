@@ -524,7 +524,7 @@ import {
   type SubmitFailureChainKey,
 } from './services/submit-failure-chain.js';
 import { createQueuedActivationReceiptObserver } from './services/queued-activation-receipts.js';
-import { diagnoseSubmitFailure } from './services/submit-failure-diagnosis.js';
+import { diagnoseBackendSubmitFailure } from './services/submit-failure-diagnosis.js';
 import {
   runAdoptQueuedWriteSequence,
   runAdoptRawInputSequence,
@@ -14878,8 +14878,10 @@ function scheduleSubmitFailureNotify(
           : (lastAnalyzerSnapshot || renderer?.rawSnapshot() || '');
       } catch { submitDiagnosisScreen = ''; }
     }
-    const submitDiagnosis = diagnoseSubmitFailure({
-      screenText: submitDiagnosisScreen,
+    const submitDiagnosis = diagnoseBackendSubmitFailure({
+      backendType: effectiveBackendType,
+      capturedScreenText: submitDiagnosisScreen,
+      cliId: lastInitConfig?.cliId,
       lastActivityAtMs: lastPtyActivityAtMs,
     });
     if (
