@@ -164,6 +164,14 @@ import type { BotConfig } from '../bot-registry.js';
 import { RestartCoordinator, type RestartObserver, type RestartSource } from './restart-coordinator.js';
 import { runtimeBuildIdentity } from '../utils/runtime-build-id.js';
 import { scrubWorkflowWorkerEnv } from '../utils/child-env.js';
+import { getLinkRefRuntime } from '../services/link-ref-runtime.js';
+import { prepareLinkRefTurnPayload } from './link-ref-turn.js';
+import { resolveEffectiveLinkRefMode } from '../services/link-ref-config.js';
+import type { LinkRefMode } from '../services/link-ref-types.js';
+import {
+  registerMcpLinkRefsFromWorker,
+  resolveMcpHostDeliveryLinkRefsFromWorker,
+} from './link-ref-ipc.js';
 import { cleanupSessionTempDirAfterExit } from './session-temp.js';
 import { resolveFeedbackPolicyForDelivery, resolveFeedbackTeamId } from '../services/feedback-policy-resolver.js';
 import { materializeFeedbackPolicyForDelivery } from '../services/feedback-reviewer-delivery.js';
@@ -850,7 +858,7 @@ const TRANSFER_FORCE_EXIT_MS = 500;
 // pm2-graceful-exit.ts): a worker (or the CLI child it forks — redactChildEnv
 // strips it there too) that inherited it would exit 90 instead of 0 on a
 // clean foreground stop, which a supervisor reads as a crash.
-const WORKER_REDACTED_ENV_KEYS = ['GITHUB_TOKEN', 'GH_TOKEN', 'BOTMUX_PM2_GRACEFUL_EXIT_CODE'] as const;
+const WORKER_REDACTED_ENV_KEYS = ['GITHUB_TOKEN', 'GH_TOKEN', 'BOTMUX_PM2_GRACEFUL_EXIT_CODE', 'BOTMUX_LINK_REFS_MODE', 'BOTMUX_LINK_REF_TURN_MODE', 'BOTMUX_HOST_RELAY_AUTHORIZED'] as const;
 
 function workerForkEnv(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...base };
@@ -860,6 +868,92 @@ function workerForkEnv(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   // workflows/v3/ephemeral-pool.ts.
   scrubWorkflowWorkerEnv(env);
   return env;
+}
+
+function prepareAdmittedLinkRefPayload(input: {
+  ds: DaemonSession;
+  payload: CliTurnPayload;
+  turnId?: string;
+  dispatchAttempt?: number;
+  frozenMode?: LinkRefMode;
+}): { payload: CliTurnPayload; mode: LinkRefMode } {
+  const declaredMode = input.payload.linkRefs?.mode;
+  // `sources` exist only before the real admission boundary, so their mode is
+  // a builder placeholder and must not freeze an earlier config snapshot. A
+  // source-free envelope is already admitted (queued/recovered) and its typed
+  // mode is copied verbatim even if live configuration changed meanwhile.
+  const pendingMode = input.ds.pendingLinkRefMode;
+  const mode = input.frozenMode ?? pendingMode
+    ?? (input.payload.linkRefs?.sources === undefined && declaredMode
+    ? declaredMode
+    : resolveEffectiveLinkRefMode({
+        env: process.env,
+        bot: getBot(input.ds.larkAppId).config.linkRefs,
+        global: readGlobalConfig().linkRefs,
+      }));
+  if (!input.turnId || mode === 'disabled') {
+    const { linkRefs: _linkRefs, ...legacy } = input.payload;
+    return { payload: legacy, mode: 'disabled' };
+  }
+  if (input.payload.linkRefs?.sources === undefined && declaredMode) {
+    return { payload: input.payload, mode };
+  }
+  const runtime = getLinkRefRuntime();
+  if (!runtime) {
+    return { payload: { ...input.payload, linkRefs: { mode } }, mode };
+  }
+  return {
+    payload: prepareLinkRefTurnPayload({
+      runtime,
+      key: {
+        appId: input.ds.larkAppId,
+        sessionId: input.ds.session.sessionId,
+        turnId: input.turnId,
+        dispatchAttempt: input.dispatchAttempt,
+      },
+      mode,
+      payload: input.payload,
+    }),
+    mode,
+  };
+}
+
+function freezeDeferredLinkRefPayload(input: {
+  ds: DaemonSession;
+  payload: CliTurnPayload;
+}): { payload: CliTurnPayload; mode: LinkRefMode } {
+  const declaredMode = input.payload.linkRefs?.mode;
+  const mode = input.ds.pendingLinkRefMode
+    ?? (input.payload.linkRefs?.sources === undefined && declaredMode
+      ? declaredMode
+      : resolveEffectiveLinkRefMode({
+          env: process.env,
+          bot: getBot(input.ds.larkAppId).config.linkRefs,
+          global: readGlobalConfig().linkRefs,
+        }));
+  if (mode === 'disabled') {
+    const { linkRefs: _linkRefs, ...legacy } = input.payload;
+    return { payload: legacy, mode };
+  }
+  return {
+    payload: {
+      ...input.payload,
+      linkRefs: {
+        mode,
+        ...(input.payload.linkRefs?.sources
+          ? { sources: input.payload.linkRefs.sources }
+          : {}),
+      },
+    },
+    mode,
+  };
+}
+
+function freezeAdmittedPayloadInPlace(target: CliTurnPayload, admitted: CliTurnPayload): CliTurnPayload {
+  if (target === admitted) return target;
+  for (const key of Object.keys(target) as Array<keyof CliTurnPayload>) delete target[key];
+  Object.assign(target, admitted);
+  return target;
 }
 
 /** Fresh workers always start with hidden output, so restore the daemon-owned mode. */
@@ -9082,6 +9176,16 @@ export async function closeSession(
         closedForkP2pTopic.chatId,
       );
     }
+    if (closeAppId) {
+      try {
+        getLinkRefRuntime()?.deleteSession(closeAppId, sessionId);
+      } catch {
+        logger.warn(
+          `[${sessionId.slice(0, 8)}] LinkRef session cleanup failed `
+          + 'code=link_ref_ledger_unavailable',
+        );
+      }
+    }
     const closeStreamingOwner = ds ?? closeStoredOwner;
     if (closeAppId && closeStreamingOwner && closePinnedStreamingTargets.length > 0) {
       void unpinProvenStreamingCardTargets(closeAppId, closePinnedStreamingTargets);
@@ -11556,6 +11660,7 @@ function acceptCodexAppDispatch(
     replyTargetSenderIsBot?: boolean;
     queuedActivationToken?: string;
     codexAppSteerable?: true;
+    linkRefMode?: 'observe' | 'enabled';
   },
   turnId: string | undefined,
   dispatchAttempt: number | undefined,
@@ -11589,6 +11694,7 @@ function acceptCodexAppDispatch(
       deliverySink: codexAppDeliverySinkForTurn(ds, turnId, dispatchAttempt),
       ...(payload.codexAppSteerable ? { codexAppSteerable: true } : {}),
       ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+      ...(payload.linkRefMode ? { linkRefMode: payload.linkRefMode } : {}),
       content: payload.content,
       ...(payload.codexAppInput ? { codexAppInput: payload.codexAppInput } : {}),
       ...(vcMeetingImTurnOrigin ? { vcMeetingImTurnOrigin } : {}),
@@ -12032,7 +12138,7 @@ export function sendWorkerInput(
   }
   const transferGate = transferInputGates.get(ds);
   if ((!ds.worker || ds.worker.killed) && !transferGate) return false;
-  const normalized = typeof payload === 'string' ? { content: payload } : payload;
+  let normalized = typeof payload === 'string' ? { content: payload } : payload;
   const trustedController = trustedSessionController(ds);
   const bot = getBot(ds.larkAppId);
   const effectiveCliId = sessionCliId(ds, bot.config);
@@ -12076,6 +12182,7 @@ export function sendWorkerInput(
           ...(normalized.codexAppInput
             ? { codexAppInput: normalized.codexAppInput }
             : {}),
+          ...(normalized.linkRefs ? { linkRefs: normalized.linkRefs } : {}),
           // R4-B1: freeze the admission-time steer authorization into the queued
           // tail's frozen payload so promote/repark/restore COPY it verbatim
           // (admission computed once; never re-inferred downstream).
@@ -12108,8 +12215,19 @@ export function sendWorkerInput(
   }
 
   // Real delivery boundary: subtract background sources covered while this
-  // turn waited (FIFO / staged tail) and freeze what is actually sent.
+  // turn waited (FIFO / staged tail) and freeze what is actually sent. LinkRef
+  // admission must follow this rewrite so its companion/ledger describe only
+  // the group context that really crosses worker IPC.
   commitGroupContextDispatch(ds, normalized, effectiveTurnId);
+  const admittedLinkRefs = prepareAdmittedLinkRefPayload({
+    ds,
+    payload: normalized,
+    turnId: effectiveTurnId,
+    dispatchAttempt: opts.dispatchAttempt,
+  });
+  normalized = typeof payload === 'string'
+    ? admittedLinkRefs.payload
+    : freezeAdmittedPayloadInPlace(payload, admittedLinkRefs.payload);
   const codexAppInput = codexAppInputForSession(
     ds,
     normalized.codexAppInput,
@@ -12130,6 +12248,9 @@ export function sendWorkerInput(
         ? { replyTargetSenderIsBot: replyContext.replyTargetSenderIsBot }
         : {}),
       ...(opts.codexAppSteerable ? { codexAppSteerable: true } : {}),
+      ...(admittedLinkRefs.mode === 'disabled'
+        ? {}
+        : { linkRefMode: admittedLinkRefs.mode }),
     },
     effectiveTurnId,
     opts.dispatchAttempt,
@@ -12149,6 +12270,7 @@ export function sendWorkerInput(
     ...(ds.crashDiagnosticParked ? { model: latestModelForRespawn(ds) } : {}),
     ...(ds.crashDiagnosticParked ? { larkToolBinding: latestLarkToolBindingForRespawn(ds) } : {}),
     ...(codexAppInput ? { codexAppInput } : {}),
+    ...(admittedLinkRefs.mode === 'disabled' ? {} : { linkRefMode: admittedLinkRefs.mode }),
     ...(nativeSessionTitle ? { nativeSessionTitle } : {}),
     ...(nativeSessionTitlePrompt ? { nativeSessionTitlePrompt } : {}),
     ...(effectiveTurnId ? { turnId: effectiveTurnId } : {}),
@@ -12471,13 +12593,14 @@ export function promoteQueuedActivationTail(
   // a true→false toggle between N+1 admission and N's ACK would otherwise
   // discard N+1's exact sidecar/hidden context. Only fill the deterministic id
   // for legacy entries persisted before admission began stamping it.
-  const codexAppInput = cloneFrozenCodexAppInput(
+  let codexAppInput = cloneFrozenCodexAppInput(
     head.cliInput.codexAppInput,
     head.turnId,
   );
-  const exactInput: CliTurnPayload = {
+  let exactInput: CliTurnPayload = {
     content: head.cliInput.content,
     ...(codexAppInput ? { codexAppInput } : {}),
+    ...(head.cliInput.linkRefs ? { linkRefs: head.cliInput.linkRefs } : {}),
     // R5-B1-2: preserve the frozen steer authorization onto the promoted
     // queuedActivationInput so the ensuing fork/accept-ledger COPY (below) sees
     // it. Only `=== true`; a missing/false tail head stays forced-serial.
@@ -12486,6 +12609,23 @@ export function promoteQueuedActivationTail(
     ...(head.cliInput.trustedController ? { trustedController: head.cliInput.trustedController } : {}),
   };
   const vcMeetingImTurnOrigin = resolveVcMeetingImTurnOrigin(ds.session, head.turnId);
+  // A queued successor can wait long enough for earlier native-input receipts
+  // to cover part of its frozen group background. Commit that exact dispatch
+  // first, then register LinkRefs using the mode frozen when the tail entry was
+  // admitted. This prevents stale, never-delivered group URLs entering the
+  // companion/ledger while keeping rollout changes from mutating queued work.
+  commitGroupContextDispatch(ds, exactInput, head.turnId);
+  const admittedLinkRefs = exactInput.linkRefs
+    ? prepareAdmittedLinkRefPayload({
+        ds,
+        payload: exactInput,
+        turnId: head.turnId,
+        dispatchAttempt: head.dispatchAttempt,
+        frozenMode: exactInput.linkRefs.mode,
+      })
+    : { payload: exactInput, mode: 'disabled' as const };
+  exactInput = freezeAdmittedPayloadInPlace(exactInput, admittedLinkRefs.payload);
+  codexAppInput = cloneFrozenCodexAppInput(exactInput.codexAppInput, head.turnId);
 
   ds.session.queued = false;
   ds.session.queuedActivationPending = true;
@@ -12521,6 +12661,9 @@ export function promoteQueuedActivationTail(
         // entry's payload onto the accept-ledger (admission computed once; never
         // re-inferred at promote time).
         ...(exactInput.codexAppSteerable ? { codexAppSteerable: true } : {}),
+        ...(admittedLinkRefs.mode !== 'disabled'
+          ? { linkRefMode: admittedLinkRefs.mode }
+          : {}),
       },
       head.turnId,
       head.dispatchAttempt,
@@ -12549,6 +12692,9 @@ export function promoteQueuedActivationTail(
       ...(ds.crashDiagnosticParked ? { model: latestModelForRespawn(ds) } : {}),
       ...(ds.crashDiagnosticParked ? { larkToolBinding: latestLarkToolBindingForRespawn(ds) } : {}),
       ...(codexAppInput ? { codexAppInput } : {}),
+      ...(admittedLinkRefs.mode !== 'disabled'
+        ? { linkRefMode: admittedLinkRefs.mode }
+        : {}),
       turnId: head.turnId,
       ...(head.dispatchAttempt !== undefined
         ? { dispatchAttempt: head.dispatchAttempt }
@@ -12624,24 +12770,32 @@ export function admitQueuedActivationTail(
   reservation: QueuedActivationTailReservation = reserveQueuedActivationTailAdmission(ds),
   opts: { codexAppInputGateFrozen?: boolean } = {},
 ): QueuedActivationTailEntry {
+  const admittedLinkRefs = entry.cliInput.linkRefs
+    ? freezeDeferredLinkRefPayload({
+        ds,
+        payload: entry.cliInput,
+      })
+    : { payload: entry.cliInput, mode: 'disabled' as const };
+  const frozenInput = admittedLinkRefs.payload;
   const acceptedCodexAppInput = opts.codexAppInputGateFrozen === true
-    ? cloneFrozenCodexAppInput(entry.cliInput.codexAppInput, entry.turnId)
+    ? cloneFrozenCodexAppInput(frozenInput.codexAppInput, entry.turnId)
     : reservation.codexAppInputAccepted === true
-      ? cloneFrozenCodexAppInput(entry.cliInput.codexAppInput, entry.turnId)
+      ? cloneFrozenCodexAppInput(frozenInput.codexAppInput, entry.turnId)
       : undefined;
   const admitted: QueuedActivationTailEntry = {
     id: reservation.id,
     order: reservation.order,
     ...entry,
     cliInput: {
-      content: entry.cliInput.content,
+      content: frozenInput.content,
       ...(acceptedCodexAppInput ? { codexAppInput: acceptedCodexAppInput } : {}),
+      ...(frozenInput.linkRefs ? { linkRefs: frozenInput.linkRefs } : {}),
       // R5-B1-2: preserve the frozen steer authorization across the tail rebuild
       // (only `=== true`, never truthy). Dropping it here silently un-authorized
       // every queued/opening turn — the strip point that defeated the R4 fix.
-      ...(entry.cliInput.codexAppSteerable === true ? { codexAppSteerable: true as const } : {}),
-      ...(entry.cliInput.trustedCaller ? { trustedCaller: entry.cliInput.trustedCaller } : {}),
-      ...(entry.cliInput.trustedController ? { trustedController: entry.cliInput.trustedController } : {}),
+      ...(frozenInput.codexAppSteerable === true ? { codexAppSteerable: true as const } : {}),
+      ...(frozenInput.trustedCaller ? { trustedCaller: frozenInput.trustedCaller } : {}),
+      ...(frozenInput.trustedController ? { trustedController: frozenInput.trustedController } : {}),
     },
   };
   const priorTail = ds.session.queuedActivationTail;
@@ -13062,7 +13216,7 @@ export function forkWorker(
     return false;
   }
 
-  const promptPayload = typeof promptInput === 'string' ? { content: promptInput } : promptInput;
+  let promptPayload = typeof promptInput === 'string' ? { content: promptInput } : promptInput;
   // Re-read after the group background is committed at the real execution
   // boundary below (after every defer/queue/admission return).
   let prompt = promptPayload.content;
@@ -13132,6 +13286,7 @@ export function forkWorker(
           ...(promptPayload.codexAppInput
             ? { codexAppInput: promptPayload.codexAppInput }
             : {}),
+          ...(promptPayload.linkRefs ? { linkRefs: promptPayload.linkRefs } : {}),
           // R5-B1-2: preserve the frozen steer authorization on the double-fork
           // staged tail entry (only `=== true`).
           ...(initCodexAppSteerable ? { codexAppSteerable: true as const } : {}),
@@ -13480,11 +13635,6 @@ export function forkWorker(
   // a successful reservation immediately invalidates any late old-worker ACK.
   const workerGeneration = reserveWorkerGeneration(ds);
   bindPreparedGroupContextWorker(ds, initAttributionTurnId, workerGeneration);
-  // A fork carries the opening/queued input straight into the worker init, so
-  // this (past every XPI/defer/admission return, at the reserved generation)
-  // is its delivery boundary; sendWorkerInput is not on this path.
-  commitGroupContextDispatch(ds, promptPayload, initAttributionTurnId);
-  prompt = promptPayload.content;
   onWorkerGenerationReserved?.(workerGeneration);
   if (initAttributionTurnId?.startsWith('om_')) {
     ensurePrincipalLaneInboundTurnBinding(ds, initAttributionTurnId, workerGeneration);
@@ -13524,6 +13674,21 @@ export function forkWorker(
   if (!initTurnId && prompt.length > 0 && isCodexAppCliId(agentCfg.cliId)) {
     initAttributionTurnId = `codex-app-dispatch-${randomUUID()}`;
   }
+  // A fork carries the opening/queued input straight into worker init. Freeze
+  // the exact group background after every defer/refusal seam, then admit
+  // LinkRefs from that final payload immediately before irreversible
+  // child-launch preparation.
+  commitGroupContextDispatch(ds, promptPayload, initAttributionTurnId);
+  const admittedOpeningLinkRefs = prepareAdmittedLinkRefPayload({
+    ds,
+    payload: promptPayload,
+    turnId: initAttributionTurnId,
+    dispatchAttempt: initDispatchAttempt,
+  });
+  promptPayload = typeof promptInput === 'string'
+    ? admittedOpeningLinkRefs.payload
+    : freezeAdmittedPayloadInPlace(promptInput, admittedOpeningLinkRefs.payload);
+  prompt = promptPayload.content;
   ensureCliEnv(agentCfg.cliId, agentCfg.cliPathOverride, { configDir: agentCfg.cliConfigDir });
   let nativeSessionTitle: string | undefined;
   let nativeSessionTitlePrompt: string | undefined;
@@ -13667,9 +13832,13 @@ export function forkWorker(
     ds.session.queuedActivationInput = {
       content: prompt,
       ...(promptCodexAppInput ? { codexAppInput: promptCodexAppInput } : {}),
+      ...(promptPayload.linkRefs ? { linkRefs: promptPayload.linkRefs } : {}),
       // R4-B1: preserve the frozen steer authorization when re-parking N+1 behind
       // a recovery fork (COPY, never re-infer).
       ...(initCodexAppSteerable ? { codexAppSteerable: true } : {}),
+      ...(admittedOpeningLinkRefs.mode === 'disabled'
+        ? {}
+        : { linkRefMode: admittedOpeningLinkRefs.mode }),
       ...(initTrustedCaller ? { trustedCaller: initTrustedCaller } : {}),
       ...(initTrustedController ? { trustedController: initTrustedController } : {}),
     };
@@ -13704,6 +13873,9 @@ export function forkWorker(
           // accept-ledger entry so a recovered/opening first turn is steerable
           // exactly as the daemon admitted it (admission computed once; COPIED).
           ...(initCodexAppSteerable ? { codexAppSteerable: true } : {}),
+          ...(admittedOpeningLinkRefs.mode === 'disabled'
+            ? {}
+            : { linkRefMode: admittedOpeningLinkRefs.mode }),
         },
         initAttributionTurnId,
         initDispatchAttempt,
@@ -14027,6 +14199,9 @@ export function forkWorker(
     ...(nativeSessionTitlePrompt ? { nativeSessionTitlePrompt } : {}),
     prompt,
     ...(promptCodexAppInput ? { promptCodexAppInput } : {}),
+    ...(admittedOpeningLinkRefs.mode === 'disabled'
+      ? {}
+      : { linkRefMode: admittedOpeningLinkRefs.mode }),
     ...(queuedActivationToken ? { queuedActivationToken } : {}),
     resume,
     // One-shot native fork intent (see Session.pendingForkSession). Only the
@@ -14745,6 +14920,77 @@ function setupWorkerHandlers(
     }
     const effectiveCliId = sessionCliId(ds, botCfg);
     switch (msg.type) {
+      case 'link_ref_register': {
+        const runtime = getLinkRefRuntime();
+        const result = runtime
+          ? registerMcpLinkRefsFromWorker({
+              ownsWorkerSession: ownsWorkerSession(),
+              daemonSession: {
+                appId: ds.larkAppId,
+                sessionId: ds.session.sessionId,
+                managedTurnOrigin: ds.managedTurnOrigin,
+              },
+              runtime,
+              request: msg,
+            })
+          : { ok: false as const, error: 'link_ref_ledger_unavailable' };
+        if (worker.connected) worker.send({
+          type: 'link_ref_register_result',
+          requestId: msg.requestId,
+          ...result,
+        } satisfies DaemonToWorker);
+        break;
+      }
+      case 'link_ref_resolve': {
+        const runtime = getLinkRefRuntime();
+        const result = runtime
+          ? resolveMcpHostDeliveryLinkRefsFromWorker({
+              ownsWorkerSession: ownsWorkerSession(),
+              daemonSession: {
+                appId: ds.larkAppId,
+                sessionId: ds.session.sessionId,
+                managedTurnOrigin: ds.managedTurnOrigin,
+              },
+              runtime,
+              request: msg,
+            })
+          : { ok: false as const, error: 'link_ref_ledger_unavailable' };
+        if (worker.connected) worker.send({
+          type: 'link_ref_resolve_result',
+          requestId: msg.requestId,
+          ...result,
+        } satisfies DaemonToWorker);
+        break;
+      }
+      case 'link_ref_restore_mode': {
+        let mode: 'enabled' | undefined;
+        let error: string | undefined;
+        if (!ownsWorkerSession()
+          || msg.sessionId !== ds.session.sessionId
+          || !msg.turnId) {
+          error = 'link_ref_identity_mismatch';
+        } else {
+          try {
+            mode = getLinkRefRuntime()?.restoreMode({
+              appId: ds.larkAppId,
+              sessionId: ds.session.sessionId,
+              turnId: msg.turnId,
+              ...(msg.dispatchAttempt !== undefined
+                ? { dispatchAttempt: msg.dispatchAttempt }
+                : {}),
+            });
+          } catch {
+            error = 'link_ref_ledger_unavailable';
+          }
+        }
+        if (worker.connected) worker.send({
+          type: 'link_ref_restore_mode_result',
+          requestId: msg.requestId,
+          ...(mode ? { mode } : {}),
+          ...(error ? { error } : {}),
+        } satisfies DaemonToWorker);
+        break;
+      }
       case 'active_turn_envelope_changed':
         inheritActiveTurnFinalSuppression(ds, msg.previousTurnId, msg.turnId);
         break;
@@ -17410,6 +17656,21 @@ function setupWorkerHandlers(
           );
           break;
         }
+        try {
+          getLinkRefRuntime()?.settleTurn({
+            appId: ds.larkAppId,
+            sessionId: ds.session.sessionId,
+            turnId: msg.turnId,
+            ...(msg.dispatchAttempt !== undefined
+              ? { dispatchAttempt: msg.dispatchAttempt }
+              : {}),
+          });
+        } catch {
+          logger.warn(
+            `[${t}] LinkRef turn settlement failed `
+            + `(turn=${msg.turnId.substring(0, 8)}, code=link_ref_ledger_unavailable)`,
+          );
+        }
         forgetScheduledTurnCaller(ds, msg.turnId);
         observeTurnResultTerminal(ds, msg, workerGeneration);
         // Defense in depth: the worker sends a token-matched revoke before the
@@ -17980,6 +18241,7 @@ function setupWorkerHandlers(
                 ...(msg.dispatchAttempt !== undefined
                   ? { dispatchAttempt: msg.dispatchAttempt }
                   : {}),
+                ...(msg.linkRefMode ? { linkRefMode: msg.linkRefMode } : {}),
               }),
             );
           } catch (err) {
@@ -18001,6 +18263,7 @@ function setupWorkerHandlers(
           ...(msg.dispatchAttempt !== undefined
             ? { dispatchAttempt: msg.dispatchAttempt }
             : {}),
+          ...(msg.linkRefMode ? { linkRefMode: msg.linkRefMode } : {}),
           ...(callerOpenId ? { callerOpenId } : {}),
           ...(preexistingProcessIdentities
             ? { preexistingProcessIdentities }
@@ -19256,6 +19519,61 @@ function deliverFinalOutput(
     onComplete?.(false);
     return;
   }
+  const unresolvedMsg = msg;
+  const linkRefKey = {
+    appId: ds.larkAppId,
+    sessionId: ds.session.sessionId,
+    turnId: msg.turnId,
+    dispatchAttempt: msg.dispatchAttempt,
+  };
+  const linkRefRuntime = msg.linkRefMode ? getLinkRefRuntime() : undefined;
+  let linkRefDraftPending = false;
+  if (msg.linkRefMode === 'enabled') {
+    try {
+      if (!linkRefRuntime) throw new Error('link_ref_ledger_unavailable');
+      const prepared = linkRefRuntime.prepareFinalDraft({
+        key: linkRefKey,
+        mode: msg.linkRefMode,
+        content: msg.content,
+      });
+      linkRefDraftPending = prepared.draftPending;
+      if (prepared.content !== msg.content) msg = { ...msg, content: prepared.content };
+    } catch (error) {
+      const errorCode = typeof error === 'object' && error && 'code' in error
+        ? String((error as { code: unknown }).code)
+        : 'link_ref_ledger_unavailable';
+      const next = attempt + 1;
+      if (next >= FINAL_OUTPUT_RETRY_BACKOFF_MS.length) {
+        logger.error(
+          `[${t}] LinkRef final preparation gave up after ${next} attempts `
+          + `(turn ${msg.turnId.substring(0, 8)}, code=${errorCode})`,
+        );
+        onComplete?.(false);
+        return;
+      }
+      logger.warn(
+        `[${t}] LinkRef final preparation attempt ${next} failed `
+        + `(turn ${msg.turnId.substring(0, 8)}, code=${errorCode}); retrying`,
+      );
+      setTimeout(() => deliverFinalOutput(
+        ds, unresolvedMsg, t, next, onComplete, isStillOwned,
+        frozenReplyTarget, frozenRenderSnapshot, frozenInitiator, imageFallback,
+      ), FINAL_OUTPUT_RETRY_BACKOFF_MS[next] ?? 0);
+      return;
+    }
+  }
+  const confirmLinkRefDraft = (): void => {
+    if (!linkRefDraftPending || !linkRefRuntime) return;
+    try {
+      linkRefRuntime.clearPendingDraft(linkRefKey);
+      linkRefDraftPending = false;
+    } catch {
+      logger.warn(
+        `[${t}] LinkRef final draft cleanup failed `
+        + `(turn ${msg.turnId.substring(0, 8)}, code=link_ref_ledger_unavailable)`,
+      );
+    }
+  };
   let renderSnapshot = frozenRenderSnapshot;
   const managedReceiver = !!ds.session.vcMeetingReceiver;
   const zeroPromptReply = !managedReceiver && (!msg.kind || msg.kind === 'bridge')
@@ -19321,6 +19639,7 @@ function deliverFinalOutput(
       rememberHttpTerminal(ds, msg.turnId);
       ds.idempotentAsyncTurns?.delete(msg.turnId);
       ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
+      confirmLinkRefDraft();
       onComplete?.(true);
       return;
     }
@@ -19355,6 +19674,7 @@ function deliverFinalOutput(
     waitPromise.resolve(msg.content);
     ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
     logger.info(`[${t}] Intercepted final_output for Wait Mode HTTP request (turn ${msg.turnId.substring(0, 8)})`);
+    confirmLinkRefDraft();
     onComplete?.(true);
     return;
   }
@@ -19388,6 +19708,7 @@ function deliverFinalOutput(
     ds.idempotentAsyncTurns?.delete(msg.turnId);
     ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
     logger.info(`[${t}] Captured final_output for Async HTTP request (turn ${msg.turnId.substring(0, 8)})`);
+    confirmLinkRefDraft();
     onComplete?.(true);
     return;
   }
@@ -19489,6 +19810,7 @@ function deliverFinalOutput(
           }
         }
         logger.info(`[${t}] doc-comment final_output → posted ${chunks.length} comment(s) on file=${docTurn.fileToken.slice(0, 12)} (turn ${msg.turnId.substring(0, 8)})`);
+        confirmLinkRefDraft();
         onComplete?.(true);
         return;
       }
@@ -19833,6 +20155,7 @@ function deliverFinalOutput(
           `[${t}] VC listener fallback replayed existing provider result `
           + `(turn ${msg.turnId.substring(0, 8)})`,
         );
+        confirmLinkRefDraft();
         onComplete?.(true, preparedListenerReply.messageId);
         return;
       }
@@ -19930,7 +20253,14 @@ function deliverFinalOutput(
       const messageId = durableDelivery?.messageId ?? unifiedReply?.messageId ?? await (managedReceiver
         ? sendFinal(canonicalOutput.content)
         : replyWithImageFallback(canonicalOutput.content, canonicalOutput.msgType, sendFinal, imageFallback));
-      if (!isStillOwned()) { onComplete?.(true); return; }
+      if (!isStillOwned()) {
+        // The provider already returned its stable message id. Ownership loss
+        // only suppresses later local bookkeeping; it cannot make that external
+        // effect un-happen, so the exact unresolved retry draft is confirmed.
+        confirmLinkRefDraft();
+        onComplete?.(true);
+        return;
+      }
       if (messageId && !managedReceiver) {
         recordTurnTerminalCarrier(ds, msg.turnId, {
           messageId,
@@ -19993,6 +20323,7 @@ function deliverFinalOutput(
         ...(unifiedReply?.record.overflowMessageId
           ? [{ kind: 'attachment' as const, messageId: unifiedReply.record.overflowMessageId }] : []),
       ]), finalPublication?.receipt.reason));
+      confirmLinkRefDraft();
       onComplete?.(true, messageId);
     } catch (err: any) {
       if (!isStillOwned()) { onComplete?.(false); return; }
@@ -20137,11 +20468,20 @@ function commitGroupContextDispatch(ds: DaemonSession, payload: CliTurnPayload, 
   try {
     if (!hasPreparedGroupContext(ds.larkAppId, ds.chatId, turnId)) return;
     const cliId = ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? getBot(ds.larkAppId).config.cliId;
-    commitGroupContextDispatchIntoPayload(payload, {
+    const committed = commitGroupContextDispatchIntoPayload(payload, {
       appId: ds.larkAppId, chatId: ds.chatId, turnId, sessionId: ds.session.sessionId,
       epoch: groupContextEpoch(ds.session.sessionId, ds.session.cliSessionId, cliId, turnId),
       ...(ds.session.workerGeneration !== undefined ? { workerGeneration: ds.session.workerGeneration } : {}),
     });
+    if (committed && payload.linkRefs?.sources) {
+      const sources = payload.linkRefs.sources.flatMap(source => {
+        if (source.sourceType !== 'group_context' || source.kind !== 'text') return [source];
+        return committed.dispatched.body
+          ? [{ ...source, text: committed.dispatched.body }]
+          : [];
+      });
+      payload.linkRefs = { ...payload.linkRefs, sources };
+    }
   } catch (error) {
     logger.warn(`[${tag(ds)}] group-context dispatch commit skipped: ${error instanceof Error ? error.message : String(error)}`);
   }
@@ -20237,6 +20577,7 @@ export function forkAdoptWorker(
   opts?: {
     restoredFromMetadata?: boolean;
     prompt?: string;
+    payload?: CliTurnPayload;
     turnId?: string;
     atMostOnce?: boolean;
     trustedCaller?: TrustedCaller;
@@ -20434,7 +20775,7 @@ export function forkAdoptWorker(
   const isStructuredBridge = isStructuredBridgeAdoptCli(adoptedCliId);
   // Adopt re-forks carry the turn's bridge-formatted input in the init
   // message; this is that path's delivery boundary for group background.
-  const adoptPrompt = { content: opts?.prompt ?? '' };
+  let adoptPrompt: CliTurnPayload = opts?.payload ?? { content: opts?.prompt ?? '' };
   commitGroupContextDispatch(ds, adoptPrompt, opts?.turnId);
   const adoptBackendType = adopted.source === 'orca'
     ? 'orca'
@@ -20443,6 +20784,14 @@ export function forkAdoptWorker(
     || isStructuredBridge
     || !!adopted.zellijPaneId
     || adopted.source === 'orca';
+  const admittedLinkRefs = prepareAdmittedLinkRefPayload({
+    ds,
+    payload: adoptPrompt,
+    turnId: opts?.turnId,
+  });
+  adoptPrompt = opts?.payload
+    ? freezeAdmittedPayloadInPlace(opts.payload, admittedLinkRefs.payload)
+    : admittedLinkRefs.payload;
 
   if (!ds.session.terminalCardEpoch) {
     ds.session.terminalCardEpoch = randomUUID();
@@ -20483,6 +20832,7 @@ export function forkAdoptWorker(
     // wrapper leaks into the user's un-injected external CLI.
     prompt: adoptPrompt.content,
     turnId: opts?.turnId,
+    ...(admittedLinkRefs.mode === 'disabled' ? {} : { linkRefMode: admittedLinkRefs.mode }),
     ...(opts?.atMostOnce ? { atMostOnce: true } : {}),
     ...(opts?.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}),
     ...(trustedSessionController(ds)

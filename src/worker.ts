@@ -193,13 +193,21 @@ import {
   MCP_GATEWAY_REQUIRED_ENV,
   MCP_GATEWAY_SOCKET_ENV,
 } from './core/plugins/mcp/environment.js';
-import type { GatewayTrustedResultDeliveryHandler } from './core/plugins/mcp/gateway.js';
+import type {
+  GatewayLinkRefRegistrationHandler,
+  GatewayTrustedResultDeliveryHandler,
+} from './core/plugins/mcp/gateway.js';
 import {
   awaitTrustedResultDeliveryAck,
   consumeTrustedResultDeliverySources,
+  resolveTrustedResultDeliveryLinkRefs,
   sendTrustedDeliveryIpcWithBackpressure,
   trustedResultTerminalObservation,
 } from './core/plugins/mcp/trusted-result-delivery.js';
+import {
+  LINK_REF_REGISTER_MAX_BODY_BYTES,
+  LINK_REF_RESOLVE_MAX_BODY_BYTES,
+} from './core/link-ref-ipc.js';
 import { PluginResultArtifactStore } from './core/plugins/mcp/result-artifact-store.js';
 import {
   readSessionMcpRuntimeManifest,
@@ -1690,7 +1698,12 @@ let sandboxRelayOutbox: string | null = null;
  *  real close / in-worker restart / a PTY-owned CLI tears it down. See
  *  sandboxTreeSurvivesWorkerExit. */
 let sandboxTreeOutlivesWorker = false;
-let sandboxRelayCapability: { token: string; turnId?: string; dispatchAttempt?: number } | null = null;
+let sandboxRelayCapability: {
+  token: string;
+  turnId?: string;
+  dispatchAttempt?: number;
+  linkRefMode?: 'observe' | 'enabled';
+} | null = null;
 let sandboxPolicyCapability: string | null = null;
 let readIsolationOriginCapabilityFile: string | null = null;
 let readIsolationOriginChannelId: string | null = null;
@@ -1700,6 +1713,106 @@ const pendingPluginResultDeliveries = new Map<string, {
   resolve: (value: { messageIds: string[] }) => void;
   reject: (error: Error) => void;
 }>();
+const pendingLinkRefRegistrations = new Map<string, {
+  resolve: (value: { companion?: string; stats: Record<string, number | undefined> }) => void;
+  reject: (error: Error) => void;
+}>();
+const pendingLinkRefResolutions = new Map<string, {
+  resolve: (value: import('./services/link-ref-resolver.js').ResolvedOutboundLinkRefs) => void;
+  reject: (error: Error) => void;
+}>();
+const pendingLinkRefModeRestores = new Map<string, {
+  resolve: (mode: 'enabled' | undefined) => void;
+  reject: (error: Error) => void;
+}>();
+
+function restoreLinkRefModeThroughHost(input: {
+  turnId: string;
+  dispatchAttempt?: number;
+}): Promise<'enabled' | undefined> {
+  const requestId = randomUUID();
+  const result = new Promise<'enabled' | undefined>((resolve, reject) => {
+    pendingLinkRefModeRestores.set(requestId, { resolve, reject });
+  });
+  send({
+    type: 'link_ref_restore_mode',
+    requestId,
+    sessionId,
+    turnId: input.turnId,
+    ...(input.dispatchAttempt !== undefined
+      ? { dispatchAttempt: input.dispatchAttempt }
+      : {}),
+  });
+  return result.finally(() => pendingLinkRefModeRestores.delete(requestId));
+}
+
+function assertBoundedLinkRefIpcValue(value: unknown, maxBytes: number): void {
+  let serialized: string;
+  try {
+    serialized = JSON.stringify(value);
+  } catch {
+    throw new Error('link_ref_limit_exceeded');
+  }
+  if (Buffer.byteLength(serialized, 'utf8') > maxBytes) {
+    throw new Error('link_ref_limit_exceeded');
+  }
+}
+
+const registerMcpLinkRefsThroughHost: GatewayLinkRefRegistrationHandler = async input => {
+  const { identity } = input;
+  if (!identity.turnId || !identity.linkRefMode) throw new Error('link_ref_identity_mismatch');
+  assertBoundedLinkRefIpcValue(input.value, LINK_REF_REGISTER_MAX_BODY_BYTES);
+  const requestId = randomUUID();
+  const result = new Promise<{ companion?: string; stats: Record<string, number | undefined> }>(
+    (resolve, reject) => pendingLinkRefRegistrations.set(requestId, { resolve, reject }),
+  );
+  send({
+    type: 'link_ref_register',
+    requestId,
+    sessionId,
+    turnId: identity.turnId,
+    ...(identity.dispatchAttempt !== undefined ? { dispatchAttempt: identity.dispatchAttempt } : {}),
+    linkRefMode: identity.linkRefMode,
+    pluginId: input.pluginId,
+    sourceId: input.sourceId,
+    value: input.value,
+  });
+  try {
+    return await result;
+  } finally {
+    pendingLinkRefRegistrations.delete(requestId);
+  }
+};
+
+async function resolveMcpLinkRefsThroughHost(input: {
+  identity: NonNullable<ReturnType<typeof currentGatewayTrustedTurnIdentity>>;
+  payload: import('./services/link-ref-resolver.js').OutboundLinkRefPayload;
+}): Promise<import('./services/link-ref-resolver.js').ResolvedOutboundLinkRefs> {
+  if (!input.identity.turnId || input.identity.linkRefMode !== 'enabled') {
+    return { ...input.payload, refCount: 0 };
+  }
+  assertBoundedLinkRefIpcValue(input.payload, LINK_REF_RESOLVE_MAX_BODY_BYTES);
+  const requestId = randomUUID();
+  const result = new Promise<import('./services/link-ref-resolver.js').ResolvedOutboundLinkRefs>(
+    (resolve, reject) => pendingLinkRefResolutions.set(requestId, { resolve, reject }),
+  );
+  send({
+    type: 'link_ref_resolve',
+    requestId,
+    sessionId,
+    turnId: input.identity.turnId,
+    ...(input.identity.dispatchAttempt !== undefined
+      ? { dispatchAttempt: input.identity.dispatchAttempt }
+      : {}),
+    linkRefMode: 'enabled',
+    payload: input.payload,
+  });
+  try {
+    return await result;
+  } finally {
+    pendingLinkRefResolutions.delete(requestId);
+  }
+}
 
 const deliverPluginResultThroughHost: GatewayTrustedResultDeliveryHandler = async (input) => {
   const { identity, delivery } = input;
@@ -1708,15 +1821,27 @@ const deliverPluginResultThroughHost: GatewayTrustedResultDeliveryHandler = asyn
     throw new Error('plugin_result_delivery_missing_identity');
   }
   const artifactStore = new PluginResultArtifactStore();
-  const artifact = artifactStore.create({
-    pluginId: input.pluginId,
+  let artifact!: ReturnType<PluginResultArtifactStore['create']>;
+  const resolvedDelivery = await resolveTrustedResultDeliveryLinkRefs({
     delivery,
-    ownerUnionId: identity.caller.requestUserUnionId,
-    ...(identity.caller.requestUserOpenId ? { ownerOpenId: identity.caller.requestUserOpenId } : {}),
-    larkAppId: cfg.larkAppId,
-    sessionId,
-    turnId: identity.turnId,
-    ...(identity.dispatchAttempt !== undefined ? { dispatchAttempt: identity.dispatchAttempt } : {}),
+    mode: identity.linkRefMode ?? 'disabled',
+    resolve: payload => resolveMcpLinkRefsThroughHost({ identity, payload }),
+    persist: value => {
+      artifact = artifactStore.create({
+        pluginId: input.pluginId,
+        delivery: value,
+        ownerUnionId: identity.caller!.requestUserUnionId!,
+        ...(identity.caller!.requestUserOpenId
+          ? { ownerOpenId: identity.caller!.requestUserOpenId }
+          : {}),
+        larkAppId: cfg.larkAppId,
+        sessionId,
+        turnId: identity.turnId!,
+        ...(identity.dispatchAttempt !== undefined
+          ? { dispatchAttempt: identity.dispatchAttempt }
+          : {}),
+      });
+    },
   });
   const requestId = randomUUID();
   let resolveResponse!: (value: { messageIds: string[] }) => void;
@@ -1738,11 +1863,11 @@ const deliverPluginResultThroughHost: GatewayTrustedResultDeliveryHandler = asyn
     ...(identity.dispatchAttempt !== undefined ? { dispatchAttempt: identity.dispatchAttempt } : {}),
     ...(identity.caller?.requestUserOpenId ? { callerOpenId: identity.caller.requestUserOpenId } : {}),
     callerUnionId: identity.caller!.requestUserUnionId!,
-    deliveryId: delivery.deliveryId,
+    deliveryId: resolvedDelivery.deliveryId,
     viewToken: artifact.viewToken,
     expiresAt: artifact.expiresAt,
     fileCount: artifact.fileCount,
-    responseKind: delivery.responseKind ?? 'final',
+    responseKind: resolvedDelivery.responseKind ?? 'final',
   };
   try {
     await sendTrustedDeliveryIpcWithBackpressure({
@@ -1766,14 +1891,14 @@ const deliverPluginResultThroughHost: GatewayTrustedResultDeliveryHandler = asyn
     pendingPluginResultDeliveries.delete(requestId);
   });
   try {
-    consumeTrustedResultDeliverySources(delivery);
+    consumeTrustedResultDeliverySources(resolvedDelivery);
   } catch (error) {
     // The host snapshot and entry card are already durable. Cleanup failure
     // must not turn a working result into a broken link; retain the source for
     // operator cleanup and keep it out of the model-facing receipt.
     log(`[plugin-result] source cleanup failed: ${error instanceof Error ? error.message : String(error)}`);
   }
-  if ((delivery.responseKind ?? 'final') === 'final') {
+  if ((resolvedDelivery.responseKind ?? 'final') === 'final') {
     const terminal = trustedResultTerminalObservation(response.messageIds);
     send({
       type: 'explicit_reply_observed',
@@ -1785,8 +1910,8 @@ const deliverPluginResultThroughHost: GatewayTrustedResultDeliveryHandler = asyn
   }
   return {
     delivered: true as const,
-    deliveryId: delivery.deliveryId,
-    fileCount: delivery.files?.length ?? 0,
+    deliveryId: resolvedDelivery.deliveryId,
+    fileCount: resolvedDelivery.files?.length ?? 0,
   };
 };
 /** Counts consecutive in-worker restart cycles (see case 'restart'). Used by
@@ -1975,6 +2100,7 @@ async function startAndRecordSessionMcpGatewayHost(sessionId: string): Promise<v
     dataDir: config.session.dataDir,
     trustedTurnIdentity: currentGatewayTrustedTurnIdentity,
     trustedResultDelivery: deliverPluginResultThroughHost,
+    linkRefRegistration: registerMcpLinkRefsThroughHost,
     onError: error => log(`[mcp-gateway] host error: ${error.message}`),
   });
   // The NEXT worker generation reads this record to decide whether a surviving
@@ -3589,6 +3715,7 @@ async function deliverRawInput(msg: Extract<DaemonToWorker, { type: 'raw_input' 
                 undefined,
                 undefined,
                 undefined,
+                undefined,
                 fence,
               );
               if (result === 'stale-before-write') {
@@ -3636,6 +3763,37 @@ const inflightInputs = new InflightInputTracker();
 let lastPtyActivityAtMs = 0;
 let currentBotmuxTurnId: string | undefined;
 let currentBotmuxDispatchAttempt: number | undefined;
+let currentBotmuxLinkRefMode: 'observe' | 'enabled' | undefined;
+const frozenTurnLinkRefModes = new Map<string, 'disabled' | 'observe' | 'enabled'>();
+
+function turnLinkRefModeKey(turnId: string, dispatchAttempt?: number): string {
+  return `${turnId}\u0000${dispatchAttempt ?? 0}`;
+}
+
+/** Freeze once from daemon-owned turn metadata. A later type-ahead turn may
+ * replace the mutable current-turn globals before an older final arrives. */
+function rememberTurnLinkRefMode(
+  turnId: string | undefined,
+  dispatchAttempt: number | undefined,
+  mode: 'observe' | 'enabled' | undefined,
+): void {
+  if (!turnId) return;
+  const key = turnLinkRefModeKey(turnId, dispatchAttempt);
+  if (!frozenTurnLinkRefModes.has(key)) {
+    frozenTurnLinkRefModes.set(key, mode ?? 'disabled');
+    while (frozenTurnLinkRefModes.size > 256) {
+      frozenTurnLinkRefModes.delete(frozenTurnLinkRefModes.keys().next().value!);
+    }
+  }
+}
+
+function frozenTurnLinkRefMode(
+  turnId: string,
+  dispatchAttempt?: number,
+): 'observe' | 'enabled' | undefined {
+  const mode = frozenTurnLinkRefModes.get(turnLinkRefModeKey(turnId, dispatchAttempt));
+  return mode === 'observe' || mode === 'enabled' ? mode : undefined;
+}
 /** Open id of the human whose turn currentBotmuxTurnId belongs to. Published
  *  alongside the live-turn marker so the identity wrapper can keep a
  *  same-principal credential across consecutive turns. */
@@ -3675,6 +3833,7 @@ let currentTurnSteerPromoted = false;
 interface QueuedTypeAheadTurnRecord {
   turnId: string;
   dispatchAttempt?: number;
+  linkRefMode?: 'observe' | 'enabled';
   trustedCaller?: TrustedCaller;
   trustedController?: TrustedCaller;
   vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin;
@@ -3839,7 +3998,11 @@ function releaseActiveTurnAuthority(
 }
 
 function currentGatewayTrustedTurnIdentity() {
-  return activeTurnAuthority.identity();
+  const identity = activeTurnAuthority.identity();
+  return {
+    ...identity,
+    ...(currentBotmuxLinkRefMode ? { linkRefMode: currentBotmuxLinkRefMode } : {}),
+  };
 }
 
 function publishSandboxRelayCapability(opts: { failClosed?: boolean } = {}): boolean {
@@ -3848,12 +4011,14 @@ function publishSandboxRelayCapability(opts: { failClosed?: boolean } = {}): boo
   const activeIdentity = activeTurnAuthority.identity();
   const authorityTurnId = activeIdentity.turnId ?? currentBotmuxTurnId;
   const authorityDispatchAttempt = activeIdentity.dispatchAttempt ?? currentBotmuxDispatchAttempt;
+  const authorityLinkRefMode = currentBotmuxLinkRefMode;
   const capability = {
     token: randomBytes(32).toString('hex'),
     ...(authorityTurnId ? { turnId: authorityTurnId } : {}),
     ...(authorityDispatchAttempt !== undefined
       ? { dispatchAttempt: authorityDispatchAttempt }
       : {}),
+    ...(authorityLinkRefMode ? { linkRefMode: authorityLinkRefMode } : {}),
   };
   const files = [
     ...(sandboxRelayOutbox
@@ -3870,6 +4035,7 @@ function publishSandboxRelayCapability(opts: { failClosed?: boolean } = {}): boo
             ...(capability.dispatchAttempt !== undefined
               ? { dispatchAttempt: capability.dispatchAttempt }
               : {}),
+            ...(authorityLinkRefMode ? { linkRefMode: authorityLinkRefMode } : {}),
             ...(daemonIpcPort !== undefined ? { ipcPort: daemonIpcPort } : {}),
           }),
         }]
@@ -3892,6 +4058,7 @@ function publishSandboxRelayCapability(opts: { failClosed?: boolean } = {}): boo
             ...(capability.dispatchAttempt !== undefined
               ? { dispatchAttempt: capability.dispatchAttempt }
               : {}),
+            ...(authorityLinkRefMode ? { linkRefMode: authorityLinkRefMode } : {}),
             ...(daemonIpcPort !== undefined ? { ipcPort: daemonIpcPort } : {}),
           }),
         }]
@@ -3939,6 +4106,7 @@ function publishSandboxRelayCapability(opts: { failClosed?: boolean } = {}): boo
       ...(capability.dispatchAttempt !== undefined
         ? { dispatchAttempt: capability.dispatchAttempt }
         : {}),
+      ...(authorityLinkRefMode ? { linkRefMode: authorityLinkRefMode } : {}),
     });
   }
   return true;
@@ -4018,6 +4186,7 @@ function authorizeManagedSend(
     turnId?: string;
     dispatchAttempt?: number;
     requiresCodexAppLedger?: boolean;
+    linkRefMode?: 'observe' | 'enabled';
   };
 } | { ok: false; error: string } {
   if (!sessionId) return { ok: false, error: 'VC policy cannot resolve session id' };
@@ -4070,6 +4239,7 @@ function authorizeManagedSend(
             ? { dispatchAttempt: capability.dispatchAttempt }
             : {}),
           ...(requiresCodexAppLedger ? { requiresCodexAppLedger: true } : {}),
+          ...(capability.linkRefMode ? { linkRefMode: capability.linkRefMode } : {}),
         },
       }
     : { ok: false, error: `${decision.errorCode}: ${decision.error}` };
@@ -4102,6 +4272,7 @@ function registerRpcEnginePidMarker(pid: number | undefined): string | null {
 function adoptInitialActiveTurn(parsed: {
   turnId: string;
   dispatchAttempt?: number;
+  linkRefMode?: 'observe' | 'enabled';
   trustedCaller?: TrustedCaller;
   trustedController?: TrustedCaller;
   steerPromotedTurn?: boolean;
@@ -4115,6 +4286,7 @@ function adoptInitialActiveTurn(parsed: {
     // continuation the marker itself already witnessed.
     parsed.callerOpenId ?? parsed.trustedCaller?.requestUserOpenId,
   );
+  currentBotmuxLinkRefMode = parsed.linkRefMode;
   currentTurnSteerPromoted = Boolean(parsed.steerPromotedTurn);
   activeTurnAuthority.clear();
   activeTurnAuthority.reserve({
@@ -4134,6 +4306,7 @@ function adoptInitialActiveTurn(parsed: {
 function adoptDisplacedActiveTurn(parsed: {
   turnId: string;
   dispatchAttempt?: number;
+  linkRefMode?: 'observe' | 'enabled';
   trustedCaller?: TrustedCaller;
   trustedController?: TrustedCaller;
   steerPromotedTurn?: boolean;
@@ -4144,6 +4317,7 @@ function adoptDisplacedActiveTurn(parsed: {
   const displaced: QueuedTypeAheadTurnRecord = {
     turnId: currentBotmuxTurnId!,
     ...(currentBotmuxDispatchAttempt !== undefined ? { dispatchAttempt: currentBotmuxDispatchAttempt } : {}),
+    ...(currentBotmuxLinkRefMode ? { linkRefMode: currentBotmuxLinkRefMode } : {}),
     ...(currentCaller ? { trustedCaller: currentCaller } : {}),
     ...(currentController ? { trustedController: currentController } : {}),
     ...(currentVcMeetingImTurnOrigin ? { vcMeetingImTurnOrigin: currentVcMeetingImTurnOrigin } : {}),
@@ -4156,6 +4330,7 @@ function adoptDisplacedActiveTurn(parsed: {
     typeof parsed.dispatchAttempt === 'number' ? parsed.dispatchAttempt : undefined,
     parsed.callerOpenId ?? parsed.trustedCaller?.requestUserOpenId,
   );
+  currentBotmuxLinkRefMode = parsed.linkRefMode;
   currentTurnSteerPromoted = Boolean(parsed.steerPromotedTurn);
   if (!queuedTypeAheadTurns.some(q => q.turnId === displaced.turnId)) {
     queuedTypeAheadTurns.unshift(displaced);
@@ -4257,6 +4432,9 @@ function writeCliPidMarker(): void {
                   queuedTypeAheadTurns.push({
                     turnId: qt.turnId,
                     ...(typeof qt.dispatchAttempt === 'number' ? { dispatchAttempt: qt.dispatchAttempt } : {}),
+                    ...(qt.linkRefMode === 'observe' || qt.linkRefMode === 'enabled'
+                      ? { linkRefMode: qt.linkRefMode }
+                      : {}),
                     ...(qt.trustedCaller && typeof qt.trustedCaller === 'object' ? { trustedCaller: qt.trustedCaller } : {}),
                     ...(qt.trustedController && typeof qt.trustedController === 'object' ? { trustedController: qt.trustedController } : {}),
                     ...(typeof qt.callerOpenId === 'string' && qt.callerOpenId ? { turnCallerOpenId: qt.callerOpenId } : {}),
@@ -4275,6 +4453,7 @@ function writeCliPidMarker(): void {
         const queuedTurns = queuedTypeAheadTurns.map(t => ({
           turnId: t.turnId,
           ...(t.dispatchAttempt !== undefined ? { dispatchAttempt: t.dispatchAttempt } : {}),
+          ...(t.linkRefMode ? { linkRefMode: t.linkRefMode } : {}),
           ...(t.trustedCaller ? { trustedCaller: t.trustedCaller } : {}),
           ...(t.trustedController ? { trustedController: t.trustedController } : {}),
           ...(t.turnCallerOpenId ? { callerOpenId: t.turnCallerOpenId } : {}),
@@ -4286,6 +4465,7 @@ function writeCliPidMarker(): void {
           sessionId,
           turnId: currentBotmuxTurnId ?? null,
           dispatchAttempt: currentBotmuxDispatchAttempt ?? null,
+          ...(currentBotmuxLinkRefMode ? { linkRefMode: currentBotmuxLinkRefMode } : {}),
           ...(currentBotmuxCallerOpenId ? { callerOpenId: currentBotmuxCallerOpenId } : {}),
           ...(effectiveCaller ? { trustedCaller: effectiveCaller } : {}),
           ...(effectiveController ? { trustedController: effectiveController } : {}),
@@ -4324,6 +4504,9 @@ function restoreQueuedTurnsFromMarkerDisk(markerPath: string): void {
             queuedTypeAheadTurns.push({
               turnId: t.turnId,
               ...(typeof t.dispatchAttempt === 'number' ? { dispatchAttempt: t.dispatchAttempt } : {}),
+              ...(t.linkRefMode === 'observe' || t.linkRefMode === 'enabled'
+                ? { linkRefMode: t.linkRefMode }
+                : {}),
               ...(t.trustedCaller && typeof t.trustedCaller === 'object' ? { trustedCaller: t.trustedCaller } : {}),
               ...(t.trustedController && typeof t.trustedController === 'object' ? { trustedController: t.trustedController } : {}),
               ...(typeof t.callerOpenId === 'string' && t.callerOpenId ? { turnCallerOpenId: t.callerOpenId } : {}),
@@ -4363,6 +4546,9 @@ function syncQueuedTurnsFromMarkerDisk(): boolean {
                 typeof parsed.dispatchAttempt === 'number' ? parsed.dispatchAttempt : advancedRecord.dispatchAttempt,
                 parsed.callerOpenId ?? advancedRecord.turnCallerOpenId,
               );
+              currentBotmuxLinkRefMode = parsed.linkRefMode === 'observe' || parsed.linkRefMode === 'enabled'
+                ? parsed.linkRefMode
+                : advancedRecord.linkRefMode;
               currentVcMeetingImTurnOrigin = advancedRecord.vcMeetingImTurnOrigin;
               currentTurnSteerPromoted = Boolean((parsed as any)?.steerPromotedTurn);
               queuedTypeAheadTurns.splice(0, idx + 1);
@@ -4390,6 +4576,9 @@ function syncQueuedTurnsFromMarkerDisk(): boolean {
             if (qt?.turnId && qt.turnId !== currentBotmuxTurnId && !retiredTurnIds.has(qt.turnId) && !queuedTypeAheadTurns.some(t => t.turnId === qt.turnId)) {
               queuedTypeAheadTurns.push({
                 turnId: qt.turnId,
+                ...(qt.linkRefMode === 'observe' || qt.linkRefMode === 'enabled'
+                  ? { linkRefMode: qt.linkRefMode }
+                  : {}),
                 ...(typeof qt.dispatchAttempt === 'number' ? { dispatchAttempt: qt.dispatchAttempt } : {}),
                 ...(qt.trustedCaller && typeof qt.trustedCaller === 'object' ? { trustedCaller: qt.trustedCaller } : {}),
                 ...(qt.trustedController && typeof qt.trustedController === 'object' ? { trustedController: qt.trustedController } : {}),
@@ -4413,6 +4602,7 @@ function advanceQueuedTypeAheadTurn(reason: string): boolean {
   const prevTurnId = currentBotmuxTurnId;
   markTurnRetired(prevTurnId);
   setCaptureIdentity(next.turnId, next.dispatchAttempt, next.turnCallerOpenId);
+  currentBotmuxLinkRefMode = next.linkRefMode;
   currentVcMeetingImTurnOrigin = next.vcMeetingImTurnOrigin;
   currentTurnSteerPromoted = true;
   queuedTurnAdvanceConsumedForPrompt = true;
@@ -6075,6 +6265,7 @@ function restoreScheduledTaskAnchorsOnce(): void {
 function journalBridgeTurnMark(entry: {
   turnId: string;
   dispatchAttempt?: number;
+  linkRefMode?: 'observe' | 'enabled';
   markTimeMs: number;
   fingerprint?: string;
   contentNormalized?: string;
@@ -6185,7 +6376,11 @@ function stampMojoTurnMark(turnId: string | undefined, dispatchAttempt: number |
   mojoTurnMark = { turnId, dispatchAttempt, markTimeMs: Date.now() };
 }
 
-function deliverRemoteTurnFinal(text: string, exactTurnId?: string): void {
+function deliverRemoteTurnFinal(
+  text: string,
+  exactTurnId?: string,
+  linkRefMode?: 'observe' | 'enabled',
+): void {
   if (!text.trim()) return;
   // A mark from an EARLIER turn must not gate this one: its window opened
   // before the previous turn's sends, which would suppress this answer for the
@@ -6239,12 +6434,14 @@ function deliverRemoteTurnFinal(text: string, exactTurnId?: string): void {
     lastUuid: turnId,
     turnId,
     ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+    ...(linkRefMode ? { linkRefMode } : {}),
   });
   log(`Remote final bridge delivered ${postContent.length} chars for turn ${turnId.substring(0, 12)}`);
 }
 
 async function deliverRemoteRunnerOutboundMessage(
   message: import('./adapters/backend/remote-runner-protocol.js').RemoteRunnerOutboundMessage,
+  linkRefMode?: 'observe' | 'enabled',
 ): Promise<import('./adapters/backend/remote-runner-protocol.js').RemoteRunnerOutboundMessageResult> {
   const authority = activeTurnAuthority.identity();
   if (!sessionId || !lastInitConfig
@@ -6282,6 +6479,7 @@ async function deliverRemoteRunnerOutboundMessage(
     ...(currentBotmuxDispatchAttempt !== undefined
       ? { dispatchAttempt: currentBotmuxDispatchAttempt }
       : {}),
+    ...(linkRefMode ? { linkRefMode } : {}),
     env,
   });
 }
@@ -6589,13 +6787,14 @@ function tryRestoreInterruptedBridgeTurns(): boolean {
     return skipRecovery(`drain-failed: ${error instanceof Error ? error.message : String(error)}`);
   }
   for (const entry of restorable) {
+    rememberTurnLinkRefMode(entry.turnId, entry.dispatchAttempt, entry.linkRefMode);
     bridgeQueue.mark(
       entry.turnId,
       entry.fingerprint,
       entry.markTimeMs,
       entry.contentNormalized,
       entry.dispatchAttempt,
-      { restoredFromJournal: true },
+      { restoredFromJournal: true, linkRefMode: entry.linkRefMode },
     );
   }
   bridgeOffset = drained.newOffset;
@@ -7533,6 +7732,7 @@ function bridgeMarkPendingTurn(
   messageText: string,
   preferredTurnId?: string,
   dispatchAttempt?: number,
+  linkRefMode?: 'observe' | 'enabled',
 ): string | undefined {
   if (!bridgeJsonlPath) return undefined;
   if (!bridgeBaselineDone) {
@@ -7568,7 +7768,7 @@ function bridgeMarkPendingTurn(
   const contentNormalized = normalised.length > 0 ? normalised : undefined;
   const turnId = preferredTurnId ?? randomBytes(8).toString('hex');
   const markTimeMs = Date.now();
-  bridgeQueue.mark(turnId, fingerprint, markTimeMs, contentNormalized, dispatchAttempt);
+  bridgeQueue.mark(turnId, fingerprint, markTimeMs, contentNormalized, dispatchAttempt, { linkRefMode });
   // Journal the mark so a worker/daemon restart mid-turn can restore it
   // (bridgeAbsorbBaseline). Excluded:
   //   - adopt mode: its baseline absorbs the whole transcript with different
@@ -7584,6 +7784,7 @@ function bridgeMarkPendingTurn(
     journalBridgeTurnMark({
       turnId,
       dispatchAttempt,
+      linkRefMode,
       markTimeMs,
       fingerprint,
       contentNormalized,
@@ -7662,6 +7863,10 @@ function emitReadyTurns(opts: { explicitTerminalOnly?: boolean } = {}): void {
   const nothingToSendTurns = new Set<(typeof ready)[number]>();
   for (let i = 0; i < ready.length; i++) {
     const turn = ready[i];
+    // A restored structured turn may predate every in-memory admission map in
+    // this worker generation. Re-freeze its exact journaled mode before the
+    // final crosses workerIpcPayload, which deliberately ignores caller fields.
+    rememberTurnLinkRefMode(turn.turnId, turn.dispatchAttempt, turn.linkRefMode);
     // Claude API-error text is execution metadata, not a model answer. The
     // structured terminal below owns retry/attention; never leak the raw
     // provider error through transcript fallback (regardless of send markers).
@@ -9401,11 +9606,12 @@ function codexBridgeMarkPendingTurn(
   preferredTurnId?: string,
   dispatchAttempt?: number,
   markTimeMs: number = Date.now(),
+  linkRefMode?: 'observe' | 'enabled',
 ): string | undefined {
   if (!codexBridgeFallbackActive()) return undefined;
   const turnId = preferredTurnId ?? `codex-${randomBytes(8).toString('hex')}`;
   const recoveryCursorAtMark = structuredBridgeRecoveryCursorAtMark();
-  codexBridgeQueue.mark(turnId, messageText, markTimeMs, dispatchAttempt, recoveryCursorAtMark);
+  codexBridgeQueue.mark(turnId, messageText, markTimeMs, dispatchAttempt, recoveryCursorAtMark, linkRefMode);
   checkpointCodexAdoptRecovery();
   checkpointStructuredBridgeRecovery();
   return turnId;
@@ -10644,11 +10850,13 @@ async function writeAdoptMessage(
   content: string,
   turnId: string | undefined,
   dispatchAttempt?: number,
+  linkRefMode?: 'observe' | 'enabled',
   vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin,
   trustedCaller?: TrustedCaller,
   trustedController?: TrustedCaller,
   fence?: AdoptWriteFence,
 ): Promise<AdoptWriteResult> {
+  rememberTurnLinkRefMode(turnId, dispatchAttempt, linkRefMode);
   const executionFence = fence ?? captureAdoptWriteFence();
   if (!executionFence || !adoptWriteFenceIsCurrent(executionFence)) {
     return 'stale-before-write';
@@ -10667,6 +10875,7 @@ async function writeAdoptMessage(
     markTurnRetired(currentBotmuxTurnId);
   }
   setCaptureIdentity(turnId, dispatchAttempt, trustedCaller?.requestUserOpenId);
+  currentBotmuxLinkRefMode = linkRefMode;
   currentVcMeetingImTurnOrigin = vcMeetingImTurnOrigin;
   markActiveTurnStarted({ turnId, dispatchAttempt, trustedCaller, trustedController });
   if (dispatchAttempt !== undefined) durableTurnInFlight = true;
@@ -10691,19 +10900,21 @@ async function writeAdoptMessage(
     beginCliWriteCycle();
     if (bridgeJsonlPath) {
       try { bridgeIngest(); } catch { /* best effort */ }
-      bridgeMarkPendingTurn(content, turnId, dispatchAttempt);
+      bridgeMarkPendingTurn(content, turnId, dispatchAttempt, linkRefMode);
     } else if (codexBridgeFallbackActive()) {
       if (structuredBridgeIs('cursor')) {
         // Cursor may append the current line before IPC handling; mark first so
         // the pre-existing line can fingerprint-match instead of becoming seen.
-        adoptStructuredBridgeTurnId = codexBridgeMarkPendingTurn(content, turnId, dispatchAttempt);
+        adoptStructuredBridgeTurnId = codexBridgeMarkPendingTurn(content, turnId, dispatchAttempt, Date.now(), linkRefMode);
         try { codexBridgeIngest(); } catch { /* best effort */ }
         // Re-arm the thinking bubble's rowid baseline at this turn's write so
         // only the new turn's reasoning/tool nodes render.
         armCursorCotForTurn();
       } else {
         try { codexBridgeIngest(); } catch { /* best effort */ }
-        adoptStructuredBridgeTurnId = codexBridgeMarkPendingTurn(content, turnId, dispatchAttempt);
+        adoptStructuredBridgeTurnId = codexBridgeMarkPendingTurn(
+          content, turnId, dispatchAttempt, Date.now(), linkRefMode,
+        );
       }
       if (adoptStructuredBridgeTurnId) {
         codexBridgeQueue.beginSubmitVerification(adoptStructuredBridgeTurnId, undefined, dispatchAttempt);
@@ -10928,6 +11139,7 @@ async function runAdoptMessageForCapturedGeneration(
       item.content,
       item.turnId,
       item.dispatchAttempt,
+      item.linkRefMode,
       item.vcMeetingImTurnOrigin,
       item.trustedCaller,
       item.trustedController,
@@ -12886,6 +13098,7 @@ async function handleTrustedCodexAppMarker(
     let nativeTurnId: string | undefined;
     let replyTurnId: string | undefined;
     let dispatchAttempt: number | undefined;
+    let linkRefMode: 'observe' | 'enabled' | undefined;
     let codexAppDispatchId: string | undefined;
     let codexAppDispatchHandle: number | undefined;
     if (isCodexAppCliId(lastInitConfig?.cliId)) {
@@ -12906,6 +13119,7 @@ async function handleTrustedCodexAppMarker(
         replyTurnId,
         nativeTurnId,
         dispatchAttempt,
+        linkRefMode,
         dispatchId: codexAppDispatchId,
         handle: codexAppDispatchHandle,
       } = settlement);
@@ -13022,6 +13236,7 @@ async function handleTrustedCodexAppMarker(
         ...(replyTurnId ? { replyTurnId } : {}),
         ...(finalUsage ? { usage: finalUsage } : {}),
         ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+        ...(linkRefMode ? { linkRefMode } : {}),
         ...((suppressDelivery || isSuperseded) ? { suppressDelivery: true } : {}),
         ...(isSuperseded ? { disposition: 'steer_superseded' as const } : {}),
         codexAppSettlement: {
@@ -13067,6 +13282,7 @@ async function handleTrustedCodexAppMarker(
         turnId,
         ...(finalUsage ? { usage: finalUsage } : {}),
         ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+        ...(linkRefMode ? { linkRefMode } : {}),
       });
       } else if (isSuperseded) {
         // A superseded member still emits a final_output so the daemon (and any
@@ -13079,6 +13295,7 @@ async function handleTrustedCodexAppMarker(
           lastUuid: turnId,
           turnId,
           ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+          ...(linkRefMode ? { linkRefMode } : {}),
           suppressDelivery: true,
           disposition: 'steer_superseded' as const,
         });
@@ -15460,6 +15677,7 @@ async function flushPending(): Promise<void> {
             queuedTypeAheadTurns.push({
               turnId: item.turnId,
               dispatchAttempt: item.dispatchAttempt,
+              linkRefMode: item.linkRefMode,
               trustedCaller: item.trustedCaller,
               trustedController: item.trustedController,
               vcMeetingImTurnOrigin: item.vcMeetingImTurnOrigin,
@@ -15476,6 +15694,7 @@ async function flushPending(): Promise<void> {
             item.dispatchAttempt,
             item.turnCallerOpenId ?? item.trustedCaller?.requestUserOpenId,
           );
+          currentBotmuxLinkRefMode = item.linkRefMode;
           currentVcMeetingImTurnOrigin = item.vcMeetingImTurnOrigin;
           currentTurnSteerPromoted = false;
           // Intentionally preserve queuedTypeAheadTurns: earlier type-ahead turns remain in queue.
@@ -15509,9 +15728,10 @@ async function flushPending(): Promise<void> {
             logicalMsg,
             item.turnId,
             item.dispatchAttempt,
+            item.linkRefMode,
           );
         } else if (codexBridgeActive && !writeRpcEngine) {
-          bridgeTurnId = codexBridgeMarkPendingTurn(logicalMsg, item.turnId, item.dispatchAttempt);
+          bridgeTurnId = codexBridgeMarkPendingTurn(logicalMsg, item.turnId, item.dispatchAttempt, Date.now(), item.linkRefMode);
           if (bridgeTurnId) {
             codexBridgeQueue.beginSubmitVerification(bridgeTurnId, undefined, item.dispatchAttempt);
           }
@@ -15584,6 +15804,7 @@ async function flushPending(): Promise<void> {
             // R4-B4: COPY the frozen steer authorization onto the reservation so a
             // superseded settlement can verify the exact head is a steerable turn.
             item.codexAppSteerable ? true : undefined,
+            item.linkRefMode,
           )
         : undefined;
       if (tracksCodexAppLiveness && item.codexAppDispatchId && codexAppFrozenTurnId) {
@@ -15657,6 +15878,7 @@ async function flushPending(): Promise<void> {
               turnId: item.turnId,
               ...(item.replyTurnId ? { replyTurnId: item.replyTurnId } : {}),
               ...(item.dispatchAttempt !== undefined ? { dispatchAttempt: item.dispatchAttempt } : {}),
+              ...(item.linkRefMode ? { linkRefMode: item.linkRefMode } : {}),
               ...(item.trustedCaller ? { trustedCaller: item.trustedCaller } : {}),
             });
           }
@@ -16195,6 +16417,7 @@ function sendToPty(
     codexAppInput?: CodexAppTurnInput;
     dispatchAttempt?: number;
     durablePrimaryInbox?: true;
+    linkRefMode?: 'observe' | 'enabled';
     codexAppDispatchId?: string;
     codexAppSteerable?: true;
     queuedActivationToken?: string;
@@ -16216,6 +16439,7 @@ function sendToPty(
     taskContinuation?: import('./types.js').TaskContinuationDispatchMarker;
   } = {},
 ): boolean {
+  rememberTurnLinkRefMode(turnId, opts.dispatchAttempt, opts.linkRefMode);
   const next: PendingCliInput = {
     content,
     turnId,
@@ -16232,6 +16456,7 @@ function sendToPty(
     ...(opts.trustedController ? { trustedController: opts.trustedController } : {}),
     ...(opts.dispatchAttempt !== undefined ? { dispatchAttempt: opts.dispatchAttempt } : {}),
     ...(opts.durablePrimaryInbox ? { durablePrimaryInbox: true } : {}),
+    ...(opts.linkRefMode ? { linkRefMode: opts.linkRefMode } : {}),
     ...(opts.atMostOnce ? { noReplay: true } : {}),
     ...(opts.taskContinuation ? { taskContinuation: opts.taskContinuation } : {}),
     ...(opts.vcMeetingImTurnOrigin
@@ -19808,7 +20033,10 @@ async function spawnCli(
       sandboxHome,
     );
     const mandatoryDenyPaths: string[] = [];
-    const hostOnlyDenyPaths: string[] = [join(canonical(dataDir), 'schedule-preconditions')];
+    const hostOnlyDenyPaths: string[] = [
+      join(canonical(dataDir), 'schedule-preconditions'),
+      join(canonical(dataDir), 'link-refs'),
+    ];
     const mandatoryDenyRegexes: string[] = [];
     const mandatoryReadOnlyPaths: string[] = [];
     // Linux: the per-session sandbox tree (`sandboxes/<sid>`) holds the deny-mask
@@ -21890,7 +22118,7 @@ async function spawnCli(
   // thread when the agent produced one but never called `botmux send`. Same
   // generation fence as onTaskDone above — a late callback from a backend the
   // worker has already replaced must not post into the current turn.
-  backend.onTurnFinal?.((text, turnId) => {
+  backend.onTurnFinal?.((text, turnId, hostContext) => {
     if (fatalWorkerErrorPending) return;
     if (backend !== observedBackend) return;
     if (turnId && currentBotmuxTurnId && turnId !== currentBotmuxTurnId) {
@@ -21898,7 +22126,7 @@ async function spawnCli(
       return;
     }
     try {
-      deliverRemoteTurnFinal(text, turnId);
+      deliverRemoteTurnFinal(text, turnId, hostContext?.linkRefMode);
     } catch (err) {
       log(`Remote final bridge failed: ${err instanceof Error ? err.message : String(err)}`);
     }
@@ -21912,7 +22140,7 @@ async function spawnCli(
       );
     }
   });
-  backend.onOutboundMessage?.(async (message) => {
+  backend.onOutboundMessage?.(async (message, hostContext) => {
     if (fatalWorkerErrorPending || backend !== observedBackend) {
       return {
         outcome: 'rejected',
@@ -21920,7 +22148,7 @@ async function spawnCli(
         message: 'The backend generation that requested this message is no longer active.',
       };
     }
-    return deliverRemoteRunnerOutboundMessage(message);
+    return deliverRemoteRunnerOutboundMessage(message, hostContext?.linkRefMode);
   });
   backend.onSessionTool?.(async (operation) => {
     if (fatalWorkerErrorPending || backend !== observedBackend) {
@@ -21932,7 +22160,7 @@ async function spawnCli(
     }
     return deliverRemoteRunnerSessionTool(operation);
   });
-  backend.onTurnRecovered?.((turn) => {
+  backend.onTurnRecovered?.(async (turn) => {
     if (fatalWorkerErrorPending || backend !== observedBackend) return;
     try {
       if (currentBotmuxTurnId && currentBotmuxTurnId !== turn.turnId) {
@@ -21940,14 +22168,33 @@ async function spawnCli(
           `turn ${currentBotmuxTurnId.substring(0, 12)} already owns this worker`,
         );
       }
+      // Fence startup synchronously before awaiting the daemon. The backend
+      // resolves its ready handshake immediately after this callback returns;
+      // without this early mark, a queued successor could flush into the still
+      // provider-owned recovered turn while its host context is being restored.
       setCaptureIdentity(turn.turnId, turn.dispatchAttempt);
+      if (turn.dispatchAttempt !== undefined) durableTurnInFlight = true;
+      remoteRunnerRecoveredTurnInFlight = true;
+      const restoredLinkRefMode = await restoreLinkRefModeThroughHost({
+        turnId: turn.turnId,
+        ...(turn.dispatchAttempt !== undefined
+          ? { dispatchAttempt: turn.dispatchAttempt }
+          : {}),
+      });
+      if (fatalWorkerErrorPending || backend !== observedBackend) return;
+      if (!observedBackend.setRecoveredTurnHostContext?.(
+        turn.turnId,
+        restoredLinkRefMode ? { linkRefMode: restoredLinkRefMode } : {},
+      )) {
+        throw new Error('recovered turn host context is no longer installable');
+      }
+      currentBotmuxLinkRefMode = restoredLinkRefMode;
+      rememberTurnLinkRefMode(turn.turnId, turn.dispatchAttempt, restoredLinkRefMode);
       // Only receiver attempts participate in the durable HOL protocol. An
       // ordinary primary Lark turn has no dispatchAttempt; its recovered-turn
       // fence below still blocks startup readiness until the provider settles,
       // but must not arm a latch that only an attempt-bearing terminal can
       // release.
-      if (turn.dispatchAttempt !== undefined) durableTurnInFlight = true;
-      remoteRunnerRecoveredTurnInFlight = true;
       currentTurnSteerPromoted = false;
       markActiveTurnStarted({
         turnId: turn.turnId,
@@ -22200,6 +22447,7 @@ async function spawnCli(
     backend = null;
     isPromptReady = false;
     setCaptureIdentity(undefined, undefined);
+    currentBotmuxLinkRefMode = undefined;
     queuedTypeAheadTurns = [];
     queuedTurnAdvanceConsumedForPrompt = false;
     retiredTurnIds.clear();
@@ -22542,6 +22790,7 @@ function killCli(opts: {
   readIsolationOriginCapabilityFile = null;
   readIsolationOriginChannelId = null;
   setCaptureIdentity(undefined, undefined);
+  currentBotmuxLinkRefMode = undefined;
   queuedTypeAheadTurns = [];
   queuedTurnAdvanceConsumedForPrompt = false;
   retiredTurnIds.clear();
@@ -25034,9 +25283,12 @@ function workerIpcPayload(msg: WorkerToDaemon): WorkerToDaemon {
   const durationMs = timing?.durationMs;
   const executionStartedAtMs = durationMs !== undefined && timing?.completedAtMs !== undefined
     ? timing.completedAtMs - durationMs : undefined;
+  const { linkRefMode: _callerSelectedLinkRefMode, ...trusted } = msg;
+  const linkRefMode = frozenTurnLinkRefMode(msg.turnId, msg.dispatchAttempt);
   return {
-    ...msg,
+    ...trusted,
     ...(sessionId ? { sessionId } : {}),
+    ...(linkRefMode ? { linkRefMode } : {}),
     ...(durationMs !== undefined ? { durationMs } : {}),
     ...(executionStartedAtMs !== undefined ? { executionStartedAtMs } : {}),
   };
@@ -25277,6 +25529,33 @@ process.on('message', async (raw: unknown) => {
   const msg = raw as DaemonToWorker;
 
   switch (msg.type) {
+    case 'link_ref_register_result': {
+      const pending = pendingLinkRefRegistrations.get(msg.requestId);
+      if (!pending) break;
+      pendingLinkRefRegistrations.delete(msg.requestId);
+      if (msg.ok) pending.resolve({
+        ...(msg.companion ? { companion: msg.companion } : {}),
+        stats: msg.stats ?? {},
+      });
+      else pending.reject(new Error(msg.error ?? 'link_ref_ledger_unavailable'));
+      break;
+    }
+    case 'link_ref_resolve_result': {
+      const pending = pendingLinkRefResolutions.get(msg.requestId);
+      if (!pending) break;
+      pendingLinkRefResolutions.delete(msg.requestId);
+      if (msg.ok && msg.payload) pending.resolve(msg.payload);
+      else pending.reject(new Error(msg.error ?? 'link_ref_ledger_unavailable'));
+      break;
+    }
+    case 'link_ref_restore_mode_result': {
+      const pending = pendingLinkRefModeRestores.get(msg.requestId);
+      if (!pending) break;
+      pendingLinkRefModeRestores.delete(msg.requestId);
+      if (msg.error) pending.reject(new Error(msg.error));
+      else pending.resolve(msg.mode === 'enabled' ? 'enabled' : undefined);
+      break;
+    }
     case 'plugin_result_delivery_result': {
       const pending = pendingPluginResultDeliveries.get(msg.requestId);
       if (!pending) break;
@@ -25372,6 +25651,9 @@ process.on('message', async (raw: unknown) => {
           ...entry,
           codexAppInput: entry.codexAppInput ? { ...entry.codexAppInput } : undefined,
         }));
+        for (const entry of codexAppRecoveredDispatches) {
+          rememberTurnLinkRefMode(entry.turnId, entry.dispatchAttempt, entry.linkRefMode);
+        }
         codexAppGenerationCommits = [...(msg.codexAppGenerationCommits ?? [])];
         codexAppTurnDispatchQueue.restore(
           codexAppRecoveredDispatches
@@ -25421,6 +25703,8 @@ process.on('message', async (raw: unknown) => {
         // Initial capture-identity snapshot (sent even for an idle/restored
         // (undefined, undefined) tuple) before any frame can be captured.
         setCaptureIdentity(msg.turnId, msg.turnId ? msg.dispatchAttempt : undefined, msg.turnCallerOpenId);
+        currentBotmuxLinkRefMode = msg.linkRefMode;
+        rememberTurnLinkRefMode(msg.turnId, msg.dispatchAttempt, msg.linkRefMode);
         if (msg.turnId) {
           currentVcMeetingImTurnOrigin = msg.vcMeetingImTurnOrigin;
           if (msg.prompt) {
@@ -25549,6 +25833,7 @@ process.on('message', async (raw: unknown) => {
             turnId: entry.turnId,
             replyTurnId: entry.replyTurnId,
             dispatchAttempt: entry.dispatchAttempt,
+            linkRefMode: entry.linkRefMode,
             codexAppDispatchId: entry.dispatchId,
             // COPY the frozen steer authorization from the ledger entry; never
             // recompute it on recovery (codex decision A).
@@ -25589,6 +25874,7 @@ process.on('message', async (raw: unknown) => {
             replyTurnId: msg.replyTurnId,
             dispatchAttempt: msg.dispatchAttempt,
             durablePrimaryInbox: msg.durablePrimaryInbox,
+            linkRefMode: msg.linkRefMode,
             codexAppDispatchId: msg.codexAppDispatchId,
             queuedActivationToken: msg.queuedActivationToken,
             vcMeetingImTurnOrigin: msg.vcMeetingImTurnOrigin,
@@ -25911,6 +26197,7 @@ process.on('message', async (raw: unknown) => {
           turnId: msg.turnId,
           replyTurnId: msg.replyTurnId,
           dispatchAttempt: msg.dispatchAttempt,
+          linkRefMode: msg.linkRefMode,
           codexAppDispatchId: msg.codexAppDispatchId,
           queuedActivationToken: msg.queuedActivationToken,
           vcMeetingImTurnOrigin: msg.vcMeetingImTurnOrigin,
@@ -25942,6 +26229,7 @@ process.on('message', async (raw: unknown) => {
           codexAppInput,
           dispatchAttempt: msg.dispatchAttempt,
           durablePrimaryInbox: msg.durablePrimaryInbox,
+          linkRefMode: msg.linkRefMode,
           codexAppDispatchId: msg.codexAppDispatchId,
           ...(msg.codexAppSteerable ? { codexAppSteerable: true } : {}),
           ...(msg.atMostOnce ? { atMostOnce: true } : {}),

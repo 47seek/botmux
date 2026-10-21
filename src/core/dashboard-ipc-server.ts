@@ -145,6 +145,14 @@ import { findConfigField, applyConfigField, applyPerBotEnvChange, coerceConfigVa
 import { defaultReplyDeliveryFor, effectiveReplyDelivery, supportsTranscriptReplyDelivery } from './reply-delivery.js';
 import { resolveFeedbackTeamId, traceFeedbackPolicyForDelivery } from '../services/feedback-policy-resolver.js';
 import { recordRelayedTurnDelivery, RELAYED_TURN_DELIVERY_MAX_BYTES, RELAYED_TURN_DELIVERY_ROUTE } from './relayed-turn-delivery.js';
+import {
+  emptyLinkRefExtractionStats,
+  LINK_REF_REGISTER_MAX_BODY_BYTES,
+  LINK_REF_RESOLVE_MAX_BODY_BYTES,
+  parseLinkRefRegistrationBody,
+  parseLinkRefResolveBody,
+} from './link-ref-ipc.js';
+import { getLinkRefRuntime } from '../services/link-ref-runtime.js';
 import { globalBuiltinSkillInjectionDefault, resolveSkillInjectionSupport } from '../skills/injection-mode.js';
 import { summaryRangeFromBotConfig, updateDashboardSummaryRange } from '../services/summary-range-store.js';
 import { config } from '../config.js';
@@ -1096,7 +1104,7 @@ export function routeHasNarrowUntrustedAuth(method: string, pathname: string): b
   // 该会话的 rotating per-turn
   // capability 并绑定到 URL 里的 sessionId（同 /api/asks 姿势）——capability 只
   // 证明「我是这个会话当前这一轮的 CLI」，选不了别的会话。
-  if (method === 'POST' && /^\/api\/sessions\/[^/]+\/(?:slash|cd|close|preview|chat-rename|chat-manager|rename|project|project-dispatch-policy|continuation|durable-send|turn-delivery|deferred-topic|auth-request|auth-status)$/.test(pathname)) return true;
+  if (method === 'POST' && /^\/api\/sessions\/[^/]+\/(?:slash|cd|close|preview|chat-rename|chat-manager|rename|project|project-dispatch-policy|continuation|durable-send|turn-delivery|deferred-topic|link-refs\/register|link-refs\/resolve|auth-request|auth-status)$/.test(pathname)) return true;
   // UserPromptSubmit hook 的 envelope claim：沙箱内 hook 读不到 host secret，
   // 走 body 里的 per-turn capability；handler 内 sessionCliIpcAuth 绑定到 URL 的
   // sessionId + 按 managedTurnOrigin.turnId 权威取（同 /close 姿势）。
@@ -1341,6 +1349,7 @@ async function handleManagedOriginAttestation(
         ...(origin.dispatchAttempt !== undefined
           ? { dispatchAttempt: origin.dispatchAttempt }
           : {}),
+        ...(origin.linkRefMode ? { linkRefMode: origin.linkRefMode } : {}),
         requiresCodexAppLedger: codexDecision.requiresLedger,
         issuedAtMs: Date.now(),
       },
@@ -1811,6 +1820,115 @@ ipcRoute('POST', '/api/sessions/:sessionId/durable-send', async (req, res, param
       ok: false,
       error: error instanceof Error ? error.message : String(error),
     });
+  }
+});
+
+/** Register model-visible history/quoted result URLs against the exact live
+ * turn. Identity and mode are daemon-owned; the body carries source data only. */
+ipcRoute('POST', '/api/sessions/:sessionId/link-refs/register', async (req, res, params) => {
+  let body: unknown;
+  try {
+    body = await readJsonBody(req, LINK_REF_REGISTER_MAX_BODY_BYTES);
+  } catch (error) {
+    return jsonRes(
+      res,
+      error instanceof JsonBodyTooLargeError ? 413 : 400,
+      { ok: false, error: error instanceof JsonBodyTooLargeError ? 'body_too_large' : 'bad_json' },
+    );
+  }
+  const record = body && typeof body === 'object' && !Array.isArray(body)
+    ? body as Record<string, unknown>
+    : undefined;
+  const ds = findActiveBySessionId(params.sessionId);
+  const auth = sessionCliIpcAuth(req, ds, params.sessionId, record);
+  if (!auth.ok) return jsonRes(res, 403, { ok: false, error: auth.error });
+  if (!ds || ds.session.status === 'closed') {
+    return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
+  }
+  const parsed = parseLinkRefRegistrationBody(body);
+  if (!parsed.ok) return jsonRes(res, 400, { ok: false, error: 'invalid_link_ref_source' });
+
+  const origin = ds.managedTurnOrigin;
+  if (!origin?.turnId) {
+    return jsonRes(res, 409, { ok: false, error: 'no_active_turn' });
+  }
+  const mode = origin.linkRefMode;
+  if (mode !== 'observe' && mode !== 'enabled') {
+    return jsonRes(res, 200, { ok: true, stats: emptyLinkRefExtractionStats() });
+  }
+
+  try {
+    const result = getLinkRefRuntime()?.registerSources({
+      key: {
+        appId: ds.larkAppId,
+        sessionId: params.sessionId,
+        turnId: origin.turnId,
+        ...(origin.dispatchAttempt !== undefined
+          ? { dispatchAttempt: origin.dispatchAttempt }
+          : {}),
+      },
+      mode,
+      sources: [parsed.source],
+    });
+    return jsonRes(res, 200, {
+      ok: true,
+      ...(result?.companion ? { companion: result.companion } : {}),
+      stats: result?.stats ?? emptyLinkRefExtractionStats(),
+    });
+  } catch {
+    return jsonRes(res, 200, { ok: true, stats: emptyLinkRefExtractionStats() });
+  }
+});
+
+/** Expand outbound LinkRefs against the daemon-owned exact live turn. The
+ * caller supplies presentation data only; identity, mode and ledger access are
+ * derived from the authenticated session. */
+ipcRoute('POST', '/api/sessions/:sessionId/link-refs/resolve', async (req, res, params) => {
+  let body: unknown;
+  try {
+    body = await readJsonBody(req, LINK_REF_RESOLVE_MAX_BODY_BYTES);
+  } catch (error) {
+    return jsonRes(
+      res,
+      error instanceof JsonBodyTooLargeError ? 413 : 400,
+      { ok: false, error: error instanceof JsonBodyTooLargeError ? 'link_ref_limit_exceeded' : 'bad_json' },
+    );
+  }
+  const record = body && typeof body === 'object' && !Array.isArray(body)
+    ? body as Record<string, unknown>
+    : undefined;
+  const ds = findActiveBySessionId(params.sessionId);
+  const auth = sessionCliIpcAuth(req, ds, params.sessionId, record);
+  if (!auth.ok) return jsonRes(res, 403, { ok: false, error: auth.error });
+  if (!ds || ds.session.status === 'closed') {
+    return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
+  }
+  const parsed = parseLinkRefResolveBody(body);
+  if (!parsed.ok) return jsonRes(res, 400, { ok: false, error: 'invalid_link_ref_payload' });
+  const origin = ds.managedTurnOrigin;
+  if (!origin?.turnId || origin.linkRefMode !== 'enabled') {
+    return jsonRes(res, 409, { ok: false, error: 'link_ref_turn_not_open' });
+  }
+  const runtime = getLinkRefRuntime();
+  if (!runtime) return jsonRes(res, 503, { ok: false, error: 'link_ref_ledger_unavailable' });
+  try {
+    const payload = runtime.resolveForDaemon({
+      appId: ds.larkAppId,
+      sessionId: params.sessionId,
+      turnId: origin.turnId,
+      ...(origin.dispatchAttempt !== undefined
+        ? { dispatchAttempt: origin.dispatchAttempt }
+        : {}),
+    }, 'enabled', parsed.payload);
+    return jsonRes(res, 200, { ok: true, payload });
+  } catch (error) {
+    const code = error && typeof error === 'object' && 'code' in error
+      ? String((error as { code: unknown }).code)
+      : 'link_ref_ledger_unavailable';
+    const stable = code.startsWith('link_ref_') || code === 'expected_link_invalid_after_link_ref'
+      ? code
+      : 'link_ref_ledger_unavailable';
+    return jsonRes(res, 409, { ok: false, error: stable });
   }
 });
 

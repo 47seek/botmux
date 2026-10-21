@@ -112,6 +112,7 @@ import { renameBotOnOpenPlatform, changeBotAvatarOnOpenPlatform, readBotDescript
 import { migrateSandboxConfigAtStartup } from './services/sandbox-migration.js';
 import * as sessionStore from './services/session-store.js';
 import { initializeDurableCoordinationRuntime } from './services/durable-coordination-runtime.js';
+import { closeLinkRefRuntime, initializeLinkRefRuntime } from './services/link-ref-runtime.js';
 import { startDurableInboxShadowConsumer } from './services/durable-inbox-shadow-consumer.js';
 import {
   createDurableSessionFacade,
@@ -19198,6 +19199,7 @@ function buildReservedInitialInput(
         : (ds.pendingTurnId ?? ds.session.pendingRepoSetup?.turnId),
       sessionBackendType: ds.session.backendType,
       promptInjection: sessionPromptInjection(ds),
+      linkRefMode: ds.pendingLinkRefMode,
       // Reserved initial admission is the fresh launch owned by this session.
       // Reforks of restored/live workers use the explicit opening paths below.
       larkToolResume: false,
@@ -19224,6 +19226,7 @@ function clearInitialStartBuffers(ds: DaemonSession): void {
   ds.pendingTrustedCaller = undefined;
   ds.pendingSender = undefined;
   ds.pendingCodexAppSteerable = undefined;
+  ds.pendingLinkRefMode = undefined;
   ds.pendingFollowUps = undefined;
   ds.pendingFollowUpTurnIds = undefined;
   ds.pendingCodexAppFollowUps = undefined;
@@ -19648,7 +19651,7 @@ function driveNextPrincipalLaneTurn(ds: DaemonSession): boolean {
       });
     } else if (ds.adoptedFrom) {
       accepted = forkAdoptWorker(ds, {
-        prompt: head.cliInput.content,
+        payload: head.cliInput,
         turnId: head.turnId,
         atMostOnce: true,
         trustedCaller: head.caller,
@@ -26574,6 +26577,7 @@ async function handleThreadReplyAdmitted(
           sessionBackendType: ds.session.backendType,
           promptInjection: sessionPromptInjection(ds),
           turnId: parsed.messageId,
+          linkRefSourceType: parsed.msgType === 'interactive' ? 'card' : 'user_message',
         });
         // R5-B1-1: freeze the admission-time steer authorization onto this earliest
         // (initialStartPending follower) tail entry — the strip-proof admit rebuild
@@ -26715,6 +26719,7 @@ async function handleThreadReplyAdmitted(
         sessionBackendType: ds.session.backendType,
         promptInjection: sessionPromptInjection(ds),
         turnId: parsed.messageId,
+        linkRefSourceType: parsed.msgType === 'interactive' ? 'card' : 'user_message',
         });
         ds.session.queuedPrompt ??= ds.pendingPrompt;
         ds.session.queuedCodexAppText ??= ds.pendingCodexAppText;
@@ -27202,6 +27207,7 @@ async function handleThreadReplyAdmitted(
             // #794 后续：empty-start 首轮 opening 也走 hook 注入。turnId 与下方
             // sendWorkerInput 的权威 turnId（parsed.messageId）一致，sidecar 可被 claim。
             turnId: parsed.messageId,
+            linkRefSourceType: parsed.msgType === 'interactive' ? 'card' : 'user_message',
             sessionBackendType: ds.session.backendType,
             // This opening is being delivered to an already-running worker.
             // Preserve the identity mode that worker was actually launched
@@ -27232,6 +27238,7 @@ async function handleThreadReplyAdmitted(
         sessionBackendType: ds.session.backendType,
         promptInjection: sessionPromptInjection(ds),
         turnId: parsed.messageId,
+        linkRefSourceType: parsed.msgType === 'interactive' ? 'card' : 'user_message',
         });
     if (!ctx.completionProposalContinuation) {
       await noteTurnReceived(ds, parsed.messageId, parsed.content, turnSender, parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
@@ -27447,6 +27454,7 @@ async function handleThreadReplyAdmitted(
             sessionBackendType: ds.session.backendType,
             promptInjection: sessionPromptInjection(ds),
             turnId: parsed.messageId,
+            linkRefSourceType: parsed.msgType === 'interactive' ? 'card' : 'user_message',
           });
           // R4-B1: freeze the admission-time steer authorization onto the queued
           // opening payload so the worker-null re-fork path carries it exactly like
@@ -27621,6 +27629,7 @@ async function handleThreadReplyAdmitted(
           // turnId 与下方 forkWorker 的权威 turnId 一致（非 queued 时 = parsed.messageId）；
           // queued dashboard 场景的 turnId 是合成的，权威流不同，保持 inline。
           turnId: queuedHasDurableTail ? undefined : parsed.messageId,
+          linkRefSourceType: parsed.msgType === 'interactive' ? 'card' : 'user_message',
           sessionBackendType: ds.session.backendType,
           larkToolResume: openingResume,
           promptInjection: sessionPromptInjection(ds),
@@ -27639,6 +27648,7 @@ async function handleThreadReplyAdmitted(
         codexAppApplicationContext: queuedHasDurableTail ? undefined : codexAppApplicationContext,
         codexAppMessageContext: reforkCodexApp.messageContext,
         turnId: parsed.messageId,
+        linkRefSourceType: parsed.msgType === 'interactive' ? 'card' : 'user_message',
       });
       wrappedInput = applyQueuedCodexAppLegacyFallback(builtReforkInput, {
         queued: queuedDashboardTurn,
@@ -27711,7 +27721,7 @@ async function handleThreadReplyAdmitted(
       // session, so the openingTurn/hadPriorCliInput resume logic doesn't apply.
       if (ds.adoptedFrom) {
         reforkAccepted = forkAdoptWorker(ds, {
-          prompt: wrappedInput.content,
+          payload: wrappedInput,
           turnId: parsed.messageId,
           ...((ds.session.xpiSharedCwdAdmissionGroupId || ds.session.principalLane)
             ? { atMostOnce: true }
@@ -28817,7 +28827,7 @@ async function handleDocCommentAdmitted(ctx: DocCommentContext, routeRetry = 0):
       }
       sessionStore.updateSession(ds.session);
       if (ds.adoptedFrom) {
-        if (forkAdoptWorker(ds, { prompt: wrappedInput.content, turnId }) !== 'accepted') {
+        if (forkAdoptWorker(ds, { payload: wrappedInput, turnId }) !== 'accepted') {
           throw new Error('adopt worker fork did not accept document comment input');
         }
         acceptDocCommentSession(ds);
@@ -29307,6 +29317,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // 不匹配只告警；编译版走 bun:sqlite）。这里经 sqlite-compat 探测，失败
   // 信息可行动，避免拖到首次落盘才炸。
   sessionStore.assertSqliteSupported();
+
+  // Inert until an enabled turn is admitted: construction performs no URL
+  // scan and does not open, create, query, or prune the LinkRef ledger.
+  initializeLinkRefRuntime(config.session.dataDir);
 
   // Survive a fire-and-forget rejection instead of dying from it. Installed here
   // rather than in index-daemon.ts on purpose: startDaemon has TWO entry points
@@ -32308,6 +32322,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     await feedbackWebhookDispatcher?.stop(remainingBudget());
     setTurnResultRuntime(undefined);
     for (const runtime of durablePrimaryEventRuntimes) runtime.close();
+    closeLinkRefRuntime();
     for (const runtime of durablePrimaryRuntimes) {
       const stopped = await runtime.stop(remainingBudget());
       if (stopped.kind === 'timed_out') {
