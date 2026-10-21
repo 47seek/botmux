@@ -8967,6 +8967,7 @@ import {
 } from './core/completion-proposal.js';
 import { resolveFeedbackPolicyForDelivery, resolveFeedbackTeamId } from './services/feedback-policy-resolver.js';
 import { normalizeFeedbackPolicy } from './services/feedback-policy.js';
+import { materializeFeedbackPolicyForDelivery } from './services/feedback-reviewer-delivery.js';
 import { attachOncallGroupButton, recordOncallGroupDelivery } from './im/lark/oncall-group.js';
 import { applyInlineMentions, applyInlineMentionsToCard } from './im/lark/inline-mentions.js';
 import { renderBrandTemplate } from './im/lark/brand-template.js';
@@ -11652,25 +11653,22 @@ async function cmdSend(rest: string[]): Promise<void> {
   // Freeze email reviewers into this bot's app-scoped open_id NOW, with
   // the bot's own credentials, so the card callback can match network-free
   // against the delivery snapshot. Pure ou_/on_ lists (and requester/everyone)
-  // skip the lookup. If resolution empties a reviewers list, fail closed (no
-  // feedback control) rather than ship a card nobody can click.
+  // skip the lookup. An empty definitive list still renders the control (the
+  // callback rejects every operator); a TRANSIENT resolution failure reuses
+  // the last-known-good cache instead of shipping an empty snapshot, and with
+  // no cache to reuse the control is dropped for this delivery.
   if (feedbackPolicy && effectiveResponseKind === 'final' && feedbackPolicy.audience === 'reviewers') {
     try {
-      const { materializeFeedbackReviewers } = await import('./services/feedback-policy.js');
       const { resolveAllowedUsersWithMap } = await import('./im/lark/client.js');
-      feedbackPolicy = await materializeFeedbackReviewers(feedbackPolicy, async entries => {
-        const { map } = await resolveAllowedUsersWithMap(s.larkAppId!, entries);
-        const resolved = new Map<string, string>();
-        for (const entry of entries) {
-          const id = map.get(entry);
-          if (id && id.startsWith('ou_')) resolved.set(entry, id);
-        }
-        return resolved;
+      feedbackPolicy = await materializeFeedbackPolicyForDelivery({
+        policy: feedbackPolicy,
+        larkAppId: s.larkAppId!,
+        dataDir: config.session.dataDir,
+        resolveAllowedUsersWithMap,
       });
     } catch {
       feedbackPolicy = undefined;
     }
-    if (feedbackPolicy && feedbackPolicy.reviewers.length === 0) feedbackPolicy = undefined;
   }
   const feedbackRequesterSubjectId = replyTargetSenderOpenId ?? s.ownerOpenId;
   const withOncallGroup = (card: string): string => {
