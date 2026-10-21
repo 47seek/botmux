@@ -23760,8 +23760,30 @@ body{display:flex;flex-direction:column;height:100vh;height:100dvh}
 body.touch #terminal .xterm-screen,
 body.touch #terminal .xterm-screen *{
   -webkit-user-select:none;user-select:none;-webkit-touch-callout:none;touch-action:pinch-zoom}
-#status{position:fixed;top:8px;right:12px;z-index:10;font:12px monospace;
+/* #status 只放短状态词（加载阶段 / connecting / connected / disconnected / 失败）。
+   右上限宽做安全边界；长内容不进这个角标——启动失败详情放居中的 #boot-error（终端
+   此时本就是空白），实时字节数放右上下一行的 #status-bytes（横幅底线以下，纵向错开，
+   且对辅助技术隐藏，避免 role=status 随 250ms 的数字一跳被屏幕阅读器反复播报）。 */
+#status{position:fixed;top:8px;right:12px;z-index:10;max-width:46%;
+  font:12px monospace;white-space:pre-wrap;overflow-wrap:anywhere;
   color:#565f89;background:#1a1b26cc;padding:2px 8px;border-radius:4px}
+#status-bytes{display:none;position:fixed;top:38px;right:12px;z-index:10;max-width:60%;
+  font:12px monospace;color:#9ece6a;background:#1a1b26cc;
+  padding:2px 8px;border-radius:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;pointer-events:none}
+#status-bytes.show{display:block}
+/* 窄屏（≤414px，手机）：居中的只读/登录横幅向右延伸会和右上状态角标擦到一起。
+   整列状态下移到横幅底线（约 36px）以下，connected/disconnected/加载阶段与字节数
+   都不再与横幅同排；宽屏没有碰撞，保持原位。触屏下右上快捷键栏是隐藏的，不抢位置。 */
+@media (max-width:414px){
+  #status{top:40px}
+  #status-bytes{top:70px}
+}
+#boot-error{display:none;position:fixed;left:50%;top:38%;transform:translate(-50%,-50%);z-index:40;
+  width:min(88vw,460px);max-height:60vh;overflow:auto;
+  font:13px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",monospace;text-align:center;
+  color:#f7768e;background:#1a1b26f2;border:1px solid rgba(247,118,114,0.35);border-radius:8px;
+  padding:14px 16px;white-space:pre-wrap;overflow-wrap:anywhere}
+#boot-error.show{display:block}
 #status.ok{color:#9ece6a}
 #status.err{color:#f7768e}
 #readonly-banner{display:none;position:fixed;top:8px;left:50%;transform:translateX(-50%);z-index:50;
@@ -23883,7 +23905,33 @@ ${loginUrl ? `<a id="login-banner" href="${loginUrl}" target="_top" rel="noopene
     <button id="mobile-send" type="submit">上屏</button>
   </div>
 </form>
-<div id="status" class="err">connecting...</div>
+<div id="status" class="err" role="status">加载中…</div>
+<div id="status-bytes" aria-hidden="true"></div>
+<div id="boot-error" aria-live="assertive"></div>
+<script>
+// Install before external scripts: a missing dependency otherwise leaves a
+// blank terminal with the initial connecting label and no visible explanation.
+// This is a STARTUP-ONLY watcher: it removes itself on ws open (see connect()),
+// so a later benign window error (e.g. ResizeObserver loop noise) can never
+// repaint a healthy connected terminal. The corner #status keeps a short word;
+// the long detail goes to the centered #boot-error (the terminal area is blank
+// while boot failed), which never overlaps the top status/login banners.
+function _wbBootstrapError(event){
+  var status=document.getElementById('status');
+  var box=document.getElementById('boot-error');
+  if(!status)return;
+  var target=event.target;
+  var detail='';
+  if(target&&target.tagName==='SCRIPT'&&target.src){
+    detail='终端组件加载失败：'+target.src.split('/').pop();
+  }else if(event.message){
+    detail='终端页面错误：'+event.message;
+  }else{return;}
+  status.textContent='加载失败';status.className='err';
+  if(box){box.textContent=detail;box.classList.add('show');}
+}
+window.addEventListener('error',_wbBootstrapError,true);
+</script>
 <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-web-links@0.11.0/lib/addon-web-links.min.js"></script>
@@ -23953,6 +24001,7 @@ function _wbTerminalWidth(){
   // 返回 0，_wbAutoFontSize 保持基准字号，等尺寸事件到了再纠正。
   return window.innerWidth||0;
 }
+document.getElementById('status').textContent='初始化…';
 var term=new Terminal({
   theme:{background:'#1a1b26',foreground:'#a9b1d6',cursor:'#c0caf5',
     selectionBackground:'#33467c',black:'#15161e',red:'#f7768e',
@@ -24331,6 +24380,34 @@ if(hasToken && !/[?&]imefix=0\\b/.test(location.search)){(function(){
 
 // ── WebSocket ──
 var ws_=null,el=document.getElementById('status');
+var _wbBytesEl=document.getElementById('status-bytes');
+var _wbBootErrorEl=document.getElementById('boot-error');
+el.textContent='connecting...';
+var _wbReceivedBytes=0,_wbStatusUpdatePending=false,_wbByteEncoder=new TextEncoder();
+function _wbFormatBytes(n){
+  if(n<1024)return n+' B';
+  if(n<1048576)return (n/1024).toFixed(1)+' KB';
+  return (n/1048576).toFixed(1)+' MB';
+}
+// #status 里永远只放工作台 reader（readTerminalFrameStatus）按字面量识别的短词
+// connected/disconnected；变化的字节数写进独立的 #status-bytes，既保住跨模块契约，
+// 也不会触发 role=status 的屏幕阅读器流式播报（该节点 aria-hidden）。
+function _wbConnectionStatus(){
+  if(!ws_||ws_.readyState!==1)return;
+  el.textContent='connected';el.className='ok';
+  // 终端真的连上了：任何启动期报过错（如某个可选插件失败但核心正常）都收起中央错误块。
+  if(_wbBootErrorEl)_wbBootErrorEl.classList.remove('show');
+  if(_wbBytesEl){_wbBytesEl.textContent='已接收 '+_wbFormatBytes(_wbReceivedBytes);_wbBytesEl.classList.add('show');}
+}
+function _wbHideBytes(){if(_wbBytesEl)_wbBytesEl.classList.remove('show');}
+// 每次（重）连都从 0 重新累计：上一条连接收到的字节不能算进新连接。
+function _wbResetBytes(){_wbReceivedBytes=0;_wbStatusUpdatePending=false;_wbHideBytes();}
+function _wbRecordOutput(data){
+  _wbReceivedBytes+=typeof data==='string'?_wbByteEncoder.encode(data).length:data.byteLength;
+  if(_wbStatusUpdatePending)return;
+  _wbStatusUpdatePending=true;
+  setTimeout(function(){_wbStatusUpdatePending=false;_wbConnectionStatus()},250);
+}
 function _sendInput(d){if(ws_&&ws_.readyState===1)ws_.send(JSON.stringify({type:'input',data:d}))}
 // Pure pointer-motion reports (SGR button code 35 + shift/alt/ctrl modifier
 // bits). Emitted by xterm once the seed re-asserts DECSET 1003 (grok build) —
@@ -24457,6 +24534,8 @@ if(typeof ResizeObserver!=='undefined'){
   var proto=location.protocol==='https:'?'wss':'ws';
   var ws=new WebSocket(proto+'://'+location.host+base+'/'+location.search);
   ws_=ws;ws.binaryType='arraybuffer';
+  // 新连接：字节计数归零、收起上一条连接遗留的字节角标。
+  _wbResetBytes();
   // Guard against a hung CONNECTING state (proxy/network black hole): if the
   // socket never opens, close it so onclose retries instead of leaving the
   // user staring at "connecting" forever.
@@ -24472,7 +24551,9 @@ if(typeof ResizeObserver!=='undefined'){
   // restart). If we never re-send our real grid, the PTY stays 160 while this
   // xterm renders narrower, and Claude's height-relative redraws drift a row
   // (status-line update bleeds into the line below). Always re-assert size.
-  ws.onopen=function(){clearTimeout(openTimer);el.textContent='connected';el.className='ok';_lastC=_lastR=0;sendResize()};
+  // 连接建立 = 启动期结束：摘掉启动专用 error 监听，之后页面（ResizeObserver 等）
+  // 的良性报错不许再把健康状态刷红；状态词由这里唯一写成 connected。
+  ws.onopen=function(){clearTimeout(openTimer);window.removeEventListener('error',_wbBootstrapError,true);el.textContent='connected';el.className='ok';_lastC=_lastR=0;sendResize();_wbConnectionStatus()};
   ws.onmessage=function(e){
     // 带外控制帧只可能是**本连接的第一帧**，而且必须整帧精确匹配（见页面顶部
     // _wbDecodeWriteFrame 那段注释）。首帧一旦消费掉，这条连接上之后的每一个字节
@@ -24482,6 +24563,7 @@ if(typeof ResizeObserver!=='undefined'){
       var _ctl=_wbDecodeWriteFrame(e.data,true);
       if(_ctl!==null){_wbSetWsWrite(_ctl);return;}
     }
+    _wbRecordOutput(e.data);
     var data=typeof e.data==='string'?e.data:new TextDecoder().decode(e.data);
     // Snapshot-aware Herdr history replaces the buffer instead of appending a
     // mostly-overlapping full screen. Preserve the reader's anchor when older
@@ -24541,7 +24623,7 @@ if(typeof ResizeObserver!=='undefined'){
     term.write(data,_settleInitialBottom);
   };
   ws.onclose=function(){
-    ws_=null;el.textContent='disconnected';el.className='err';
+    ws_=null;el.textContent='disconnected';el.className='err';_wbHideBytes();
     // 关闭当下就把这条连接的写权限退回未知：先复位首帧标志（重连后要等新首帧才恢复
     // 结论），再 _wbSetWsWrite(null) —— 它同时收起输入（term.onData/toolbar/_fwdScroll
     // 的门禁都以 wsHasWrite===true 为准）并向嵌入方上抛 write:null。不这样做的话，断线
