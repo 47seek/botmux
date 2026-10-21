@@ -1222,10 +1222,10 @@ export interface Session {
    */
   autoWorktreeFallbackDir?: string;
   /** Persisted adopt metadata — allows adopt sessions to survive daemon restarts.
-   *  Either tmuxTarget (tmux backend) OR zellijSession+zellijPaneId (zellij). */
+   *  The source-specific tmux, Zellij, Herdr, or Orca identity is set. */
   adoptedFrom?: {
     /** Source backend of the external session. Absent means legacy tmux metadata. */
-    source?: 'tmux' | 'herdr' | 'zellij';
+    source?: 'tmux' | 'herdr' | 'zellij' | 'orca';
     tmuxTarget?: string;
     /** zellij adopt target: session name + pane id (e.g. "terminal_1"). */
     zellijSession?: string;
@@ -1235,6 +1235,17 @@ export interface Session {
     herdrPaneId?: string;
     herdrAgentName?: string;
     herdrTerminalId?: string;
+    orcaTerminalHandle?: string;
+    /** Display snapshot from adoption; the handle remains the stable identity. */
+    orcaTerminalTitle?: string;
+    /** Orca control route; absent = desktop relay for legacy rows. */
+    orcaInstance?: import('./services/orca-cli.js').OrcaInstance;
+    orcaPtyId?: string;
+    orcaIncarnationId?: string;
+    orcaExecutionHostId?: string;
+    orcaWorktreeId?: string;
+    orcaAgentIdentity?: string;
+    orcaPaneSizeVerified?: boolean;
     originalCliPid?: number;
     sessionId?: string;
     cliId?: string;
@@ -1957,7 +1968,10 @@ type DaemonToWorkerBase =
 
 export type DaemonToWorker = DaemonToWorkerBase extends infer Message
   ? Message extends { type: 'init' }
-    ? Omit<Message, 'loadedBotsConfigPath'> & {
+    ? Omit<Message, 'loadedBotsConfigPath' | 'adoptSource'> & {
+        adoptSource?: 'tmux' | 'herdr' | 'zellij' | 'orca';
+        adoptOrcaIdentity?: import('./services/orca-cli.js').OrcaExpectedTerminalIdentity;
+        adoptOrcaSizeVerified?: boolean;
         loadedBotsConfigPath?: string;
         loadedBotsConfigProvenance?: import('./core/config-dir.js').BotsConfigProvenance;
         feedback?: import('./services/feedback-policy.js').FeedbackPolicy;
