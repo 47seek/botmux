@@ -137,6 +137,8 @@ import {
 import { aidenCodexResumeNeedsRedraw, CodexUpdateDialogGuard, codexUpdateDialogSafeKeys } from './utils/codex-update-dialog.js';
 import { CodexModelMigrationDialogGuard, codexModelMigrationSafeKeys, isCodexModelMigrationScreen } from './utils/codex-model-migration-dialog.js';
 import { EffortConfirmDialogGuard, isEffortLevelCommand } from './utils/effort-confirm-dialog.js';
+import { applyCodexEffortMenu, hasEmptyCodexComposer, parseCodexEffortMenu } from './utils/codex-effort-menu.js';
+import { sandboxBoolValue } from './adapters/cli/sandbox-mode.js';
 import {
   ClaudeBtwCaptureGuard,
   claudeBtwOverlayVisible,
@@ -3337,6 +3339,34 @@ async function sendRawCommandLine(be: NonNullable<typeof backend>, content: stri
  * native /rename) from splicing keystrokes into one another. */
 let commandLineWriteTail: Promise<void> = Promise.resolve();
 let commandLineWritesPending = 0;
+// If cleanup cannot confirm the composer, keep queued messages out of the picker.
+let codexCliEffortRecovery: { backend: SessionBackend; lifetime: number } | undefined;
+let codexCliEffortOperation: { requestId: string; abort: AbortController; done: Promise<void> } | undefined;
+
+function codexCliEffortNeedsRecovery(): boolean {
+  const hold = codexCliEffortRecovery;
+  if (!hold) return false;
+  if (hold.backend !== backend || hold.lifetime !== cliLifetimeNonce) {
+    codexCliEffortRecovery = undefined;
+    return false;
+  }
+  try {
+    const screen = isObserveBackend(hold.backend)
+      ? hold.backend.captureCurrentScreen() : renderer?.rawSnapshot() ?? '';
+    if (hasEmptyCodexComposer(screen) && !parseCodexEffortMenu(screen)) {
+      codexCliEffortRecovery = undefined;
+      return false;
+    }
+  } catch { /* Missing screen evidence keeps queued input held. */ }
+  return true;
+}
+
+async function cancelCodexCliEffort(): Promise<void> {
+  const operation = codexCliEffortOperation;
+  if (!operation) return;
+  operation.abort.abort();
+  await operation.done;
+}
 
 class SubmissionWriteError extends Error {
   constructor(
@@ -3805,7 +3835,8 @@ const SESSION_RENAME_IDLE_TIMEOUT_MS = 5_000;
 let sessionRenameIdleTimer: ReturnType<typeof setTimeout> | null = null;
 
 function sessionRenameInFlight(): boolean {
-  return sessionRenamePhase !== 'idle';
+  // Both native menu operations own the composer until their picker is closed.
+  return sessionRenamePhase !== 'idle' || codexCliEffortOperation !== undefined || codexCliEffortNeedsRecovery();
 }
 
 function forceClearSessionRenameInFlight(): void {
@@ -12106,6 +12137,9 @@ async function handleTermAction(key: TermActionKey): Promise<void> {
   }
   if (!backend) return;
   const targetBackend = backend;
+  const lifetime = cliLifetimeNonce;
+  if (codexCliEffortOperation) await cancelCodexCliEffort();
+  if (backend !== targetBackend || cliLifetimeNonce !== lifetime) return;
   const isHalfPage = key === 'half_page_up' || key === 'half_page_down';
 
   // Tmux copy-mode scroll (works around alternate-buffer scrollback limitation)
@@ -12215,6 +12249,12 @@ async function handleExactTurnInterrupt(requestId: string, turnId: string): Prom
     return;
   }
   const targetBackend = backend;
+  const lifetime = cliLifetimeNonce;
+  if (codexCliEffortOperation) await cancelCodexCliEffort();
+  if (backend !== targetBackend || cliLifetimeNonce !== lifetime || currentBotmuxTurnId !== turnId) {
+    send({ type: 'turn_interrupt_result', requestId, turnId, delivered: false, reason: 'stale_turn' });
+    return;
+  }
   let delivered = false;
   try {
     delivered = await runAfterAmbiguousSubmissionWrites(targetBackend, async () => {
@@ -12301,6 +12341,9 @@ async function handleTuiKeysDirect(
 async function handleTuiKeys(keys: string[], isFinal: boolean): Promise<boolean> {
   if (!backend || keys.length === 0) return false;
   const targetBackend = backend;
+  const lifetime = cliLifetimeNonce;
+  if (codexCliEffortOperation) await cancelCodexCliEffort();
+  if (backend !== targetBackend || cliLifetimeNonce !== lifetime) return false;
   try {
     return await runAfterAmbiguousSubmissionWrites(
       targetBackend,
@@ -12408,6 +12451,9 @@ async function handleTuiTextInput(keys: string[], text: string): Promise<boolean
   if (!backend || !cliAdapter) return false;
   const targetBackend = backend;
   const targetAdapter = cliAdapter;
+  const lifetime = cliLifetimeNonce;
+  if (codexCliEffortOperation) await cancelCodexCliEffort();
+  if (backend !== targetBackend || cliAdapter !== targetAdapter || cliLifetimeNonce !== lifetime) return false;
   const navKeyCount = keys[keys.length - 1] === 'Enter' ? keys.length - 1 : keys.length;
 
   log(`TUI text input: writing "${text.substring(0, 80)}" to PTY (after ${navKeyCount} nav keys)`);
@@ -24026,7 +24072,7 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
         // attach at a reasonable default after a short delay.
         const spawnTimer = setTimeout(() => startAttach(150, 40), 500);
 
-        ws.on('message', (raw) => {
+        ws.on('message', async (raw) => {
           try {
             const msg = JSON.parse(String(raw));
             if (msg.type === 'resize' && msg.cols > 0 && msg.rows > 0) {
@@ -24041,6 +24087,12 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
               // a mouse-aware TUI may bind any of them to approvals/actions.
               // A view capability therefore forwards no input bytes at all.
               if (!authedClients.has(ws)) return;
+              if (codexCliEffortOperation) {
+                const target = backend;
+                const lifetime = cliLifetimeNonce;
+                await cancelCodexCliEffort();
+                if (backend !== target || cliLifetimeNonce !== lifetime || !authedClients.has(ws)) return;
+              }
               auditTerminalInput(auditUser, msg.data);
               if (cp) cp.write(msg.data);
               else pendingInput.push(msg.data);
@@ -24109,7 +24161,7 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
 
         const spawnTimer = setTimeout(() => startAttach(150, 40), 500);
 
-        ws.on('message', (raw) => {
+        ws.on('message', async (raw) => {
           try {
             const msg = JSON.parse(String(raw));
             if (msg.type === 'resize' && msg.cols > 0 && msg.rows > 0) {
@@ -24117,6 +24169,12 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
               else cp.resize(msg.cols, msg.rows);
             } else if (msg.type === 'input' && typeof msg.data === 'string') {
               if (!authedClients.has(ws)) return;
+              if (codexCliEffortOperation) {
+                const target = backend;
+                const lifetime = cliLifetimeNonce;
+                await cancelCodexCliEffort();
+                if (backend !== target || cliLifetimeNonce !== lifetime || !authedClients.has(ws)) return;
+              }
               auditTerminalInput(auditUser, msg.data);
               if (cp) cp.write(msg.data);
               else pendingInput.push(msg.data);
@@ -24205,7 +24263,7 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
           ws.send(seed + modeSeed + herdrWebCursorSequence());
         }
 
-        ws.on('message', (raw) => {
+        ws.on('message', async (raw) => {
           try {
             const msg = JSON.parse(String(raw));
             if (msg.type === 'resize' && msg.cols > 0 && msg.rows > 0) {
@@ -24219,6 +24277,12 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
               // Mouse protocols can encode approvals/actions as well as wheel input.
               // A read-only view capability must never forward bytes to the backend.
               if (!authedClients.has(ws)) return;
+              if (codexCliEffortOperation) {
+                const target = backend;
+                const lifetime = cliLifetimeNonce;
+                await cancelCodexCliEffort();
+                if (backend !== target || cliLifetimeNonce !== lifetime || !authedClients.has(ws)) return;
+              }
               auditTerminalInput(auditUser, msg.data);
               lastWebTerminalInputAtMs = Date.now();
               webTerminalInputGeneration++;
@@ -27067,6 +27131,86 @@ process.on('message', async (raw: unknown) => {
             );
           }
         } else if (ordinaryImTurnId) rejectOrdinaryImTurn(ordinaryImTurnId, 'cli_input_unavailable');
+      }
+      break;
+    }
+
+    case 'codex_cli_effort_cancel': {
+      if (codexCliEffortOperation?.requestId === msg.requestId) await cancelCodexCliEffort();
+      break;
+    }
+
+    case 'codex_cli_effort': {
+      const target = backend;
+      const path = codexBridgeRolloutPath;
+      const model = publishedActiveRuntime.model;
+      const lifetime = cliLifetimeNonce;
+      if (lastInitConfig?.cliId !== 'codex' || !target || !path || !model
+        || !['pty', 'tmux'].includes(lastInitConfig.backendType) || lastInitConfig.wrapperCli
+        || codexRpcEngine || lastInitConfig.adoptMode || sandboxBoolValue(lastInitConfig.sandbox)
+        || sandboxEnabled() || lastInitConfig.readIsolation
+        || sessionRenameInFlight() || isFlushing || injectionFlushing || commandLineWritesPending
+        || cliRestartInProgress || pendingMessages.length || pendingRawInputs.length
+        || bareShellCheckInProgress || bareShellLaunchBlocked || tuiPromptBlocking
+        || shouldHoldCodexRunnerInput(codexRunnerFreshness)) {
+        send({ type: 'codex_cli_effort_result', requestId: msg.requestId,
+          status: 'unavailable', reason: 'cli_menu_unavailable' });
+        break;
+      }
+      let rollout: ReturnType<typeof statSync>;
+      try { rollout = statSync(path); } catch {
+        send({ type: 'codex_cli_effort_result', requestId: msg.requestId, status: 'error' });
+        break;
+      }
+      let offset = rollout.size;
+      const abort = new AbortController();
+      let finish!: () => void;
+      const done = new Promise<void>(resolve => { finish = resolve; });
+      codexCliEffortOperation = { requestId: msg.requestId, abort, done };
+      commandLineWritesPending++;
+      let latestSettings: CodexDrainResult['latestThreadSettings'];
+      const current = () => backend === target && cliLifetimeNonce === lifetime
+        && codexBridgeRolloutPath === path && !cliRestartInProgress;
+      try {
+        const result = await applyCodexEffortMenu({
+          signal: abort.signal, deadline: msg.deadline, isCurrent: current,
+          screen: async () => {
+            if (!current()) return '';
+            if (isObserveBackend(target)) return (await snapshotToText(target, renderCols, renderRows, { filter: false }))?.content ?? '';
+            await renderer?.writeAndFlush('');
+            return current() ? renderer?.rawSnapshot() ?? '' : '';
+          },
+          command: () => {
+            codexCliEffortRecovery = { backend: target, lifetime };
+            return sendRawCommandLine(target, '/model');
+          },
+          key: key => {
+            if (!current()) throw new Error('CLI generation changed');
+            const bytes = { Up: '\x1b[A', Down: '\x1b[B', Enter: '\r', Escape: '\x1b', s: 's' }[key];
+            if (target.write(bytes) === false) throw new Error('CLI input unavailable');
+          },
+          settings: () => {
+            if (!current()) return undefined;
+            const liveRollout = statSync(path);
+            if (liveRollout.dev !== rollout.dev || liveRollout.ino !== rollout.ino || liveRollout.size < offset) {
+              throw new Error('Rollout was replaced or truncated');
+            }
+            const drained = drainCodexRollout(path, offset);
+            offset = drained.newOffset;
+            latestSettings = drained.latestThreadSettings ?? latestSettings;
+            return latestSettings;
+          },
+        }, model, msg.effort);
+        if (current() && result.status === 'future_only' && result.reason === 'cli_next_turn') {
+          lastInitConfig.reasoningEffort = msg.effort as NonNullable<typeof lastInitConfig.reasoningEffort>;
+        }
+        send({ type: 'codex_cli_effort_result', requestId: msg.requestId, ...result });
+      } finally {
+        codexCliEffortOperation = undefined;
+        commandLineWritesPending--;
+        finish();
+        void flushPendingInjections();
+        void flushPending();
       }
       break;
     }
