@@ -483,6 +483,8 @@ export interface MessageProvenance {
 
 export interface Session {
   sessionId: string;
+  /** Frozen opt-in at birth; ordinary sessions never inherit listener cleanup. */
+  messageListenerAutoClose?: boolean;
   /** Internal target-side owner for an idempotent dispatch-launch session. */
   dispatchLaunchId?: string;
   /** Immutable model/effort selected by the public topic dispatch seam. */
