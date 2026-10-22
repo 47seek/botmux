@@ -133,6 +133,7 @@ import { groupContextEpoch, commitGroupContextDispatchIntoPayload } from '../ser
 import { replyToDocComment, chunkCommentText, unsubscribeDocFile, removeCommentReaction } from '../im/lark/doc-comment.js';
 import { listDocSubscriptionsForSession, removeDocSubscription } from '../services/doc-subs-store.js';
 import { TmuxBackend } from '../adapters/backend/tmux-backend.js';
+import { managedTmuxCandidateSockets, preferredManagedTmuxSocket, tmuxServerLabel } from '../adapters/backend/tmux-socket.js';
 import { HerdrBackend } from '../adapters/backend/herdr-backend.js';
 import { ZmxBackend } from '../adapters/backend/zmx-backend.js';
 import { zmxEnv } from '../setup/ensure-zmx.js';
@@ -8485,7 +8486,13 @@ function liveLocalResidual(
  */
 function reclaimParkedCrashDiagnostic(ds: DaemonSession): void {
   if (getSessionPersistentBackendType(ds) !== 'tmux') return;
-  try { TmuxBackend.killSession(TmuxBackend.diagnosticSessionName(ds.session.sessionId)); } catch { /* benign */ }
+  // The worker parks it next to the managed session, whose server may have
+  // changed since (legacy default → dedicated socket), so sweep every candidate.
+  const target = ds.session.persistentBackendTarget;
+  const recordedSocket = target?.backendType === 'tmux' ? target.socketName : undefined;
+  for (const socketName of managedTmuxCandidateSockets(recordedSocket, preferredManagedTmuxSocket())) {
+    try { TmuxBackend.killSession(TmuxBackend.diagnosticSessionName(ds.session.sessionId), socketName); } catch { /* benign */ }
+  }
   try { unlinkSync(join(config.session.dataDir, 'crash-diagnostics', `${ds.session.sessionId}.ansi`)); } catch { /* absent — benign */ }
 }
 
@@ -8597,8 +8604,8 @@ export function setSessionReasoningEffort(ds: DaemonSession, effort: unknown): '
 export interface SuspendBackingVerificationOps {
   kill(target: PersistentBackendTarget, sessionId: string): void;
   probe(target: PersistentBackendTarget): ReturnType<typeof probePersistentBackendTarget>;
-  killDiagnostic?(sessionName: string): void;
-  probeDiagnostic?(sessionName: string): ReturnType<typeof TmuxBackend.probeSession>;
+  killDiagnostic?(sessionName: string, socketName?: string): void;
+  probeDiagnostic?(sessionName: string, socketName?: string): ReturnType<typeof TmuxBackend.probeSession>;
 }
 
 /**
@@ -8614,24 +8621,43 @@ export function destroySuspendBackingVerified(
   ops: SuspendBackingVerificationOps = {
     kill: killPersistentBackendTarget,
     probe: probePersistentBackendTarget,
-    killDiagnostic: sessionName => TmuxBackend.killSession(sessionName),
-    probeDiagnostic: sessionName => TmuxBackend.probeSession(sessionName),
   },
 ): boolean {
   if (ds.crashDiagnosticParked) {
     const diagnosticName = TmuxBackend.diagnosticSessionName(ds.session.sessionId);
-    let diagnosticProbe: ReturnType<typeof TmuxBackend.probeSession> = 'unknown';
+    // The worker parks it next to the managed session, whose server may have
+    // changed since (legacy default → dedicated socket): every candidate server
+    // must positively read 'missing', same set reclaimParkedCrashDiagnostic sweeps
+    // (recorded socket first). Each attempt kills on EVERY candidate before
+    // probing, so one unanswerable server never spares a live shell elsewhere.
+    const recorded = ds.session.persistentBackendTarget;
+    const sockets = managedTmuxCandidateSockets(
+      recorded?.backendType === 'tmux' ? recorded.socketName : undefined,
+      preferredManagedTmuxSocket(),
+    );
+    let unverified: { socketName: string | undefined; probe: ReturnType<typeof TmuxBackend.probeSession> } | null = null;
     for (let attempt = 1; attempt <= 2; attempt++) {
-      try { (ops.killDiagnostic ?? TmuxBackend.killSession)(diagnosticName); }
-      catch { /* the post-probe below is authoritative */ }
-      try {
-        diagnosticProbe = (ops.probeDiagnostic ?? TmuxBackend.probeSession)(diagnosticName);
-      } catch { diagnosticProbe = 'unknown'; }
-      if (diagnosticProbe === 'missing') break;
+      for (const socketName of sockets) {
+        try { (ops.killDiagnostic ?? TmuxBackend.killSession)(diagnosticName, socketName); }
+        catch { /* the post-probe below is authoritative */ }
+      }
+      unverified = null;
+      for (const socketName of sockets) {
+        let probe: ReturnType<typeof TmuxBackend.probeSession>;
+        try {
+          // Teardown-grade: a server that has never run (the default one on a
+          // host whose managed sessions all moved to `-L botmux`) cannot hold
+          // the shell, while a running server that cannot answer — including
+          // one whose socket file was unlinked under it — still fails closed.
+          probe = (ops.probeDiagnostic ?? TmuxBackend.probeSessionForTeardown)(diagnosticName, socketName);
+        } catch { probe = 'unknown'; }
+        if (probe !== 'missing') { unverified = { socketName, probe }; break; }
+      }
+      if (!unverified) break;
     }
-    if (diagnosticProbe !== 'missing') {
+    if (unverified) {
       logger.error(
-        `[${tag(ds)}] Suspend refused: crash diagnostic teardown unverified probe=${diagnosticProbe}`,
+        `[${tag(ds)}] Suspend refused: crash diagnostic teardown unverified on ${tmuxServerLabel(unverified.socketName)} probe=${unverified.probe}`,
       );
       return false;
     }
@@ -21792,6 +21818,20 @@ function cleanupPersistentBackendSessions(
   }
   const ownedTargetKeys = new Set(ownedIdsByTarget.keys());
   const listBackingTargets = (): PersistentBackendTarget[] => {
+    if (backendType === 'tmux') {
+      // Managed sessions span the default server (pre-isolation rows / opt-out)
+      // and the dedicated socket(s). Ownership below stays name-keyed, so a row
+      // whose recorded server is stale still protects / releases its pane.
+      const sockets = new Set<string | undefined>([undefined, preferredManagedTmuxSocket()]);
+      for (const session of ownedSessions.concat(runtimeSessionRows.filter(belongsToBackend))) {
+        const target = session.persistentBackendTarget;
+        if (target?.backendType === 'tmux' && target.socketName !== undefined) sockets.add(target.socketName);
+      }
+      return [...sockets].flatMap(socketName => TmuxBackend.listBotmuxSessions(socketName)
+        .map((sessionName): PersistentBackendTarget => (socketName === undefined
+          ? { backendType: 'tmux', sessionName }
+          : { backendType: 'tmux', sessionName, socketName })));
+    }
     if (backendType !== 'zmx') {
       return backend.listBotmuxSessions().map(sessionName => ({ backendType, sessionName }));
     }
@@ -21893,6 +21933,10 @@ function cleanupPersistentBackendSessions(
   };
   const killOwnedBackendSession = (target: PersistentBackendTarget, exactSessionId?: string): void => {
     const name = target.sessionName;
+    if (target.backendType === 'tmux') {
+      TmuxBackend.killSession(name, target.socketName);
+      return;
+    }
     if (backendType !== 'zmx') {
       backend.killSession(name);
       return;
