@@ -31882,6 +31882,24 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     }
   });
   scheduler.setOwnerFilter(cfg.larkAppId, idx === 0);
+  scheduler.setScheduleFailureAlert((task, consecutiveFailures, lastError) => {
+    // 周期任务连续失败达到阈值：私信一个可操作的管理员一次，避免像协作人
+    // 日更那样静默失败十余天无人知。无可用管理员则只留 error 日志。
+    const bot = getBot(cfg.larkAppId);
+    const adminOpenId = bot?.resolvedAllowedUsers.find(u => u.startsWith('ou_'));
+    const detail = (lastError ?? '').slice(0, 200);
+    const text =
+      `[botmux 定时任务告警]「${task.name}」(id=${task.id}) 已连续失败 ${consecutiveFailures} 次。\n` +
+      `最近错误：${detail || '(无错误信息)'}\n` +
+      `任务仍按计划触发；请到工作台查看该任务（${task.parsed.display}），确认目标群是否还在、授权与工作目录是否有效。成功执行一次后本告警自动解除。`;
+    if (adminOpenId) {
+      void sendUserMessage(cfg.larkAppId, adminOpenId, text, 'text')
+        .then(() => logger.info(`[scheduler] failure alert DM sent for task=${task.id} to ${adminOpenId.substring(0, 12)}`))
+        .catch(err => logger.warn(`[scheduler] failure alert DM failed for task=${task.id}: ${err instanceof Error ? err.message : String(err)}`));
+    } else {
+      logger.error(`[scheduler] task ${task.id} failed ${consecutiveFailures}x but no admin open id available to alert`);
+    }
+  });
   scheduler.startScheduler();
 
   // Cross-daemon busy heartbeat: each daemon reports how many of its sessions
