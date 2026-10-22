@@ -758,6 +758,7 @@ let vcMeetingTerminalReconciler: VcMeetingTerminalReconciler | undefined;
 import { isBotMentioned, getGroupStats, probeBotOpenId, createLarkEventDispatcherRuntime, startLarkEventDispatcher, markForwardFollowupsSessionsReady, writeBotInfoFile, canOperate, canRunDaemonCommand, evaluateTalk, evaluateBotTalk, evaluateAskAnswerTalk, askCustomReplyCandidate, grantCommandRestriction, isKnownPeerBot, resolveSiblingBotNameByUnionId, checkRequiredScopes, ensureVcMeetingEventsSubscribed, ensureMessageUpdatedEventSubscribed, ensureMessageRecalledEventSubscribed, type RoutingContext, type TalkEvaluation, type DocCommentContext, type EventHandlers, type LarkEventDispatcherRuntime } from './im/lark/event-dispatcher.js';
 import { commitDocCommentPollCursor, docCommentThreadAnchor, getDocSubscription, isDocNativeWatchSubscription, isPollingDocTriggerMode, listAllDocSubscriptions, normalizeDocNativeWatchSubscription, putDocSubscription, recordDocWatchActivity, removeDocSubscription, settleDocCommentWsDelivery, type DocSubscription } from './services/doc-subs-store.js';
 import { BOT_REPLY_SENTINEL, subscribeDocFile, unsubscribeDocFile, addCommentReactionChecked, removeCommentReaction, hasBotSentinel, isBotAuthoredReply, listDocComments, polledReplyTriggerAllowed, type DocCommentReactionIdentity } from './im/lark/doc-comment.js';
+import { pruneOldAttachments } from './core/attachment-prune.js';
 import { learnFromMentions, getIdentity, resolveSender, flushIdentityCacheSync, type ResolvedSender } from './im/lark/identity-cache.js';
 import { normalizeBrand } from './im/lark/lark-hosts.js';
 import { buildDocCommentTurnInput, buildDocWatchWarmupTurnInput } from './core/doc-comment-prompt.js';
@@ -29356,6 +29357,16 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // 不匹配只告警；编译版走 bun:sqlite）。这里经 sqlite-compat 探测，失败
   // 信息可行动，避免拖到首次落盘才炸。
   sessionStore.assertSqliteSupported();
+
+  // 启动时回收过期入站附件（默认 14 天）。附件仅供产生它的那个 CLI turn
+  // 引用，turn 结束后无读者；旧实现只写不删，随消息量线性膨胀（实测单桶近
+  // 1GB，私聊文件长期留存也有隐私面）。fail-open，不阻断启动。
+  try {
+    const { removedDirs, appBuckets } = pruneOldAttachments(join(config.session.dataDir, 'attachments'));
+    if (removedDirs > 0) logger.info(`[attachments] startup prune removed ${removedDirs} old message dirs across ${appBuckets} app buckets`);
+  } catch (err) {
+    logger.warn(`[attachments] startup prune failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
 
   // Inert until an enabled turn is admitted: construction performs no URL
   // scan and does not open, create, query, or prune the LinkRef ledger.
