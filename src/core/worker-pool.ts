@@ -4974,10 +4974,20 @@ export async function __testOnly_waitForPinStreamingCardIdle(): Promise<void> {
  * accepts another turn is already past startup, so surface the turn as working
  * immediately. The worker's structured lifecycle gate will later publish the
  * authoritative terminal state from updates.jsonl.
+ *
+ * Codex App projects the card from the OBSERVED worker state: a fresh card can
+ * be posted for a message steered into the running turn, a serially queued
+ * follow-up (/queue, multi-human serial groups), or a fresh-ready repost, all
+ * while the worker is already `working`. Same-turn screen_updates only PATCH on
+ * a status edge, so working→working produces no patch and a card posted as
+ * `starting` stays 「启动中…」 for the rest of the turn. Unlike Grok, gate on
+ * `lastScreenStatus === 'working'` so a genuinely cold turn still renders
+ * `starting`; a queued turn gets a real edge when the preceding turn settles.
  */
 export function turnStartingCardStatus(ds: DaemonSession, effectiveCliId: CliId): 'limited' | 'working' | 'starting' {
   if (ds.usageLimit) return 'limited';
   if (effectiveCliId === 'grok' && workerHasInitialized(ds)) return 'working';
+  if (isCodexAppCliId(effectiveCliId) && workerHasInitialized(ds) && ds.lastScreenStatus === 'working') return 'working';
   return 'starting';
 }
 
