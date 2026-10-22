@@ -9260,6 +9260,7 @@ import {
   type ReplyLayout,
 } from './im/lark/reply-card-style.js';
 import { buildFeedbackElement } from './im/lark/skill-feedback-card.js';
+import { buildReplyCardActionOverflow } from './im/lark/reply-card-actions.js';
 import { buildCompletionProposalElement } from './im/lark/completion-proposal-card.js';
 import { composeFinalCardSections, customFinalCardError } from './im/lark/final-card-sections.js';
 import {
@@ -12977,11 +12978,34 @@ async function cmdSend(rest: string[]): Promise<void> {
           }
         } catch { /* voice module/config unavailable */ }
       }
+      // Per-bot opt-in reply-card menu: final answers only, same scope gates as
+      // the voice button (no top-level broadcast / cross-chat publish / managed
+      // VC receiver), and only when the card is bound to a live session.
+      // Sandboxed/read-isolated sends carry no control-card surface.
+      let replyCardMenu: Record<string, unknown> | undefined;
+      {
+        const anchorId = (isChatScope ? s.chatId : s.rootMessageId) ?? s.chatId;
+        if (effectiveResponseKind === 'final'
+          && !sendTopLevel && !vcMeetingManagedSendOrigin
+          && !overrideChatId && !sendInto
+          && !(s.sandbox === true || s.sandbox === 'oncall' || s.sandbox === 'scratch'
+            || process.env.BOTMUX_READ_ISOLATION === '1' || process.env.BOTMUX_SANDBOX === '1')
+          && sid && anchorId
+          && getBot(appId)?.config?.replyCardActions === true) {
+          replyCardMenu = buildReplyCardActionOverflow({
+            larkAppId: appId,
+            chatId: targetChatId,
+            rootId: anchorId,
+            sessionId: sid,
+            adopt: !!s.adoptedFrom,
+          }, localeForBot(appId));
+        }
+      }
       elements.push(...buildReplyCardFooterElements({
         brand: footerBrand, recipientOpenIds: footerRecipients,
         usage: shouldRenderBrand ? usageSnapshot : { ...usageSnapshot, model: undefined },
         presentation: shouldRenderBrand ? renderSnapshot : { ...renderSnapshot, timing: undefined },
-        locale: localeForBot(appId), voiceButton,
+        locale: localeForBot(appId), voiceButton, actionMenu: replyCardMenu,
       }));
 
       // Preserve caller-owned layout/header/config; only the host sections and
@@ -13000,7 +13024,6 @@ async function cmdSend(rest: string[]): Promise<void> {
         });
       }
       if (feedbackPolicy && effectiveResponseKind === 'final') {
-
         feedbackBaseCard = canonicalCard as unknown as Record<string, unknown>;
       }
       // Fit charts to Feishu's 30KB request limit on the fully assembled card;
