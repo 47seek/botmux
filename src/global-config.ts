@@ -18,6 +18,7 @@ import { join, dirname, isAbsolute } from 'node:path';
 import { homedir } from 'node:os';
 import { isLocale, type Locale } from './i18n/types.js';
 import type { VoiceConfig } from './services/voice/types.js';
+import { parseVolcengineConfig } from './services/voice/volcengine-config.js';
 import type { VcMeetingConsumerProfileConfig } from './types.js';
 import { normalizePluginIdList } from './core/plugins/ids.js';
 import { assertDurableConfigMutationAllowed } from './services/durable-config-mutation.js';
@@ -423,9 +424,11 @@ export interface DashboardGlobalConfig {
 function readVoice(raw: unknown): VoiceConfig | undefined {
   if (!raw || typeof raw !== 'object') return undefined;
   const v = raw as Record<string, unknown>;
-  const engineOk = v.engine === 'sami' || v.engine === 'openai' || v.engine === 'minimax' || v.engine === undefined;
+  const engineOk = v.engine === 'sami' || v.engine === 'openai' || v.engine === 'minimax' || v.engine === 'volcengine' || v.engine === undefined;
   if (!engineOk) return undefined;
-  if (!v.sami && !v.openai && !v.minimax && !v.engine && !v.asr) return undefined;
+  if (!v.sami && !v.openai && !v.minimax && !v.engine && !v.asr && v.volcengine === undefined
+    && typeof v.speaker !== 'string' && typeof v.rate !== 'number') return undefined;
+  if (v.volcengine !== undefined) v.volcengine = parseVolcengineConfig(v.volcengine);
   // 与 bot-registry 的 per-bot 解析对齐：minimax.region 只接受 'cn'/'global'，
   // 拼错/其它值一律删掉（适配器再兜底 global），避免脏值静默落到海外端点、还被
   // `voice status` 原样显示。

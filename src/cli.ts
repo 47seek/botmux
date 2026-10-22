@@ -18053,6 +18053,7 @@ async function cmdVoiceSetup(args: string[]): Promise<void> {
     DEFAULT_OPENAI_SPEAKER,
     DEFAULT_MINIMAX_SPEAKER,
     DEFAULT_MINIMAX_TTS_MODEL,
+    DEFAULT_VOLCENGINE_SPEAKER,
   } = await import('./services/voice/index.js');
   const mask = (s?: string) => (s ? `${s.slice(0, 4)}***` : '(未设)');
 
@@ -18066,6 +18067,15 @@ async function cmdVoiceSetup(args: string[]): Promise<void> {
     if (v.sami) console.log(`  SAMI: accessKey=${mask(v.sami.accessKey)} secretKey=${mask(v.sami.secretKey)} appkey=${v.sami.appkey ?? '(未设)'}${v.sami.tokenUrl ? ` tokenUrl=${v.sami.tokenUrl}` : ''}`);
     if (v.openai) console.log(`  OpenAI: baseUrl=${v.openai.baseUrl ?? '(未设)'} model=${v.openai.model ?? '(未设)'} apiKey=${mask(v.openai.apiKey)}`);
     if (v.minimax) console.log(`  MiniMax: region=${v.minimax.region ?? 'global'} model=${v.minimax.model ?? DEFAULT_MINIMAX_TTS_MODEL} apiKey=${mask(v.minimax.apiKey)}`);
+    if (v.engine === 'volcengine' || v.volcengine !== undefined) {
+      const { resolveVolcengineConfig } = await import('./services/voice/volcengine-config.js');
+      console.log(`  Volcengine: mode=${v.volcengine?.mode ?? '(未设置)'} resource=seed-tts-2.0 apiKey=${v.volcengine?.apiKey ? '(已设置)' : '(未设)'}`);
+      console.log(`  火山引擎配置: ${v.engine === 'volcengine' && resolveVolcengineConfig(v.volcengine) ? '可用' : '已禁用或不完整'}`);
+      if (v.engine === 'volcengine') {
+        console.log(`  默认音色: ${v.speaker ?? DEFAULT_VOLCENGINE_SPEAKER}`);
+        console.log(`  配置语速: ${v.rate ?? 1}`);
+      }
+    }
     return;
   }
   if (sub === 'disable' || sub === 'off') {
@@ -18130,9 +18140,21 @@ async function cmdVoiceSetup(args: string[]): Promise<void> {
   const rl = createInterface({ input: process.stdin, output: process.stdout });
   try {
     console.log('🔊 配置语音总结（高级功能）。写入全局 ~/.botmux/config.json，重启后生效。\n');
-    const eng = (await ask(rl, '选择 TTS 引擎  [1] SAMI（需 AK/SK/appkey）  [2] OpenAI 兼容（自带 baseUrl/key）  [3] MiniMax（自带 API key）: ')).trim();
-    const voice: Record<string, any> = {};
-    if (eng === '3' || /minimax/i.test(eng)) {
+    const eng = (await ask(rl, '选择 TTS 引擎  [1] SAMI（需 AK/SK/appkey）  [2] OpenAI 兼容（自带 baseUrl/key）  [3] MiniMax（自带 API key）  [4] 火山引擎 / 豆包 V3: ')).trim();
+    const voice: import('./services/voice/types.js').VoiceConfig = {};
+    if (eng === '4' || eng === 'volcengine') {
+      voice.engine = 'volcengine';
+      const answer = (await ask(rl, '选择 mode（必填）  [1] standard  [2] agent-plan: ')).trim();
+      const mode = answer === '1' || answer === 'standard' ? 'standard'
+        : answer === '2' || answer === 'agent-plan' ? 'agent-plan' : undefined;
+      if (!mode) { console.error('❌ mode 必须是 standard 或 agent-plan，未写入。'); return; }
+      const apiKey = await ask(rl, `${mode} 专用 API key（不会自动切换账户或端点）: `);
+      const { resolveVolcengineConfig } = await import('./services/voice/volcengine-config.js');
+      const credentials = resolveVolcengineConfig({ mode, apiKey });
+      if (!credentials) { console.error('❌ 需要非空且不含控制字符的专用 API key，未写入。'); return; }
+      voice.volcengine = credentials;
+      voice.speaker = (await ask(rl, `音色 speaker（留空=默认 ${DEFAULT_VOLCENGINE_SPEAKER}）: `)).trim() || DEFAULT_VOLCENGINE_SPEAKER;
+    } else if (eng === '3' || /minimax/i.test(eng)) {
       voice.engine = 'minimax';
       const apiKey = (await ask(rl, 'MiniMax API key: ')).trim();
       if (!apiKey) { console.error('❌ MiniMax API key 必填，未写入。'); return; }
@@ -18168,10 +18190,15 @@ async function cmdVoiceSetup(args: string[]): Promise<void> {
         if (wsUrl) voice.sami.wsUrl = wsUrl;
       }
     }
-    const rate = (await ask(rl, '语速倍率（留空=1.1）: ')).trim();
-    if (rate && !Number.isNaN(Number(rate))) voice.rate = Number(rate);
+    const rate = (await ask(rl, `语速倍率（留空=${voice.engine === 'volcengine' ? '1' : '1.1'}）: `)).trim();
+    if (voice.engine === 'volcengine') {
+      const value = rate ? Number(rate) : 1;
+      if (!Number.isFinite(value) || value <= 0) { console.error('❌ 语速必须是有限正数，未写入。'); return; }
+      voice.rate = value;
+    } else if (rate && !Number.isNaN(Number(rate))) voice.rate = Number(rate);
 
-    mergeGlobalConfig({ voice: voice as any });
+    const asr = readGlobalConfig().voice?.asr;
+    mergeGlobalConfig({ voice: { ...voice, ...(asr ? { asr } : {}) } });
     console.log('\n✅ 已写入 voice 配置。`botmux restart` 后，配了语音的机器人回复卡片底部会出现「🔊 语音总结」按钮。');
     console.log('   查看：`botmux voice status`  关闭：`botmux voice disable`');
 
