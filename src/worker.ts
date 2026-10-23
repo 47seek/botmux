@@ -114,6 +114,7 @@ import {
   POST_HOOK_EVIDENCE_FALLBACK_MS,
   POST_HOOK_EVIDENCE_RETRY_MS,
 } from './utils/input-gate.js';
+import { promptCacheKeepaliveRefusal } from './core/prompt-cache-keepalive-gate.js';
 import {
   decideCodexRunnerFreshness,
   CodexRunnerFreshnessInputQueue,
@@ -20972,6 +20973,7 @@ async function spawnCli(
     // replyDelivery=transcript + solo：daemon 冻结在 init 上的值，系统提示改口用。
     replyDelivery: cfg.replyDelivery,
     promptInjection: cfg.promptInjection,
+    promptCacheTtl: cfg.promptCacheTtl,
     solo: cfg.solo,
     locale: cfg.locale,
     model: ttadkGateway ? undefined : cfg.model,
@@ -28577,6 +28579,41 @@ process.on('message', async (raw: unknown) => {
       // disarmed until the next real stall. t/Esc and all ScreenAnalyzer cards
       // never set this flag.
       if (shouldRearmStuckDetector(!!msg.rearmStuckDetector, wroteKeys)) stuckDetector?.arm();
+      break;
+    }
+
+    case 'prompt_cache_keepalive': {
+      // Claude Code prompt-cache keep-alive (core/prompt-cache-keepalive.ts).
+      // Only into a CLI that is quietly idle AND visibly sitting in its real
+      // composer: a permission dialog / AskUserQuestion picker also reads as
+      // idle, and the Enter would approve it (core/prompt-cache-keepalive-gate.ts).
+      let keepaliveScreen: string | undefined;
+      if (renderer && backendScreenEvidenceIsAuthoritativeForMutation()) {
+        try { keepaliveScreen = renderer.rawSnapshot({ preserveFormatting: true }); } catch { keepaliveScreen = undefined; }
+      }
+      const refusal = promptCacheKeepaliveRefusal({
+        hasBackend: !!backend && !!cliAdapter,
+        restarting: cliRestartInProgress,
+        promptReady: isPromptReady,
+        tuiPromptOpen: tuiPromptBlocking,
+        bareShell: bareShellLaunchBlocked,
+        inputPending: isFlushing || injectionFlushing || pendingMessages.length > 0 || pendingRawInputs.length > 0
+          || pendingInjections.length > 0 || pendingSessionRename !== null,
+        screen: keepaliveScreen,
+        readyPattern: cliAdapter?.readyPattern,
+      });
+      if (refusal) {
+        send({ type: 'prompt_cache_keepalive_result', injected: false, reason: refusal });
+        break;
+      }
+      // The keep-alive belongs to no botmux turn: drop the previous turn's
+      // identity so its screen updates cannot flip that turn's reply card back
+      // to "working" or be attributed to it in any way.
+      setCaptureIdentity(undefined, undefined);
+      pendingInjections.push({ command: msg.text, barrier: false });
+      send({ type: 'prompt_cache_keepalive_result', injected: true });
+      log('Prompt-cache keep-alive queued');
+      void flushPendingInjections();
       break;
     }
 
