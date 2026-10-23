@@ -40,6 +40,23 @@ it('re-probes the same Bot and choice when an env value changes', async () => {
 });
 
 describe('bounded readiness probe cache', () => {
+  it('bounds queue waiting without starting an expired probe or consuming a slot', async () => {
+    vi.useFakeTimers();
+    const cache = createCliAvailabilityCache({ concurrency: 1 });
+    let release!: () => void;
+    const first = cache('busy', async () => { await new Promise<void>(resolve => { release = resolve; }); return available; });
+    const queuedProbe = vi.fn<typeof checkCliAvailabilityAsync>(async () => available);
+    const queued = cache('queued', () => queuedProbe({ cliId: 'traex' }));
+    try {
+      await vi.advanceTimersByTimeAsync(15_001);
+      expect(await queued).toMatchObject({ status: 'unknown' });
+      expect(queuedProbe).not.toHaveBeenCalled();
+      release(); await first;
+      expect(await cache('next', async () => available)).toMatchObject({ status: 'available' });
+    } finally { release(); vi.useRealTimers(); }
+  });
+
+
   it('coalesces in-flight calls, expires results, and separates same-key env values', async () => {
     let now = 0;
     const cache = createCliAvailabilityCache({ now: () => now, ttlMs: 10 });

@@ -16,8 +16,18 @@ export function createCliAvailabilityCache(options: { ttlMs?: number; concurrenc
     if (prior && prior.expires > now()) return prior.pending;
     if (waiting.length >= 64) return { available: false, localExecutableRequired: true, status: 'unknown' };
     const pending = (async () => {
-      if (running >= (options.concurrency ?? 4)) await new Promise<void>(resolve => waiting.push(resolve));
-      else running++;
+      if (running >= (options.concurrency ?? 4)) {
+        const admitted = await new Promise<boolean>(resolve => {
+          const wake = () => { clearTimeout(timer); resolve(true); };
+          const timer = setTimeout(() => {
+            const index = waiting.indexOf(wake);
+            if (index >= 0) waiting.splice(index, 1);
+            resolve(false);
+          }, 15_000);
+          waiting.push(wake);
+        });
+        if (!admitted) return { available: false, localExecutableRequired: true, status: 'unknown' as const };
+      } else running++;
       try { return await probe(); }
       finally {
         const next = waiting.shift();
