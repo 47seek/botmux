@@ -777,6 +777,7 @@ let vcMeetingTerminalReconciler: VcMeetingTerminalReconciler | undefined;
 import { isBotMentioned, getGroupStats, probeBotOpenId, createLarkEventDispatcherRuntime, startLarkEventDispatcher, markForwardFollowupsSessionsReady, writeBotInfoFile, canOperate, canRunDaemonCommand, evaluateTalk, evaluateBotTalk, evaluateAskAnswerTalk, askCustomReplyCandidate, grantCommandRestriction, isKnownPeerBot, resolveSiblingBotNameByUnionId, checkRequiredScopes, ensureVcMeetingEventsSubscribed, ensureMessageUpdatedEventSubscribed, ensureMessageRecalledEventSubscribed, type RoutingContext, type TalkEvaluation, type DocCommentContext, type EventHandlers, type LarkEventDispatcherRuntime } from './im/lark/event-dispatcher.js';
 import { commitDocCommentPollCursor, docCommentThreadAnchor, getDocSubscription, isDocNativeWatchSubscription, isPollingDocTriggerMode, listAllDocSubscriptions, normalizeDocNativeWatchSubscription, putDocSubscription, recordDocWatchActivity, removeDocSubscription, settleDocCommentWsDelivery, type DocSubscription } from './services/doc-subs-store.js';
 import { BOT_REPLY_SENTINEL, subscribeDocFile, unsubscribeDocFile, addCommentReactionChecked, removeCommentReaction, hasBotSentinel, isBotAuthoredReply, listDocComments, polledReplyTriggerAllowed, type DocCommentReactionIdentity } from './im/lark/doc-comment.js';
+import { pruneOldAttachments, collectProtectedAttachmentDirs } from './core/attachment-prune.js';
 import { learnFromMentions, getIdentity, resolveSender, flushIdentityCacheSync, type ResolvedSender } from './im/lark/identity-cache.js';
 import { normalizeBrand } from './im/lark/lark-hosts.js';
 import { buildDocCommentTurnInput, buildDocWatchWarmupTurnInput } from './core/doc-comment-prompt.js';
@@ -29435,6 +29436,30 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // 不匹配只告警；编译版走 bun:sqlite）。这里经 sqlite-compat 探测，失败
   // 信息可行动，避免拖到首次落盘才炸。
   sessionStore.assertSqliteSupported();
+
+  // 启动时回收过期入站附件（默认 14 天）。附件仅供产生它的那个 CLI turn
+  // 引用，turn 结束后无读者；旧实现只写不删，随消息量线性膨胀（实测单桶近
+  // 1GB，私聊文件长期留存也有隐私面）。fail-open，不阻断启动。
+  // 选仓卡 / Dashboard backlog 待办等长期挂起的会话会把附件路径持久化在
+  // 会话库里，且会话本身被无限期保护、可能 14 天后才被用户继续——这些目录
+  // 即使超龄也跳过，否则用户日后继续会话时，注入 prompt 的会是已删除的
+  // 失效路径。
+  try {
+    const attachmentsRoot = join(config.session.dataDir, 'attachments');
+    let protectedDirs: Set<string> = new Set();
+    try {
+      const snapshot = sessionStore.loadAllSessionsSnapshot({ dataDir: config.session.dataDir });
+      protectedDirs = collectProtectedAttachmentDirs(snapshot.values(), attachmentsRoot);
+    } catch (err) {
+      // 快照读不出来时按「无保护」继续（回收仍逐目录 fail-open）；宁可留下
+      // 过期文件，也不能阻断启动。
+      logger.warn(`[attachments] protected-dir scan failed, pruning without exclusions: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    const { removedDirs, appBuckets } = pruneOldAttachments(attachmentsRoot, undefined, undefined, protectedDirs);
+    if (removedDirs > 0) logger.info(`[attachments] startup prune removed ${removedDirs} old message dirs across ${appBuckets} app buckets`);
+  } catch (err) {
+    logger.warn(`[attachments] startup prune failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
 
   // Inert until an enabled turn is admitted: construction performs no URL
   // scan and does not open, create, query, or prune the LinkRef ledger.
