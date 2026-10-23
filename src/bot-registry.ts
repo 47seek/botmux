@@ -1,3 +1,4 @@
+import { normalizeVcMeetingListenerPolicy, type VcMeetingListenerPolicy } from './services/vc-meeting-listener-policy.js';
 import { normalizeReplyFooter, parseReplyFooterEnv, type ReplyFooterPreferences } from './services/reply-footer.js';
 import { parseGroupCreationDefaults, type GroupCreationDefaults } from './services/group-creation-options.js';
 import { readGlobalConfig } from './global-config.js';
@@ -474,6 +475,8 @@ function normalizeVcMeetingAgentConfig(raw: unknown): VcMeetingAgentConfig | und
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
   const entry = raw as Record<string, unknown>;
   const out: VcMeetingAgentConfig = {};
+  const listenerPolicy = normalizeVcMeetingListenerPolicy(entry.listenerPolicy);
+  if (listenerPolicy) out.listenerPolicy = listenerPolicy;
   // VC 默认对每个连着飞书的 bot 生效(vcMeetingAgentConfigActive:enabled!==false),
   // 所以 enabled:false 是**显式退出**,必须原样保留——只留 true 会把 false round-trip
   // 成 undefined(=默认开),让"关掉这个 bot 的会议"重载即失效。
@@ -1328,6 +1331,7 @@ export interface SubstituteModeConfig {
 }
 
 export interface VcMeetingAgentConfig {
+  listenerPolicy?: Partial<VcMeetingListenerPolicy>;
   /** Owner opt-in: verified inviters may manage only the invited meeting. Default false. */
   inviterManagementEnabled?: boolean;
   inviterManagementEnabledAt?: number;
