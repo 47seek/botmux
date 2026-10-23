@@ -10,10 +10,14 @@
  * 不依赖消息 id 编码时间；appId 桶目录本身保留。默认 14 天——远长于任何 turn
  * 的生命周期，活跃会话绝不会引用到这么旧的下载。
  *
- * 例外：选仓卡等长期挂起的会话会把附件路径持久化进 pendingRepoSetup，
- * 这类会话被无限期保护、不会被回收（见 session-mutation-guard），用户可能
- * 在 14 天之后才点卡继续。调用方用 collectProtectedAttachmentDirs 从会话
- * 快照收集这些仍被引用的目录，sweep 时跳过——即使它已经超过 TTL。
+ * 例外：长期挂起的会话会把附件路径持久化下来，这类会话被无限期保护、
+ * 不会被回收（见 session-mutation-guard），用户可能在 14 天之后才继续：
+ *  - pendingRepoSetup.attachments：选仓卡挂起；
+ *  - queuedAttachments：Dashboard backlog 待办（queued === true 同样被
+ *    queued_todo 无限期保护），激活时原样注入首轮；
+ *  - dashboardAttachments：Dashboard 创建会话时上传、活跃期间保留的图片。
+ * 调用方用 collectProtectedAttachmentDirs 从会话快照收集这些仍被引用的
+ * 目录，sweep 时跳过——即使它已经超过 TTL。
  *
  * 任何单个目录删除失败都跳过；不存在的根直接返回 0。fail-open，不阻断启动。
  */
@@ -27,17 +31,20 @@ export interface PruneAttachmentsResult {
   appBuckets: number;
 }
 
-/** 会话里持久化持有附件路径的最小结构（当前只有 pendingRepoSetup）。 */
+/** 会话里持久化持有附件路径的最小结构。 */
 type SessionWithProtectedAttachments = {
   pendingRepoSetup?: {
     attachments?: ReadonlyArray<{ path?: string }>;
   };
+  queuedAttachments?: ReadonlyArray<{ path?: string }>;
+  dashboardAttachments?: ReadonlyArray<{ path?: string }>;
 };
 
 /**
  * 从全部会话快照收集仍被持久化引用、TTL sweep 不得删除的附件 messageId
- * 目录（绝对路径）。只接纳位于 attachmentsRoot 之内的路径：根目录本身与
- * 根外路径都不保护，附件路径损坏不影响其余回收。
+ * 目录（绝对路径）。三类持有者都是「路径持久化、重启后注入、会话被无限期
+ * 保护」的同一机制，缺一个就留一个已知同型空洞。只接纳位于 attachmentsRoot
+ * 之内的路径：根目录本身与根外路径都不保护，附件路径损坏不影响其余回收。
  */
 export function collectProtectedAttachmentDirs(
   sessions: Iterable<SessionWithProtectedAttachments>,
@@ -46,7 +53,12 @@ export function collectProtectedAttachmentDirs(
   const root = resolve(attachmentsRoot);
   const protectedDirs = new Set<string>();
   for (const session of sessions) {
-    for (const attachment of session.pendingRepoSetup?.attachments ?? []) {
+    const holders: ReadonlyArray<{ path?: string }> = [
+      ...(session.pendingRepoSetup?.attachments ?? []),
+      ...(session.queuedAttachments ?? []),
+      ...(session.dashboardAttachments ?? []),
+    ];
+    for (const attachment of holders) {
       if (!attachment.path) continue;
       const dir = resolve(dirname(attachment.path));
       if (dir === root) continue;
@@ -91,8 +103,8 @@ export function pruneOldAttachments(
     }
     for (const messageId of messageDirs) {
       const dir = resolve(bucket, messageId);
-      // 仍被选仓卡等持久化状态引用的目录跳过，无论多旧——删了用户日后点卡
-      // 注入的就是失效路径（静默降级）。
+      // 仍被选仓卡/backlog 待办等持久化状态引用的目录跳过，无论多旧——
+      // 删了用户日后继续会话时注入的就是失效路径（静默降级）。
       if (protectedAbsolute.has(dir)) continue;
       try {
         if (statSync(dir).mtimeMs < cutoff) {

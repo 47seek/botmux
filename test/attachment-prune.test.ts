@@ -50,32 +50,47 @@ describe('pruneOldAttachments', () => {
 
   it('never removes loose files at the root or inside an app bucket', () => {
     // 删除作用域只能是 <bucket>/<messageId>/ 目录：根层散落文件（元数据等）
-    // 与桶内散落文件都必须原样保留。
-    writeFileSync(join(root, 'stray-root.txt'), 'x');
+    // 与桶内散落文件都必须原样保留。散落文件也要超龄——否则年龄判定先挡掉，
+    // isDirectory() 守卫本身根本没被走到。
+    const rootStray = join(root, 'stray-root.txt');
+    const bucketStray = join(root, 'cli_a', 'stray-bucket.txt');
+    writeFileSync(rootStray, 'x');
     mkdirSync(join(root, 'cli_a'), { recursive: true });
-    writeFileSync(join(root, 'cli_a', 'stray-bucket.txt'), 'x');
+    writeFileSync(bucketStray, 'x');
+    const oldSeconds = (Date.now() - 30 * 86400_000) / 1000;
+    utimesSync(rootStray, oldSeconds, oldSeconds);
+    utimesSync(bucketStray, oldSeconds, oldSeconds);
     msgDir('cli_a', 'om_old', 30 * 24 * 3600_000);
 
     const r = pruneOldAttachments(root, 14 * 24 * 3600_000);
     expect(r.removedDirs).toBe(1);
-    expect(existsSync(join(root, 'stray-root.txt'))).toBe(true);
-    expect(existsSync(join(root, 'cli_a', 'stray-bucket.txt'))).toBe(true);
+    expect(existsSync(rootStray)).toBe(true);
+    expect(existsSync(bucketStray)).toBe(true);
   });
 
-  it('keeps expired dirs still referenced by persisted pendingRepoSetup attachments', () => {
-    // 选仓卡挂起 14 天以上时，附件目录虽超龄但仍被持久化状态引用：
-    // 用户日后点卡继续，注入 prompt 的路径必须仍然存在。
-    const held = msgDir('cli_a', 'om_held', 30 * 24 * 3600_000);
-    const other = msgDir('cli_a', 'om_old', 30 * 24 * 3600_000);
+  it('keeps expired dirs referenced by any persisted attachment holder', () => {
+    // 三类持久化持有者是同一机制：pendingRepoSetup（选仓卡）、
+    // queuedAttachments（Dashboard backlog 待办）、dashboardAttachments
+    // （Dashboard 建会话上传）。会话都被无限期保护，附件可能 14 天后才被引用。
+    const repo = msgDir('cli_a', 'om_repo', 30 * 24 * 3600_000);
+    const queued = msgDir('cli_a', 'om_queued', 30 * 24 * 3600_000);
+    const dash = msgDir('cli_a', 'om_dash', 30 * 24 * 3600_000);
+    const orphan = msgDir('cli_a', 'om_orphan', 30 * 24 * 3600_000);
     const protectedDirs = collectProtectedAttachmentDirs(
-      [{ pendingRepoSetup: { attachments: [{ path: join(held, 'image.png') }] } }],
+      [
+        { pendingRepoSetup: { attachments: [{ path: join(repo, 'image.png') }] } },
+        { queuedAttachments: [{ path: join(queued, 'image.png') }] },
+        { dashboardAttachments: [{ path: join(dash, 'image.png') }] },
+      ],
       root,
     );
 
     const r = pruneOldAttachments(root, 14 * 24 * 3600_000, undefined, protectedDirs);
     expect(r.removedDirs).toBe(1);
-    expect(existsSync(held)).toBe(true);
-    expect(existsSync(other)).toBe(false);
+    expect(existsSync(repo)).toBe(true);
+    expect(existsSync(queued)).toBe(true);
+    expect(existsSync(dash)).toBe(true);
+    expect(existsSync(orphan)).toBe(false);
   });
 
   it('default max age is a positive multi-day window', () => {

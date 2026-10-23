@@ -29361,9 +29361,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // 启动时回收过期入站附件（默认 14 天）。附件仅供产生它的那个 CLI turn
   // 引用，turn 结束后无读者；旧实现只写不删，随消息量线性膨胀（实测单桶近
   // 1GB，私聊文件长期留存也有隐私面）。fail-open，不阻断启动。
-  // 选仓卡等长期挂起的会话把附件路径持久化在 pendingRepoSetup 里，且会话
-  // 本身被无限期保护、可能 14 天后才被用户继续——这些目录即使超龄也跳过，
-  // 否则用户日后点卡，注入 prompt 的会是已删除的失效路径。
+  // 选仓卡 / Dashboard backlog 待办等长期挂起的会话会把附件路径持久化在
+  // 会话库里，且会话本身被无限期保护、可能 14 天后才被用户继续——这些目录
+  // 即使超龄也跳过，否则用户日后继续会话时，注入 prompt 的会是已删除的
+  // 失效路径。
   try {
     const attachmentsRoot = join(config.session.dataDir, 'attachments');
     let protectedDirs: Set<string> = new Set();
