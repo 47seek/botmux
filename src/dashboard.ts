@@ -178,8 +178,9 @@ import {
   isKnownSelectionKey,
   buildModelChoicesResponse,
 } from './services/model-catalog.js';
+import { cliAvailabilityResponse } from './dashboard/cli-availability-request.js';
 import { modelCatalogProbeContext } from './dashboard/model-catalog-request.js';
-import { checkCliAvailability, checkCliAvailabilityAsync, preliminaryCliAvailability } from './setup/cli-availability.js';
+import { checkCliAvailability, preliminaryCliAvailability } from './setup/cli-availability.js';
 import { invalidWorkingDirs } from './utils/working-dir.js';
 import { applyGlobalSessionEnvOps, globalConfigPath, invalidateGlobalConfigCache, mergeDashboardConfig, mergeGlobalConfig, readGlobalConfig, type MaintenanceConfig, type RepoPickerMode, type WhiteboardConfig, type SessionCleanupHours } from './global-config.js';
 import { hostLocalTimeZone, scheduleTimeZone } from './utils/timezone.js';
@@ -5875,16 +5876,8 @@ const server = createServer(async (req, res) => {
       } catch {
         botConfig = undefined;
       }
-      const selection = resolveCliSelection(key);
-      const context = modelCatalogProbeContext(key, botConfig, process.env);
-      const availability = await checkCliAvailabilityAsync({
-        ...selection, cliPathOverride: context.runtimeExecutable,
-      }, { env: context.probeEnv, shellFallback: !selection.wrapperCli });
-      // Expose readiness only; Bot env and executable paths stay server-side.
-      return jsonRes(res, 200, {
-        status: availability.status,
-        command: availability.command,
-      });
+      const response = await cliAvailabilityResponse(key, botConfig, process.env);
+      return jsonRes(res, response.statusCode, response.body);
     }
 
     // On-demand 模型探测：只探测当前选中的单个 CLI（用户在模型下拉旁点「刷新」时），

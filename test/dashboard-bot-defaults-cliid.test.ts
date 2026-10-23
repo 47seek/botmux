@@ -1,6 +1,6 @@
 import React from 'react';
 import TestRenderer, { act } from 'react-test-renderer';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { displayCliId } from '../src/dashboard/web/bot-defaults.js';
 import {
   BotAgentSection,
@@ -14,13 +14,16 @@ import { isOnboardingSubmitDisabled } from '../src/dashboard/web/bot-onboarding.
 
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
 
+const originalFetch = globalThis.fetch;
+afterEach(() => { vi.unstubAllGlobals(); globalThis.fetch = originalFetch; });
+
 // Readiness timing/responses have dedicated coverage. Keep this fixture's
 // request recorders scoped to the save/model APIs they assert.
 function stubReadinessProbe(): void {
   const configuredFetch = globalThis.fetch;
-  globalThis.fetch = ((url: any, init?: any) => String(url).includes('/api/cli-options/availability?')
+  vi.stubGlobal('fetch', ((url: any, init?: any) => String(url).includes('/api/cli-options/availability?')
     ? Promise.resolve({ ok: true, json: async () => ({ status: 'unknown' }) } as Response)
-    : configuredFetch(url, init)) as typeof fetch;
+    : configuredFetch(url, init)) as typeof fetch);
 }
 
 describe('bot defaults task tabs', () => {
@@ -115,7 +118,7 @@ describe('bot defaults cli label', () => {
     });
     const root = renderer.root;
     const dropdown = root.findByProps({ dataInput: 'agentCliId' });
-    expect(dropdown.props.options[0].label).not.toBe('Codex（codex）');
+    expect(dropdown.props.options[0].label).toMatch(/未安装|不可用/);
     expect(root.findByProps({ className: 'hint-warn' }).children.join('')).toContain('codex');
   });
 });

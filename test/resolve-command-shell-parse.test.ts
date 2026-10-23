@@ -1,5 +1,6 @@
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { execFileSync, spawn } from 'node:child_process';
 import { join } from 'node:path';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import {
@@ -185,5 +186,53 @@ describe('asynchronous shell discovery', () => {
     expect(await resolveCommandAsync('botmux-test-not-installed', {
       env: { HOME: dir, ZDOTDIR: dir, SHELL: shell, PATH: '/usr/bin:/bin' },
     })).toEqual({ resolved: 'botmux-test-not-installed', inconclusive: true });
+  });
+});
+
+
+describe('async shell process-group retirement', () => {
+  function live(pid: number): boolean {
+    try { process.kill(pid, 0); } catch { return false; }
+    try {
+      const state = process.platform === 'linux'
+        ? readFileSync(`/proc/${pid}/status`, 'utf8').match(/^State:\s*(\w)/m)?.[1]
+        : execFileSync('ps', ['-o', 'state=', '-p', String(pid)], { encoding: 'utf8' }).trim()[0];
+      return state !== 'Z';
+    } catch { return false; }
+  }
+
+  it.each(['complete', 'timeout'] as const)('retires rc background children after %s with a positive control', async mode => {
+    const root = mkdtempSync(join(tmpdir(), 'probe-child-'));
+    const shell = join(root, 'shell');
+    const pidfile = join(root, 'children');
+    const tool = join(root, 'tool');
+    const env = { HOME: root, ZDOTDIR: root, SHELL: shell, PATH: '/usr/bin:/bin' };
+    const pids = () => existsSync(pidfile) ? readFileSync(pidfile, 'utf8').trim().split('\n').filter(Boolean).map(Number) : [];
+    const manual = new Set<number>();
+    try {
+      writeFileSync(tool, '#!/bin/sh\nexit 0\n'); chmodSync(tool, 0o755);
+      writeFileSync(shell, `#!/bin/sh\n/bin/sleep 45 >/dev/null 2>&1 &\necho $! >> '${pidfile}'\n` +
+        (mode === 'timeout' ? '/bin/sleep 5\n' : `echo '${tool}'\n`));
+      chmodSync(shell, 0o755);
+      // Same fixture outside the resolver proves rc really started a live child.
+      const control = spawn(shell, [], { env, detached: true, stdio: 'ignore' });
+      await new Promise<void>((resolve, reject) => { control.once('error', reject); const check = () => {
+        if (pids().length) resolve(); else setTimeout(check, 10);
+      }; check(); });
+      for (const pid of pids()) { manual.add(pid); expect(live(pid)).toBe(true); }
+      if (control.pid) { try { process.kill(-control.pid, 'SIGKILL'); } catch { /* exited */ } }
+      for (const pid of manual) { try { process.kill(pid, 'SIGKILL'); } catch { /* exited */ } }
+      writeFileSync(pidfile, '');
+      const result = await resolveCommandAsync('probe-child-tool', { env, timeoutMs: 100 });
+      expect(pids().length).toBeGreaterThan(0);
+      if (mode === 'complete') expect(result.resolved).toBe(tool);
+      else expect(result.inconclusive).toBe(true);
+      const deadline = Date.now() + 2_000;
+      while (pids().some(live) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 25));
+      expect(pids().filter(live)).toEqual([]);
+    } finally {
+      for (const pid of [...manual, ...pids()]) { try { process.kill(pid, 'SIGKILL'); } catch { /* exited */ } }
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });

@@ -265,6 +265,7 @@ export type BotSubstituteMode = {
 };
 
 export type BotDefaultsRow = {
+  envRevision?: string;
   larkAppId: string;
   botName?: string;
   cliId?: string;

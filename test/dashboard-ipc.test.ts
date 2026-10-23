@@ -8034,6 +8034,63 @@ describe('PUT /api/bot-agent', () => {
       expect(disk().wrapperCli).toBe('codex --profile withhooks');
     });
 
+    it('does not hold the global config lock while a shell probe waits, and rejects changed input', async () => {
+      const shell = join(dir, 'probe-shell');
+      const started = join(dir, 'probe-started');
+      const release = join(dir, 'probe-release');
+      const launcher = join(dir, 'launcher');
+      writeFileSync(launcher, '#!/bin/sh\nexit 0\n'); chmodSync(launcher, 0o755);
+      writeFileSync(shell, `#!/bin/sh\ntouch '${started}'\nwhile [ ! -f '${release}' ]; do /bin/sleep 0.02; done\necho '${launcher}'\n`);
+      chmodSync(shell, 0o755);
+      await setup({ cliId: 'codex', wrapperCli: 'aiden x codex', env: { SHELL: shell, PATH: '/usr/bin:/bin' } });
+      const pending = save({ cliId: 'aiden-x-codex', model: 'requested' });
+      const deadline = Date.now() + 2_000;
+      while (!existsSync(started) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10));
+      expect(existsSync(started)).toBe(true);
+      const begin = Date.now();
+      await rmwBotEntry(appId, entry => { entry.env.PATH = '/changed/bin'; return { write: true, result: null }; });
+      expect(Date.now() - begin).toBeLessThan(500);
+      writeFileSync(release, 'release');
+      const response = await pending;
+      expect(response.status).toBe(409);
+      expect(await response.json()).toMatchObject({ error: 'agent_probe_changed' });
+      expect(disk().env.PATH).toBe('/changed/bin');
+      expect(disk()).not.toHaveProperty('model');
+    });
+
+    it('keeps runtime version probes outside the config lock and fences an env change', async () => {
+      const executable = join(dir, 'custom-runtime');
+      const started = join(dir, 'version-started');
+      const release = join(dir, 'version-release');
+      writeFileSync(executable, `#!/bin/sh\ntouch '${started}'\nwhile [ ! -f '${release}' ]; do /bin/sleep 0.02; done\necho 'runtime 1.2.3'\n`);
+      chmodSync(executable, 0o755);
+      await setup({ cliId: 'codex', env: { PATH: '/usr/bin:/bin' } });
+      const pending = save({ cliId: 'codex', cliRuntime: { id: 'test', executable } });
+      const deadline = Date.now() + 2_000;
+      while (!existsSync(started) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10));
+      expect(existsSync(started)).toBe(true);
+      const begin = Date.now();
+      await rmwBotEntry(appId, entry => { entry.env.EXTRA = 'changed'; return { write: true, result: null }; });
+      expect(Date.now() - begin).toBeLessThan(500);
+      writeFileSync(release, 'release');
+      const response = await pending;
+      expect(response.status).toBe(409);
+      expect(disk()).not.toHaveProperty('cliRuntime');
+    });
+
+    it('finds an rc-only wrapper on save without executing the wrapper itself', async () => {
+      const shell = join(dir, 'rc-shell');
+      const launcher = join(dir, 'rc-only-wrapper');
+      const executed = join(dir, 'wrapper-executed');
+      writeFileSync(launcher, `#!/bin/sh\ntouch '${executed}'\n`); chmodSync(launcher, 0o755);
+      writeFileSync(shell, `#!/bin/sh\necho '${launcher}'\n`); chmodSync(shell, 0o755);
+      await setup({ cliId: 'codex', wrapperCli: 'aiden x codex', env: { SHELL: shell, PATH: '/usr/bin:/bin' } });
+      const response = await save({ cliId: 'aiden-x-codex' });
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({ agentAvailable: true, requiredCommand: 'aiden' });
+      expect(existsSync(executed)).toBe(false);
+    });
+
     it('checks the wrapper executable without running it or its hooks', async () => {
       const marker = join(dir, 'executed');
       const launcher = join(dir, 'launcher');
