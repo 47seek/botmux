@@ -137,8 +137,7 @@ describe('asynchronous shell discovery', () => {
     chmodSync(tool, 0o755);
     return { dir, bin, tool };
   }
-  it.each(['.zprofile', '.zshrc'])('finds an executable installed only through %s', async rc => {
-    if (!existsSync('/bin/zsh')) return;
+  it.skipIf(!existsSync('/bin/zsh')).each(['.zprofile', '.zshrc'])('finds an executable installed only through %s', async rc => {
     const { dir, bin, tool } = fixture();
     writeFileSync(join(dir, rc), `export PATH="${bin}:$PATH"\n`);
     const result = await resolveCommandAsync('botmux-test-rc-only', {
