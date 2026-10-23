@@ -132,6 +132,7 @@ import {
   resolveDashboardH5AuthConfig,
 } from './dashboard/h5-auth.js';
 import { PluginResultArtifactStore } from './core/plugins/mcp/result-artifact-store.js';
+import { listLatestDiagnosticFiles } from './core/plugins/mcp/diagnostics-files.js';
 import {
   handlePluginResultAccess,
   resolvePluginResultViewerIdentity,
@@ -2653,13 +2654,7 @@ function latestGatewayDiagnostics(): Map<string, unknown[]> {
   const root = join(config.session.dataDir, 'mcp-gateway');
   const byPlugin = new Map<string, unknown[]>();
   if (!existsSync(root)) return byPlugin;
-  let files: string[] = [];
-  try {
-    files = readdirSync(root)
-      .filter(file => file.endsWith('.json'))
-      .sort((a, b) => statSync(join(root, b)).mtimeMs - statSync(join(root, a)).mtimeMs)
-      .slice(0, 50);
-  } catch { return byPlugin; }
+  const files = listLatestDiagnosticFiles(root, 50);
   const seen = new Set<string>();
   for (const file of files) {
     try {

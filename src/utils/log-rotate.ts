@@ -8,8 +8,12 @@
  * 有界大小：daemon 重启（含每日升级/崩溃自愈）天然提供滚动时机。
  *
  * 策略（与常见 logrotate 一致的最小版）：
- *   file.log ≥ maxBytes → file.log 重命名为 file.1.log（覆盖旧 .1），
+ *   file.log ≥ maxBytes → file.log 重命名为 file.log.1（覆盖旧 .1），
  *   调用方随后以 'a' 新建空 file.log。只保留 1 份历史，避免无限归档。
+ *   rename 覆盖已存在目标在 POSIX 与 Windows 上都成立：Node 经 libuv
+ *   uv_fs_rename，Windows 侧是 MoveFileExW(MOVEFILE_REPLACE_EXISTING)；
+ *   唯一会 EPERM 的情形是源/目标正被其它进程打开，而 .1 归档从不被打开。
+ *   （Windows 原生不在支持范围，仅支持 WSL2。）
  * 失败一律 fail-open（返回 false，调用方照常 append），轮转绝不阻断 daemon 启动。
  */
 import { openSync, statSync, renameSync, mkdirSync } from 'node:fs';
@@ -27,7 +31,8 @@ export function rotateLogIfNeeded(path: string, maxBytes: number = DEFAULT_LOG_M
     }
     if (size < maxBytes) return false;
     const rolled = `${path}.1`;
-    // 覆盖上一份归档（先删再 rename，避免 EXDEV 之外的平台差异）。
+    // rename 直接覆盖已存在的旧归档（POSIX 原子替换；Windows 经 libuv 的
+    // MOVEFILE_REPLACE_EXISTING 同样覆盖）。.1 从不被任何进程打开，无 EPERM 面。
     renameSync(path, rolled);
     return true;
   } catch {

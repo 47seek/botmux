@@ -54,4 +54,14 @@ describe('pruneFilesByAge', () => {
     expect(pruneFilesByAge({ dir, maxAgeMs: 1, retainMin: 5 })).toBe(0);
     expect(existsSync(join(dir, 'a.json'))).toBe(true);
   });
+
+  it('defaults retainMin to 1: all expired still keeps the newest file', () => {
+    // 省略 retainMin 时的默认值是 1（工具的复用调用方可能不传）。
+    touch('older.json', 100_000);
+    touch('newer.json', 90_000);
+    const removed = pruneFilesByAge({ dir, maxAgeMs: 1_000 });
+    expect(removed).toBe(1);
+    expect(existsSync(join(dir, 'older.json'))).toBe(false);
+    expect(existsSync(join(dir, 'newer.json'))).toBe(true);
+  });
 });
