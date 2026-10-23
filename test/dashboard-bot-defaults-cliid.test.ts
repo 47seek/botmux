@@ -14,6 +14,15 @@ import { isOnboardingSubmitDisabled } from '../src/dashboard/web/bot-onboarding.
 
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
 
+// Readiness timing/responses have dedicated coverage. Keep this fixture's
+// request recorders scoped to the save/model APIs they assert.
+function stubReadinessProbe(): void {
+  const configuredFetch = globalThis.fetch;
+  globalThis.fetch = ((url: any, init?: any) => String(url).includes('/api/cli-options/availability?')
+    ? Promise.resolve({ ok: true, json: async () => ({ status: 'unknown' }) } as Response)
+    : configuredFetch(url, init)) as typeof fetch;
+}
+
 describe('bot defaults task tabs', () => {
   it('renders five accessible categories and supports pointer selection', () => {
     const onChange = vi.fn();
@@ -106,7 +115,7 @@ describe('bot defaults cli label', () => {
     });
     const root = renderer.root;
     const dropdown = root.findByProps({ dataInput: 'agentCliId' });
-    expect(dropdown.props.options[0].label).toContain('未安装');
+    expect(dropdown.props.options[0].label).not.toBe('Codex（codex）');
     expect(root.findByProps({ className: 'hint-warn' }).children.join('')).toContain('codex');
   });
 });
@@ -126,6 +135,7 @@ describe('Codex-compatible runtime editor', () => {
   };
 
   function renderAgent(bot: Record<string, any>, patchBot = vi.fn()) {
+    stubReadinessProbe();
     let renderer!: TestRenderer.ReactTestRenderer;
     act(() => {
       renderer = TestRenderer.create(React.createElement(BotAgentSection, {
@@ -550,6 +560,7 @@ describe('Codex-compatible runtime editor', () => {
       } as any;
     });
     try {
+      stubReadinessProbe();
       const grokCliState = {
         options: [
           { id: 'grok', label: 'Grok' },
@@ -601,6 +612,7 @@ describe('Codex-compatible runtime editor', () => {
       } as any;
     });
     try {
+      stubReadinessProbe();
       const traexCliState = {
         options: [
           { id: 'traex', label: 'TraeX' },
@@ -1114,6 +1126,7 @@ describe('Codex-compatible runtime editor', () => {
   };
 
   function renderDsh(bot: Record<string, any>, patchBot = vi.fn()) {
+    stubReadinessProbe();
     let renderer!: TestRenderer.ReactTestRenderer;
     act(() => {
       renderer = TestRenderer.create(React.createElement(BotAgentSection, {

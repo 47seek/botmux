@@ -1,10 +1,11 @@
-import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import {
   macOSBundledCodexCandidates,
   resolveCommand,
+  resolveCommandAsync,
 } from '../src/adapters/cli/registry.js';
 import { shellPathProbes } from '../src/desktop/shared/shell-path-probes.js';
 
@@ -120,5 +121,70 @@ describe('macOS bundled Codex CLI discovery', () => {
       '/Applications/Codex.app/Contents/Resources/codex',
       '/Users/example/Applications/Codex.app/Contents/Resources/codex',
     ]);
+  });
+});
+
+describe('asynchronous shell discovery', () => {
+  const dirs: string[] = [];
+  afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
+  function fixture() {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-async-shell-'));
+    dirs.push(dir);
+    const bin = join(dir, 'bin');
+    mkdirSync(bin);
+    const tool = join(bin, 'botmux-test-rc-only');
+    writeFileSync(tool, '#!/bin/sh\nexit 0\n');
+    chmodSync(tool, 0o755);
+    return { dir, bin, tool };
+  }
+  it.each(['.zprofile', '.zshrc'])('finds an executable installed only through %s', async rc => {
+    if (!existsSync('/bin/zsh')) return;
+    const { dir, bin, tool } = fixture();
+    writeFileSync(join(dir, rc), `export PATH="${bin}:$PATH"\n`);
+    const result = await resolveCommandAsync('botmux-test-rc-only', {
+      env: { HOME: dir, ZDOTDIR: dir, SHELL: '/bin/zsh', PATH: '/usr/bin:/bin' },
+    });
+    expect(result).toEqual({ resolved: tool, inconclusive: false });
+  });
+  it('finds a Bash rc-only install after the login lookup misses', async () => {
+    const { dir, bin, tool } = fixture();
+    const shell = join(dir, 'bash-shell');
+    writeFileSync(join(dir, 'bashrc'), `export PATH="${bin}:$PATH"\n`);
+    writeFileSync(shell, '#!/bin/sh\nexec /bin/bash --noprofile --rcfile "$TEST_RC" "$@"\n');
+    chmodSync(shell, 0o755);
+    expect(await resolveCommandAsync('botmux-test-rc-only', {
+      env: { HOME: dir, ZDOTDIR: dir, SHELL: shell, TEST_RC: join(dir, 'bashrc'), PATH: '/usr/bin:/bin' },
+    })).toEqual({ resolved: tool, inconclusive: false });
+  });
+  it('retains literal argv and never evaluates command substitutions', async () => {
+    const { dir } = fixture();
+    const command = `botmux-test-missing$(touch ${join(dir, 'marker')}); echo unsafe`;
+    const result = await resolveCommandAsync(command, {
+      env: { HOME: dir, ZDOTDIR: dir, SHELL: '/bin/sh', PATH: '/usr/bin:/bin' },
+    });
+    expect(result).toEqual({ resolved: command, inconclusive: false });
+    expect(existsSync(join(dir, 'marker'))).toBe(false);
+  });
+  it('keeps a timed-out shell inconclusive and releases the event loop', async () => {
+    const { dir } = fixture();
+    const shell = join(dir, 'slow-shell');
+    writeFileSync(shell, '#!/bin/sh\n/bin/sleep 10\n');
+    chmodSync(shell, 0o755);
+    const promise = resolveCommandAsync('botmux-test-never-installed', {
+      env: { HOME: dir, ZDOTDIR: dir, SHELL: shell, PATH: '/usr/bin:/bin' }, timeoutMs: 100,
+    });
+    let progressed = false;
+    await new Promise<void>(resolve => setImmediate(() => { progressed = true; resolve(); }));
+    expect(progressed).toBe(true);
+    expect(await promise).toEqual({ resolved: 'botmux-test-never-installed', inconclusive: true });
+  });
+  it('ignores an absolute banner when the lookup exits with an error', async () => {
+    const { dir, tool } = fixture();
+    const shell = join(dir, 'bad-shell');
+    writeFileSync(shell, `#!/bin/sh\nprintf '%s\\n' '${tool}'\nexit 3\n`);
+    chmodSync(shell, 0o755);
+    expect(await resolveCommandAsync('botmux-test-not-installed', {
+      env: { HOME: dir, ZDOTDIR: dir, SHELL: shell, PATH: '/usr/bin:/bin' },
+    })).toEqual({ resolved: 'botmux-test-not-installed', inconclusive: true });
   });
 });
