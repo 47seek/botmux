@@ -85,6 +85,8 @@ describe.skipIf(!realCli)('installed lark-cli command contract (fake credentials
     expect(requests).toEqual(['bot']);
   });
   it('passes a trailing foreign --profile to the binary without requesting managed identity', async () => {
+    // lark-cli 1.0.80 answers an unknown profile with exit 3 / not_configured.
+    // A CLI upgrade that changes this contract is diagnosed here on purpose.
     const result = await run(['docs', '+fetch', '--doc', 'doc-fixture', '--dry-run', '--profile', 'cli_other1234']);
     expect(result.code, result.out + result.err).toBe(3);
     expect(JSON.parse(result.err || result.out).error?.subtype).toBe('not_configured');
