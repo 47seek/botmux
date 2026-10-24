@@ -1269,6 +1269,21 @@ export function identityStorageModelForDaemonSession(ds: DaemonSession): Identit
   return report.model;
 }
 
+/** Whether an identity-decision report's turn may be replayed on a flip.
+ *
+ * The decision arrives over the CURRENT worker generation's private IPC (that
+ * gate already ran in the message switch) and is emitted synchronously at
+ * spawn for the turn that generation runs — so the reported turn is
+ * authoritative even at the opening-turn boundary, when the daemon's own
+ * live-turn fields (currentTurnId is assigned later, the opening uses
+ * pendingTurnId) do not point at it yet. The one thing that permanently retires
+ *  a turn is an observed turn_terminal, and that set is checked explicitly. */
+export function identityDecisionTurnIsLive(ds: DaemonSession, turnId: string): boolean {
+  if (ds.session.status !== 'active' || !ds.worker || ds.worker.killed) return false;
+  if (ds.terminalIdentityTurnIds?.has(turnId)) return false;
+  return true;
+}
+
 /** Env-independent structural half the daemon can check against a report:
  *  Linux + managed lark-tool binding on the frozen session shape. Sandbox and
  *  loopback facts are NOT re-derived here (the worker owns those). */
@@ -18539,6 +18554,11 @@ function setupWorkerHandlers(
           );
         }
         forgetScheduledTurnCaller(ds, msg.turnId);
+        // Mark the turn terminal for identity-decision replay gating (bounded;
+        // the generation gate above makes stale-worker terminals harmless).
+        const terminalSet = ds.terminalIdentityTurnIds ?? (ds.terminalIdentityTurnIds = new Set());
+        terminalSet.add(msg.turnId);
+        trimOldest(terminalSet, TERMINAL_RECEIPT_DEDUPE_MAX);
         observeTurnResultTerminal(ds, msg, workerGeneration);
         // Defense in depth: the worker sends a token-matched revoke before the
         // terminal IPC, but an older/mixed worker must still lose authority at

@@ -858,9 +858,20 @@ export interface DaemonSession {
    *  worker re-reports proven, and that must still count as a real flip even
    *  though no prior report exists. */
   lastPublishedIdentityModel?: import('./lark-tool-binding.js').IdentityStorageModel;
-  /** Last `model:turnId` replayed by the identity-decision flip handler, so a
-   *  re-reported decision never republishes the same turn twice. */
-  lastIdentityDecisionRepublish?: string;
+  /** Last replay outcome of the identity-decision flip handler. A successful
+   *  replay moves the publication baseline (so identical reports stop
+   *  flipping); recording `ok:false` lets a later report of the OTHER model
+   *  heal the purge a failed attempt performed. */
+  lastIdentityDecisionRepublish?: {
+    model: import('./lark-tool-binding.js').IdentityStorageModel;
+    turnId: string;
+    ok: boolean;
+  };
+  /** Bounded set of turns the CURRENT worker generation has already sent
+   *  turn_terminal for. Refuses an identity-decision flip replay for a turn
+   *  that is over: a late spawn decision must not resurrect a terminal turn's
+   *  credentials or pin its proven material against GC. FIFO-trimmed. */
+  terminalIdentityTurnIds?: Set<string>;
   /** Authority snapshot captured when an explicit Lark IM message was
    * deterministically routed into this dedicated meeting receiver. */
   vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin;

@@ -18,6 +18,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as botRegistry from '../src/bot-registry.js';
 import {
   identityDecisionConflict,
+  identityDecisionTurnIsLive,
   identityStorageModelForDaemonSession,
   recordWorkerIdentityDecision,
 } from '../src/core/worker-pool.js';
@@ -213,5 +214,40 @@ describe('fail-closed on impossible or malformed reports', () => {
     });
     // No lastPublishedIdentityModel: nothing on disk to roll back.
     expect(decision.flipped).toBe(false);
+  });
+});
+
+describe('identityDecisionTurnIsLive (P2 opening-turn gate)', () => {
+  function liveSession(sessionExtra: Record<string, unknown> = {}, dsExtra: Record<string, unknown> = {}): any {
+    return {
+      session: { sessionId: 'decision-session', status: 'active', ...sessionExtra },
+      larkAppId: 'cli_decision', chatId: 'oc_decision',
+      worker: { killed: false, pid: 1 }, workerGeneration: 1,
+      ...dsExtra,
+    };
+  }
+
+  it('accepts the reported spawn turn before any daemon live-turn field is set (opening turn)', () => {
+    // The new-topic boundary: accept ran before fork; currentTurnId is set
+    // later by beginNewTurn and pendingTurnId/managedOrigin are not populated
+    // yet. The current-generation worker's own spawn decision is authority.
+    const ds = liveSession();
+    expect(ds.currentTurnId).toBeUndefined();
+    expect(identityDecisionTurnIsLive(ds, 'first-turn')).toBe(true);
+  });
+
+  it('refuses a turn the current worker already sent turn_terminal for', () => {
+    // Reverse-risk: a late decision for an over turn must not resurrect it.
+    const ds = liveSession({}, { terminalIdentityTurnIds: new Set(['om_old']) });
+    expect(identityDecisionTurnIsLive(ds, 'om_old')).toBe(false);
+    expect(identityDecisionTurnIsLive(ds, 'om_new')).toBe(true);
+  });
+
+  it('refuses when the session is inactive or the live worker is dead', () => {
+    expect(identityDecisionTurnIsLive(liveSession({ status: 'closed' }), 'first-turn')).toBe(false);
+    expect(identityDecisionTurnIsLive(liveSession({}, { worker: { killed: true, pid: 1 } }), 'first-turn')).toBe(false);
+    expect(identityDecisionTurnIsLive({
+      session: { sessionId: 'x', status: 'active' }, larkAppId: 'a', chatId: 'c',
+    }, 'first-turn')).toBe(false);
   });
 });

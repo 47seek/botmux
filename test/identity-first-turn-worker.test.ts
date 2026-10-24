@@ -16,18 +16,39 @@
  *    covered in identity-decision-flip.test.ts).
  */
 import { type ChildProcess } from 'node:child_process';
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
+import ts from 'typescript';
 import {
   sessionIdentityDataDir,
   sessionIdentityPath,
   writeSessionIdentity,
+  recallProvenIdentityContent,
+  clearSingleIdentityArtifacts,
+  forgetProvenIdentityContent,
 } from '../src/core/cli-identity.js';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
 import { spawnNodeTsScript } from './helpers/ts-runner.js';
 import { rmSandboxScratch } from './helpers/rm-sandbox-scratch.js';
+
+/** Extract the REAL handleIdentityDecisionFlip from daemon.ts so the
+ *  composition (purge → live gate → proven memory) is production code, not a
+ *  copy. Same source-extraction technique as identity-decision-flip. */
+function extractFlipHandler() {
+  const daemonSource = readFileSync(resolve('src/daemon.ts'), 'utf8');
+  const ast = ts.createSourceFile('daemon.ts', daemonSource, ts.ScriptTarget.Latest, true);
+  const node = ast.statements.find(
+    n => ts.isFunctionDeclaration(n) && n.name?.text === 'handleIdentityDecisionFlip',
+  );
+  if (!node) throw new Error('Missing handleIdentityDecisionFlip');
+  const text = ts.transpileModule(node.getText(ast), {
+    compilerOptions: { target: ts.ScriptTarget.ES2022 },
+  }).outputText;
+  return (ds: any, context: any, deps: any) =>
+    new Function('deps', 'with (deps) { ' + text + '; return handleIdentityDecisionFlip; }')(deps)(ds, context);
+}
 
 const children = new Set<ChildProcess>();
 const tempDirs = new Set<string>();
@@ -144,7 +165,7 @@ describe.skipIf(process.platform !== 'linux')('opening-turn identity survives th
       .toContain('OPENING-TURN-JWT');
   }, 45_000);
 
-  it('proven init clears the pre-fork single file and reports proven for the daemon replay', async () => {
+  it('proven init clears the pre-fork single file and the daemon flip replays opening-turn content (N1/P2)', async () => {
     const h = spawnIdentityWorker({ apiOnly: false });
     await waitForDecision(h, 'proven');
     await delay(300);
@@ -154,5 +175,41 @@ describe.skipIf(process.platform !== 'linux')('opening-turn identity survives th
     // Proven keeps no plaintext — the fail-closed single accept file is
     // removed entirely (proven init creates no root token placeholder).
     expect(existsSync(sessionIdentityPath(h.root, h.sessionId, 'bytedcli'))).toBe(false);
+
+    // The worker named its spawn turn on the decision (the P2 fact: at the
+    // opening boundary no daemon live-turn field points at it yet).
+    const decision = h.messages.findLast(m => m.type === 'session_identity_decision') as any;
+    expect(decision.turnId).toBe('first-turn');
+
+    // Run the REAL daemon flip handler against REAL identity storage, with a
+    // replay that republishes the opening turn the way refreshTurnCliIdentity
+    // does. Composition proves: purge plaintext → proven memory holds the
+    // opening turn (what the proven cli-identity-runner then fetches).
+    const flip = extractFlipHandler();
+    const ds: any = {
+      session: { sessionId: h.sessionId, status: 'active' },
+      larkAppId: 'app_first_turn', chatId: 'oc_first_turn',
+      worker: { killed: false },
+      lastPublishedIdentityModel: 'single',
+    };
+    const deps = {
+      config: { session: { dataDir: h.root } },
+      logger: { error: () => {} },
+      clearSingleIdentityArtifacts,
+      forgetProvenIdentityContent,
+      identityDecisionTurnIsLive: () => true,
+      refreshTurnCliIdentity: async (target: any, turnId: string) => {
+        // Replay republishes the opening turn the accept-time single write
+        // carried, now under proven.
+        writeSessionIdentity(h.root, target.session.sessionId, {
+          tool: 'bytedcli', cloudJwt: 'OPENING-TURN-JWT', turnId, openId: 'ou_opener',
+        }, 'proven');
+        target.lastPublishedIdentityModel = 'proven';
+      },
+    };
+    await flip(ds, { model: 'proven', flipped: true, turnId: 'first-turn' }, deps);
+    expect(existsSync(sessionIdentityPath(h.root, h.sessionId, 'bytedcli'))).toBe(false);
+    expect(recallProvenIdentityContent(h.root, h.sessionId, 'first-turn', 'bytedcli'))
+      .toContain('OPENING-TURN-JWT');
   }, 45_000);
 });

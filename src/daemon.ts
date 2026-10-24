@@ -436,6 +436,7 @@ import {
   isResumeRecoveryPlaceholder,
   identityStorageModelForDaemonSession,
   identityDecisionConflict,
+  identityDecisionTurnIsLive,
   collectSessionTurnGarbage,
 } from './core/worker-pool.js';
 import { resetPromptCacheKeepalive, runPromptCacheKeepaliveSweep } from './core/prompt-cache-keepalive.js';
@@ -4212,27 +4213,45 @@ function identityModelForPublication(ds: DaemonSession): IdentityStorageModel {
  *  the worker's spawn decision differs, that material is unreadable: purge it
  *  FIRST (plaintext must never coexist with a proven session), then republish
  *  the turn once if it is still the live turn. A terminal turn is never
- *  replayed, so the GC retention set cannot be pinned by a stale turn. */
+ *  replayed, so the GC retention set cannot be pinned by a stale turn.
+ *
+ *  Replay suppression is the flip baseline itself: a successful replay
+ *  publishes under the new model (identityModelForPublication), so the next
+ *  identical report computes flipped=false and never gets here. A FAILED
+ *  attempt does NOT move the baseline and is recorded, which lets a following
+ *  decision for the OTHER model heal the material its purge removed. */
 async function handleIdentityDecisionFlip(
   ds: DaemonSession,
   context: { model: IdentityStorageModel; flipped: boolean; turnId?: string },
 ): Promise<void> {
-  if (!context.flipped || !context.turnId) return;
+  if (!context.turnId) return;
   const turnId = context.turnId;
+  const prev = ds.lastIdentityDecisionRepublish;
+  const needsReplay = context.flipped
+    || (!!prev && !prev.ok && prev.turnId === turnId && prev.model !== context.model);
+  if (!needsReplay) return;
   if (context.model === 'proven') {
     clearSingleIdentityArtifacts(config.session.dataDir, ds.session.sessionId);
   } else {
     forgetProvenIdentityContent(config.session.dataDir, ds.session.sessionId);
   }
-  const live = ds.session.status === 'active' && !!ds.worker && !ds.worker.killed
-    && (turnId === ds.currentTurnId
-      || turnId === ds.session.queuedActivationTurnId
-      || turnId === ds.managedTurnOrigin?.turnId);
-  if (!live) return;
-  const dedupeKey = `${context.model}:${turnId}`;
-  if (ds.lastIdentityDecisionRepublish === dedupeKey) return;
-  ds.lastIdentityDecisionRepublish = dedupeKey;
-  await refreshTurnCliIdentity(ds, turnId);
+  // Re-check liveness AFTER the purge: an identity turn that terminated in the
+  // meantime must stay purged with no replay (and no success record, so a
+  // genuinely new spawn decision still gets evaluated).
+  if (!identityDecisionTurnIsLive(ds, turnId)) return;
+  try {
+    await refreshTurnCliIdentity(ds, turnId);
+    ds.lastIdentityDecisionRepublish = { model: context.model, turnId, ok: true };
+  } catch (error) {
+    // Keep the failure visible and replayable: no success baseline, no
+    // unhandledRejection, and the ok:false record lets the other-model report
+    // heal the purge above.
+    ds.lastIdentityDecisionRepublish = { model: context.model, turnId, ok: false };
+    logger.error(
+      `[trigger-user-auth] identity model flip replay failed for ${ds.session.sessionId} `
+      + `turn=${turnId} model=${context.model}: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
 }
 
 async function prepareScheduledTurnCliIdentity(ds: DaemonSession, turnId: string): Promise<void> {
@@ -30579,7 +30598,12 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       scheduleDeferredScheduleSettlement(ds, context);
     },
     onIdentityDecision(ds, context) {
-      void handleIdentityDecisionFlip(ds, context);
+      // Fire-and-forget (the IPC switch must not serialize behind possibly
+      // slow identity resolution), but every failure is captured inside the
+      // handler — no unhandledRejection, and failures stay replayable.
+      void handleIdentityDecisionFlip(ds, context).catch(error => {
+        logger.error(`[trigger-user-auth] identity decision handler failed for ${ds.session.sessionId}: ${error instanceof Error ? error.message : String(error)}`);
+      });
     },
     onCliExit(ds, context) {
       ds.messageListenerCompletedTurnId = undefined;
