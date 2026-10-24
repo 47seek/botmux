@@ -31,10 +31,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { spawnSync } from 'node:child_process';
 import {
   chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync,
-  readlinkSync, rmSync, statSync, writeFileSync,
+  readlinkSync, realpathSync, rmSync, statSync, writeFileSync,
 } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
-import { dirname, join, realpathSync } from 'node:path';
+import { dirname, join } from 'node:path';
 import net from 'node:net';
 import { buildFsPolicy, compileToBwrap } from '../src/adapters/cli/fs-policy.js';
 import { resolveLocalSandboxMode } from '../src/adapters/backend/sandbox.js';
