@@ -851,6 +851,16 @@ export interface DaemonSession {
     reportedAt: number;
     conflict?: string;
   };
+  /** Model used by the daemon's LAST actual identity publication for this
+   *  session (in-memory; absent before the first publish or after restart).
+   *  This — not the previous report value — is the flip baseline: after a
+   *  daemon restart the accept-time publication is written single before the
+   *  worker re-reports proven, and that must still count as a real flip even
+   *  though no prior report exists. */
+  lastPublishedIdentityModel?: import('./lark-tool-binding.js').IdentityStorageModel;
+  /** Last `model:turnId` replayed by the identity-decision flip handler, so a
+   *  re-reported decision never republishes the same turn twice. */
+  lastIdentityDecisionRepublish?: string;
   /** Authority snapshot captured when an explicit Lark IM message was
    * deterministically routed into this dedicated meeting receiver. */
   vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin;

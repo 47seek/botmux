@@ -9,7 +9,7 @@
  *             clears the other's artifacts first.
  */
 import { beforeEach, afterEach, describe, expect, it } from 'vitest';
-import { mkdtempSync, rmSync, existsSync, readdirSync, mkdirSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, existsSync, readdirSync, mkdirSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import {
@@ -165,30 +165,35 @@ describe('the two models are mutually exclusive per session', () => {
     expect(recallProvenIdentityContent(dir, SESSION, 'turn-A', 'bytedcli')).toContain('jwt-turn-A');
   });
 
-  it('clears a markerless R3 turns/ snapshot on first init of EITHER model (F2)', () => {
+  it('markerless first init: single clears only R3 turns/ leftovers and KEEPS the accept-time root file (F2/N1)', () => {
     const dataDir = sessionIdentityDataDir(dir, SESSION);
-    const plantStaleTurnSnapshot = () => {
-      rmSync(dataDir, { recursive: true, force: true });
-      mkdirSync(dataDir, { recursive: true, mode: 0o700 });
-      const stalePath = sessionIdentityPath(dir, SESSION, 'bytedcli', 'turn-from-old-layout');
-      mkdirSync(dirname(stalePath), { recursive: true, mode: 0o700 });
-      // Older layouts left live per-turn tokens under turns/<sha>/ with NO
-      // identity-layout marker on the directory.
-      writeFileSync(
-        stalePath,
-        "BYTEDCLI_USER_CLOUD_JWT='LEFTOVER-JWT'\n",
-        { mode: 0o600 },
-      );
-      expect(existsSync(join(dataDir, 'identity-layout'))).toBe(false);
-    };
+    // Simulate the real accept→fork order: the daemon writes the opening turn
+    // into the single root file BEFORE the worker initializes storage, while an
+    // R3 upgrade left a live per-turn token under turns/ — both markerless.
+    rmSync(dataDir, { recursive: true, force: true });
+    mkdirSync(dataDir, { recursive: true, mode: 0o700 });
+    const stalePath = sessionIdentityPath(dir, SESSION, 'bytedcli', 'turn-from-old-layout');
+    mkdirSync(dirname(stalePath), { recursive: true, mode: 0o700 });
+    writeFileSync(stalePath, "BYTEDCLI_USER_CLOUD_JWT='LEFTOVER-JWT'\n", { mode: 0o600 });
+    writeFileSync(join(dataDir, 'bytedcli.env'), "BYTEDCLI_USER_CLOUD_JWT='OPENING-TURN'\n", { mode: 0o600 });
 
-    // A first SINGLE init used to leave the live turn token in place; the
-    // documented "upgrade clears first" contract runs both directions now.
-    plantStaleTurnSnapshot();
     ensureSessionIdentityStorage(dir, SESSION, ['bytedcli'], 'single');
+    // R3 leftover is gone …
     expect(existsSync(join(dataDir, 'turns'))).toBe(false);
+    // … but the opening turn the daemon published before the fork survives.
+    expect(readFileSync(join(dataDir, 'bytedcli.env'), 'utf8')).toContain('OPENING-TURN');
+    expect(readFileSync(join(dataDir, 'identity-layout'), 'utf8').trim()).toBe('single-v1');
+  });
 
-    plantStaleTurnSnapshot();
+  it('markerless first PROVEN init wipes BOTH turns/ leftovers and any root file', () => {
+    const dataDir = sessionIdentityDataDir(dir, SESSION);
+    rmSync(dataDir, { recursive: true, force: true });
+    mkdirSync(dataDir, { recursive: true, mode: 0o700 });
+    const stalePath = sessionIdentityPath(dir, SESSION, 'bytedcli', 'turn-from-old-layout');
+    mkdirSync(dirname(stalePath), { recursive: true, mode: 0o700 });
+    writeFileSync(stalePath, "BYTEDCLI_USER_CLOUD_JWT='LEFTOVER-JWT'\n", { mode: 0o600 });
+    // A fail-closed single accept publication that must not survive a proven init.
+    writeFileSync(join(dataDir, 'bytedcli.env'), "BYTEDCLI_USER_CLOUD_JWT='EARLY-SINGLE'\n", { mode: 0o600 });
     ensureSessionIdentityStorage(dir, SESSION, ['bytedcli'], 'proven');
     expect(existsSync(join(dataDir, 'turns'))).toBe(false);
     expect(readdirSync(dataDir).some(name => name.endsWith('.env'))).toBe(false);

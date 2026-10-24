@@ -18,6 +18,8 @@
 
 模型的唯一事实源是 **worker 实际 spawn 后的决策**：worker 用 `resolveLocalSandboxMode`（含 `BOTMUX_SANDBOX` 操作开关与 remote 后端豁免）解析出本次 spawn 的真实沙盒，用 `resolveSpawnNetworkShape` 得出「沙盒是否生效 / bwrap argv 是否带 `--unshare-net` / 主机 loopback 是否可达」，再经 `resolveIdentityStorageModel`（Linux + binding + 沙盒不切断 loopback）得出模型，渲染 wrapper 后立刻经私有 IPC（`session_identity_decision`）上报 daemon。daemon 只消费当前 worker 世代的上报值发布身份，**不再从冻结配置或自己的 `BOTMUX_SANDBOX` 环境二次推导**——配置与环境在沙盒事实上分叉时（如 worker 进程带了与 daemon 不同的开关），两侧各自选模型正是旧实现「工具恒 77 + 明文落盘」的根因。worker 未上报（冷启动 / daemon 重启后重报前）fail-closed 按 single 发布、proven 内容路由拒绝；上报 proven 但会话结构（adopt/remote/apiOnly/binding 关闭）不允许时，两个模型都拒发布直到活 worker 重新上报。环境开关 × 冻结配置的五格矩阵与真 bwrap 探针见 `test/identity-spawn-matrix.test.ts`。
 
+**accept→fork 窗口与模型翻转重发**：daemon 在消息接受时（先于 worker fork）就要发布开场轮身份，此时尚无上报，故按 single 兜底写入根快照。worker 无 marker 的首次 single 初始化只清理 R3 时代的 `turns/<sha>/` 残留，**保留**该根快照（首轮不被清成 77）；首次 proven 初始化则清空根明文。daemon 以「上一次实际发布使用的模型」（内存 `lastPublishedIdentityModel`，不依赖上一帧上报，故重启窗口也成立）判定翻转：收到与发布模型不一致的上报时，先删除错误模型的制品（single→proven：删根明文；proven→single：忘 proven 内存），再在该 turnId 仍是当前/排队/受管来源的活轮次时幂等重发一次（同一 `model:turnId` 只重发一次）；已终态轮次不重发，GC 保留集不被旧轮钉住。
+
 会话目录的 `identity-layout` marker 记录当前模型；**任何**模型初始化（含无 marker 的旧布局、模型切换）都先清空全部身份制品再初始化，两个模型绝不复用同一份目录。
 
 ## proven 模型（默认受管路径）

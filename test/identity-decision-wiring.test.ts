@@ -20,6 +20,7 @@ import { describe, expect, it } from 'vitest';
 
 const workerSource = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
 const workerPoolSource = readFileSync(new URL('../src/core/worker-pool.ts', import.meta.url), 'utf8');
+const daemonSource = readFileSync(new URL('../src/daemon.ts', import.meta.url), 'utf8');
 
 // 源码结构护栏(K3)：F3 的三处 fail-closed 接线（两个 spawn 站点都上报、daemon
 // 无第二条沙盒推导、net 事实只有一个来源）行为测试只能间接覆盖，少一根线的
@@ -52,5 +53,26 @@ describe('F3 identity decision wiring (source structure guard)', () => {
     expect(workerSource).toContain('const spawnNetworkShape = resolveSpawnNetworkShape({');
     expect(workerSource).toContain('sandboxEngaged: spawnNetworkShape.sandboxEngaged');
     expect(workerSource).toContain('loopbackShared: spawnNetworkShape.loopbackShared');
+  });
+
+  it('records the published model at every actual publication site (N1/N2 flip baseline)', () => {
+    // The flip detector compares against the model REALLY published, not the
+    // previous report: after a daemon restart an accept-time single publish
+    // exists while no report does. Three daemon sites publish turn identity;
+    // all must run through the recording helper, and the helper must record.
+    const helper = daemonSource
+      .slice(daemonSource.indexOf('function identityModelForPublication'))
+      .split(/\n}\n/)[0];
+    expect(helper).toContain('ds.lastPublishedIdentityModel = model');
+    const publishSites = daemonSource.match(/storageModel: identityModelForPublication\(ds\)/g) ?? [];
+    expect(publishSites).toHaveLength(3);
+    // And no site may still bypass the recorder with the bare accessor.
+    expect(daemonSource).not.toContain(
+      'storageModel: identityStorageModelForDaemonSession(ds)',
+    );
+  });
+
+  it('worker decision reports carry the spawn turn id for the flip replay', () => {
+    expect(workerSource).toContain("...(currentBotmuxTurnId ? { turnId: currentBotmuxTurnId } : {})");
   });
 });

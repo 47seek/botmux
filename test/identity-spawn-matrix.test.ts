@@ -31,11 +31,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { spawnSync } from 'node:child_process';
 import {
   chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync,
-  readlinkSync, realpathSync, rmSync, statSync, writeFileSync,
+  readlinkSync, realpathSync, statSync, writeFileSync,
 } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import net from 'node:net';
+import { rmSandboxScratch } from './helpers/rm-sandbox-scratch.js';
 import { buildFsPolicy, compileToBwrap } from '../src/adapters/cli/fs-policy.js';
 import { resolveLocalSandboxMode } from '../src/adapters/backend/sandbox.js';
 import { resolveSpawnNetworkShape } from '../src/adapters/cli/sandbox-mode.js';
@@ -160,7 +161,10 @@ d('F3 five-cell identity model matrix', () => {
 
   afterEach(() => {
     vi.restoreAllMocks();
-    rmSync(root, { recursive: true, force: true });
+    // compileCellBwrap chmods deny-mask sources to 0o000; a plain recursive
+    // rm fails EACCES for a non-root uid (the GitHub runner). Reopen then rm,
+    // exactly as the other real-bwrap suites do.
+    rmSandboxScratch(root);
   });
 
   it.each(CELLS)('cell $n: model=$model engaged=$engaged loopbackShared=$shared', (cell) => {

@@ -1501,6 +1501,7 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
         model: engineIdentityModel,
         sandboxEngaged: false,
         loopbackShared: true,
+        ...(currentBotmuxTurnId ? { turnId: currentBotmuxTurnId } : {}),
       });
     }
     prepareTriggerUserCliEnv(engineEnv, process.env.SESSION_DATA_DIR, cfg.sessionId, identityPolicy, log,
@@ -21326,6 +21327,7 @@ async function spawnCli(
       model: childIdentityModel,
       sandboxEngaged: spawnNetworkShape.sandboxEngaged,
       loopbackShared: spawnNetworkShape.loopbackShared,
+      ...(currentBotmuxTurnId ? { turnId: currentBotmuxTurnId } : {}),
     });
   }
   prepareTriggerUserCliEnv(childEnv, process.env.SESSION_DATA_DIR, cfg.sessionId, identityPolicy, log,

@@ -504,7 +504,7 @@ describe('target daemon consumes signed message authority', () => {
     const code = ['triggerUserAuthEnabledFor', 'prepareTurnCliIdentity',
       'dispatchUserForTurn', 'targetUserForDelegation', 'delegatedScheduleRuntimeDeps',
       'delegatedScheduleCliIdentity', 'prepareScheduledTurnCliIdentity', 'prepareDelegatedScheduledTurnIdentity',
-      'refreshTurnCliIdentity', 'identityPublicationConflicted'].map(name => {
+      'refreshTurnCliIdentity', 'identityPublicationConflicted', 'identityModelForPublication'].map(name => {
       const fn = source.statements.find(n => ts.isFunctionDeclaration(n) && n.name?.text === name);
       if (!fn) throw new Error('Missing production handler');
       return ts.transpileModule(fn.getText(source), { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText;

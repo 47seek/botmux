@@ -21,7 +21,6 @@ import {
   identityStorageModelForDaemonSession,
   recordWorkerIdentityDecision,
 } from '../src/core/worker-pool.js';
-
 function sessionFixture(extra: Record<string, unknown> = {}): any {
   return {
     session: {
@@ -169,5 +168,50 @@ describe('fail-closed on impossible or malformed reports', () => {
     ds.session.adoptedFrom = 'pane-abc';
     expect(identityDecisionConflict(ds)).toMatch(/structurally cannot run proven/);
     expect(identityStorageModelForDaemonSession(ds)).toBe('single');
+  });
+
+  it('detects a flip against the LAST PUBLISHED model, not the previous report (N1/N2 restart window)', () => {
+    const ds = sessionFixture({ sessionExtra: { sandbox: false, sandboxNetwork: false } });
+
+    // Cold start / restart: the daemon publishes the opening turn single
+    // BEFORE any worker report exists (the accept-time fail-closed default).
+    ds.lastPublishedIdentityModel = 'single';
+
+    // The spawn actually runs proven (no sandbox / loopback shared): flip.
+    const proven = recordWorkerIdentityDecision(ds, worker, 10, {
+      model: 'proven', sandboxEngaged: false, loopbackShared: true,
+    });
+    expect(proven).toEqual({ model: 'proven', flipped: true });
+
+    // Until the daemon actually replays the turn under proven, an identical
+    // report keeps reporting the flip (a skipped/failed replay gets retried).
+    const retried = recordWorkerIdentityDecision(ds, worker, 10, {
+      model: 'proven', sandboxEngaged: false, loopbackShared: true,
+    });
+    expect(retried.flipped).toBe(true);
+
+    // The flip handler's replay publishes via identityModelForPublication,
+    // which moves the baseline; a later identical report is then no flip.
+    ds.lastPublishedIdentityModel = 'proven';
+    const again = recordWorkerIdentityDecision(ds, worker, 10, {
+      model: 'proven', sandboxEngaged: false, loopbackShared: true,
+    });
+    expect(again.flipped).toBe(false);
+
+    // The reverse transition after an actual single publication also flips.
+    ds.lastPublishedIdentityModel = 'proven';
+    const backToSingle = recordWorkerIdentityDecision(ds, worker, 11, {
+      model: 'single', sandboxEngaged: true, loopbackShared: false,
+    });
+    expect(backToSingle).toEqual({ model: 'single', flipped: true });
+  });
+
+  it('reports no flip (and no replay) before the daemon published anything', () => {
+    const ds = sessionFixture();
+    const decision = recordWorkerIdentityDecision(ds, worker, 1, {
+      model: 'proven', sandboxEngaged: false, loopbackShared: true,
+    });
+    // No lastPublishedIdentityModel: nothing on disk to roll back.
+    expect(decision.flipped).toBe(false);
   });
 });

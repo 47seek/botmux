@@ -522,6 +522,8 @@ import {
   closeCliMismatchedSessionsForBot,
 } from './core/session-manager.js';
 import { publishTurnCliIdentity, type DelegatedCliIdentity } from './core/turn-cli-identity.js';
+import { clearSingleIdentityArtifacts, forgetProvenIdentityContent } from './core/cli-identity.js';
+import type { IdentityStorageModel } from './core/lark-tool-binding.js';
 import { noteInboundSenderUnionId, noteSenderUnionId } from './core/platform-credential-source.js';
 import { authorityForDispatch, dispatchCallerFromReply, deliverDispatchWithUser, resolveDispatchUser, scheduleCreateCapabilities, DISPATCH_USER_DELIVERY_ROUTE, DISPATCH_USER_DELIVERY_MAX_BYTES, SCHEDULE_DELEGATED_ADD_ROUTE, SCHEDULE_MANAGED_MUTATE_ROUTE } from './core/dispatch-user-delegation.js';
 import { resolveUnionIdFromOpenId } from './im/lark/client.js';
@@ -4193,6 +4195,46 @@ function identityPublicationConflicted(ds: DaemonSession): boolean {
   return false;
 }
 
+/** Model an actual identity publication used. Records it on the session so the
+ *  worker-decision flip detector compares against what was really published
+ *  (after a daemon restart the accept publish lands single before any worker
+ *  report exists — that baseline must not be lost). */
+function identityModelForPublication(ds: DaemonSession): IdentityStorageModel {
+  const model = identityStorageModelForDaemonSession(ds);
+  ds.lastPublishedIdentityModel = model;
+  return model;
+}
+
+/** Replay the opening turn after a reported model flip.
+ *
+ *  At accept time the daemon publishes before the worker fork, so with no
+ *  report yet the material lands under the fail-closed single default. When
+ *  the worker's spawn decision differs, that material is unreadable: purge it
+ *  FIRST (plaintext must never coexist with a proven session), then republish
+ *  the turn once if it is still the live turn. A terminal turn is never
+ *  replayed, so the GC retention set cannot be pinned by a stale turn. */
+async function handleIdentityDecisionFlip(
+  ds: DaemonSession,
+  context: { model: IdentityStorageModel; flipped: boolean; turnId?: string },
+): Promise<void> {
+  if (!context.flipped || !context.turnId) return;
+  const turnId = context.turnId;
+  if (context.model === 'proven') {
+    clearSingleIdentityArtifacts(config.session.dataDir, ds.session.sessionId);
+  } else {
+    forgetProvenIdentityContent(config.session.dataDir, ds.session.sessionId);
+  }
+  const live = ds.session.status === 'active' && !!ds.worker && !ds.worker.killed
+    && (turnId === ds.currentTurnId
+      || turnId === ds.session.queuedActivationTurnId
+      || turnId === ds.managedTurnOrigin?.turnId);
+  if (!live) return;
+  const dedupeKey = `${context.model}:${turnId}`;
+  if (ds.lastIdentityDecisionRepublish === dedupeKey) return;
+  ds.lastIdentityDecisionRepublish = dedupeKey;
+  await refreshTurnCliIdentity(ds, turnId);
+}
+
 async function prepareScheduledTurnCliIdentity(ds: DaemonSession, turnId: string): Promise<void> {
   if (identityPublicationConflicted(ds)) return;
   if (await prepareDelegatedScheduledTurnIdentity(ds, turnId)) return;
@@ -4230,7 +4272,7 @@ async function prepareScheduledTurnCliIdentity(ds: DaemonSession, turnId: string
     senderOpenId,
     locale: localeForBot(ds.larkAppId),
     turnId,
-    storageModel: identityStorageModelForDaemonSession(ds),
+    storageModel: identityModelForPublication(ds),
   });
 }
 
@@ -4257,7 +4299,7 @@ async function prepareDelegatedScheduledTurnIdentity(
     delegatedIdentity: delegatedScheduleCliIdentity(authority, authorized.targetOpenId),
     locale: localeForBot(ds.larkAppId),
     turnId,
-    storageModel: identityStorageModelForDaemonSession(ds),
+    storageModel: identityModelForPublication(ds),
   });
   return true;
 }
@@ -4302,7 +4344,7 @@ async function refreshTurnCliIdentity(ds: DaemonSession, turnId: string): Promis
     ...(delegatedIdentity ? { delegatedIdentity } : {}),
     locale: localeForBot(ds.larkAppId),
     turnId,
-    storageModel: identityStorageModelForDaemonSession(ds),
+    storageModel: identityModelForPublication(ds),
   });
 
   // NO chat notice here.
@@ -30535,6 +30577,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     },
     onDeferredScheduleTurnSettled(ds, context) {
       scheduleDeferredScheduleSettlement(ds, context);
+    },
+    onIdentityDecision(ds, context) {
+      void handleIdentityDecisionFlip(ds, context);
     },
     onCliExit(ds, context) {
       ds.messageListenerCompletedTurnId = undefined;

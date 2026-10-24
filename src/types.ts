@@ -2328,6 +2328,11 @@ export type WorkerToDaemon =
       sandboxEngaged: boolean;
       /** Whether the daemon loopback is reachable inside the spawn. */
       loopbackShared: boolean;
+      /** Turn the spawned CLI is being launched for (init turn / adopted
+       *  turn), so the daemon can republish the opening turn once if its
+       *  pre-fork accept publication landed under the fail-closed single
+       *  default. Absent when no turn is attached to this spawn. */
+      turnId?: string;
     }
   /** An in-worker CLI restart rotates the managed-send authority without
    * replacing the Node worker. Carry the old token so the daemon can revoke

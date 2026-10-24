@@ -1110,6 +1110,15 @@ export interface WorkerPoolCallbacks {
     ds: DaemonSession,
     context: { turnId: string; source: 'terminal' | 'idle' },
   ) => void | Promise<void>;
+  /** The worker reported its identity storage decision for the current spawn.
+   *  `flipped` means the daemon's last actual publication used the other model
+   *  (cold start / restart window): the daemon must discard the wrong-model
+   *  material and replay the still-live opening turn under the reported model.
+   *  Only called for the CURRENT worker generation. */
+  onIdentityDecision?: (
+    ds: DaemonSession,
+    context: { model: IdentityStorageModel; flipped: boolean; turnId?: string },
+  ) => void | Promise<void>;
   /** A process exit makes every unresolved receipt dispatched to this exact
    *  worker generation ambiguous; the receiver decides retry policy. */
   onWorkerExit?: (
@@ -1295,13 +1304,16 @@ export function identityDecisionConflict(ds: DaemonSession): string | undefined 
 }
 
 /** Store a fresh worker identity decision. Called only from the private worker
- *  IPC channel (already gated to the current worker generation). */
+ *  IPC channel (already gated to the current worker generation). Returns the
+ *  effective model and whether it FLIPPED relative to the daemon's last actual
+ *  publication (see lastPublishedIdentityModel — the post-restart accept
+ *  publication is the baseline, not a previous report). */
 export function recordWorkerIdentityDecision(
   ds: DaemonSession,
   worker: ChildProcess,
   workerGeneration: number,
   report: { model: IdentityStorageModel; sandboxEngaged: boolean; loopbackShared: boolean },
-): void {
+): { model: IdentityStorageModel; flipped: boolean } {
   let conflict: string | undefined;
   if (report.model !== 'single' && report.model !== 'proven') {
     conflict = `malformed identity model report: ${String(report.model)}`;
@@ -1313,8 +1325,11 @@ export function recordWorkerIdentityDecision(
   if (conflict) {
     logger.error(`[${ds.session.sessionId}] ${conflict}; withholding identity publication until a live worker reports again`);
   }
+  const model: IdentityStorageModel = conflict ? 'single' : report.model;
+  const flipped = ds.lastPublishedIdentityModel !== undefined
+    && ds.lastPublishedIdentityModel !== model;
   ds.reportedIdentityModel = {
-    model: conflict ? 'single' : report.model,
+    model,
     sandboxEngaged: report.sandboxEngaged === true,
     loopbackShared: report.loopbackShared === true,
     workerPid: worker.pid ?? -1,
@@ -1322,6 +1337,7 @@ export function recordWorkerIdentityDecision(
     reportedAt: Date.now(),
     ...(conflict ? { conflict } : {}),
   };
+  return { model, flipped };
 }
 
 /**
@@ -19137,10 +19153,13 @@ function setupWorkerHandlers(
           logger.warn(`[${t}] Dropped session_identity_decision with mismatched sessionId`);
           break;
         }
-        recordWorkerIdentityDecision(ds, worker, workerGeneration, {
+        const decision = recordWorkerIdentityDecision(ds, worker, workerGeneration, {
           model: msg.model,
           sandboxEngaged: msg.sandboxEngaged,
           loopbackShared: msg.loopbackShared,
+        });
+        await cb.onIdentityDecision?.(ds, {
+          model: decision.model, flipped: decision.flipped, turnId: msg.turnId,
         });
         break;
       }

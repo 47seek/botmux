@@ -203,6 +203,30 @@ function resetIdentityArtifacts(sessionDataDir: string, sessionId: string): void
   }
 }
 
+/** Remove the R3-era per-turn snapshot directory only. R3 (the pre-marker
+ *  layout) left live tokens under turns/<sha>/*.env with no identity-layout
+ *  marker. A first SINGLE init must clear those, but must NOT touch the root
+ *  <tool>.env files: the daemon publishes the opening turn into the root file
+ *  at accept time, BEFORE the worker fork initializes this directory, and
+ *  wiping it there made the very first turn 77. */
+function resetLegacyTurnSnapshots(sessionDataDir: string, sessionId: string): void {
+  try { rmSync(join(sessionIdentityDataDir(sessionDataDir, sessionId), 'turns'), { recursive: true, force: true }); }
+  catch { /* best-effort: absence is the desired state */ }
+}
+
+/** Remove the single-model root snapshot files (one per governed tool) while
+ *  leaving the marker, the live turn marker and proven memory untouched. Used
+ *  by the daemon when the worker's report flips the session to proven: any
+ *  plaintext the daemon wrote before the report (cold start / restart window)
+ *  must leave disk BEFORE the proven body is served from memory. */
+export function clearSingleIdentityArtifacts(sessionDataDir: string, sessionId: string): void {
+  const dir = sessionIdentityDataDir(sessionDataDir, sessionId);
+  for (const tool of Object.keys(IDENTITY_ENV_KEYS) as TriggerUserAuthTool[]) {
+    try { rmSync(join(dir, `${tool}.env`), { force: true }); }
+    catch { /* best-effort: absence is the desired state */ }
+  }
+}
+
 /**
  * Identity file for one tool and optional prepared turn in a session.
  */
@@ -900,15 +924,20 @@ export function ensureSessionIdentityStorage(
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   const current = readIdentityLayout(sessionDataDir, sessionId);
   if (current !== model) {
-    // Missing marker OR an explicit model switch wipes every identity artifact
-    // once. The missing-marker case matters after upgrades: older layouts left
-    // live tokens under turns/<sha>/*.env with no marker, and a single-model
-    // init used to leave them in place ("upgrade clears first" was only half
-    // honored). The worker renders the wrapper (and reports its spawn decision
-    // to the daemon, F3) before any turn is published, so the only cost of the
-    // wipe is the first turn's republication.
-    resetIdentityArtifacts(sessionDataDir, sessionId);
-    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    if (current === undefined && model === 'single') {
+      // No marker, first SINGLE init: remove ONLY R3 per-turn leftovers. The
+      // root files are the live accept→fork publication channel — the daemon
+      // writes the opening turn before this worker spawned, and deleting it
+      // would deny the first turn (N1). A PROVEN init below still wipes
+      // everything, including root files, because proven keeps no disk token.
+      resetLegacyTurnSnapshots(sessionDataDir, sessionId);
+      mkdirSync(dir, { recursive: true, mode: 0o700 });
+    } else {
+      // Explicit model switch, or a markerless first PROVEN init: wipe every
+      // artifact of the other layout (and any older build's leftovers).
+      resetIdentityArtifacts(sessionDataDir, sessionId);
+      mkdirSync(dir, { recursive: true, mode: 0o700 });
+    }
     atomicWriteFileSync(identityLayoutMarkerPath(sessionDataDir, sessionId), `${model}-v1\n`, { mode: 0o600 });
   }
   const paths = [
