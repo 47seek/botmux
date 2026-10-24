@@ -9,7 +9,7 @@ import type {
   RemoteRunnerUsageReport,
 } from './remote-runner-protocol.js';
 
-export type BackendType = 'pty' | 'tmux' | 'herdr' | 'zellij' | 'zmx' | 'riff' | 'mojo' | 'remote-runner';
+export type BackendType = 'pty' | 'tmux' | 'herdr' | 'zellij' | 'zmx' | 'riff' | 'mojo' | 'remote-runner' | 'orca';
 
 export type HerdrBackendPlacement = 'workspace' | 'tab' | 'split';
 
@@ -129,7 +129,14 @@ export interface BackendTurnInput {
   turnId: string;
   replyTurnId?: string;
   dispatchAttempt?: number;
+  linkRefMode?: 'observe' | 'enabled';
   trustedCaller?: RemoteRunnerTrustedCaller;
+}
+
+/** Host-owned state frozen beside a Remote Runner turn. Providers never send
+ * or receive this context; it exists only on the backend → worker callbacks. */
+export interface RemoteRunnerTurnHostContext {
+  linkRefMode?: 'observe' | 'enabled';
 }
 
 export interface BackendTurnSubmission {
@@ -156,10 +163,23 @@ export interface BackendTurnFailure {
  * untouched on restore/close paths that run without a live worker.
  */
 export type PersistentBackendTarget =
-  | { backendType: 'tmux' | 'zellij'; sessionName: string }
+  // New tmux targets freeze the server (`-L <socketName>`, see tmux-socket.ts);
+  // a tmux target without it lives on the default server (every older row).
+  | { backendType: 'tmux'; sessionName: string; socketName?: string }
+  | { backendType: 'zellij'; sessionName: string }
   // New ZMX targets freeze the native socket directory; older rows may omit it.
   | { backendType: 'zmx'; sessionName: string; socketDir?: string }
-  | { backendType: 'herdr'; sessionName: string; agentName?: string };
+  | {
+    backendType: 'herdr';
+    sessionName: string;
+    agentName?: string;
+    /**
+     * Full Botmux owner id attached by the lifecycle resolver. It is required
+     * before an agent-less legacy `bmx-<sid8>` target may be treated as an
+     * exclusive whole-session resource; persisted/shared targets may omit it.
+     */
+    sessionId?: string;
+  };
 
 /**
  * Tri-state result of probing whether a named backing session exists.
@@ -190,6 +210,20 @@ export interface SpawnOpts {
    * merges them into the child env. Already sanitized (see sanitizePerBotEnv).
    */
   injectEnv?: Record<string, string>;
+  /**
+   * Inherited variables the session env overlay removes (core/session-env.ts).
+   * The worker already deleted them from `env`; the shell-wrapped backends
+   * (tmux/zellij/zmx) additionally pass `-u KEY` to the pane's final
+   * `/usr/bin/env`, which runs after the rcfile and the terminal server's
+   * global env have been applied, so those sources cannot re-add them.
+   */
+  unsetEnv?: string[];
+  /**
+   * Botmux-owned per-session directory (pane-launch.ts paneLaunchDir) for the
+   * private file a tmux pane reads its launch argv from. Without it the tmux
+   * backend uses a fresh private temp directory.
+   */
+  paneLaunchDir?: string;
   /** Strict panes launch with env -i and skip user shell startup profiles. */
   strictEnv?: boolean;
   /** Worker verified the surviving generation's policy stamp. */
@@ -300,6 +334,9 @@ export interface SessionBackend {
    */
   settleCurrentScreen?(): Promise<boolean>;
   captureViewport?(): string;
+  /** Fresh, bounded viewport read without blocking the Worker event loop.
+   * Returns plain text; rejects or returns empty when the viewport is unknown. */
+  captureViewportAsync?(): Promise<string>;
   /**
    * Plain current viewport plus the real terminal cursor. Adopt-mode input
    * guards use this to detect an unsubmitted local composer draft before a
@@ -340,7 +377,11 @@ export interface SessionBackend {
    * a backend must not pre-filter it. Optional — backends whose output the user
    * can already read in a terminal never implement it.
    */
-  onTurnFinal?(cb: (text: string, turnId?: string) => void): void;
+  onTurnFinal?(cb: (
+    text: string,
+    turnId?: string,
+    hostContext?: RemoteRunnerTurnHostContext,
+  ) => void): void;
   /** Exact provider-reported terminal failure for a submitted turn. */
   onTurnFailure?(cb: (failure: BackendTurnFailure) => void): void;
   /** Provider-requested chat output for the active turn. A negotiated final
@@ -348,7 +389,10 @@ export interface SessionBackend {
    * delivery authority, and providers never receive a destination override or
    * platform credential. */
   onOutboundMessage?(
-    cb: (message: RemoteRunnerOutboundMessage) => Promise<RemoteRunnerOutboundMessageResult>,
+    cb: (
+      message: RemoteRunnerOutboundMessage,
+      hostContext: RemoteRunnerTurnHostContext,
+    ) => Promise<RemoteRunnerOutboundMessageResult>,
   ): void;
   /** Provider-requested access to the current BotMux session's allowlisted
    * helper surface. The worker freezes session and turn authority before
@@ -360,6 +404,12 @@ export interface SessionBackend {
   /** A provider-owned turn survived the host/worker process and is now being
    * observed without resubmitting its prompt. */
   onTurnRecovered?(cb: (turn: RemoteRunnerRecoveredTurn) => void): void;
+  /** Install daemon-restored host-only state for an exact provider-owned turn.
+   * Until this succeeds, the backend must not release recovered output. */
+  setRecoveredTurnHostContext?(
+    turnId: string,
+    context: RemoteRunnerTurnHostContext,
+  ): boolean;
   /** Provider handshake/startup is complete and turns may be accepted. */
   onReady?(cb: () => void): void;
   /** Durable, provider-neutral lineage/runtime state changed. */
@@ -504,6 +554,8 @@ export interface ObserveBackend extends SessionBackend {
   captureViewport(): string;
   /** Live pane dimensions, or null if the pane is gone. */
   getPaneSize(): { cols: number; rows: number } | null;
+  /** Notify viewers when an external pane changes geometry after attach. */
+  onPaneSizeChange?(cb: (size: { cols: number; rows: number }) => void): void;
   /** Cheap liveness probe. */
   isPaneAlive(): boolean;
   /**

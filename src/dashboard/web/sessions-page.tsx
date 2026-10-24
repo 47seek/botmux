@@ -54,6 +54,7 @@ import {
   writeStoredSessionsViewMode,
 } from './preferences.js';
 import { OPEN_CREATE_SESSION_EVENT, consumePendingCreateSession } from './create-session-entry.js';
+import { clearHashQueryParam, hashQueryParam } from './dashboard-routes.js';
 import {
   BOARD_COLUMNS,
   CLI_FILTER_OPTIONS,
@@ -72,6 +73,7 @@ import {
   copySpawnCommand,
   repoBasename,
   restartConfirmMessage,
+  restartErrorMessage,
   resumeErrorMessage,
   sessionLocationText,
   preferChatFilterLabel,
@@ -125,6 +127,7 @@ import {
 } from './sessions-kanban.js';
 import { toast } from './toast.js';
 import { confirm } from './confirm-modal.js';
+import { SessionEnvLiveModal } from './session-env-editor.js';
 import { controlCsrfHeaders } from './control-csrf.js';
 
 type SessionRow = Record<string, any> & { sessionId: string; status: string };
@@ -584,81 +587,6 @@ function LocateIconButton(props: { row: any; onLocate: (row: any) => Promise<boo
         if (ok) setCooldown(30);
       }}
     />
-  );
-}
-
-export function CliFilterGroup(props: { selected: Set<string>; onToggle: (cli: string, checked: boolean) => void }): React.JSX.Element {
-  const checked = CLI_FILTER_OPTIONS.filter(cli => props.selected.has(cli)).length;
-  const detailsRef = useRef<HTMLDetailsElement>(null);
-  const [query, setQuery] = useState('');
-
-  useEffect(() => {
-    const close = () => {
-      if (detailsRef.current?.open) detailsRef.current.open = false;
-    };
-    const onPointerDown = (event: PointerEvent) => {
-      const details = detailsRef.current;
-      if (details?.open && !details.contains(event.target as Node)) close();
-    };
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') close();
-    };
-    document.addEventListener('pointerdown', onPointerDown, true);
-    document.addEventListener('keydown', onKeyDown);
-    return () => {
-      document.removeEventListener('pointerdown', onPointerDown, true);
-      document.removeEventListener('keydown', onKeyDown);
-    };
-  }, []);
-
-  const q = query.trim().toLowerCase();
-  const visible = q ? CLI_FILTER_OPTIONS.filter(cli => cli.toLowerCase().includes(q)) : CLI_FILTER_OPTIONS;
-
-  return (
-    <details className="filter-cli" ref={detailsRef}>
-      <summary>{t('sessions.cli')} · <b id="cli-filter-count" className={checked === CLI_FILTER_OPTIONS.length ? undefined : 'cli-filter-active'}>
-        {checked === CLI_FILTER_OPTIONS.length ? t('common.all') : `${checked}/${CLI_FILTER_OPTIONS.length}`}
-      </b></summary>
-      <div className="filter-cli-pop" role="group" aria-label={t('sessions.cli')}>
-        <div className="filter-cli-head">
-          <input
-            type="search"
-            className="filter-cli-search"
-            placeholder={t('sessions.cliSearch')}
-            value={query}
-            autoFocus
-            onChange={event => setQuery(event.currentTarget.value)}
-            onClick={event => event.stopPropagation()}
-          />
-          <div className="filter-cli-bulk">
-            <button
-              type="button"
-              onClick={() => { for (const cli of CLI_FILTER_OPTIONS) if (!props.selected.has(cli)) props.onToggle(cli, true); }}
-            >{t('sessions.cliSelectAll')}</button>
-            <button
-              type="button"
-              onClick={() => { for (const cli of CLI_FILTER_OPTIONS) if (props.selected.has(cli)) props.onToggle(cli, false); }}
-            >{t('sessions.cliClear')}</button>
-          </div>
-        </div>
-        <div className="filter-cli-options">
-          {visible.length === 0 ? (
-            <span className="filter-cli-empty">{t('sessions.cliNoMatch')}</span>
-          ) : visible.map(cli => (
-            <label key={cli} className="filter-check">
-              <input
-                type="checkbox"
-                name="cli"
-                value={cli}
-                checked={props.selected.has(cli)}
-                onChange={event => props.onToggle(cli, event.currentTarget.checked)}
-              />
-              <span>{cli}</span>
-            </label>
-          ))}
-        </div>
-      </div>
-    </details>
   );
 }
 
@@ -2224,7 +2152,10 @@ function Drawer(props: {
   const terminal = row ? terminalHref(row) : null;
   const closed = !!row && row.status === 'closed';
   const canTakeover = !!row && !closed && !!terminal;
+  const [envOpen, setEnvOpen] = useState(false);
+  useEffect(() => { setEnvOpen(false); }, [row?.sessionId]);
   return (
+    <>
     <ModalDialog
       id="drawer"
       open={!!props.row}
@@ -2350,12 +2281,33 @@ function Drawer(props: {
                     {t('sessions.create.start')}
                   </button>
                 ) : null}
+                {!closed && row.larkAppId ? (
+                  <button
+                    id="session-env-btn"
+                    type="button"
+                    role="menuitem"
+                    data-action="open-session-env"
+                    onClick={() => setEnvOpen(true)}
+                  >
+                    {t('sessionEnv.viewLive')}
+                  </button>
+                ) : null}
               </div>
             </details>
           </footer>
         </article>
       ) : null}
     </ModalDialog>
+    {row ? (
+      <SessionEnvLiveModal
+        open={envOpen}
+        larkAppId={String(row.larkAppId ?? '')}
+        sessionId={String(row.sessionId)}
+        title={stripMentionPrefix(row.title) || undefined}
+        onClose={() => setEnvOpen(false)}
+      />
+    ) : null}
+    </>
   );
 }
 
@@ -2890,7 +2842,9 @@ function SessionsPage(): React.JSX.Element {
   const [idleCleanupBusy, setIdleCleanupBusy] = useState(false);
   const [idleCleanupHours, setIdleCleanupHours] = useState<IdleCleanupHours>(24);
   const [idleCleanupStatus, setIdleCleanupStatus] = useState('');
-  const [drawerSessionId, setDrawerSessionId] = useState<string | null>(null);
+  // `#/sessions?session=<id>`（⌘K 全局搜索等跨页入口）直接打开该会话的详情抽屉；
+  // 会话还没进 store 时抽屉先不出，快照到了 rowsById 命中后自然弹出。
+  const [drawerSessionId, setDrawerSessionId] = useState<string | null>(() => hashQueryParam('session'));
   const [historyState, setHistoryState] = useState<HistoryState | null>(null);
   const [termState, setTermState] = useState<TerminalState | null>(null);
   const [kanbanHost, setKanbanHost] = useState<HTMLElement | null>(null);
@@ -3376,7 +3330,7 @@ function SessionsPage(): React.JSX.Element {
       const r = await fetch(`/api/sessions/${encodeURIComponent(row.sessionId)}/restart`, { method: 'POST' });
       const body = await r.json().catch(() => ({}));
       if (!r.ok || body?.ok === false) {
-        if (r.status !== 401) toast(`${t('sessions.restartFailed')}: ${body?.message ?? body?.error ?? r.status}`, { kind: 'error' });
+        if (r.status !== 401) toast(restartErrorMessage(body, r.status), { kind: 'error' });
         return false;
       }
       restartCooldownIds.current.add(row.sessionId);
@@ -4061,7 +4015,10 @@ function SessionsPage(): React.JSX.Element {
 
       <Drawer
         row={drawerRow}
-        onClose={() => setDrawerSessionId(null)}
+        onClose={() => {
+          setDrawerSessionId(null);
+          clearHashQueryParam('session');
+        }}
         locateSession={locateSession}
         openHistory={openHistoryModal}
         resumeSession={resumeSession}

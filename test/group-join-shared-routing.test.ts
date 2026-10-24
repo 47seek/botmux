@@ -286,6 +286,116 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
     );
   });
 
+  it('首轮登记拉 bot 入群的操作人为 sender（schedule 身份），且保持 mention 安全方向', async () => {
+    const { daemon, registry, types } = modules;
+    const appId = 'app_join_sender';
+    const chatId = 'oc_join_sender';
+    registry.registerBot({
+      larkAppId: appId,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: ['ou_owner'],
+      autoStartOnGroupJoin: true,
+      autoStartOnGroupJoinPrompt: '开始排查',
+      defaultWorkingDir: tempDir('repo-join-sender'),
+      regularGroupReplyMode: 'shared',
+    });
+
+    await daemon.__testOnly_handleBotAdded(chatId, 'ou_owner', appId);
+
+    const ds = daemon.__testOnly_activeSessions.get(types.sessionKey(chatId, appId));
+    const entry = ds?.session.replyTargets?.om_join_seed;
+    expect(entry).toMatchObject({
+      senderOpenId: 'ou_owner',
+      participants: [{ openId: 'ou_owner', isBot: false }],
+      participantsIncomplete: true,
+    });
+  });
+
+  it('操作人缺失时首轮登记保持无 sender（fail-closed）', async () => {
+    const { daemon, registry, types } = modules;
+    const appId = 'app_join_no_operator';
+    const chatId = 'oc_join_no_operator';
+    registry.registerBot({
+      larkAppId: appId,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: ['ou_owner'],
+      autoStartOnGroupJoin: true,
+      defaultWorkingDir: tempDir('repo-join-no-operator'),
+      regularGroupReplyMode: 'shared',
+    });
+
+    await daemon.__testOnly_handleBotAdded(chatId, undefined, appId);
+
+    const ds = daemon.__testOnly_activeSessions.get(types.sessionKey(chatId, appId));
+    const entry = ds?.session.replyTargets?.om_join_seed;
+    expect(entry).toBeDefined();
+    expect(entry?.senderOpenId).toBeUndefined();
+    expect(entry?.participants).toBeUndefined();
+  });
+
+  it('chat 模式（非 shared）首轮同样登记操作人 sender', async () => {
+    const { daemon, registry, types } = modules;
+    const appId = 'app_join_chat_sender';
+    const chatId = 'oc_join_chat_sender';
+    registry.registerBot({
+      larkAppId: appId,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: ['ou_owner'],
+      autoStartOnGroupJoin: true,
+      autoStartOnGroupJoinPrompt: '开始排查',
+      defaultWorkingDir: tempDir('repo-join-chat-sender'),
+      regularGroupReplyMode: 'chat',
+    });
+
+    await daemon.__testOnly_handleBotAdded(chatId, 'ou_owner', appId);
+
+    const ds = daemon.__testOnly_activeSessions.get(types.sessionKey(chatId, appId));
+    const entries = Object.entries(ds?.session.replyTargets ?? {});
+    const joinEntry = entries.find(([turnId]) => turnId.startsWith('join_'));
+    expect(joinEntry?.[1]).toMatchObject({
+      senderOpenId: 'ou_owner',
+      participants: [{ openId: 'ou_owner', isBot: false }],
+      participantsIncomplete: true,
+    });
+    // chat 顶层无根：join_ 首轮不带 rootMessageId。
+    expect(joinEntry?.[1]?.rootMessageId).toBeUndefined();
+  });
+
+  it('话题群（thread scope）首轮同样登记操作人 sender', async () => {
+    const { daemon, registry, types } = modules;
+    const appId = 'app_join_topic_sender';
+    const chatId = 'oc_join_topic_sender';
+    mocks.getChatContext.mockImplementationOnce(async (_appId: string, targetChatId: string) => ({
+      chatId: targetChatId,
+      name: '话题群',
+      description: null,
+      mode: 'topic',
+      fetchStatus: 'ok',
+    }));
+    registry.registerBot({
+      larkAppId: appId,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: ['ou_owner'],
+      autoStartOnGroupJoin: true,
+      autoStartOnGroupJoinPrompt: '开始排查',
+      defaultWorkingDir: tempDir('repo-join-topic-sender'),
+    });
+
+    await daemon.__testOnly_handleBotAdded(chatId, 'ou_owner', appId);
+
+    const ds = daemon.__testOnly_activeSessions.get(types.sessionKey('om_join_seed', appId));
+    expect(ds?.scope).toBe('thread');
+    expect(ds?.session.replyTargets?.om_join_seed).toMatchObject({
+      senderOpenId: 'ou_owner',
+      participants: [{ openId: 'ou_owner', isBot: false }],
+      participantsIncomplete: true,
+    });
+  });
+
   it.each(['peer', 'bot', 'app'] as const)('keeps %s operator bot evidence through opening and identity-cache resolution', async (evidence) => {
     const { daemon, registry, identities, types } = modules;
     const appId = `app_join_bot_${evidence}`;
@@ -667,6 +777,39 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
     expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
     // 卡片没发出去就没有可删的消息，别拿 undefined 去调删除接口。
     expect(mocks.deleteMessage).not.toHaveBeenCalled();
+  });
+
+  // 默认工作目录不存在（被删、写错、配置自别的机器）：既不能在那里开工，也不能当成
+  // 「无可选项目 → 直接开工」——那条路同样落到这个目录，被 forkWorker 拒绝后首轮就挂在
+  // 会话上。改为发缺目录形态的选仓卡（没有「直接开启会话」），首轮挂在卡后，选好目录即开工。
+  it('默认工作目录不存在时发缺目录选仓卡等选目录，而不是在不存在的目录里开工', async () => {
+    const { daemon, registry, types } = modules;
+    const appId = 'app_join_missing_default';
+    const chatId = 'oc_join_missing_default';
+    const missing = join(tempRoot, 'gone', 'botmux');
+    registry.registerBot({
+      larkAppId: appId,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: ['ou_owner'],
+      autoStartOnGroupJoin: true,
+      autoStartOnGroupJoinPrompt: '开始排查',
+      defaultWorkingDir: missing,
+      regularGroupReplyMode: 'shared',
+    });
+
+    await daemon.__testOnly_handleBotAdded(chatId, 'ou_owner', appId);
+
+    const ds = daemon.__testOnly_activeSessions.get(types.sessionKey(chatId, appId));
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+    expect(ds?.pendingRepo).toBe(true);
+    expect(ds?.repoCardMessageId).toBe('om_reply');
+    const cardCall = mocks.replyMessage.mock.calls.find(call => (call as unknown[])[3] === 'interactive') as unknown[] | undefined;
+    // The card belongs under the shared join seed, like the ordinary picker.
+    expect(cardCall?.[1]).toBe('om_join_seed');
+    expect(String(cardCall?.[2])).toContain(missing);
+    expect(String(cardCall?.[2])).toContain('repo_manual_submit');
+    expect(String(cardCall?.[2])).not.toContain('skip_repo');
   });
 
   it('losing registration leaves no shared seed message or orphaned first turn', async () => {

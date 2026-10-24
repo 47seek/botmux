@@ -155,6 +155,12 @@ const CONSUMERS: Record<string, Rule> = {
       + 'the row back directly, so it cannot recursively wake a second provider.',
     count: 3,
   },
+  'core/session-manager.ts::reconcileStartedRemoteResumeExit::closeSessionForBackgroundCleanup': {
+    category: 'background',
+    why: 'A provisional Remote Runner resume lost its provider before canonical activation. '
+      + 'The background wrapper logs refusals and residuals; durable control commits closed '
+      + 'only after the authoritative close is proven.',
+  },
   'core/session-manager.ts::spawnDashboardSession::closeSession': {
     category: 'impossible_by_invariant',
     why: 'Same scratch-placeholder eviction as resumeSession: no remote lineage.',
@@ -194,6 +200,11 @@ const CONSUMERS: Record<string, Rule> = {
     category: 'infrastructure',
     why: 'Injects the raw typed close result into the durable card-control runtime; '
       + 'that runtime durably replies with refusal/residual details before settling.',
+  },
+  'daemon.ts::closeCompletedSession::closeSessionForBackgroundCleanup': {
+    category: 'background',
+    why: 'Listener auto-close waits for final delivery outside the Bot mutation gate; '
+      + 'the background wrapper logs refusal and residual, and refusal never reports success.',
   },
   'daemon.ts::cleanupFailedDelivery::closeSessionForBackgroundCleanup': {
     category: 'background',
@@ -474,6 +485,8 @@ function probe(code: string): ts.SourceFile {
   return ts.createSourceFile('probe.ts', code, ts.ScriptTarget.Latest, true);
 }
 
+// 源码结构护栏(K4)：src 里每个 close 调用点与 close 路由响应点都必须登记在矩阵里并归类；调用点散落在各处闭包里，
+// 只能扫源码核对（同文件下半部分的自检保证扫描器对别名 / 命名空间 / 动态 import 与注释字符串的判定）。
 describe('close consumer matrix (call-site)', () => {
   it('every close call site is classified', () => {
     const unclassified = [...new Set(

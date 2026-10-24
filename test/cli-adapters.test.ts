@@ -26,6 +26,8 @@ vi.mock('node:child_process', () => ({
 
 import { createCliAdapterSync } from '../src/adapters/cli/registry.js';
 import { busyProbeRegion } from '../src/utils/busy-probe.js';
+import { shouldWriteNow } from '../src/utils/input-gate.js';
+import { isTypeAheadBlockedByBypass, resolvePtyInputPolicy } from '../src/utils/pty-input-policy.js';
 import { TERMINAL_CANCEL_COOLDOWN_MS } from '../src/adapters/backend/critical-control-key.js';
 import { createClaudeCodeAdapter } from '../src/adapters/cli/claude-code.js';
 import { createAidenAdapter } from '../src/adapters/cli/aiden.js';
@@ -272,6 +274,12 @@ describe('claude-code buildArgs', () => {
       if (previous === undefined) delete process.env[GOAL_ENV.V3_MARKER];
       else process.env[GOAL_ENV.V3_MARKER] = previous;
     }
+  });
+
+  it('writes promptCacheTtl into --settings only when configured', () => {
+    const settingsOf = (args: string[]) => JSON.parse(args[args.indexOf('--settings') + 1]);
+    expect(settingsOf(adapter.buildArgs({ sessionId: 's', resume: false })).promptCacheTtl).toBeUndefined();
+    expect(settingsOf(adapter.buildArgs({ sessionId: 's', resume: false, promptCacheTtl: '1h' })).promptCacheTtl).toBe('1h');
   });
 
   it('passes inline --settings that skips the dangerous-mode prompt', () => {
@@ -3422,14 +3430,16 @@ describe('idleToBusyPattern', () => {
     expect(busy!.test('Working through the implementation')).toBe(false);
   });
 
-  it('pi opts in with the same Working... marker as its busyPattern', () => {
-    // Pi's `Working...` is an ephemeral status line (never part of transcript
+  it('pi opts in with the same busy-line marker as its busyPattern', () => {
+    // Pi's busy line is an ephemeral status line (never part of transcript
     // history redraws), so idle→busy recovery is safe: a falsely published
     // ready self-heals when the marker renders again.
     const adapter = createPiAdapter('/bin/pi');
     expect(adapter.idleToBusyPattern).toBeDefined();
     expect(adapter.idleToBusyPattern!.source).toBe(adapter.busyPattern!.source);
     expect(adapter.idleToBusyPattern!.test('● Working... (esc to interrupt)')).toBe(true);
+    // Pi 1.3.0 frame as it appears in the ANSI-stripped PTY stream.
+    expect(adapter.idleToBusyPattern!.test('── ⠙ Working ──')).toBe(true);
     expect(adapter.idleToBusyPattern!.test('Working through the implementation')).toBe(false);
   });
 
@@ -3567,6 +3577,21 @@ describe('readyPattern', () => {
     expect(adapter.busyPattern).toBeDefined();
     expect(adapter.busyPattern!.test('esc to cancel')).toBe(true);
     expect(typeof adapter.isSessionBusy).toBe('function');
+    expect(adapter.supportsTypeAhead).toBe(true);
+    const bypassedPolicy = resolvePtyInputPolicy(adapter, true, false, isTypeAheadBlockedByBypass(adapter, false));
+    const restrictedPolicy = resolvePtyInputPolicy(adapter, true, false, isTypeAheadBlockedByBypass(adapter, true));
+    expect(shouldWriteNow({
+      isPromptReady: false,
+      isFlushing: false,
+      supportsTypeAhead: bypassedPolicy.supportsTypeAhead,
+      awaitingFirstPrompt: false,
+    })).toBe(true);
+    expect(shouldWriteNow({
+      isPromptReady: false,
+      isFlushing: false,
+      supportsTypeAhead: restrictedPolicy.supportsTypeAhead,
+      awaitingFirstPrompt: false,
+    })).toBe(false);
   });
 
   it('mtr has no readyPattern', () => {

@@ -36,6 +36,7 @@ import {
   replyCardHeadingElementId,
 } from './reply-card-footer-signature.js';
 import { buildFeedbackElement } from './skill-feedback-card.js';
+import { buildReplyCardActionOverflow, buildReplyCardChromeRow, type ReplyCardActionBinding } from './reply-card-actions.js';
 import { buildCompletionProposalElement } from './completion-proposal-card.js';
 import { composeFinalCardSections } from './final-card-sections.js';
 import type { FeedbackPolicy } from '../../services/feedback-policy.js';
@@ -152,6 +153,9 @@ export interface CardUsageSnapshot {
   tokens: {
     in: number;
     out: number;
+    /** Optional cumulative cache reads / writes, both subsets of `in`. */
+    cacheReadTokens?: number;
+    cacheCreateTokens?: number;
   } | null;
   /** Delta for the latest user turn (small, matches the CLI TUI's per-turn
    *  ↑↓). Null for dialects without per-turn tracking. Rendered on the live
@@ -166,6 +170,8 @@ export interface CardUsageSnapshot {
   reasoningEffort?: string;
   /** Session-only configuration; separate from the last executor-reported effort. */
   reasoningControl?: {
+    /** Native CLI menu accepted this setting for the next turn. */
+    nextTurn?: boolean;
     choices: readonly import('../../services/codex-reasoning-effort.js').CodexReasoningEffort[];
     selected?: string;
     pending: boolean;
@@ -182,6 +188,9 @@ export interface CardUsageSnapshot {
    *  上下文段改渲染纯百分比 `ctx N%`，并追加 `5h N%` / `7d N%` 账号配额段。
    *  缺省 / null ⇒ 与无 statusline 时逐字节相同（只看 `context`）。 */
   quota?: StatuslineQuota | null;
+  /** bots.json `cardFooterExtension` 命令给出的自定义段（已收成短单行纯文本），
+   *  渲染时转义并接在用量段末尾。缺省 ⇒ 与未配置时逐字节相同。 */
+  extensionSegments?: string[];
 }
 
 export interface ReplyCardFooter {
@@ -455,7 +464,8 @@ function stripModelProviderPrefix(value: string | undefined): string | undefined
 
 /** Format usage as one segment shared by reply-card footers and the live
  * streaming card. The caller supplies native facts; this module only formats
- * them and never infers a context window or token count. Returns null when no
+ * them (it may derive ratios between supplied counts) and never infers a
+ * context window or token count. Returns null when no
  * valid native metric is available.
  *
  * `variant`:
@@ -464,7 +474,8 @@ function stripModelProviderPrefix(value: string | undefined): string | undefined
  *     dropped here (it lives on the streaming card / usage ledger). 上下文占用
  *     is the one glanceable "how full am I" metric worth keeping.
  *   - `'streaming'`: rich — context + `本轮 ↑X ↓Y`(per-turn delta, matches the
- *     CLI TUI) + `累计 ↑A ↓B`(session total). The live card has room and
+ *     CLI TUI) + `累计 ↑A ↓B`(session total) + `缓存命中 N%`(session cache
+ *     reads over the cache-inclusive prompt total). The live card has room and
  *     refreshes during execution. */
 /**
  * True when a context snapshot is at/over the compact threshold — the single
@@ -552,6 +563,11 @@ export function cardUsageFooterSegment(
     const sevenDay = quotaPercent(quota.sevenDayPercent);
     if (sevenDay !== undefined) parts.push(`${t('card.usage.quota_7d', undefined, locale)} ${sevenDay}%`);
   }
+  // 自定义扩展段（cardFooterExtension）：footer 与 streaming 都渲染，排在账号配额之后。
+  for (const segment of usage.extensionSegments ?? []) {
+    const text = segment.trim();
+    if (text) parts.push(escapeCardPlainText(text));
+  }
   // Footer variant is context-only (keeps the cramped reply-card footer clean);
   // the token breakdown below is streaming-only.
   if (variant !== 'streaming') {
@@ -580,6 +596,26 @@ export function cardUsageFooterSegment(
       `${t('card.usage.total', undefined, locale)} `
       + `↑${compactTokenCount(usage.tokens.in)} ↓${compactTokenCount(usage.tokens.out)}`,
     );
+    // Session cache hit rate: cache reads over the cache-inclusive prompt total.
+    // Dialects without cache fields still fold to 0/0, which is "unknown", not
+    // "0% hit" — so require one of the counters to be present and non-negative,
+    // and some cache activity. A session whose cache is only written (a remote
+    // provider reporting cacheCreate alone, or a first-turn Claude prompt) thus
+    // honestly renders 0%.
+    const cacheReadRaw = usage.tokens.cacheReadTokens;
+    const cacheCreateRaw = usage.tokens.cacheCreateTokens;
+    const cacheRead = isNonNegativeFinite(cacheReadRaw) ? cacheReadRaw : undefined;
+    const cacheCreate = isNonNegativeFinite(cacheCreateRaw) ? cacheCreateRaw : undefined;
+    if (usage.tokens.in > 0
+      && (cacheRead !== undefined || cacheCreate !== undefined)
+      && ((cacheRead ?? 0) > 0 || (cacheCreate ?? 0) > 0)) {
+      // floor, not round: 99.6% must not read as "100%" (everything cached).
+      // Multiply before dividing: (read / in) * 100 lands at x.99999… in
+      // floating point for exact integer percentages (290000 / 1e6 → 28).
+      // Token counts are integers far below 2^53 / 100, so read * 100 is exact.
+      const pct = Math.min(100, Math.floor((cacheRead ?? 0) * 100 / usage.tokens.in));
+      parts.push(`${t('card.usage.cache_hit', undefined, locale)} ${pct}%`);
+    }
   }
   // Runtime identity is formatted separately by cardUsageRuntimeSegment. Keep
   // this function metric-only so callers can also render identity without usage.
@@ -767,21 +803,26 @@ export function buildReplyCardFooter(opts: {
   };
 }
 
-/** Compose the entire footer once: text, divider and optional voice action. */
+/** Compose the entire footer once: text, divider and optional voice/menu
+ * actions. Footer, voice and the per-bot reply-card action menu share one
+ * chrome row (stable id `botmux_reply_actions`) so the on-call button, long
+ * card degradation and group-context projection can locate them. */
 export function buildReplyCardFooterElements(
-  opts: Parameters<typeof buildReplyCardFooter>[0] & { voiceButton?: Record<string, unknown> },
+  opts: Parameters<typeof buildReplyCardFooter>[0] & {
+    voiceButton?: Record<string, unknown>;
+    actionMenu?: Record<string, unknown>;
+  },
 ): any[] {
   const policy = resolveReplyFooterPolicy(opts.presentation?.footerPreferences);
   if (!policy.enabled) return [];
   const footer = buildReplyCardFooter(opts);
-  const voice = policy.voice ? opts.voiceButton : undefined;
-  if (!footer && !voice) return [];
-  return [{ tag: 'hr' }, ...(voice ? [{
-    tag: 'column_set', flex_mode: 'none', horizontal_spacing: 'default', columns: [
-      { tag: 'column', width: 'weighted', weight: 1, vertical_align: 'center', elements: [footer?.element ?? { tag: 'markdown', text_size: 'notation', content: ' ' }] },
-      { tag: 'column', width: 'auto', vertical_align: 'center', elements: [voice] },
-    ],
-  }] : [footer!.element])];
+  const controls: Array<Record<string, unknown>> = [];
+  if (policy.voice && opts.voiceButton) controls.push(opts.voiceButton);
+  if (opts.actionMenu) controls.push(opts.actionMenu);
+  if (!footer && controls.length === 0) return [];
+  return [{ tag: 'hr' }, ...(controls.length > 0
+    ? [buildReplyCardChromeRow({ footer, controls })]
+    : [footer!.element])];
 }
 
 /** Clone a caller-supplied schema-2 card and append the canonical reply
@@ -1518,28 +1559,6 @@ export function buildImageCardElements(
 }
 
 /**
- * Heuristic: does `text` contain markdown syntax that renders badly as plain
- * text in Feishu (code fences, headings, lists, bold, inline code, links,
- * tables, blockquotes, hr)? Callers use this to decide between an interactive
- * card and a plain post.
- */
-export function hasMarkdown(text: string): boolean {
-  if (!text) return false;
-  return (
-    /```/.test(text) ||
-    /^#{1,6}\s/m.test(text) ||
-    /^\s{0,3}[-*+]\s+\S/m.test(text) ||
-    /^\s{0,3}\d+\.\s+\S/m.test(text) ||
-    /\*\*[^*\n]+\*\*/.test(text) ||
-    /(^|[^`])`[^`\n]+`([^`]|$)/.test(text) ||
-    /\[[^\]\n]+\]\([^)\n]+\)/.test(text) ||
-    /^\s*\|.+\|\s*$/m.test(text) ||
-    /^>\s/m.test(text) ||
-    /^(?:---|\*\*\*|___)\s*$/m.test(text)
-  );
-}
-
-/**
  * Build a complete Feishu interactive card (schema 2.0) from a markdown
  * body, with the same footer chrome `botmux send` uses: HR + small grey
  * brand segment + optional `发送给：@<owner>` mention.
@@ -1595,6 +1614,8 @@ export function buildCanonicalFinalReplyCard(opts: {
   executionDurationMs?: number;
   waitingDurationMs?: number;
   presentation?: ReplyCardPresentation;
+  /** Per-bot opt-in reply-card action menu binding. */
+  cardActions?: ReplyCardActionBinding;
 }): string {
   const elements = opts.markdown
     ? buildCardBodyElements(opts.markdown, opts.workingDir, opts.localHomeLinkMode ?? 'filesystem')
@@ -1607,6 +1628,9 @@ export function buildCanonicalFinalReplyCard(opts: {
     executionDurationMs: opts.executionDurationMs,
     waitingDurationMs: opts.waitingDurationMs,
     locale: opts.locale,
+    ...(opts.cardActions
+      ? { actionMenu: buildReplyCardActionOverflow(opts.cardActions, opts.locale) }
+      : {}),
   });
   elements.push(...footerElements);
   const card = createReplyCard(elements);
@@ -1659,6 +1683,8 @@ export function buildContextualReplyCard(opts: {
   waitingDurationMs?: number;
   presentation?: ReplyCardPresentation;
   feedback?: { policy: FeedbackPolicy };
+  /** Per-bot opt-in reply-card action menu binding. */
+  cardActions?: ReplyCardActionBinding;
 }): string {
   const {
     title,
@@ -1709,6 +1735,9 @@ export function buildContextualReplyCard(opts: {
     executionDurationMs: opts.executionDurationMs,
     waitingDurationMs: opts.waitingDurationMs,
     presentation: opts.presentation,
+    ...(opts.cardActions
+      ? { actionMenu: buildReplyCardActionOverflow(opts.cardActions, locale) }
+      : {}),
   });
   elements.push(...footerElements);
 

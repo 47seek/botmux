@@ -284,9 +284,9 @@ describe('daemon terminal GC retention set (mutation matrix)', () => {
     const ds = dsWith({});
     publish('turn-A');
     sessionAuthRequests.set('req-1', {
-      sessionId: SESSION, callerOpenId: 'ou-alice', identityTurnId: 'turn-A',
-      isCurrent: () => false, poll: (async () => ({ status: 'pending' as const })) as any,
-    });
+      sessionId: SESSION, appId: 'cli_app', callerOpenId: 'ou-alice', identityTurnId: 'turn-A',
+      isCurrent: () => false,
+    } as any);
     releaseActiveIdentityTurn(dir, SESSION, 'turn-A');
     expect(collectSessionTurnGarbage(ds)).toEqual([]);
     expect(recallProvenIdentityContent(dir, SESSION, 'turn-A', 'bytedcli')).toContain('jwt-turn-A');

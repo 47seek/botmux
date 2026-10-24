@@ -14,6 +14,7 @@ export type SessionAuthPoll = Awaited<ReturnType<typeof requestUserAuthorization
 
 export interface SessionAuthRequest {
   sessionId: string;
+  appId: string;
   /** Human who approved this grant, frozen at request creation. The live origin
    *  of a later auth-status call may already belong to another turn or another
    *  person; this frozen id is the only safe same-principal reference. */
@@ -22,8 +23,15 @@ export interface SessionAuthRequest {
    *  even when the live turn rotates while the human is authorizing, the
    *  original turn's material must survive terminal GC until this settles. */
   identityTurnId: string;
+  authorization: Awaited<ReturnType<typeof requestUserAuthorization>>;
+  /** Creating-turn closure: true only while the exact originating turn is live. */
   isCurrent: () => boolean;
+  /** Session/app liveness used to keep or retire the daemon-side background poll. */
+  isValid: () => boolean;
+  status: 'pending' | 'ready' | 'failed';
+  expiresAt: number;
   poll: SessionAuthPoll;
+  dispose: () => void;
 }
 
 export class SessionAuthRequestStore {
@@ -41,6 +49,19 @@ export class SessionAuthRequestStore {
     this.byId.delete(requestId);
   }
 
+  values(): IterableIterator<SessionAuthRequest> {
+    return this.byId.values();
+  }
+
+  entries(): IterableIterator<[string, SessionAuthRequest]> {
+    return this.byId.entries();
+  }
+
+  disposeAndClear(): void {
+    for (const request of this.byId.values()) request.dispose();
+    this.byId.clear();
+  }
+
   /** Identity turns that pending grants in this session still target. */
   identityTurnsFor(sessionId: string): string[] {
     const turns: string[] = [];
@@ -54,4 +75,3 @@ export class SessionAuthRequestStore {
 /** Process-wide registry shared by the IPC route handlers and the terminal
  *  identity garbage collector. */
 export const sessionAuthRequests = new SessionAuthRequestStore();
-

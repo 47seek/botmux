@@ -414,6 +414,13 @@ const TRAEX_PENDING_AGENT_ITEMS_PER_TURN_MAX = 64;
  * rollout. Keep de-duplication scoped to a rollout and its stable turn id:
  * identical prompts in distinct turns must remain distinct local turns. */
 const traexSeenUserTurns = new Map<string, Map<string, string | undefined>>();
+/** One native turn may contain several real UserMessage items. Track their
+ * ids separately from the legacy turn-level mirror claim. */
+interface TraexSeenUserItems {
+  messages: Map<string, string>;
+  turnCounts: Map<string, number>;
+}
+const traexSeenUserItems = new Map<string, TraexSeenUserItems>();
 /** TraeX can write the legacy and item_completed user records in either order.
  * Remember the one missing counterpart across incremental drains. The state
  * belongs only to the currently open native turn and is cleared at its
@@ -439,6 +446,27 @@ const TRAEX_SEEN_USER_TURN_PATHS_MAX = 512;
 const TRAEX_SEEN_USER_TURNS_PER_PATH_MAX = 4096;
 const TRAEX_PENDING_USER_MIRRORS_PER_PATH_MAX = 64;
 const TRAEX_LEGACY_USER_MIRROR_WINDOW_MS = 5_000;
+
+function claimTraexUserItem(
+  seen: TraexSeenUserItems,
+  turnId: string | undefined,
+  itemId: string | undefined,
+): 'first' | 'additional' | 'duplicate' | undefined {
+  if (!turnId || !itemId) return undefined;
+  const key = JSON.stringify([turnId, itemId]);
+  if (seen.messages.has(key)) return 'duplicate';
+  const count = seen.turnCounts.get(turnId) ?? 0;
+  seen.messages.set(key, turnId);
+  seen.turnCounts.set(turnId, count + 1);
+  if (seen.messages.size > TRAEX_SEEN_USER_TURNS_PER_PATH_MAX) {
+    const [oldestKey, oldestTurn] = seen.messages.entries().next().value!;
+    seen.messages.delete(oldestKey);
+    const remaining = seen.turnCounts.get(oldestTurn)! - 1;
+    if (remaining > 0) seen.turnCounts.set(oldestTurn, remaining);
+    else seen.turnCounts.delete(oldestTurn);
+  }
+  return count > 0 ? 'additional' : 'first';
+}
 
 function claimTraexUserTurn(path: string, turnId: unknown, legacyStateKey?: string): boolean {
   if (typeof turnId !== 'string' || turnId.length === 0) return true;
@@ -531,7 +559,14 @@ function takeTraexUserMirrorAtTerminal(
   // cannot consume a source-less candidate belonging to a typed-ahead turn.
   const exactIndex = pending.findIndex(candidate => candidate.sourceTurnId === sourceTurnId);
   if (exactIndex >= 0) {
-    return pending.splice(exactIndex, 1)[0];
+    const exact = pending[exactIndex];
+    // Every item in a merged turn shares this one terminal. Leaving another
+    // item's legacy mirror behind can swallow a same-text input in the next
+    // native turn while the short mirror window is still open.
+    for (let i = pending.length - 1; i >= 0; i--) {
+      if (pending[i].sourceTurnId === sourceTurnId) pending.splice(i, 1);
+    }
+    return exact;
   }
   if (legacyStateKey !== undefined) {
     const replayIndex = pending.findIndex(candidate => candidate.agentStateKey === legacyStateKey);
@@ -919,6 +954,15 @@ export function drainTraexRollout(
 
   const events: CodexBridgeEvent[] = [];
   const seenUserTurns = new Set<string>();
+  const freshUserItems = (): TraexSeenUserItems => ({ messages: new Map(), turnCounts: new Map() });
+  const seenUserItems = probe ? freshUserItems()
+    : (traexSeenUserItems.get(path) ?? freshUserItems());
+  if (!probe && !traexSeenUserItems.has(path)) {
+    traexSeenUserItems.set(path, seenUserItems);
+    if (traexSeenUserItems.size > TRAEX_SEEN_USER_TURN_PATHS_MAX) {
+      traexSeenUserItems.delete(traexSeenUserItems.keys().next().value!);
+    }
+  }
   const pendingUserMirrors: TraexDrainUserMirror[] = probe
     ? []
     : (traexPendingUserMirrors.get(path) ?? []).map(candidate => ({ ...candidate }));
@@ -1013,7 +1057,13 @@ export function drainTraexRollout(
       && payload.type === 'item_completed') {
       const userText = itemCompletedUserText(payload.item);
       if (userText) {
-        if (claimUserTurn(payload.turn_id)) {
+        const sourceMessageId = typeof payload.item.id === 'string' && payload.item.id
+          ? payload.item.id : undefined;
+        const itemClaim = claimTraexUserItem(seenUserItems, sourceTurnId, sourceMessageId);
+        // A duplicate can still bind a replayed id-less legacy record's
+        // assistant bucket below; suppress its user edge, not that hydration.
+        const firstUserInTurn = itemClaim !== 'duplicate' && claimUserTurn(payload.turn_id);
+        if (firstUserInTurn || itemClaim === 'additional') {
           // Legacy user_message records did not always carry a turn id. When
           // the same drain also contains their 0.201.4 UserMessage mirror,
           // replace the uncorrelatable legacy event with the turn-addressable
@@ -1026,9 +1076,11 @@ export function drainTraexRollout(
             events[legacyIndex] = {
               ...events[legacyIndex],
               ...(sourceTurnId ? { sourceTurnId } : {}),
+              ...(sourceMessageId ? { sourceMessageId } : {}),
             };
           } else if (expectedMirror?.expected === 'item' && sourceTurnId) {
-            events.push({ ...base, kind: 'turn_bind', text: '', sourceTurnId });
+            events.push({ ...base, kind: 'turn_bind', text: '', sourceTurnId,
+              ...(sourceMessageId ? { sourceMessageId } : {}) });
           } else if (!expectedMirror) {
             const preserveCollecting = shouldPreserveUnboundLegacyPredecessor(
               pendingUserMirrors, sourceTurnId, base.timestampMs,
@@ -1038,6 +1090,7 @@ export function drainTraexRollout(
               kind: 'user',
               text: userText,
               ...(sourceTurnId ? { sourceTurnId } : {}),
+              ...(sourceMessageId ? { sourceMessageId } : {}),
               ...(preserveCollecting ? { preserveCollecting: true } : {}),
             });
           }
@@ -1246,23 +1299,6 @@ export function readLatestTraexRuntime(path: string): TraexRuntimeSnapshot {
 
 function normaliseInputText(text: string): string {
   return text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
-}
-
-/** Submit-confirmation probe: only a complete user event record appended after
- * `fromOffset` can match. Read-only — drains with `probe` so
- * it never mutates the per-turn agent_message cache the production drainer
- * relies on (a re-drain of the same live rollout at a different offset must
- * not clear pending turn state). Not currently wired into the production
- * submit-confirmation path; kept as a tested probe. */
-export function traexRolloutHasUserInputSince(
-  path: string,
-  fromOffset: number,
-  expectedText: string,
-): boolean {
-  const expected = normaliseInputText(expectedText);
-  return drainTraexRollout(path, fromOffset, { probe: true }).events.some(event =>
-    event.kind === 'user' && normaliseInputText(event.text) === expected,
-  );
 }
 
 // -- history.jsonl submit-confirmation (submit-time truth) ------------------
@@ -1483,6 +1519,45 @@ export function findTraexRolloutByPid(
   if (!targets) return undefined;
   const selected = selectTraexRollout(traexRolloutRefs(targets), preferredSessionId);
   return selected ? { path: selected.path, cliSessionId: selected.cliSessionId } : undefined;
+}
+
+/** Resolve the user-visible TRAE thread held by a process from its writer lock.
+ * Unlike rollout files, these locks remain addressable when Orca has unlinked
+ * an old rollout that the live process still keeps open. */
+export function findTraexThreadByPid(
+  pid: number,
+): { cliSessionId: string; title?: string } | undefined {
+  const targets = listProcessOpenFiles(pid);
+  if (!targets) return undefined;
+  const ids = [...new Set(targets.flatMap(target => {
+    const match = /[\\/]thread-writer-locks[\\/]([0-9a-f-]{36})\.lock(?: \(deleted\))?$/i.exec(target);
+    return match?.[1] ? [match[1]] : [];
+  }))];
+  if (ids.length === 0) return undefined;
+  return withTraeDb((db) => {
+    const placeholders = ids.map(() => '?').join(',');
+    let rows: Array<{ id?: string; title?: string; firstMessage?: string; updatedAt?: number; source?: string }>;
+    try {
+      rows = db.prepare(
+        `SELECT id, title, first_user_message AS firstMessage, updated_at_ms AS updatedAt, thread_source AS source FROM threads WHERE id IN (${placeholders})`,
+      ).all(...ids);
+    } catch {
+      rows = db.prepare(
+        `SELECT id, title, first_user_message AS firstMessage FROM threads WHERE id IN (${placeholders})`,
+      ).all(...ids);
+    }
+    const candidates = rows
+      .filter(row => typeof row.id === 'string' && row.source !== 'subagent')
+      .sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0));
+    const selected = candidates.find(row => row.source === 'user') ?? candidates[0];
+    if (!selected?.id) return undefined;
+    const title = String(selected.title || selected.firstMessage || '').replace(/\s+/g, ' ').trim();
+    const titleChars = Array.from(title);
+    return {
+      cliSessionId: selected.id,
+      ...(title ? { title: titleChars.length > 80 ? `${titleChars.slice(0, 79).join('')}…` : title } : {}),
+    };
+  }) ?? undefined;
 }
 
 /** Lowercased set of TRAE session ids whose rollout the pid holds open. The
