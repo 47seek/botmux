@@ -75,4 +75,15 @@ describe('F3 identity decision wiring (source structure guard)', () => {
   it('worker decision reports carry the spawn turn id for the flip replay', () => {
     expect(workerSource).toContain("...(currentBotmuxTurnId ? { turnId: currentBotmuxTurnId } : {})");
   });
+
+  it('the onIdentityDecision registration never fires a bare void promise (K3 + P3-a behavior twin)', () => {
+    // 源码结构护栏(K3)：行为用例（identity-decision-flip P3-a）已能捕获
+    // 裸 void 的回归；这道文本护栏防止整个回调被改成不带收口的形态而
+    // 行为用例因提取器失效静默跳过。
+    const callback = daemonSource
+      .slice(daemonSource.indexOf('onIdentityDecision(ds, context)'))
+      .split(/\n\s*},\n/)[0];
+    expect(callback).toContain('handleIdentityDecisionFlip(ds, context).catch');
+    expect(callback).not.toMatch(/void\s+handleIdentityDecisionFlip\(ds,\s*context\)\s*;/);
+  });
 });

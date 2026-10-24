@@ -13,6 +13,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import ts from 'typescript';
 import { readFileSync } from 'node:fs';
+import { identityDecisionTurnIsLive } from '../src/core/worker-pool.js';
 
 const source = ts.createSourceFile('daemon.ts', readFileSync('src/daemon.ts', 'utf8'), ts.ScriptTarget.Latest, true);
 const fnNode = source.statements.find(
@@ -55,6 +56,23 @@ function deps(overrides: Record<string, unknown> = {}) {
     refreshTurnCliIdentity: vi.fn(async () => {}),
     ...overrides,
   };
+}
+
+async function testProductionLiveness(terminal: Set<string> | undefined, expectReplay: boolean): Promise<void> {
+  const d = deps({ identityDecisionTurnIsLive });
+  const ds = {
+    session: { sessionId: 'flip-session', status: 'active' },
+    larkAppId: 'cli_flip', chatId: 'oc_flip',
+    worker: { killed: false, pid: 7 },
+    terminalIdentityTurnIds: terminal,
+    lastPublishedIdentityModel: 'single',
+  } as any;
+  await runHandler(ds, { model: 'proven', flipped: true, turnId: 'om_term' }, d);
+  if (expectReplay) {
+    expect(d.refreshTurnCliIdentity).toHaveBeenCalledWith(ds, 'om_term');
+  } else {
+    expect(d.refreshTurnCliIdentity).not.toHaveBeenCalled();
+  }
 }
 
 describe('handleIdentityDecisionFlip', () => {
@@ -100,6 +118,19 @@ describe('handleIdentityDecisionFlip', () => {
     // No success record: a genuinely new decision for a live turn still runs.
     expect(ds.lastIdentityDecisionRepublish).toBeUndefined();
   });
+
+  it('uses the PRODUCTION liveness function: a terminal-but-otherwise-live turn is not replayed (P3-b)', () =>
+    // The default deps() injects an equivalent vi.fn. Here the production
+    // identityDecisionTurnIsLive is wired in, so mutating the production
+    // terminal check (deleting terminalIdentityTurnIds) turns THIS case red —
+    // the flip layer must not rely solely on a mock copy of the gate.
+    // Fixture design: the turn passes EVERY production liveness condition
+    // (active session, live worker) EXCEPT membership in the terminal set.
+    // Removing the terminal check would then wrongly classify it as live.
+    testProductionLiveness(new Set(['om_term']), false));
+
+  it('uses the PRODUCTION liveness function: a genuinely live opening turn IS replayed (P3-b control)', () =>
+    testProductionLiveness(undefined, true));
 
   it('does not replay when the session is inactive or the worker is dead', async () => {
     const d1 = deps({ identityDecisionTurnIsLive: () => false });
@@ -162,5 +193,53 @@ describe('handleIdentityDecisionFlip', () => {
     ds.lastPublishedIdentityModel = 'single';
     await runHandler(ds, { model: 'proven', flipped: true, turnId: 'om_1' }, d);
     expect(d.refreshTurnCliIdentity).toHaveBeenCalledTimes(3);
+  });
+});
+
+// P3-a: the daemon registers onIdentityDecision as fire-and-forget but MUST
+// not let a rejected flip promise escape as unhandledRejection (the inner
+// try/catch only covers refreshTurnCliIdentity; a purge throw still rejects
+// handleIdentityDecisionFlip). Exercise the REAL registered callback text.
+function extractOnIdentityDecision(): (deps: any) => any {
+  let text: string | undefined;
+  function walk(node: ts.Node) {
+    // The callback is a shorthand method inside the worker-handlers object.
+    if (ts.isMethodDeclaration(node)
+      && node.name && ts.isIdentifier(node.name)
+      && node.name.text === 'onIdentityDecision') {
+      text = node.getText(source);
+    }
+    ts.forEachChild(node, walk);
+  }
+  walk(source);
+  if (!text) throw new Error('Missing onIdentityDecision callback');
+  // text: "onIdentityDecision(ds, context) { void ... .catch(...) }" → fn
+  const fnText = 'function ' + text;
+  return (injectedDeps: any) => {
+    const body = 'with (deps) { ' + fnText + '; return onIdentityDecision; }';
+    // eslint-disable-next-line @typescript-eslint/no-implied-eval
+    return new Function('deps', body)(injectedDeps);
+  };
+}
+
+describe('onIdentityDecision registration (P3-a)', () => {
+  it('captures a rejected flip (purge throws) via .catch and never throws itself', async () => {
+    const logger = { error: vi.fn(), warn: vi.fn() };
+    const flip = vi.fn(async () => { throw new Error('PURGE-BOOM'); });
+    const callback = extractOnIdentityDecision();
+    const ds = { session: { sessionId: 's' } };
+    // Synchronous return must be undefined and must not throw.
+    let unhandled: unknown;
+    const onUnhandled = (reason: unknown) => { unhandled = reason; };
+    process.once('unhandledRejection', onUnhandled);
+    expect(() => callback({ logger, handleIdentityDecisionFlip: flip })(
+      ds, { model: 'proven', flipped: true, turnId: 'om_1' },
+    )).not.toThrow();
+    // Give the rejected promise's microtask + .catch a tick.
+    await new Promise(r => setTimeout(r, 10));
+    process.removeListener('unhandledRejection', onUnhandled);
+    expect(unhandled).toBeUndefined();
+    expect(logger.error).toHaveBeenCalledOnce();
+    expect(String(logger.error.mock.calls[0])).toContain('PURGE-BOOM');
   });
 });
