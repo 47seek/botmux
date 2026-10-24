@@ -814,7 +814,7 @@ import {
 } from './active-identity-turns.js';
 import { clearAllSessionIdentities, collectProvenIdentityContents } from './cli-identity.js';
 import {
-  identityStorageModelForManagedSession,
+  identityBindingAllowsProven,
   type IdentityStorageModel,
 } from './lark-tool-binding.js';
 import { larkToolDelegationTurnIds } from './lark-tool-delegation.js';
@@ -1239,12 +1239,33 @@ export function findActiveBySessionId(sessionId: string): DaemonSession | undefi
   return undefined;
 }
 
-/** Identity storage model the daemon uses for a managed session. The worker
- *  renders the matching wrapper from the same inputs (see
- *  resolveIdentityStorageModel); a session never mixes the two. */
+/** Identity storage model the daemon publishes a managed session with.
+ *
+ * Single source of truth: the CURRENT worker generation's
+ * `session_identity_decision` report, computed from the actual spawn (env
+ * override, remote bypass, real bwrap/Seatbelt engagement, loopback sharing).
+ * The daemon deliberately does NOT re-derive sandbox/network facts from frozen
+ * config — that re-derivation is the split-brain this removes.
+ *
+ * Fail-closed defaults:
+ *  - no report yet (cold start, daemon restart before the worker re-reported):
+ *    'single'. A proven wrapper cannot exist before its decision was reported,
+ *    and the proven content route refuses non-proven sessions.
+ *  - a report structurally impossible on the daemon side (conflict): 'single',
+ *    and identityDecisionConflict() withholds publication on BOTH models. */
 export function identityStorageModelForDaemonSession(ds: DaemonSession): IdentityStorageModel {
+  const report = ds.reportedIdentityModel;
+  if (!report) return 'single';
+  if (identityDecisionConflict(ds)) return 'single';
+  return report.model;
+}
+
+/** Env-independent structural half the daemon can check against a report:
+ *  Linux + managed lark-tool binding on the frozen session shape. Sandbox and
+ *  loopback facts are NOT re-derived here (the worker owns those). */
+function provenStructurallyPossible(ds: DaemonSession): boolean {
   const bot = getBot(ds.larkAppId).config;
-  return identityStorageModelForManagedSession({
+  return identityBindingAllowsProven({
     platform: process.platform,
     sessionId: ds.session.sessionId,
     larkAppId: ds.larkAppId,
@@ -1253,18 +1274,54 @@ export function identityStorageModelForDaemonSession(ds: DaemonSession): Identit
     adoptMode: !!ds.session.adoptedFrom,
     existingAppServerEndpoint: ds.session.existingAppServerEndpoint,
     backendType: ds.session.backendType ?? bot.backendType ?? config.daemon.backendType,
-    // This model question is only reached for a governed tool under an enabled
-    // triggerUserAuth policy; bytedcli (and the Codebase companion) is managed
-    // regardless of the separate lark-cli app binding. The worker passes the
-    // same effective value (usesLarkToolBinding(..., {larkToolBinding: true})),
-    // so the two sides never disagree when larkToolBinding is explicitly off.
     larkToolBinding: true,
-    sandbox: ds.session.sandbox === true
-      || ds.session.sandbox === 'oncall'
-      || ds.session.sandbox === 'scratch',
-    sandboxNetwork: ds.session.sandboxNetwork,
-    sandboxNetworkPolicy: ds.session.sandboxNetworkPolicy,
   });
+}
+
+/** Non-undefined when the worker's reported identity decision cannot be
+ *  honored: either the report is for a session whose structure forbids proven
+ *  on the daemon side (binding disabled after a config change, adopt/remote/
+ *  apiOnly — the env-independent half the daemon CAN check), or the report's
+ *  shape is malformed. Publication is withheld and the proven route refuses
+ *  until a live worker reports again. */
+export function identityDecisionConflict(ds: DaemonSession): string | undefined {
+  const report = ds.reportedIdentityModel;
+  if (!report) return undefined;
+  if (report.conflict) return report.conflict;
+  if (report.model === 'proven' && !provenStructurallyPossible(ds)) {
+    return 'worker reported the proven identity model for a session that structurally cannot run proven';
+  }
+  return undefined;
+}
+
+/** Store a fresh worker identity decision. Called only from the private worker
+ *  IPC channel (already gated to the current worker generation). */
+export function recordWorkerIdentityDecision(
+  ds: DaemonSession,
+  worker: ChildProcess,
+  workerGeneration: number,
+  report: { model: IdentityStorageModel; sandboxEngaged: boolean; loopbackShared: boolean },
+): void {
+  let conflict: string | undefined;
+  if (report.model !== 'single' && report.model !== 'proven') {
+    conflict = `malformed identity model report: ${String(report.model)}`;
+  } else if (typeof report.sandboxEngaged !== 'boolean' || typeof report.loopbackShared !== 'boolean') {
+    conflict = 'malformed identity decision report: spawn facts are not booleans';
+  } else if (report.model === 'proven' && !provenStructurallyPossible(ds)) {
+    conflict = 'worker reported the proven identity model for a session that structurally cannot run proven';
+  }
+  if (conflict) {
+    logger.error(`[${ds.session.sessionId}] ${conflict}; withholding identity publication until a live worker reports again`);
+  }
+  ds.reportedIdentityModel = {
+    model: conflict ? 'single' : report.model,
+    sandboxEngaged: report.sandboxEngaged === true,
+    loopbackShared: report.loopbackShared === true,
+    workerPid: worker.pid ?? -1,
+    workerGeneration,
+    reportedAt: Date.now(),
+    ...(conflict ? { conflict } : {}),
+  };
 }
 
 /**
@@ -19067,6 +19124,23 @@ function setupWorkerHandlers(
           dispatchAttempt: msg.dispatchAttempt,
           workerGeneration,
           disposition: msg.disposition,
+        });
+        break;
+      }
+
+      case 'session_identity_decision': {
+        if (ds.worker !== worker) {
+          logger.warn(`[${t}] Ignored session_identity_decision from stale worker generation`);
+          break;
+        }
+        if (msg.sessionId !== ds.session.sessionId) {
+          logger.warn(`[${t}] Dropped session_identity_decision with mismatched sessionId`);
+          break;
+        }
+        recordWorkerIdentityDecision(ds, worker, workerGeneration, {
+          model: msg.model,
+          sandboxEngaged: msg.sandboxEngaged,
+          loopbackShared: msg.loopbackShared,
         });
         break;
       }

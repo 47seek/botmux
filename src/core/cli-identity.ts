@@ -900,15 +900,15 @@ export function ensureSessionIdentityStorage(
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   const current = readIdentityLayout(sessionDataDir, sessionId);
   if (current !== model) {
-    // An explicit switch wipes everything. A missing marker on a SINGLE init is
-    // the first worker spawn for a session whose identity the daemon may have
-    // already published into the root file during accept→fork: leave it in
-    // place. A missing marker on a PROVEN init still wipes — proven sessions
-    // must have no token file on disk, including leftovers from an older build.
-    if (current !== undefined || model === 'proven') {
-      resetIdentityArtifacts(sessionDataDir, sessionId);
-      mkdirSync(dir, { recursive: true, mode: 0o700 });
-    }
+    // Missing marker OR an explicit model switch wipes every identity artifact
+    // once. The missing-marker case matters after upgrades: older layouts left
+    // live tokens under turns/<sha>/*.env with no marker, and a single-model
+    // init used to leave them in place ("upgrade clears first" was only half
+    // honored). The worker renders the wrapper (and reports its spawn decision
+    // to the daemon, F3) before any turn is published, so the only cost of the
+    // wipe is the first turn's republication.
+    resetIdentityArtifacts(sessionDataDir, sessionId);
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
     atomicWriteFileSync(identityLayoutMarkerPath(sessionDataDir, sessionId), `${model}-v1\n`, { mode: 0o600 });
   }
   const paths = [

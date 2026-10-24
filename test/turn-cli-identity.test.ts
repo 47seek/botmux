@@ -504,7 +504,7 @@ describe('target daemon consumes signed message authority', () => {
     const code = ['triggerUserAuthEnabledFor', 'prepareTurnCliIdentity',
       'dispatchUserForTurn', 'targetUserForDelegation', 'delegatedScheduleRuntimeDeps',
       'delegatedScheduleCliIdentity', 'prepareScheduledTurnCliIdentity', 'prepareDelegatedScheduledTurnIdentity',
-      'refreshTurnCliIdentity'].map(name => {
+      'refreshTurnCliIdentity', 'identityPublicationConflicted'].map(name => {
       const fn = source.statements.find(n => ts.isFunctionDeclaration(n) && n.name?.text === name);
       if (!fn) throw new Error('Missing production handler');
       return ts.transpileModule(fn.getText(source), { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText;
@@ -532,8 +532,9 @@ describe('target daemon consumes signed message authority', () => {
         if (options.memberError) throw new Error('member list exceeds 2000 members');
         return options.member === false ? [] : ['ou_alice_target'];
       },
-      publishTurnCliIdentity, noteSenderUnionId, localeForBot: () => 'en', logger: { warn: vi.fn() },
+      publishTurnCliIdentity, noteSenderUnionId, localeForBot: () => 'en', logger: { warn: vi.fn(), error: vi.fn() },
       identityStorageModelForDaemonSession: () => 'proven',
+      identityDecisionConflict: () => undefined,
       parseScheduledTurnId: (turnId: string) => {
         const match = /^schedule:([0-9a-z_]{1,50}):[0-9a-f-]{36}$/.exec(turnId);
         return match?.[1] ?? null;
@@ -801,6 +802,19 @@ describe('target daemon consumes signed message authority', () => {
     await h.run(turnId);
     expect(identityBody('bytedcli', turnId))
       .toContain('scheduled-original-user');
+  });
+
+  it('withholds every identity publication while the worker decision conflicts', async () => {
+    const h = await targetHarness();
+    const publish = vi.fn();
+    h.scopeValues.publishTurnCliIdentity = publish;
+    h.scopeValues.identityDecisionConflict = () => 'structurally cannot run proven';
+    await h.run('om_kickoff');
+    expect(publish).not.toHaveBeenCalled();
+    // A live worker reporting again clears the conflict: publication resumes.
+    h.scopeValues.identityDecisionConflict = () => undefined;
+    await h.run('om_kickoff');
+    expect(publish).toHaveBeenCalledOnce();
   });
 });
 

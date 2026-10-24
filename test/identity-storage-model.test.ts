@@ -9,9 +9,9 @@
  *             clears the other's artifacts first.
  */
 import { beforeEach, afterEach, describe, expect, it } from 'vitest';
-import { mkdtempSync, rmSync, existsSync, readdirSync } from 'node:fs';
+import { mkdtempSync, rmSync, existsSync, readdirSync, mkdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
 import {
   ensureSessionIdentityStorage,
   writeSessionIdentity,
@@ -20,6 +20,7 @@ import {
   forgetProvenIdentityContent,
   collectProvenIdentityContents,
   sessionIdentityDataDir,
+  sessionIdentityPath,
   sessionIdentityBinDir,
   type CliIdentity,
 } from '../src/core/cli-identity.js';
@@ -61,30 +62,34 @@ afterEach(() => {
 describe('resolveIdentityStorageModel path matrix', () => {
   it('is proven for a Linux managed session with host-reachable loopback', () => {
     expect(resolveIdentityStorageModel({
-      platform: 'linux', binding: true, sandboxRequested: false,
+      platform: 'linux', binding: true, sandboxEngaged: false, loopbackShared: true,
     })).toBe('proven');
     expect(resolveIdentityStorageModel({
-      platform: 'linux', binding: true, sandboxRequested: true, sandboxNetwork: true,
+      platform: 'linux', binding: true, sandboxEngaged: true, loopbackShared: true,
     })).toBe('proven');
   });
 
   it('is single off Linux or without the managed binding', () => {
     expect(resolveIdentityStorageModel({
-      platform: 'darwin', binding: true, sandboxRequested: false,
+      platform: 'darwin', binding: true, sandboxEngaged: false, loopbackShared: true,
     })).toBe('single');
     expect(resolveIdentityStorageModel({
-      platform: 'linux', binding: false, sandboxRequested: false,
+      platform: 'linux', binding: false, sandboxEngaged: false, loopbackShared: true,
     })).toBe('single');
   });
 
-  it('is single whenever the sandbox cuts the daemon loopback', () => {
+  it('is single whenever a sandbox actually engaged cuts the daemon loopback', () => {
     expect(resolveIdentityStorageModel({
-      platform: 'linux', binding: true, sandboxRequested: true, sandboxNetwork: false,
+      platform: 'linux', binding: true, sandboxEngaged: true, loopbackShared: false,
     })).toBe('single');
+  });
+
+  it('never trusts the loopback flag without an engaged sandbox in the other direction', () => {
+    // Spawn facts are carried as a pair; the predicate only degrades to single
+    // on a REAL network cut (engaged + !shared), never on the config inputs.
     expect(resolveIdentityStorageModel({
-      platform: 'linux', binding: true, sandboxRequested: true, sandboxNetwork: true,
-      sandboxNetworkPolicy: { mode: 'slirp' },
-    })).toBe('single');
+      platform: 'linux', binding: true, sandboxEngaged: false, loopbackShared: false,
+    })).toBe('proven');
   });
 });
 
@@ -158,6 +163,35 @@ describe('the two models are mutually exclusive per session', () => {
     writeSessionIdentity(dir, SESSION, aliceBy('turn-A'), 'proven');
     ensureSessionIdentityStorage(dir, SESSION, ['bytedcli'], 'proven');
     expect(recallProvenIdentityContent(dir, SESSION, 'turn-A', 'bytedcli')).toContain('jwt-turn-A');
+  });
+
+  it('clears a markerless R3 turns/ snapshot on first init of EITHER model (F2)', () => {
+    const dataDir = sessionIdentityDataDir(dir, SESSION);
+    const plantStaleTurnSnapshot = () => {
+      rmSync(dataDir, { recursive: true, force: true });
+      mkdirSync(dataDir, { recursive: true, mode: 0o700 });
+      const stalePath = sessionIdentityPath(dir, SESSION, 'bytedcli', 'turn-from-old-layout');
+      mkdirSync(dirname(stalePath), { recursive: true, mode: 0o700 });
+      // Older layouts left live per-turn tokens under turns/<sha>/ with NO
+      // identity-layout marker on the directory.
+      writeFileSync(
+        stalePath,
+        "BYTEDCLI_USER_CLOUD_JWT='LEFTOVER-JWT'\n",
+        { mode: 0o600 },
+      );
+      expect(existsSync(join(dataDir, 'identity-layout'))).toBe(false);
+    };
+
+    // A first SINGLE init used to leave the live turn token in place; the
+    // documented "upgrade clears first" contract runs both directions now.
+    plantStaleTurnSnapshot();
+    ensureSessionIdentityStorage(dir, SESSION, ['bytedcli'], 'single');
+    expect(existsSync(join(dataDir, 'turns'))).toBe(false);
+
+    plantStaleTurnSnapshot();
+    ensureSessionIdentityStorage(dir, SESSION, ['bytedcli'], 'proven');
+    expect(existsSync(join(dataDir, 'turns'))).toBe(false);
+    expect(readdirSync(dataDir).some(name => name.endsWith('.env'))).toBe(false);
   });
 });
 

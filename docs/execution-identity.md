@@ -1,6 +1,6 @@
 # 任务执行与工具身份
 
-工具身份跟随正在执行的任务。身份只存在于两个互斥的模型之一，由会话启动条件冻结：受管证明通道可达时走 **proven**（身份内容只在 Daemon 内存、经进程证明通道下发），其余路径走 **single**（单快照文件、每轮覆盖或删除）。
+工具身份跟随正在执行的任务。身份只存在于两个互斥的模型之一，由 **worker 实际 spawn 的决策**（沙盒是否真正生效、daemon loopback 在该 spawn 内是否可达）唯一决定：受管证明通道可达时走 **proven**（身份内容只在 Daemon 内存、经进程证明通道下发），其余路径走 **single**（单快照文件、每轮覆盖或删除）。
 
 ## 两种身份模型与路径矩阵
 
@@ -16,7 +16,9 @@
 | 非 Lark 传输（apiOnly / headless / http_async） | 不挂 runner | 是 | 单快照文件 |
 | 非 Linux（macOS 等） | 不挂 runner | 是 | 单快照文件 |
 
-模型由 worker 渲染 wrapper 与 daemon 发布身份时用**同一个谓词**（`resolveIdentityStorageModel`：Linux + binding + 沙盒不切断 loopback）得出。会话目录的 `identity-layout` marker 记录当前模型；模型变化（配置/沙盒调整、升级）时先清空全部身份制品再初始化，两个模型绝不复用同一份目录。
+模型的唯一事实源是 **worker 实际 spawn 后的决策**：worker 用 `resolveLocalSandboxMode`（含 `BOTMUX_SANDBOX` 操作开关与 remote 后端豁免）解析出本次 spawn 的真实沙盒，用 `resolveSpawnNetworkShape` 得出「沙盒是否生效 / bwrap argv 是否带 `--unshare-net` / 主机 loopback 是否可达」，再经 `resolveIdentityStorageModel`（Linux + binding + 沙盒不切断 loopback）得出模型，渲染 wrapper 后立刻经私有 IPC（`session_identity_decision`）上报 daemon。daemon 只消费当前 worker 世代的上报值发布身份，**不再从冻结配置或自己的 `BOTMUX_SANDBOX` 环境二次推导**——配置与环境在沙盒事实上分叉时（如 worker 进程带了与 daemon 不同的开关），两侧各自选模型正是旧实现「工具恒 77 + 明文落盘」的根因。worker 未上报（冷启动 / daemon 重启后重报前）fail-closed 按 single 发布、proven 内容路由拒绝；上报 proven 但会话结构（adopt/remote/apiOnly/binding 关闭）不允许时，两个模型都拒发布直到活 worker 重新上报。环境开关 × 冻结配置的五格矩阵与真 bwrap 探针见 `test/identity-spawn-matrix.test.ts`。
+
+会话目录的 `identity-layout` marker 记录当前模型；**任何**模型初始化（含无 marker 的旧布局、模型切换）都先清空全部身份制品再初始化，两个模型绝不复用同一份目录。
 
 ## proven 模型（默认受管路径）
 

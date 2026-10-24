@@ -328,6 +328,24 @@ describe('worker turn-idle channel', () => {
     expect(harness.logs.join('')).toContain('Ignoring turn-idle report (missing-attempt)');
   }, 60_000);
 
+  it('reports the identity decision for the actual spawn before the CLI runs', async () => {
+    // F3: the daemon's publication model is the worker's report, not its own
+    // config derivation. The PTY spawn path must therefore emit the decision
+    // (with the real spawn facts) during init, before the first turn.
+    const harness = await startWorkerWaitingOnTurn();
+    const reports = harness.messages.filter(message => message.type === 'session_identity_decision');
+    expect(reports.length).toBeGreaterThan(0);
+    const report = reports.at(-1) as Extract<WorkerToDaemon, { type: 'session_identity_decision' }>;
+    expect(report.sessionId.startsWith('turnidle')).toBe(true);
+    expect(report.sandboxEngaged).toBe(false);
+    expect(report.loopbackShared).toBe(true);
+    expect(report.model).toBe(process.platform === 'linux' ? 'proven' : 'single');
+    // The decision lands before the first prompt_ready, so no turn can be
+    // published against an unreported model.
+    expect(harness.messages.findIndex(m => m.type === 'session_identity_decision'))
+      .toBeLessThan(harness.messages.findIndex(m => m.type === 'prompt_ready'));
+  }, 60_000);
+
   it('publishes the adopted disk turn with its original identity snapshot', async () => {
     const harness = await startWorkerWaitingOnTurn();
     const before = readyCount(harness);
@@ -370,23 +388,30 @@ describe('worker turn-idle channel', () => {
     });
   }, 60_000);
 
-  it('drops a malformed marker identityTurnId and falls back to the envelope turn', async () => {
+  // Each malformation gets its OWN fresh harness: a shared adopt loop only
+  // lets the first malformed value reach the marker shape guard — the later
+  // iterations replay through the in-memory queued record and skip the guard
+  // entirely, which is why weakening the predicate used to stay green.
+  it.each([
+    { label: 'number', malformed: 12345 },
+    { label: 'embedded newline', malformed: 'bad\nturn' },
+    { label: '257 chars', malformed: 'x'.repeat(257) },
+    { label: 'whitespace', malformed: 'bad turn' },
+  ])('drops a malformed marker identityTurnId ($label) and falls back to the envelope turn', async ({ malformed }) => {
     const harness = await startWorkerWaitingOnTurn();
     const before = readyCount(harness);
     const markersDir = join(harness.root, '.botmux-cli-pids');
     const markerName = readdirSync(markersDir).find(name => /^\d+$/.test(name));
     expect(markerName).toBeDefined();
     const markerPath = join(markersDir, markerName!);
-    for (const malformed of [12345, 'bad\nturn', 'x'.repeat(257), 'bad turn']) {
-      writeFileSync(markerPath, JSON.stringify({
-        ...JSON.parse(readFileSync(markerPath, 'utf-8')),
-        turnId: NEXT_TURN_ID,
-        identityTurnId: malformed,
-      }));
-      harness.child.send({ type: 'turn_idle', turnId: TURN_ID, seq: 1 } satisfies DaemonToWorker);
-      await waitFor(harness, () => readyCount(harness) > before, `worker to adopt (${String(malformed)})`);
-      expect(publishedIdentity(harness)).toMatchObject({ turnId: NEXT_TURN_ID, identityTurnId: NEXT_TURN_ID });
-    }
+    writeFileSync(markerPath, JSON.stringify({
+      ...JSON.parse(readFileSync(markerPath, 'utf-8')),
+      turnId: NEXT_TURN_ID,
+      identityTurnId: malformed,
+    }));
+    harness.child.send({ type: 'turn_idle', turnId: TURN_ID, seq: 1 } satisfies DaemonToWorker);
+    await waitFor(harness, () => readyCount(harness) > before, `worker to adopt (${String(malformed).slice(0, 12)})`);
+    expect(publishedIdentity(harness)).toMatchObject({ turnId: NEXT_TURN_ID, identityTurnId: NEXT_TURN_ID });
   }, 60_000);
 
   /**

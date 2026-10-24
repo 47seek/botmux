@@ -435,6 +435,7 @@ import {
   buildStreamingCardJson,
   isResumeRecoveryPlaceholder,
   identityStorageModelForDaemonSession,
+  identityDecisionConflict,
   collectSessionTurnGarbage,
 } from './core/worker-pool.js';
 import { resetPromptCacheKeepalive, runPromptCacheKeepaliveSweep } from './core/prompt-cache-keepalive.js';
@@ -4179,7 +4180,21 @@ function delegatedScheduleCliIdentity(
   };
 }
 
+/** F3 fail-closed: when the live worker's reported identity decision cannot
+ *  be honored (structurally impossible proven report), publish NOTHING on
+ *  either model rather than writing a snapshot the proven wrapper cannot read
+ *  or serving memory the single wrapper should never reach. */
+function identityPublicationConflicted(ds: DaemonSession): boolean {
+  const reason = identityDecisionConflict(ds);
+  if (reason) {
+    logger.error(`[trigger-user-auth] withholding turn identity for ${ds.session.sessionId}: ${reason}`);
+    return true;
+  }
+  return false;
+}
+
 async function prepareScheduledTurnCliIdentity(ds: DaemonSession, turnId: string): Promise<void> {
+  if (identityPublicationConflicted(ds)) return;
   if (await prepareDelegatedScheduledTurnIdentity(ds, turnId)) return;
   const taskId = parseScheduledTurnId(turnId);
   if (!taskId) throw new Error('invalid scheduled turn');
@@ -4223,6 +4238,7 @@ async function prepareDelegatedScheduledTurnIdentity(
   ds: DaemonSession,
   turnId: string,
 ): Promise<boolean> {
+  if (identityPublicationConflicted(ds)) return false;
   const taskId = parseScheduledTurnId(turnId);
   if (!taskId) return false;
   const authority = scheduleAuthorityStore?.getRecord(ds.larkAppId, taskId);
@@ -4250,6 +4266,7 @@ async function refreshTurnCliIdentity(ds: DaemonSession, turnId: string): Promis
   let botConfig;
   try { botConfig = getBot(ds.larkAppId).config; } catch { return; }
   if (!botConfig.triggerUserAuth?.enabled) return;
+  if (identityPublicationConflicted(ds)) return;
 
   const reply = pickTurnReplyTarget(ds.session, turnId);
   let delegatedIdentity: import('./core/turn-cli-identity.js').DelegatedCliIdentity | undefined;

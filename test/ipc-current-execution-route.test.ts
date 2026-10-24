@@ -17,9 +17,15 @@ afterEach(async () => {
   if (previousDataDir) { config.session.dataDir = previousDataDir; previousDataDir = ''; }
 });
 function session(): any {
-  return { session: { sessionId: 's-execution', status: 'active' },
+  return { session: { sessionId: 's-execution', status: 'active', backendType: 'pty' },
     larkAppId: 'cli_execution', chatId: 'oc_execution', workerGeneration: 7,
     worker: { pid: process.pid, killed: false },
+    // F3: the daemon's identity model comes from the worker's spawn report,
+    // never from a config re-derivation. The proven-content cases below rely
+    // on this report; the adopt case mutates the session into a shape where
+    // this report is structurally impossible (conflict → refused).
+    reportedIdentityModel: { model: 'proven', sandboxEngaged: false, loopbackShared: true,
+      workerPid: process.pid, workerGeneration: 7, reportedAt: 1 },
     localProcessAttestation: { backendType: 'pty', workerGeneration: 7,
       cliPid: process.pid, cliProcStart: readProcessStartIdentity(process.pid) },
     managedTurnOrigin: { capability: 'ca'.repeat(32), turnId: 'trigger-current', dispatchAttempt: 3,

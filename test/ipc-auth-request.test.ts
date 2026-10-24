@@ -21,10 +21,14 @@ let session: any;
 
 beforeEach(async () => {
   session = {
-    session: { sessionId: 'auth-session', status: 'active' },
+    session: { sessionId: 'auth-session', status: 'active', backendType: 'pty' },
     larkAppId: 'cli_test', chatId: 'oc_test',
-    worker: { killed: false }, workerGeneration: 4,
+    worker: { killed: false, pid: process.pid }, workerGeneration: 4,
     managedTurnOrigin: { capability: CAP, turnId: 'om_turn', callerOpenId: 'ou_sender' },
+    // F3: the worker spawn report is the daemon's only identity-model input.
+    reportedIdentityModel: { model: process.platform === 'linux' ? 'proven' : 'single',
+      sandboxEngaged: false, loopbackShared: true,
+      workerPid: process.pid, workerGeneration: 4, reportedAt: 1 },
   };
   vi.spyOn(workerPool, 'findActiveBySessionId').mockImplementation(id => id === 'auth-session' ? session : undefined);
   vi.spyOn(botRegistry, 'getBot').mockReturnValue({ config: { larkAppId: 'cli_test', larkAppSecret: 'test-secret', triggerUserAuth: { enabled: true, tools: ['lark-cli'], fallback: 'none' } } } as any);
@@ -321,6 +325,33 @@ describe('agent authorization', () => {
     expect(await (await post('auth-status', { requestId })).json()).toEqual({ ok: true, status: 'ready' });
   });
 
+  it('terminates the wait with 409 when the current turn material is gone for good', async () => {
+    // Branch 1: originating turn still live. A failed refresh means the
+    // material vanished (GC / never prepared / daemon restart) — polling until
+    // the deadline could never succeed, so the CLI must stop waiting.
+    requestId = (await (await post()).json()).requestId;
+    poll.mockResolvedValue({ status: 'ready', token: 'test-user-token' });
+    vi.mocked(cliIdentity.refreshSessionIdentity).mockReturnValue(false);
+    vi.mocked(cliIdentity.sessionIdentityMaterialPresent).mockReturnValue(false);
+    const response = await post('auth-status', { requestId });
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({ ok: false, error: 'auth_identity_snapshot_missing' });
+  });
+
+  it('terminates the wait with 409 when a rotated same-person turn has no material', async () => {
+    // Branch 2: the turn rotated to a same-principal follow-up while the human
+    // was authorizing; the live turn's material is missing, so neither a
+    // perpetual pending poll nor publication into a dead turn is acceptable.
+    requestId = (await (await post()).json()).requestId;
+    poll.mockResolvedValue({ status: 'ready', token: 'test-user-token' });
+    vi.mocked(cliIdentity.refreshSessionIdentity).mockReturnValue(false);
+    vi.mocked(cliIdentity.sessionIdentityMaterialPresent).mockReturnValue(false);
+    session.managedTurnOrigin = { capability: CAP, turnId: 'om_next', callerOpenId: 'ou_sender' };
+    const response = await post('auth-status', { requestId, originTurnId: 'om_next' });
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({ ok: false, error: 'auth_identity_snapshot_missing' });
+  });
+
   it('daemon-side polling completes the grant after the Agent turn ends without a wait call', async () => {
     requestId = (await (await post()).json()).requestId;
     // The originating turn is gone; the daemon keeps polling but must not
@@ -407,9 +438,12 @@ describe.skipIf(process.platform !== 'linux')('agent authorization over a manage
   function hostSession(): any {
     const start = readProcessStartIdentity(process.pid);
     return {
-      session: { sessionId: 'host-session', status: 'active' },
+      session: { sessionId: 'host-session', status: 'active', backendType: 'pty' },
       larkAppId: 'cli_test', chatId: 'oc_test',
       worker: { pid: process.pid, killed: false }, workerGeneration: 9,
+      // F3: identity model comes from the worker spawn report.
+      reportedIdentityModel: { model: 'proven', sandboxEngaged: false, loopbackShared: true,
+        workerPid: process.pid, workerGeneration: 9, reportedAt: 1 },
       localProcessAttestation: {
         backendType: 'pty', credentialIsolated: false,
         cliPid: process.pid, cliProcStart: start, workerGeneration: 9,
