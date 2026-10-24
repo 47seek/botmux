@@ -154,7 +154,10 @@ vi.mock('../src/services/groups-store.js', async (importOriginal) => ({
 }));
 
 vi.mock('../src/utils/logger.js', () => ({
-  logger: { info: vi.fn(), debug: vi.fn(), warn: vi.fn(), error: vi.fn() },
+  // isDebug 也要补：内置免@ 命令的车道确认复用 message-parser 的 parseEventMessage，
+  // 它在非 text 消息上会调 logger.isDebug()；缺了这个方法解析直接抛错被 fail-closed
+  // 吞掉，车道确认会恒为 false（见 /dash 套件里的 post 用例）。
+  logger: { info: vi.fn(), debug: vi.fn(), isDebug: vi.fn(() => false), warn: vi.fn(), error: vi.fn() },
 }));
 
 const mockRecordObservedBots = vi.fn();
@@ -13834,8 +13837,7 @@ describe('im.message.receive_v1 — /dash 内置免@ 控制命令', () => {
   it.each([
     { name: 'code_block', node: { tag: 'code_block', language: 'ts', text: 'const x = 1\n' } },
     { name: 'link', node: { tag: 'a', text: 'docs', href: 'http://x' } },
-    { name: 'img', node: { tag: 'img', image_key: 'img_2' } },
-  ])('单段 post（/dash + $name 节点）也不放行：富文本渲染与路由不同构', async ({ node }) => {
+  ])('单段 post（/dash + $name 节点）也不放行：daemon 车道渲染与路由窥视不同构', async ({ node }) => {
     const handlers = setup('topic');
     const postContent = JSON.stringify({
       zh_cn: { content: [[{ tag: 'text', text: '/dash' }, node]] },
@@ -13845,6 +13847,75 @@ describe('im.message.receive_v1 — /dash 内置免@ 控制命令', () => {
       content: postContent,
       messageId: `msg-dash-post-${node.tag}`,
       chatId: `chat-dash-post-${node.tag}`,
+      chatType: 'group',
+    });
+    (event.message as any).message_type = 'post';
+
+    await fire(event);
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it('单段 post（/dash 文本节点紧贴 at 节点、无空格）不放行：daemon 车道是 /dash@张三', async () => {
+    // 取代旧的「单段 + img」用例：图片节点在资源处理路径就被提前丢弃，那条用例
+    // 删不删守卫都绿、钉不住守卫；at 节点能走到群闸，而 daemon 把 at 渲染成不带
+    // 前导空格的 @name，车道变 /dash@张三，必须由车道确认腿拦下。
+    const handlers = setup('topic');
+    const postContent = JSON.stringify({
+      zh_cn: { content: [[{ tag: 'text', text: '/dash' }, { tag: 'at', user_id: 'ou_other_zhang', user_name: '张三' }]] },
+    });
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: postContent,
+      messageId: 'msg-dash-post-at-nospace',
+      chatId: 'chat-dash-post-at-nospace',
+      chatType: 'group',
+      mentions: [{ key: '@_user_1', name: '张三', id: { open_id: 'ou_other_zhang' } }],
+    });
+    (event.message as any).message_type = 'post';
+
+    await fire(event);
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it('带标题的单段 post（title + /dash）不放行：daemon 车道是 标题\\n/dash', async () => {
+    const handlers = setup('topic');
+    const postContent = JSON.stringify({
+      zh_cn: { title: '求链接', content: [[{ tag: 'text', text: '/dash' }]] },
+    });
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: postContent,
+      messageId: 'msg-dash-post-title',
+      chatId: 'chat-dash-post-title',
+      chatType: 'group',
+    });
+    (event.message as any).message_type = 'post';
+
+    await fire(event);
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it('前导 at 名字含空格、at 无可解析 user_id 且无结构化 mentions[] 时不放行：daemon 只能剥掉 @张，车道剩 三 /dash', async () => {
+    // 合成/开放 API 富文本：at 节点只有名字、没有可解析 user_id，飞书也没给结构化
+    // mentions[]。它既不触发显式 @ 本 bot 腿（messageMentionsBot 认不出），也不触发
+    // 让路礼仪（mentionsAnotherMember 跳过无 user_id 的 at），于是廉价窥视把它当成
+    // 裸 /dash 候选；daemon 渲染却是「@张 三 /dash」，剥前导 @ 的正则只剥得掉空格
+    // 前的 @张 —— 两侧不同结论，车道确认腿必须拦下。
+    const handlers = setup('topic');
+    const postContent = JSON.stringify({
+      zh_cn: { content: [[{ tag: 'at', user_name: '张 三' }, { tag: 'text', text: ' /dash' }]] },
+    });
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: postContent,
+      messageId: 'msg-dash-post-at-space-name',
+      chatId: 'chat-dash-post-at-space-name',
       chatType: 'group',
     });
     (event.message as any).message_type = 'post';
@@ -13867,6 +13938,28 @@ describe('im.message.receive_v1 — /dash 内置免@ 控制命令', () => {
       chatId: 'chat-dash-post-single',
       chatType: 'group',
       mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+    (event.message as any).message_type = 'post';
+
+    await fire(event);
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledOnce();
+  });
+
+  it('单段 post（/dash 带尾空格再接 at 节点）仍免 @ 寻址：daemon 车道 /dash @张三 仍是 /dash', async () => {
+    // 车道确认不能误杀合法形态：at 与命令之间有空格时，daemon 车道 /dash @张三 的
+    // 首 token 仍是 /dash（命令在前 @ 别人当参数，让路礼仪同款放行）。
+    const handlers = setup('topic');
+    const postContent = JSON.stringify({
+      zh_cn: { content: [[{ tag: 'text', text: '/dash ' }, { tag: 'at', user_id: 'ou_other_zhang', user_name: '张三' }]] },
+    });
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: postContent,
+      messageId: 'msg-dash-post-at-trailing-space',
+      chatId: 'chat-dash-post-at-trailing-space',
+      chatType: 'group',
+      mentions: [{ key: '@_user_1', name: '张三', id: { open_id: 'ou_other_zhang' } }],
     });
     (event.message as any).message_type = 'post';
 

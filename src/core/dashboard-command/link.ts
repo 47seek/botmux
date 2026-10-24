@@ -11,9 +11,15 @@
  *
  * 链接每次现读：端口取 dashboard 实际绑定后落盘的 `~/.botmux/.dashboard-port`
  * （EADDRINUSE 探测可能落在配置端口之外），token 取当前 `~/.botmux/.dashboard-token`
- * （轮换写文件后这里立刻读到新值），host 走 {@link getDashboardExternalHost}：
- * BOTMUX_DASHBOARD_EXTERNAL_HOST 优先，其次非通配监听地址，最后局域网 IP；仅监听
- * loopback 时链接照旧给出但附带本机可达提示，不伪造公网地址。
+ * （轮换写文件后这里立刻读到新值）。
+ *
+ * 链接基址**只**由 dashboard 家族唯一事实源 {@link buildDashboardUrls} 给出，本文件
+ * 不自己拼 host/协议：远程访问开启且绑定中心平台时主链接翻成平台机子域（平台注入
+ * 身份，`?t=` 在该链路上无效，按 {@link reportDashboardUrls} 摘掉）；配了
+ * `BOTMUX_PUBLIC_URL` 反代时主链接走反代基址（无人注入身份，token 保留）；两者都没
+ * 有时才是本地 `http://<host>:<port>`。host 走 {@link getDashboardExternalHost}：
+ * BOTMUX_DASHBOARD_EXTERNAL_HOST 优先，其次非通配监听地址，最后局域网 IP；主链接是
+ * loopback 本机形态时照旧给出但附带本机可达提示，不伪造公网地址。
  */
 import { existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
@@ -29,21 +35,36 @@ import {
 import { cardHeaderTemplateFirst, larkMdDiv, wideCard } from '../../im/lark/card-primitives.js';
 import type { LarkMessage } from '../../types.js';
 import { loadPersistedToken } from '../../dashboard/auth.js';
-import { formatUrlHost } from '../dashboard-url.js';
+import { buildDashboardUrls, reportDashboardUrls, type DashboardUrls } from '../dashboard-url.js';
 import { logger } from '../../utils/logger.js';
 
 export interface DashboardAdminLink {
-  /** 管理首页完整链接：`http://<host>:<port>/?t=<token>#/`。 */
+  /** 管理首页完整链接；平台托管时不含 `?t=`（见 {@link platformHosted}）。 */
   url: string;
   host: string;
   port: number;
-  /** host 是 loopback 时为 true —— 链接只能在运行 Dashboard 的机器本机打开。 */
+  /** 主链接是 loopback 本机形态时为 true —— 只能在运行 Dashboard 的机器本机打开。 */
   loopbackOnly: boolean;
+  /**
+   * 主链接走中心平台机子域：平台在边缘注入身份，链接里的 `?t=` 无效且不应进入聊天
+   * 记录，因此 url 已摘掉 token。false 时（本地直连 / `BOTMUX_PUBLIC_URL` 反代）url
+   * 仍带 token——反代不注入身份，token 是唯一凭证。
+   */
+  platformHosted: boolean;
 }
 
 export type ResolveDashboardLinkResult =
   | { ok: true; link: DashboardAdminLink }
-  | { ok: false; reason: 'token_unavailable' };
+  | { ok: false; reason: 'token_unavailable' | 'url_unavailable' };
+
+/** resolveDashboardAdminLink 的测试注入缝；生产路径省略后走文件 / 配置默认值。 */
+export interface DashboardLinkResolveSeams {
+  host?: string;
+  readPortFile?: () => string | null;
+  readTokenFile?: () => string | null;
+  /** 覆盖 dashboard 链接事实源（测试用来造平台托管 / 反代形态）。 */
+  buildUrls?: (opts: { host: string; port: number; token: string }) => DashboardUrls;
+}
 
 /** 测试注入缝；生产路径省略后走文件 / 配置默认值。 */
 export interface DashboardLinkSeams {
@@ -67,7 +88,7 @@ export function maskDashboardToken(token: string | null | undefined): string {
 function maskTokenInUrl(url: string): string {
   try {
     const u = new URL(url);
-    u.searchParams.set('t', maskDashboardToken(u.searchParams.get('t')));
+    if (u.searchParams.has('t')) u.searchParams.set('t', maskDashboardToken(u.searchParams.get('t')));
     return u.toString();
   } catch {
     return '(unparseable-url)';
@@ -78,11 +99,7 @@ function maskTokenInUrl(url: string): string {
  * 现读当前 Dashboard 管理首页信息。端口 / token 都不缓存：dashboard 探测换端口、
  * `botmux dashboard rotate` 换 token 后，下一次调用立刻反映。
  */
-export function resolveDashboardAdminLink(seams: {
-  host?: string;
-  readPortFile?: () => string | null;
-  readTokenFile?: () => string | null;
-} = {}): ResolveDashboardLinkResult {
+export function resolveDashboardAdminLink(seams: DashboardLinkResolveSeams = {}): ResolveDashboardLinkResult {
   const botmuxDir = join(homedir(), '.botmux');
   const readPortFile = seams.readPortFile ?? (() => {
     try {
@@ -105,8 +122,28 @@ export function resolveDashboardAdminLink(seams: {
 
   const port = Number(readPortFile()) || config.dashboard.port;
   const host = seams.host ?? getDashboardExternalHost();
-  const url = `http://${formatUrlHost(host)}:${port}/?t=${encodeURIComponent(token)}#/`;
-  return { ok: true, link: { url, host, port, loopbackOnly: isLoopbackHost(host) } };
+  // 链接基址必须走 buildDashboardUrls：平台托管 / 自建反代场景下自己拼 LAN:port
+  // 会给出远程根本打不开的链接（手机点飞书消息是本命令核心场景）。
+  const urls = (seams.buildUrls ?? buildDashboardUrls)({ host, port, token });
+  // 平台托管摘 token（身份由平台注入）；反代/本地形态原样保留。
+  const reported = reportDashboardUrls(urls);
+  let primary: URL;
+  try {
+    primary = new URL(reported.url);
+  } catch {
+    return { ok: false, reason: 'url_unavailable' };
+  }
+  primary.hash = '/'; // 管理首页，不是 workbench 等子路由。
+  return {
+    ok: true,
+    link: {
+      url: primary.toString(),
+      host,
+      port,
+      loopbackOnly: !urls.platformHosted && isLoopbackHost(primary.hostname),
+      platformHosted: urls.platformHosted,
+    },
+  };
 }
 
 export type DashboardLinkChannel = 'p2p' | 'ephemeral' | 'dm' | 'failed' | 'unavailable';

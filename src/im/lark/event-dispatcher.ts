@@ -22,7 +22,7 @@ import { commandSpec, isBuiltinMentionlessInvocation } from '../../core/command-
 import { isTopicHeader, parseTopicHeader } from '../../core/topic-header.js';
 import { commandTriggerArgs, matchCommandTrigger, type CommandTriggerMatch } from '../../services/command-trigger.js';
 import { shouldAutoStartOnNewTopic } from '../../core/auto-start.js';
-import { stripBotMentions, stripLeadingMentions, mentionOpenId, mentionAppId, extractMentionIdentities, messageMentionsBot, resolveNonsupportMessage, type MentionIdentity } from './message-parser.js';
+import { stripBotMentions, stripLeadingMentions, mentionOpenId, mentionAppId, extractMentionIdentities, messageMentionsBot, resolveNonsupportMessage, daemonCommandLanePreview, type MentionIdentity } from './message-parser.js';
 import { emitHookEvent, runGroupJoinCommand } from '../../services/hook-runner.js';
 import { commandPrecedesMentions, isCommandTargetOnly } from './mention-targets.js';
 import { recordObservedBots, listObservedBots } from '../../services/observed-bots-store.js';
@@ -3664,32 +3664,25 @@ export function extractMessageTextForRouting(message: any): string | null {
 }
 
 /**
- * 入站消息是否为「单行命令同构」形态：dispatcher 路由文本与 daemon 命令车道文本
- * 会逐字一致（剥 @ 后）。
+ * 内置免 @ 控制命令的**车道确认**：dispatcher 的轻量路由窥视已把消息认成候选后，
+ * 用 daemon 命令车道的**同一套渲染**（{@link daemonCommandLanePreview}）重算一遍，
+ * 剥前导 @ 后再走同一个 `parseSlashCommandInvocation` +
+ * {@link isBuiltinMentionlessInvocation}；只有两侧解析出**同一条**内置命令才放行。
  *
- * - `text` 消息：一致。
- * - `post` 富文本：仅当**恰好一个段落**且节点只含 text / at 时一致 ——
- *   多段落会被 daemon 按 `\n` 拼接；img/file/media 渲染成 `[图片 N]`/`[文件]`，
- *   超链接 `a` 会补成 `text(href)`，`code_block` 会展开成多行围栏代码块，
- *   而路由侧只拼 text 节点、把这些全部丢掉或改写成不同文本，二者不再相同。
- *
- * 用来约束内置免 @ 控制命令：只在两侧解析器必然得到同一结论时才放行，避免
- * 「/dash + 图片/链接/代码块」这类富文本在群闸被当命令放行、daemon 却判为普通
- * 正文去建会话/worktree。节点黑名单必须与 message-parser 的 renderPostNode
- * 分支一一对应，新增富文本节点类型时这里也要评估。
+ * 不能只比对路由文本：那个窥视对 post 只拼 text 节点、丢标题、丢附件节点，与 daemon
+ * 的 `parseEventMessage` 渲染（标题拼成首行、段落以 `\n` 连、`at`→`@name` 不带空格、
+ * `a`→`text(href)`、`code_block`→多行围栏、`img`→`[图片 N]`）在多种形态上不一致。
+ * 实测会被这里拦下的形态：带标题富文本（车道 `标题\n/dash`）、text 与 at 节点紧贴
+ *（车道 `/dash@张三`）、at 名含空格且无 mentions[]（车道 `@张 三 /dash`）、多段图片、
+ * 单段超链接/代码块。解析失败按不一致处理（fail-closed，不放行免 @）。
  */
-function isSingleLineCommandShape(message: any): boolean {
-  const msgType = message?.message_type;
-  if (msgType !== 'post') return true;
+function builtinMentionlessConfirmedByDaemonLane(data: any, routingCmd: string | undefined): boolean {
+  if (!routingCmd) return false;
   try {
-    const parsed = JSON.parse(message?.content ?? '{}');
-    const inner = parsed?.zh_cn ?? parsed?.en_us ?? parsed;
-    const paragraphs = inner?.content;
-    if (!Array.isArray(paragraphs) || paragraphs.length !== 1) return false;
-    const nodes = Array.isArray(paragraphs[0]) ? paragraphs[0] : [];
-    // 与 renderPostNode 中会产生额外文本/多行的节点保持同步：text、at 之外
-    // 全部判为非同构。
-    return nodes.every((node: any) => node?.tag === 'text' || node?.tag === 'at');
+    const { text, mentions } = daemonCommandLanePreview(data);
+    const lane = stripLeadingMentions(text.trim(), mentions).trim();
+    const laneCmd = parseSlashCommandInvocation(lane)?.cmd;
+    return laneCmd === routingCmd && isBuiltinMentionlessInvocation(laneCmd, lane);
   } catch {
     return false;
   }
@@ -5775,17 +5768,17 @@ export function createLarkEventDispatcherRuntime(
         // 拒绝。@ 别的成员的让路礼仪与 commandTriggers 同款（命令在前的 @参数
         // 不算让路）。
         //
-        // 关键：dispatcher 用来取首 token 的 routingText 对富文本 post 只拼各段
-        // text 节点（img/file 节点丢弃、段落间无换行），而 daemon 命令车道会把
-        // 图片渲染成 `[图片 N]`、按段落 join 成多行。多段 post「/dash + 图片」在
-        // routingText 下像单行 `/dash`，daemon 的 parseSlashCommandInvocation 却会
-        // 因第二行非空且 /dash 非多行命令而判 discussion，消息落回建会话路径并可能
-        // 触发 auto-worktree。因此只在「单行同构」（text 消息，或 post 仅一段且无
-        // img/file/media 节点）时放行 —— 该形态下两侧解析逐字一致。
+        // 关键：dispatcher 用来取首 token 的 routingText 是热路径轻量窥视——对
+        // post 只拼 text 节点（丢标题、img/file 节点丢弃、段落间无换行），与 daemon
+        // 命令车道的 parseEventMessage 渲染并不逐字相同。因此先用它做廉价候选过滤，
+        // 再用 daemon 车道同一套渲染（daemonCommandLanePreview）重算一次：标题成
+        // 首行、text 紧贴 at 变 `/dash@张三`、图片成 `[图片 N]` 多段等形态下，车道
+        // 解析不出同一条内置命令，群闸就不放行，杜绝「放行后 daemon 落建会话/
+        // auto-worktree」。
         const builtinMentionlessCommand = isAllowed
           && (!mentionsOther || commandLeadsMessage)
-          && isSingleLineCommandShape(message)
           && isBuiltinMentionlessInvocation(triggeredCommand, strippedRoutingText)
+          && builtinMentionlessConfirmedByDaemonLane(data, triggeredCommand)
           ? triggeredCommand
           : undefined;
         // replyRootId means this turn has already been explicitly addressed

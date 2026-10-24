@@ -14,6 +14,7 @@ const LINK = Object.freeze({
   host: '10.20.30.40',
   port: 7900,
   loopbackOnly: false,
+  platformHosted: false,
 });
 
 function makeMessage(over: Partial<LarkMessage> = {}): LarkMessage {
