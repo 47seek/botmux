@@ -69,7 +69,7 @@ import { buildClosedSessionCard } from './closed-session-card.js';
 import { cardMessageTitle, staleWorkingCardIds, streamingCardTitleClaimsWork } from './restored-card-status.js';
 import { codexServiceTierBadge, isCodexServiceTierCliId, type CodexServiceTier } from '../services/codex-service-tier.js';
 import { isFableModelId, normalizeClaudeModelId } from '../services/claude-transcript.js';
-import { knownTraexReasoningEffortsForModel, cliModelSupportsReasoningEffort, isBackendVariantCliId, isConfigurableReasoningCliId, reasoningEffortsForCliModel } from '../services/codex-reasoning-effort.js';
+import { cliModelSupportsReasoningEffort, isBackendVariantCliId, isConfigurableReasoningCliId, reasoningEffortsForCliModel } from '../services/codex-reasoning-effort.js';
 import { RPC_CAPABLE_CLIS } from '../codex-rpc-lifecycle.js';
 import { resolveCodexRpcInput } from '../services/codex-rpc-input-policy.js';
 import { loadFrozenCards, saveFrozenCards } from '../services/frozen-card-store.js';
@@ -169,6 +169,7 @@ import { freezeMojoIdentityForSession } from './mojo-session-identity.js';
 import { getBot, getAllBots, getBotBrand, getOwnerOpenId, loadBotConfigs, resolveBrandLabel, getLoadedConfigPath, getLoadedConfigProvenance, resolveUsageDisplay } from '../bot-registry.js';
 import { resolveHiddenStreamingCardButtons } from '../im/lark/streaming-card-buttons.js';
 import { isLarkContentAuditError, larkErrorCode } from '../im/lark/content-audit.js';
+import { LARK_CODE_CARD_CONTENT_REJECTED, LARK_CODE_MESSAGE_CONTENT_TOO_LONG } from '../im/lark/lark-errors.js';
 import { resolvePricingConfig, type ResolvedModelPricing } from '../services/model-pricing.js';
 import type { BotConfig } from '../bot-registry.js';
 import { RestartCoordinator, type RestartObserver, type RestartSource } from './restart-coordinator.js';
@@ -672,6 +673,7 @@ import {
 } from './session-preview-registry.js';
 import { composeRowFromActive } from './dashboard-rows.js';
 import { publishAttentionPatch, publishClosedSessionPatch } from './session-activity.js';
+import { isOrdinaryImTurnId } from './ordinary-im-turn.js';
 import { isSerialGroupInput, trustedSessionController } from './trusted-session-controller.js';
 import {
   attachOrdinaryTurnRecovery,
@@ -830,6 +832,7 @@ import {
   replaceManagedOriginCapabilityFile,
 } from './managed-origin-capability.js';
 import { truncateUtf16WellFormed } from '../utils/unicode.js';
+import { recentCliUpgrade } from './cli-version-history.js';
 
 type WorkerStartupState = {
   ready: boolean;
@@ -1103,6 +1106,15 @@ export interface WorkerPoolCallbacks {
       activeController?: TrustedCaller;
     },
   ) => boolean | Promise<boolean>;
+  /** A decision-board batch turn (`board:<app>:<batchId>`) never got a
+   * confirmed worker receipt (watchdog expiry or authoritative rejection).
+   * The pool does NOT post its usual group failure card for these turns:
+   * the owner is on the dashboard, where the batch row carries the failure
+   * and the re-deliver action. The daemon marks the batch failed here. */
+  onBoardTurnDeliveryFailed?: (
+    ds: DaemonSession,
+    context: { turnId: string; reason: string; messageKey: string },
+  ) => void;
   /** A hidden fresh-topic schedule can be reclaimed once its exact turn is
    * settled. Transcript-backed CLIs report `terminal`; screen-only/remote
    * adapters use the existing debounced idle edge as a compatibility fallback. */
@@ -3029,8 +3041,9 @@ function sessionAgentConfig(
   recordLaunchModel(ds, model);
   // Effort is frozen per session, but whether it is *supported* depends on the
   // model this spawn actually uses — which is resolved live above, not frozen.
+  // TraeX efforts are syntax-checked at load time; its live catalog owns capability.
   if (ds.session.reasoningEffort && !modelChoice.traexAutoModel
-      && !(ds.session.cliId === 'traex' && knownTraexReasoningEffortsForModel(model ?? '') === undefined)
+      && ds.session.cliId !== 'traex'
       && !cliModelSupportsReasoningEffort(ds.session.cliId, model, ds.session.reasoningEffort)) {
     ds.session.reasoningEffort = undefined;
     sessionStore.updateSession(ds.session);
@@ -10724,6 +10737,25 @@ function failOrdinaryImDelivery(
     );
     return;
   }
+  // 决策看板批次（board:<app>:<batchId>）是 owner 在看板前触发的后台投递，不是群里
+  // 等来的真人消息：失败不往管家群贴卡片（owner 看不到，横幅还会造成困惑），交给
+  // daemon 的回调把批次退回 failed——Dashboard 批次行显示原因并用同一稳定 turnId 重投。
+  if (record.turnId.startsWith('board:')) {
+    try {
+      const handled = requireCallbacks().onBoardTurnDeliveryFailed?.(
+        record.ds,
+        { turnId: record.turnId, reason, messageKey },
+      );
+      void Promise.resolve(handled).catch(err => logger.error(
+        `[${tag(record.ds)}] board delivery failure callback errored: ${err instanceof Error ? err.message : String(err)}`,
+      ));
+    } catch (err) {
+      logger.error(
+        `[${tag(record.ds)}] board delivery failure callback threw: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+    return;
+  }
   // Plan B: a meeting agent is an ordinary chat-scope session. This tracker only
   // ever holds ORDINARY IM turns (durable transcript deliveries use the receipt
   // path, not this map), so a plain user turn's delivery failure must be reported
@@ -10887,12 +10919,18 @@ function sendOrdinaryImDeliveryTracked(
   return sendOrdinaryImDeliveryAttempt(record);
 }
 
+/**
+ * 哪些回合走「ordinary turn 投递协议」：daemon 侧 begin/complete 投递追踪（收据
+ * ACK + 同代重试 + 终态失败上报），worker 侧收到/提交内存去重，冷启动 preload 补
+ * 收据。前缀族只有 isOrdinaryImTurnId 这一处定义：真人 om_ 消息、bmx-recovery-
+ * 恢复回合、board: 决策看板批次（id 按批次稳定）。名字保留 "Im" 是因为整套协议
+ * 是按「owner 的一条普通消息」建模的——看板批次在 daemon 里也正是这种身份。
+ */
 function shouldTrackOrdinaryImDelivery(
   ds: DaemonSession,
   message: Extract<DaemonToWorker, { type: 'message' | 'init' }>,
 ): boolean {
-  return !!message.turnId
-    && (message.turnId.startsWith('om_') || message.turnId.startsWith('bmx-recovery-'))
+  return isOrdinaryImTurnId(message.turnId)
     && message.dispatchAttempt === undefined
     && (message.type !== 'init' || (!!message.prompt && !message.adoptMode))
     && !isSharedAdoptSession(ds)
@@ -14861,6 +14899,12 @@ export function forkWorker(
     cliRuntime: agentCfg.cliRuntime,
     cliPathOverride: agentCfg.cliPathOverride,
     cliConfigDir: agentCfg.cliConfigDir,
+    // Lets a startup-stall notice say "just upgraded to x.y.z".
+    cliUpgrade: recentCliUpgrade(runtimeInstallationKey({
+      cliId: agentCfg.cliId,
+      cliRuntime: agentCfg.cliRuntime,
+      cliPathOverride: agentCfg.cliPathOverride,
+    })),
     wrapperCli: agentCfg.wrapperCli,
     cliLaunchMode: agentCfg.cliLaunchMode,
     launchShell: agentCfg.launchShell,
@@ -18658,7 +18702,7 @@ function setupWorkerHandlers(
           );
         }
         let nonLarkFailureHandled = false;
-        if ((isClaudeProviderFailure || msg.status === 'failed' || msg.status === 'ambiguous')
+        if ((isClaudeProviderFailure || msg.status === 'failed' || msg.status === 'ambiguous' || msg.status === 'cancelled')
           && !ds.session.vcMeetingReceiver) {
           const failureCode = msg.errorCode ?? msg.status;
           const waitPromise = ds.pendingWaitPromises?.get(msg.turnId);
@@ -18692,15 +18736,29 @@ function setupWorkerHandlers(
                 `[${t}] Ignored failed terminal for completed async HTTP turn `
                 + msg.turnId.substring(0, 8),
               );
-            } else {
-              if (asyncResult?.status === 'pending') {
-                asyncResult.status = 'failed';
-                asyncResult.failedAt = failedAt;
-                asyncResult.errorCode = 'trigger_failed';
-                asyncResult.terminalErrorCode = failureCode;
+            } else if (msg.status !== 'cancelled'
+              || asyncResult?.status === 'pending' || asyncResult?.status === 'failed') {
+              // MiniMax's bare cancellation interrupts a pending trigger only.
+              // remote-runner sends turnFailed first: retain that failure and
+              // upgrade its generic code with this terminal's provider code.
+              // Use the same snapshot for memory and disk; a virtual/headless
+              // sink alone must not create a cancelled trigger out of nothing.
+              const interrupted = msg.status === 'cancelled' && asyncResult?.status === 'pending';
+              if (asyncResult?.status === 'pending' || asyncResult?.status === 'failed') {
+                if (interrupted) {
+                  asyncResult.status = 'interrupted';
+                  asyncResult.interruptedAt = failedAt;
+                } else {
+                  asyncResult.status = 'failed';
+                  asyncResult.failedAt = failedAt;
+                  asyncResult.errorCode = 'trigger_failed';
+                  asyncResult.terminalErrorCode = failureCode;
+                }
               }
               try {
-                const outcome = asyncTriggerStore.recordTerminalFailureStrict(
+                const outcome = interrupted
+                  ? asyncTriggerStore.recordInterruptedStrict(ds.session.sessionId, msg.turnId, failedAt, ds.larkAppId)
+                  : asyncTriggerStore.recordTerminalFailureStrict(
                   ds.session.sessionId,
                   msg.turnId,
                   failedAt,
@@ -18725,7 +18783,7 @@ function setupWorkerHandlers(
               ds.idempotentAsyncTurns?.delete(msg.turnId);
               logger.info(
                 `[${t}] Settled async HTTP turn ${msg.turnId.substring(0, 8)} `
-                + `failed (${failureCode})`,
+                + `${interrupted ? 'interrupted' : 'failed'} (${failureCode})`,
               );
             }
           }
@@ -20737,7 +20795,7 @@ function deliverFinalOutput(
     ).target) };
   }
   const cb = requireCallbacks();
-  const effectiveCliId = ds.session.cliId ?? getBot(ds.larkAppId).config.cliId;
+  const effectiveCliId = sessionCliId(ds, getBot(ds.larkAppId).config);
   const groupContextAuthorOrigin = !msg.turnFailed && (!msg.kind || msg.kind === 'bridge')
     ? readGroupContextAuthorOrigin({
         appId: ds.larkAppId, chatId: ds.chatId, sessionId: ds.session.sessionId, turnId: msg.turnId,
@@ -21094,6 +21152,18 @@ function deliverFinalOutput(
             presentation: renderSnapshot,
             ...(replyCardActionBinding ? { cardActions: replyCardActionBinding } : {}),
           });
+      if (effectiveCliId === 'minimax' && msg.turnFailed
+          && ['turn_budget_exhausted', 'execution_failed'].includes(msg.turnFailureCode ?? '')) {
+        // MiniMax uses the legacy reply-card path. Keep the machine-readable
+        // reason visible on that actual carrier, even when the native message
+        // is generic; the ordered terminal independently owns settlement.
+        // This bounded, allowlisted code row fits within fitBuiltCard's
+        // CARD_LATE_CHROME_RESERVE_BYTES (2000) for late card chrome.
+        const failedCard = JSON.parse(cardJson);
+        failedCard.body.elements.unshift({ tag: 'markdown', element_id: 'botmux_turn_error',
+          content: tr('card.turn_failed.field_error', { errorCode: `\`${msg.turnFailureCode}\`` }, localeForBot(ds.larkAppId)) });
+        cardJson = JSON.stringify(failedCard);
+      }
       if (!managedReceiver) {
         cardJson = attachOncallGroupButton(cardJson, getBot(ds.larkAppId).config.oncallGroup, ds.chatId, ds.chatType);
       }
@@ -21387,8 +21457,14 @@ function deliverFinalOutput(
         onComplete?.(true);
         return;
       }
+      // 230099: card content rejected (the image downgrade above already ran).
+      // 230025: the reply is over Feishu's message length cap, so the same
+      // payload can never be delivered — a long transcript final (Antigravity
+      // reads its untruncated log) reaches it, and retrying only ends in a
+      // silent give-up with nothing in the chat.
+      const rejectedCode = larkErrorCode(err);
       const cardRejected = !managedReceiver && !resolveDocCommentTarget(ds, msg.turnId)
-        && larkErrorCode(err) === 230099;
+        && (rejectedCode === LARK_CODE_CARD_CONTENT_REJECTED || rejectedCode === LARK_CODE_MESSAGE_CONTENT_TOO_LONG);
       if (isLarkContentAuditError(err) || cardRejected) {
         const deliveredParts = partialResultMessages();
         const permanentReason = cardRejected ? 'card_content_rejected' : 'content_audit_blocked';

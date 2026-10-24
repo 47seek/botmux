@@ -1392,6 +1392,7 @@ export const messages: Record<string, string> = {
   'worker.ordinary_recovery_non_retryable': '⚠️ {cliName} 本轮执行失败，且当前错误不能安全自动续跑。为避免重复外部操作，Botmux 已停止自动处理；请检查 Web 终端和模型服务状态后，再发送一条消息继续。',
   'worker.claude_terminal_failure_unrecovered': '⚠️ Claude 本轮因模型服务错误中断（{errorCode}），当前投递通道未启动自动续跑。请检查 Web 终端后重试，或发送一条消息继续。',
   'worker.local_turn_failed': '⚠️ {cliName} 执行失败（{errorCode}）。失败的这一轮没有对应的飞书消息（例如在终端里直接输入的内容，或接续上一轮的输出），所以不会自动重试。请检查 Web 终端，需要时重新发送。',
+  'worker.claude_stop_failure_unsettled': '⚠️ {cliName} 因 API 错误中断了这一轮（{errorCode}），但 botmux 没能把这次中断对应到正在跟踪的回合，所以不会自动续跑，任务可能停在中途。请检查 Web 终端，需要时回复「继续」。',
 
   // ─── Turn-failure card (通用失败卡：@人 + 重试按钮) ────────────────────────
   'card.turn_failed.title': '⚠️ {cliName} 本轮执行失败',
@@ -1952,9 +1953,12 @@ export const messages: Record<string, string> = {
 
   // Markdown / contextual reply card chrome
   'card.you': '你',
-  'card.waiting_duration': '等待 {seconds} 秒',
-  'card.execution_until_reply': '执行至回复 {seconds} 秒',
-  'card.execution_duration': '执行耗时 {seconds} 秒',
+  'card.waiting_duration': '等待 {duration}',
+  'card.execution_until_reply': '执行至回复 {duration}',
+  'card.execution_duration': '执行耗时 {duration}',
+  'card.duration_seconds': '{seconds} 秒',
+  'card.duration_minutes': '{minutes} 分',
+  'card.duration_hours': '{hours} 小时',
   'card.sent_to': '发送给：',
   'card.usage.context': '上下文',
   // Claude Code statusline 配额段（纯文本 `ctx 23% · 5h 18% · 7d 5%`），两语言同值。
@@ -1975,6 +1979,7 @@ export const messages: Record<string, string> = {
   'card.codex_app_shared_turn': '🖥️ Codex App 共享对话（已同步至飞书）',
 
   // Scheduler announcements
+  'decisionBoard.batch_banner': '📥 决策看板：收到 {count} 项决定（批次 #{id}），管家开始处理',
   'scheduler.task_started': '🕐 定时任务「{name}」开始执行',
   'scheduler.task_triggered_target_chat': '🕐 定时任务「{name}」已在目标群聊触发\n打开目标群聊：{link}',
   'scheduler.task_triggered_target_thread': '🕐 定时任务「{name}」已在目标话题触发\n打开目标话题：{link}',
@@ -2002,6 +2007,17 @@ export const messages: Record<string, string> = {
   'worker.skill_delivery_failed': '⚠️ 当前 bot 的 Skill delivery 配置阻止了新会话启动：{reason}\n请把 skills.delivery 改为 auto/prompt，或改用支持 native skill delivery 的 CLI 后再重试。',
   'worker.coco_session_dir_gone': '⚠️ 当前 CoCo 进程的会话目录已被删除（可能是 e2e 测试清理或手动 rm），写到 events.jsonl 的内容会落到一个失效 inode 上，桥接读不到。请重启 CoCo 后重新 /adopt。',
   'worker.structured_turn_not_collected': '⚠️ 这条消息已经发给 {cliName}，但它的会话记录（transcript）里一直没出现这一轮，botmux 采集不到本轮回复，结论不会自动转发到群里。{cliName} 若已在终端里作答，请打开 Web 终端查看；确认没被处理再重发。',
+  'worker.structured_turn_not_started_blocked': '⚠️ {cliName} 一直停在{blocker}，这条消息没有开始处理，botmux 已不再等这一轮的回复。在 Web 终端里处理完后请重发。',
+  'worker.startup_upgrade_hint': '（{cliName} 刚升级到 {to}，之前是 {from}）',
+  'worker.startup_blocker_label.folder_trust': '目录信任确认',
+  'worker.startup_blocker_label.login': '登录',
+  'worker.startup_blocker_label.update': '升级确认',
+  'worker.startup_blocker_label.terms': '条款确认',
+  'worker.startup_blocked.folder_trust': '⚠️ {cliName} 卡在目录信任确认：{folder}{upgrade}。它在等人确认是否信任这个目录，这条消息还没开始处理。请打开 Web 终端选择信任，确认后会自动接着处理。',
+  'worker.startup_blocked.login': '⚠️ {cliName} 卡在登录{upgrade}：它在等人完成登录，这条消息还没开始处理。请打开 Web 终端（或在本机）按提示登录，登录后会接着处理。',
+  'worker.startup_blocked.update': '⚠️ {cliName} 卡在升级确认{upgrade}：它在等人选择是否升级，这条消息还没开始处理。请打开 Web 终端做出选择，之后会接着处理。',
+  'worker.startup_blocked.terms': '⚠️ {cliName} 卡在条款确认{upgrade}：它在等人接受新的使用条款，这条消息还没开始处理。请打开 Web 终端确认后继续。',
+  'worker.workspace_trust_explicitly_denied': '⚠️ 工作目录 {folder} 在 {cliName} 的信任记录里被显式设为不信任（{store} 里 trusted = false）。botmux 不会替你改这个决定，所以 {cliName} 启动时会停在目录信任确认、不处理消息。要在这个目录里用它，请在 Web 终端里选择信任，或把该条目改为 trusted = true（或删掉）后重发。',
   'worker.claude_bridge_turn_unread': '⚠️ {cliName} 刚跑完一轮，但 botmux 没在它的会话记录（transcript）里读到这一轮，这一轮的回复可能不会自动转发到群里。请打开 Web 终端查看；之后在群里再发消息时，botmux 会重新定位会话记录。',
 
   // Restart / maintenance report (bot-0 DM to owner)

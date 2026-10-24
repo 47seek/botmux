@@ -1,6 +1,10 @@
 import { shareVcMeetingSummary } from './services/vc-meeting-summary-share.js';
 import { isCurrentBotInChat, resolveUnionIdFromOpenIdStrict } from './im/lark/client.js';
 import { createBotAdminUnionsPublisher } from './services/bot-admin-unions-store.js';
+import { DecisionBoardService } from './core/decision-board/service.js';
+import { resolveDashboardOrigin } from './core/workbench-link.js';
+import { getAttachmentsDir } from './core/attachment-path.js';
+import { scheduleTimeZone } from './utils/timezone.js';
 import { authorizeVcMeetingSummaryShare } from './services/vc-meeting-send-policy.js';
 import { globalVcMeetingAgentConfigLive } from './global-config.js';
 import { resolveVcMeetingListenerPolicy, vcMeetingSummaryShareTarget, type VcMeetingListenerPolicy } from './services/vc-meeting-listener-policy.js';
@@ -90,6 +94,7 @@ import {
   getAllBots,
   getConfiguredOwnerOpenId,
   getOwnerOpenId,
+  getBotBrand,
   getDashboardAdminOpenIds,
   findOncallChat,
   effectiveDefaultWorkingDir,
@@ -447,7 +452,7 @@ import {
   allFinalOutputDeliveryCount,
   snapshotAllFinalOutputDeliveries,
 } from './core/final-output-delivery-drain.js';
-import { AbortDeadlineError, hasExactSafeJsonKeys, ipcRoute, isTrustedHostIpcRequest, JsonBodyTooLargeError, jsonRes, readJsonBody, runWithAbortDeadline, setBotName, setLarkAppId, startIpcServer, setBotRenamer, setBotAvatarChanger, setBotDescriptionManager, armCoreOnlyReadinessGate, setCoreOnlyReady, setSupervisorShutdownHandler, setCrossPrincipalInterruptionDisableHandler, setDurableSessionLifecycleHandler, setDurableSessionListHandler, setDurableSessionSendHandler, type DurableSessionSendRequest, type DurableSessionSendResult } from './core/dashboard-ipc-server.js';
+import { AbortDeadlineError, hasExactSafeJsonKeys, ipcRoute, isTrustedHostIpcRequest, JsonBodyTooLargeError, jsonRes, readJsonBody, runWithAbortDeadline, setBotName, setLarkAppId, setDecisionBoardService, startIpcServer, setBotRenamer, setBotAvatarChanger, setBotDescriptionManager, armCoreOnlyReadinessGate, setCoreOnlyReady, setSupervisorShutdownHandler, setCrossPrincipalInterruptionDisableHandler, setDurableSessionLifecycleHandler, setDurableSessionListHandler, setDurableSessionSendHandler, type DurableSessionSendRequest, type DurableSessionSendResult } from './core/dashboard-ipc-server.js';
 import { setDeviceIsolationDaemonIdentity } from './core/device-isolation-daemon.js';
 import { currentDeviceIsolationFreezeLease } from './core/device-isolation-activation.js';
 import { reconcileContainmentHandlesOnBoot } from './core/mojo-containment.js';
@@ -489,6 +494,7 @@ import { loadFrozenCards, saveFrozenCards } from './services/frozen-card-store.j
 import { resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, handleCommand, handleCardCommand, handleCotCommand, handleTermLinkCommand } from './core/command-handler.js';
 import { classifySlash, isCommandDecision, type CascadeItem } from './core/command-router.js';
 import { deriveSessionPhase } from './core/session-phase.js';
+import { noteObservedCliVersion } from './core/cli-version-history.js';
 import { cascadeTiming, waitForCliIdle, waitForCommandSettled } from './core/cli-idle-wait.js';
 import { parseTopicHeader, isTopicHeader, isTopicHeaderError, topicHeaderDeclaresSpec } from './core/topic-header.js';
 import { resolveTopicSpec, type TopicSpec } from './core/topic-spec.js';
@@ -514,6 +520,7 @@ import {
   getAvailableBots,
   restoreActiveSessions,
   executeScheduledTask,
+  deliverOwnerBatchTurn,
   persistStreamCardState,
   rememberLastCliInput,
   ensureTerminalWorkerPort,
@@ -1056,6 +1063,7 @@ import {
 import { VC_MEETING_HUMAN_IM_OUTPUT_CONTRACT } from './services/vc-meeting-listener-output-protocol.js';
 import { loopbackFetch } from './core/loopback-fetch.js';
 import { decideTurnIdleReport } from './utils/turn-idle-report.js';
+import { normalizeClaudeStopFailureReport } from './services/claude-stop-failure.js';
 
 // ─── State ───────────────────────────────────────────────────────────────────
 
@@ -5441,10 +5449,17 @@ function refreshCliVersion(botCfg: Pick<BotConfig, 'cliId' | 'cliRuntime' | 'cli
     const oldVersion = cached?.version;
     cliVersionCache.set(key, { version: newVersion, lastCheckAt: now });
     setCurrentCliVersion(newVersion, key);
+    // Persisted so an upgrade that happened while the daemon was down is still
+    // known as one (startup-stall notices quote it).
+    const record = noteObservedCliVersion(key, newVersion, { nowMs: now });
 
     if (oldVersion && oldVersion !== newVersion) {
       logger.info(`CLI version updated: ${oldVersion} → ${newVersion} (${botCfg.cliRuntime?.displayName ?? adapter.id})`);
       return true;
+    }
+    if (!oldVersion && record?.previousVersion && record.changedAtMs === now) {
+      logger.info(`CLI version changed since last seen: ${record.previousVersion} → ${newVersion} (${botCfg.cliRuntime?.displayName ?? adapter.id})`);
+      return false;
     }
 
     logger.info(`CLI version: ${newVersion} (${botCfg.cliRuntime?.displayName ?? adapter.id})`);
@@ -9022,6 +9037,93 @@ ipcRoute('POST', '/api/turn-idle', async (req, res) => {
       logger.info(`[${sessionId.slice(0, 8)}] turn-idle signal forwarded to worker (turn=${typeof raw.originTurnId === 'string' ? raw.originTurnId.slice(0, 12) : '?'})`);
     } catch (err) {
       logger.warn(`turn-idle forward failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+  return jsonRes(res, 200, { ok: true });
+});
+
+// ─── claude-stop-failure IPC route (internal: Claude 回合因 API 错误结束) ──────────
+//
+// NOT an agent-facing command. Claude Code 的 StopFailure hook 经
+// `botmux __claude-stop-failure-v1`（cli.ts cmdClaudeStopFailure）调到这里。这条
+// 路径上 Claude 不跑 Stop hook，transcript 跟丢了这一轮时就没有任何东西收口它：
+// 不续跑、不发失败卡，用户对着已经停下的任务干等。daemon 把错误类型、发起方
+// 身份与上报者读到的回合身份转给 worker；worker 先给 transcript 留宽限期，到期
+// 这次失败仍没呈现出来，才为仍开着的回合补发终态，或发一条提示（见
+// services/claude-stop-failure.ts）。
+//
+// 鉴权与 /api/turn-idle 同构，同样不放行 receiver 会话：转发可能让 worker 发出
+// 回合终态，属可观测副作用；声明的回合也必须正是该 capability 对应的 live
+// origin，绑定失败 403、不转发。找不到会话 / worker 仍返回 200（best-effort）：
+// 丢一次兜底只是退回既有行为。
+ipcRoute('POST', '/api/claude-stop-failure', async (req, res) => {
+  let raw: Record<string, unknown>;
+  try {
+    raw = await readJsonBody(req);
+  } catch {
+    return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  }
+  const sessionId = typeof raw.sessionId === 'string' ? raw.sessionId : '';
+  if (!sessionId) return jsonRes(res, 400, { ok: false, error: 'missing_sessionId' });
+  const report = normalizeClaudeStopFailureReport(raw);
+  if (!report) return jsonRes(res, 400, { ok: false, error: 'missing_error' });
+
+  let ds: DaemonSession | undefined;
+  for (const s of activeSessions.values()) {
+    if (s.session.sessionId === sessionId) { ds = s; break; }
+  }
+  const positiveInt = (value: unknown): number | undefined => (
+    typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : undefined
+  );
+  const claimedTurnId = typeof raw.originTurnId === 'string' ? raw.originTurnId : undefined;
+  const claimedDispatchAttempt = positiveInt(raw.originDispatchAttempt);
+  if (!isTrustedHostIpcRequest(req)) {
+    const verified = authorizeSessionScopedIpc({
+      trustedHost: false,
+      sessionExists: !!ds,
+      receiverSession: !!ds?.session.vcMeetingReceiver,
+      allowReceiver: false,
+      sessionId,
+      liveOrigin: ds?.managedTurnOrigin,
+      claimedCapability: typeof raw.originCapability === 'string'
+        ? raw.originCapability
+        : undefined,
+      claimedTurnId,
+      claimedDispatchAttempt,
+    });
+    if (!verified.ok) {
+      return jsonRes(res, 403, {
+        ok: false,
+        error: verified.error,
+      });
+    }
+    // Same binding as /api/turn-idle: a live token proves only "current turn
+    // of this session", so the claimed tuple must be the one it was minted for.
+    const binding = decideTurnIdleReport({
+      reportedTurnId: claimedTurnId,
+      reportedDispatchAttempt: claimedDispatchAttempt,
+      activeTurnId: ds?.managedTurnOrigin?.turnId,
+      activeDispatchAttempt: ds?.managedTurnOrigin?.dispatchAttempt,
+      promptReady: false,
+    });
+    if (!binding.accept) {
+      logger.warn(`[${sessionId.slice(0, 8)}] claude-stop-failure claim refused (${binding.reason})`);
+      return jsonRes(res, 403, { ok: false, error: 'origin_identity_mismatch' });
+    }
+  }
+  if (ds?.worker) {
+    try {
+      ds.worker.send({
+        type: 'claude_stop_failure',
+        report,
+        turnId: claimedTurnId,
+        dispatchAttempt: claimedDispatchAttempt,
+      } as DaemonToWorker);
+      // WARN, not info: an API error ended this turn, which is exactly the event
+      // that has to be reconstructable afterwards.
+      logger.warn(`[${sessionId.slice(0, 8)}] Claude StopFailure (${report.error}) forwarded to worker (turn=${claimedTurnId?.slice(0, 12) ?? '?'})`);
+    } catch (err) {
+      logger.warn(`claude-stop-failure forward failed: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
   return jsonRes(res, 200, { ok: true });
@@ -30433,6 +30535,16 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       }).then(() => undefined);
     },
     onQueuedActivationSubmitted,
+    // 决策看板批次回合的投递终态失败（收据超时 / worker 拒绝入队）：不往管家群贴失败
+    // 卡片，只把批次退回 failed，owner 在 Dashboard 批次行看到原因并重投（同一 turnId）。
+    onBoardTurnDeliveryFailed(ds, context) {
+      if (ds.larkAppId !== cfg.larkAppId) return;
+      try {
+        decisionBoard.noteDeliveryFailure(context.turnId, context.reason);
+      } catch (err) {
+        logger.warn(`[decision-board] noteDeliveryFailure failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    },
     async onOrdinaryImInputRejected(ds, context) {
       if (!context.rejectedBeforeAdmission
         || context.reason !== 'cross_principal_requires_owner_confirmation') return false;
@@ -32332,6 +32444,43 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   });
   scheduler.setOwnerFilter(cfg.larkAppId, idx === 0);
   scheduler.startScheduler();
+
+  // 决策看板：本 daemon 是自己这张看板唯一的写入方。存储懒打开，没开管家的 bot 不建库。
+  const decisionBoard = new DecisionBoardService({
+    dataDir: config.session.dataDir,
+    larkAppId: () => cfg.larkAppId,
+    steward: () => getBot(cfg.larkAppId).config.steward,
+    locale: () => localeForBot(cfg.larkAppId),
+    brand: () => getBotBrand(cfg.larkAppId),
+    dashboardOrigin: () => resolveDashboardOrigin(),
+    ownerOpenId: () => getOwnerOpenId(cfg.larkAppId),
+    ownerName: async () => {
+      const owner = getOwnerOpenId(cfg.larkAppId);
+      return owner ? (await resolveSender(cfg.larkAppId, owner, 'user'))?.name : undefined;
+    },
+    timeZone: () => scheduleTimeZone(),
+    batchAttachmentsDir: batchId => getAttachmentsDir(cfg.larkAppId, `board-${batchId}`),
+    banner: ({ batchId, count, locale }) => tr('decisionBoard.batch_banner', { id: batchId, count }, locale),
+    deliver: input => withBotTurnAdmission(cfg.larkAppId, () => deliverOwnerBatchTurn({
+      larkAppId: cfg.larkAppId,
+      chatId: input.chatId,
+      turnId: input.turnId,
+      prompt: input.prompt,
+      banner: input.banner,
+      attachments: input.attachments,
+      ...(input.ownerOpenId ? { ownerOpenId: input.ownerOpenId } : {}),
+      ...(input.ownerName ? { ownerName: input.ownerName } : {}),
+      sessionTitle: input.sessionTitle,
+    }, activeSessions, refreshCliVersion, {
+      prepareTurnIdentity: (session, turnId) => prepareTurnCliIdentity(session, turnId),
+    })),
+    log: (level, message) => (level === 'warn' ? logger.warn(message) : logger.info(message)),
+  });
+  setDecisionBoardService(decisionBoard);
+  // 补投重启前没送达的批次。等会话恢复与 worker 就绪的初始阶段过去再投，避免和恢复抢同一个会话。
+  setTimeout(() => {
+    void decisionBoard.redeliverUndelivered().catch(err => logger.warn(`[decision-board] redelivery failed: ${err?.message ?? err}`));
+  }, 30_000).unref?.();
 
   // Cross-daemon busy heartbeat: each daemon reports how many of its sessions
   // are mid-CLI-turn so the primary daemon's maintenance gate sees activity

@@ -1393,6 +1393,7 @@ export const messages: Record<string, string> = {
   'worker.ordinary_recovery_non_retryable': '⚠️ This {cliName} turn failed, and the current error cannot be retried safely. Botmux stopped automatic processing to avoid repeating external side effects. Check the Web Terminal and model-service status, then send a message to continue.',
   'worker.claude_terminal_failure_unrecovered': '⚠️ This Claude turn stopped with a model-service error ({errorCode}). This delivery channel did not start an automatic continuation. Check the Web Terminal, then retry or send a message to continue.',
   'worker.local_turn_failed': '⚠️ {cliName} failed ({errorCode}). The failed turn has no matching Lark message (for example input typed in the terminal, or output continuing the previous turn), so it is not retried automatically. Check the Web Terminal and resend if needed.',
+  'worker.claude_stop_failure_unsettled': '⚠️ {cliName} stopped this turn on an API error ({errorCode}), but botmux could not match the interruption to the turn it was tracking, so it is not continued automatically and the task may have stopped midway. Check the Web Terminal and reply "continue" if needed.',
 
   // ─── Turn-failure card (generic failure card: @mention + retry button) ────
   'card.turn_failed.title': '⚠️ {cliName} turn failed',
@@ -1951,9 +1952,12 @@ export const messages: Record<string, string> = {
 
   // Markdown / contextual reply card chrome
   'card.you': 'You',
-  'card.waiting_duration': 'Waiting {seconds}s',
-  'card.execution_until_reply': 'Execution until reply {seconds}s',
-  'card.execution_duration': 'Execution time {seconds}s',
+  'card.waiting_duration': 'Waiting {duration}',
+  'card.execution_until_reply': 'Execution until reply {duration}',
+  'card.execution_duration': 'Execution time {duration}',
+  'card.duration_seconds': '{seconds}s',
+  'card.duration_minutes': '{minutes}m',
+  'card.duration_hours': '{hours}h',
   'card.sent_to': 'Sent to: ',
   'card.usage.context': 'Context',
   // Claude Code statusline quota segment (plain `ctx 23% · 5h 18% · 7d 5%`); same in both locales.
@@ -1974,6 +1978,7 @@ export const messages: Record<string, string> = {
   'card.codex_app_shared_turn': '🖥️ Codex App shared turn (synced to Lark)',
 
   // Scheduler announcements
+  'decisionBoard.batch_banner': '📥 Decision board: received {count} decision(s) (batch #{id}); the steward is on it',
   'scheduler.task_started': '🕐 Scheduled task “{name}” started',
   'scheduler.task_triggered_target_chat': '🕐 Scheduled task “{name}” triggered in the target chat\nOpen target chat: {link}',
   'scheduler.task_triggered_target_thread': '🕐 Scheduled task “{name}” triggered in the target topic\nOpen target topic: {link}',
@@ -2001,6 +2006,17 @@ export const messages: Record<string, string> = {
   'worker.skill_delivery_failed': '⚠️ This bot’s Skill delivery config blocked the new session: {reason}\nSet skills.delivery to auto/prompt, or switch to a CLI that supports native skill delivery, then retry.',
   'worker.coco_session_dir_gone': '⚠️ The current CoCo session directory was deleted (e2e cleanup or a manual rm). Content written to events.jsonl lands on a stale inode the bridge can’t read. Restart CoCo and run /adopt again.',
   'worker.structured_turn_not_collected': '⚠️ This message was sent to {cliName}, but the turn never showed up in its session transcript, so botmux cannot collect the reply and it will not be forwarded here automatically. If {cliName} answered in the terminal, open the Web terminal to read it; resend only if it was not processed.',
+  'worker.structured_turn_not_started_blocked': '⚠️ {cliName} is still waiting on a {blocker}, so this message never started and botmux has stopped waiting for its reply. Resolve it in the Web terminal, then resend.',
+  'worker.startup_upgrade_hint': ' ({cliName} was just upgraded to {to}, previously {from})',
+  'worker.startup_blocker_label.folder_trust': 'folder trust confirmation',
+  'worker.startup_blocker_label.login': 'sign-in',
+  'worker.startup_blocker_label.update': 'update confirmation',
+  'worker.startup_blocker_label.terms': 'terms confirmation',
+  'worker.startup_blocked.folder_trust': '⚠️ {cliName} is stuck on a folder trust confirmation for {folder}{upgrade}. It is waiting for someone to decide whether to trust this folder, so this message has not been processed yet. Open the Web terminal and choose to trust it; processing continues automatically afterwards.',
+  'worker.startup_blocked.login': '⚠️ {cliName} is stuck at sign-in{upgrade}: it is waiting for someone to finish logging in, so this message has not been processed yet. Open the Web terminal (or use this machine) and follow the sign-in prompt; processing continues afterwards.',
+  'worker.startup_blocked.update': '⚠️ {cliName} is stuck on an update prompt{upgrade}: it is waiting for someone to choose whether to update, so this message has not been processed yet. Make the choice in the Web terminal to continue.',
+  'worker.startup_blocked.terms': '⚠️ {cliName} is stuck on a terms confirmation{upgrade}: it is waiting for someone to accept updated terms, so this message has not been processed yet. Confirm it in the Web terminal to continue.',
+  'worker.workspace_trust_explicitly_denied': '⚠️ The working directory {folder} is explicitly marked untrusted for {cliName} ({store}: trusted = false). botmux will not override that decision, so {cliName} will stop at its folder trust confirmation and not process messages. To use it here, choose to trust the folder in the Web terminal, or set the entry to trusted = true (or delete it), then resend.',
   'worker.claude_bridge_turn_unread': '⚠️ {cliName} just finished a turn, but botmux found nothing of it in the session transcript it reads, so this turn\'s reply may not be forwarded here automatically. Open the Web terminal to read it; botmux will look for the transcript again on your next message here.',
 
   // Restart / maintenance report (bot-0 DM to owner)
