@@ -8097,6 +8097,44 @@ describe('PUT /api/bot-agent', () => {
       expect(disk()).not.toHaveProperty('cliRuntime');
     });
 
+    it('saves an unknown slow-shell runtime without attempting its version probe', async () => {
+      const shell = join(dir, 'slow-runtime-shell');
+      const executable = join(dir, 'rc-only-runtime');
+      const marker = join(dir, 'runtime-executed');
+      writeFileSync(executable, `#!/bin/sh\ntouch '${marker}'\necho 'runtime 1.2.3'\n`);
+      chmodSync(executable, 0o755);
+      writeFileSync(shell, `#!/bin/sh\n/bin/sleep 2\necho '${executable}'\n`);
+      chmodSync(shell, 0o755);
+      await setup({ cliId: 'codex', env: { SHELL: shell, PATH: '/usr/bin:/bin' } });
+      const runtime = { id: 'test', executable: 'rc-only-runtime' };
+      const response = await save({ cliId: 'codex', cliRuntime: runtime });
+      expect(response.status).toBe(200);
+      expect(await response.json()).not.toHaveProperty('runtimeProbe');
+      expect(disk().cliRuntime).toEqual(runtime);
+      expect(existsSync(marker)).toBe(false);
+    });
+
+    it('rejects an unavailable absolute runtime without writing the configuration', async () => {
+      await setup({ cliId: 'codex' });
+      const before = readFileSync(configPath, 'utf8');
+      const response = await save({ cliId: 'codex', cliRuntime: { id: 'test', executable: join(dir, 'missing-runtime') } });
+      expect(response.status).toBe(400);
+      expect(await response.json()).toMatchObject({ error: 'runtime_unavailable' });
+      expect(readFileSync(configPath, 'utf8')).toBe(before);
+    });
+
+    it('saves an available runtime with its verified version', async () => {
+      const executable = join(dir, 'available-runtime');
+      writeFileSync(executable, '#!/bin/sh\necho "runtime 1.2.3"\n');
+      chmodSync(executable, 0o755);
+      await setup({ cliId: 'codex' });
+      const runtime = { id: 'test', executable };
+      const response = await save({ cliId: 'codex', cliRuntime: runtime });
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({ runtimeProbe: { version: '1.2.3' } });
+      expect(disk().cliRuntime).toEqual(runtime);
+    });
+
     it('finds an rc-only wrapper on save without executing the wrapper itself', async () => {
       const shell = join(dir, 'rc-shell');
       const launcher = join(dir, 'rc-only-wrapper');

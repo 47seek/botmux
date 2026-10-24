@@ -8739,10 +8739,12 @@ ipcRoute('PUT', '/api/bot-agent', requireBoundBot(async (req, res) => {
   }
   const probeResult = await probeAgentSaveAvailability(preflight);
   let runtimeProbeFailure: { error: string; message?: string } | undefined;
+  // An inconclusive shell probe cannot reject an rc-only executable or run
+  // its bare name without that shell. The worker's launch preflight decides.
   if (Object.prototype.hasOwnProperty.call(body, 'cliRuntime') && preflight.runtime) {
-    if (!probeResult.availability.available) {
+    if (probeResult.availability.status === 'unavailable') {
       runtimeProbeFailure = { error: 'runtime_unavailable', message: probeResult.availability.reason };
-    } else {
+    } else if (probeResult.availability.status === 'available') {
       try {
         const { stdout } = await promisify(execFile)(probeResult.availability.resolvedPath ?? preflight.runtime.executable,
           ['--version'], { env: preflight.env, encoding: 'utf8', timeout: 5_000, killSignal: 'SIGKILL', maxBuffer: 2 * 1024 * 1024 });
