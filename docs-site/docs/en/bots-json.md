@@ -227,10 +227,14 @@ This option addresses one narrow gap: Codex running through Botmux's app-server 
 
 | Field | Description |
 |------|------|
-| `sandbox` | When `true`, launch new sessions in the Linux file sandbox. Writes are isolated and must be landed with `/land` |
-| `sandboxHidePaths` | Paths masked inside the sandbox with empty dirs/files so the bot cannot read them, e.g. `["~/.ssh", "~/.botmux/bots.json"]` |
-| `sandboxReadonlyPaths` | Extra existing paths mounted read-only inside the sandbox, useful for shared source snapshots, reference repos, or generated docs the bot should inspect but not modify |
-| `sandboxNetwork` | Network policy for sandboxed sessions. Omitted / `true` keeps current network and proxy access; `false` adds `--unshare-net` and blocks normal network egress |
+| `sandbox` | File sandbox mode: `"oncall"` (or `true`, default whitelist sandbox for confidentiality), `"scratch"` (full-root Copy-on-Write draft sandbox), or `false` / `"off"` (disabled). Supported on Linux and macOS. See [Sandbox documentation](/en/sandbox) |
+| `scratchStorage` | Effective only under `sandbox: "scratch"`. `"tmpfs"` (default, in-memory ephemeral) or `"disk"` (persists across daemon restarts for cold recovery) |
+| `scratchTmpfsSizeMb` | Effective only under `sandbox: "scratch"`. Upper tmpfs limit in MB (default `0` uses kernel default ≈ half of RAM) |
+| `scratchDenyPaths` | Effective only under `sandbox: "scratch"`. Additional paths masked on top of the natively readable root (botmux credentials are fixed-masked by default) |
+| `sandboxHidePaths` | Effective only under `sandbox: "oncall"`. Paths masked inside the sandbox with empty dirs/files, e.g. `["~/.ssh", "~/.botmux/bots.json"]` |
+| `sandboxReadonlyPaths` | Effective only under `sandbox: "oncall"`. Extra existing paths mounted read-only inside the sandbox (shared snapshots, reference repos, docs) |
+| `sandboxNetwork` | Network policy. Omitted / `true` keeps current network and proxy access; `false` adds `--unshare-net` to block normal network egress |
+| `sandboxNetworkPolicy` | Granular destination IP policy object (Linux + PTY). Configures independent `public` and `private` IP filtering rules (`allow / block / allowlist / denylist`) and trusted proxy egress |
 
 > ZMX cannot enforce the file sandbox or effective read isolation, so configurations that enable those boundaries fail closed; see [ZMX backend boundaries](/en/zmx#unsupported-combinations).
 

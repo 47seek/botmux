@@ -230,10 +230,14 @@ Dashboard 保存后无需重启 daemon。模型、思考强度分别选择“继
 
 | 字段 | 说明 |
 |------|------|
-| `sandbox` | `true` 时，新会话在 Linux 文件沙盒中启动。写入被隔离，需要通过 `/land` 审阅落盘 |
-| `sandboxHidePaths` | 在沙盒内用空目录 / 空文件遮罩的路径，避免机器人读取，例如 `["~/.ssh", "~/.botmux/bots.json"]` |
-| `sandboxReadonlyPaths` | 在沙盒内额外只读挂载的已存在路径，适合共享源码快照、参考仓库或生成文档等只允许查看、不允许修改的输入 |
-| `sandboxNetwork` | 沙盒会话的网络策略。缺省 / `true` 保留当前网络和代理访问；`false` 添加 `--unshare-net`，阻断普通网络出口 |
+| `sandbox` | 文件沙盒模式。可选 `"oncall"`（或 `true`，默认白名单保密沙盒）、`"scratch"`（全根 Copy-on-Write 草稿沙盒）、`false` / `"off"`（关闭沙盒）。支持 Linux 与 macOS。详见 [文件沙盒文档](/sandbox) |
+| `scratchStorage` | 仅在 `sandbox: "scratch"` 下生效。`"tmpfs"`（默认，内存即焚，重启即销毁）或 `"disk"`（磁盘持久，跨 daemon 重启可冷恢复续跑） |
+| `scratchTmpfsSizeMb` | 仅在 `sandbox: "scratch"` 下生效。tmpfs 最大容量（MB，默认 `0` 使用内核默认值 ≈ 半内存） |
+| `scratchDenyPaths` | 仅在 `sandbox: "scratch"` 下生效。在全盘原生可读之上额外遮罩的路径数组（botmux 凭证已固定遮罩） |
+| `sandboxHidePaths` | 仅在 `sandbox: "oncall"` 下生效。在沙盒内用空目录 / 空文件遮罩的敏感路径，例如 `["~/.ssh", "~/.botmux/bots.json"]` |
+| `sandboxReadonlyPaths` | 仅在 `sandbox: "oncall"` 下生效。在沙盒内额外只读挂载的已存在路径，适合共享源码快照、参考仓库或生成文档 |
+| `sandboxNetwork` | 沙盒网络开关。缺省 / `true` 保留当前网络和代理访问；`false` 添加 `--unshare-net`，阻断普通网络出口 |
+| `sandboxNetworkPolicy` | 高级网络分区策略对象。Linux + PTY 环境下支持按公网与内网配置目标 IP 过滤（`allow / block / allowlist / denylist`）与可信代理出口 |
 
 > ZMX 无法执行文件沙盒或实际生效的读隔离，开启这些边界的配置组合会 fail closed，详见 [ZMX 后端边界](/zmx#不支持的组合)。
 
