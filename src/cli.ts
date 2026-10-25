@@ -6073,6 +6073,7 @@ export async function resolveLinkRefsThroughSessionHost(
   input: import('./services/link-ref-resolver.js').OutboundLinkRefPayload,
   options: {
     mode?: 'observe' | 'enabled';
+    responseKind?: TurnSendKind;
     sessionId?: string;
     appId?: string;
     ipcPort?: number;
@@ -6085,7 +6086,7 @@ export async function resolveLinkRefsThroughSessionHost(
     expandOutboundLinkRefs,
     findOutboundExecutableLinkRefs,
   } = await import('./services/link-ref-resolver.js');
-  if (findOutboundExecutableLinkRefs(input).length === 0) {
+  if (findOutboundExecutableLinkRefs(input).length === 0 && options.responseKind !== 'final') {
     return expandOutboundLinkRefs(input, new Map());
   }
   const sessionId = options.sessionId ?? context?.sessionId;
@@ -6103,7 +6104,10 @@ export async function resolveLinkRefsThroughSessionHost(
     ipcPort,
     sessionId,
     'link-refs/resolve',
-    { payload: input },
+    {
+      payload: input,
+      ...(options.responseKind === undefined ? {} : { responseKind: options.responseKind }),
+    },
   );
   const body = await response.json().catch(() => ({})) as {
     ok?: boolean;
@@ -11347,6 +11351,7 @@ async function cmdSend(rest: string[]): Promise<void> {
       expectedLinks,
     }, {
       mode: linkRefMode,
+      responseKind: effectiveResponseKind,
       sessionId: originSessionId ?? sid,
       appId: originSession?.larkAppId ?? s.larkAppId,
     });
