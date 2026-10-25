@@ -85,7 +85,7 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
     id: 'steward',
     tab: 'sessions',
     titleKey: 'botDefaults.sectionSteward',
-    fieldKeys: ['botDefaults.stewardEnabled', 'botDefaults.stewardChat', 'botDefaults.stewardGuide'],
+    fieldKeys: ['botDefaults.stewardEnabled', 'botDefaults.stewardChat', 'botDefaults.stewardAutoJoin', 'botDefaults.stewardAutoJoinSolo', 'botDefaults.stewardGuide'],
   },
   {
     id: 'substitute',
@@ -296,6 +296,7 @@ export type BotDefaultsRow = {
   traexAutoModelBlockedReason?: 'rpc_input' | null;
   modelBackendVariant?: 'standard' | 'max' | null;
   reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
+  codexProfile?: string | null;
   serviceTier?: CodexServiceTier;
   nativeSubagentRuntime?: NativeSubagentRuntimePolicy;
   /** dsh runner turn timeout (ms); rendered as a dsh-only field. */
