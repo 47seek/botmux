@@ -200,6 +200,14 @@ botmux 不重新实现记忆、上下文管理、工具调用、权限体系—�
 - 🤝 **贡献**：欢迎 issue / PR。新增适配器见 [多 CLI 适配器](https://deepcoldy.github.io/botmux/adapters)。
 - 📄 **License**：[MIT](LICENSE)
 
+## 贡献者
+
+botmux 或许是目前专为飞书（Feishu/Lark）打造的开源项目中贡献者最多的一个——这离不开每一位参与者。感谢所有提交过代码、文档，以及提出 issue 的朋友：
+
+<a href="https://github.com/deepcoldy/botmux/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=deepcoldy/botmux" alt="contributors" />
+</a>
+
 <p align="center">好用的话，顺手点个 ⭐ Star 吧 → <a href="https://github.com/deepcoldy/botmux">deepcoldy/botmux</a></p>
 
 [建群参数与默认配置](docs/guide/group-creation.md)

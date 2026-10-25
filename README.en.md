@@ -151,6 +151,14 @@ External applications can use experimental [model proxy mode](docs/model-proxy.m
 - 🤝 **Contributing**: issues / PRs welcome. To add an adapter, see [CLI Adapters](https://deepcoldy.github.io/botmux/en/adapters).
 - 📄 **License**: [MIT](LICENSE)
 
+## Contributors
+
+botmux may well be the most-contributed-to open-source project built specifically for Feishu/Lark — and that is entirely thanks to everyone who has taken part. Thanks to all who have contributed code, documentation, and issues:
+
+<a href="https://github.com/deepcoldy/botmux/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=deepcoldy/botmux" alt="contributors" />
+</a>
+
 <p align="center">If it's useful, drop a ⭐ Star → <a href="https://github.com/deepcoldy/botmux">deepcoldy/botmux</a></p>
 
 [Group creation options and defaults](docs/guide/group-creation.md)
