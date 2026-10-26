@@ -606,6 +606,25 @@ const TASK_ID_RE = /^[0-9a-z_]{1,50}$/;
 /** 周期任务连续失败达到此次数后发出一次告警（成功即清零）。 */
 export const SCHEDULE_FAILURE_ALERT_THRESHOLD = 3;
 
+/**
+ * 连续失败计数 / 告警水印的唯一推进规则，schedule-store（JSON legacy 路径）
+ * 与 scheduler（authority store 生产路径）共用，避免两份实现漂移：
+ *  - 成功：计数清零、水印清除，下一轮失败串允许再告警一次；
+ *  - 失败：计数 +1，达到阈值且本串尚未告警时 crossedFailureThreshold=true，
+ *    由调用方据此投递一次告警；阈值之后继续失败不再重复 crossed。
+ */
+export function nextFailureTracking(
+  current: { consecutiveFailures?: number; failureAlertSent?: boolean } | undefined,
+  success: boolean,
+): { consecutiveFailures: number; failureAlertSent: boolean; crossedFailureThreshold: boolean } {
+  if (success) return { consecutiveFailures: 0, failureAlertSent: false, crossedFailureThreshold: false };
+  const consecutiveFailures = (current?.consecutiveFailures ?? 0) + 1;
+  const alreadyAlerted = current?.failureAlertSent === true;
+  const crossedFailureThreshold =
+    consecutiveFailures >= SCHEDULE_FAILURE_ALERT_THRESHOLD && !alreadyAlerted;
+  return { consecutiveFailures, failureAlertSent: alreadyAlerted || crossedFailureThreshold, crossedFailureThreshold };
+}
+
 function assertValidTaskId(id: string): void {
   if (!TASK_ID_RE.test(id)) {
     throw new TypeError(`invalid schedule task id: ${JSON.stringify(id)}`);
@@ -899,18 +918,11 @@ export function markRun(
     task.lastError = success ? undefined : error;
     task.lastDeliveryError = deliveryError;
 
-    if (success) {
-      // 一次成功终结失败串：清零计数与告警水印，下轮再失败允许重新告警。
-      task.consecutiveFailures = 0;
-      task.failureAlertSent = false;
-    } else {
-      consecutiveFailures = (task.consecutiveFailures ?? 0) + 1;
-      task.consecutiveFailures = consecutiveFailures;
-      if (consecutiveFailures >= SCHEDULE_FAILURE_ALERT_THRESHOLD && !task.failureAlertSent) {
-        task.failureAlertSent = true;
-        crossedFailureThreshold = true;
-      }
-    }
+    const tracking = nextFailureTracking(task, success);
+    task.consecutiveFailures = tracking.consecutiveFailures;
+    task.failureAlertSent = tracking.failureAlertSent;
+    crossedFailureThreshold = tracking.crossedFailureThreshold;
+    consecutiveFailures = tracking.consecutiveFailures;
 
     // Advance repeat counter
     if (task.repeat) {

@@ -296,7 +296,7 @@ function markRuntimeRun(
   runId?: string,
 ): { crossedFailureThreshold?: boolean; consecutiveFailures?: number } {
   if (!authorityStore) {
-    return scheduleStore.markRun(id, success, error, deliveryError, runId);
+    return scheduleStore.markRun(id, success, error, deliveryError, runId) ?? {};
   }
   if (!runtimeTask(id)) return {};
   let result: { crossedFailureThreshold?: boolean; consecutiveFailures?: number } = {};
@@ -305,23 +305,19 @@ function markRuntimeRun(
     const repeat = task.repeat ? { ...task.repeat, completed: (task.repeat.completed ?? 0) + 1 } : undefined;
     const finiteComplete = !!repeat && repeat.times !== null && repeat.times !== undefined
       && repeat.times > 0 && repeat.completed >= repeat.times;
-    const consecutiveFailures = success ? 0 : (task.consecutiveFailures ?? 0) + 1;
-    let crossedFailureThreshold = false;
-    if (!success
-      && consecutiveFailures >= scheduleStore.SCHEDULE_FAILURE_ALERT_THRESHOLD
-      && !task.failureAlertSent) {
-      task.failureAlertSent = true;
-      crossedFailureThreshold = true;
-    }
-    result = { crossedFailureThreshold, consecutiveFailures };
+    const tracking = scheduleStore.nextFailureTracking(task, success);
+    result = {
+      crossedFailureThreshold: tracking.crossedFailureThreshold,
+      consecutiveFailures: tracking.consecutiveFailures,
+    };
     return {
       ...task,
       lastRunAt: new Date().toISOString(),
       lastStatus: success ? 'ok' : 'error',
       lastError: success ? undefined : error,
       lastDeliveryError: deliveryError,
-      consecutiveFailures,
-      failureAlertSent: success ? false : task.failureAlertSent,
+      consecutiveFailures: tracking.consecutiveFailures,
+      failureAlertSent: tracking.failureAlertSent,
       repeat,
       enabled: finiteComplete || task.parsed.kind === 'once' ? false : task.enabled,
       disabledReason: finiteComplete || task.parsed.kind === 'once' ? 'once_completed' : task.disabledReason,
@@ -862,13 +858,15 @@ async function tick(): Promise<void> {
           emitScheduleFiredHook(claimedTask, 'error', err);
         });
     } else {
-      markRuntimeRun(
+      // 回调缺失本身是持续故障：阈值 crossed 时同样要告警，不能把水印静默落库。
+      const runResult = markRuntimeRun(
         claimedTask.id,
         false,
         'scheduler execute callback is not initialised',
         undefined,
         executionContext.runId,
       );
+      emitFailureAlertIfNeeded(runtimeTask(claimedTask.id) ?? claimedTask, runResult);
     }
   }
 }
@@ -911,13 +909,16 @@ export function startScheduler(): void {
   const startupTasks = runtimeTasks();
   for (const task of startupTasks) {
     if (!taskBelongsToThisDaemon(task) || task.lastStatus !== 'running') continue;
-    markRuntimeRun(
+    // 重启把在途任务对账为失败时，水印也可能在这一步跨过阈值——必须补发告警，
+    // 否则 failureAlertSent 已落库而私信永不发出，此后持续真失败也不再 crossed。
+    const runResult = markRuntimeRun(
       task.id,
       false,
       'schedule run interrupted by daemon restart',
       undefined,
       task.lastRunId,
     );
+    emitFailureAlertIfNeeded(runtimeTask(task.id) ?? task, runResult);
   }
   const tasks = runtimeTasks();
   const enabled = tasks.filter(t => t.enabled);

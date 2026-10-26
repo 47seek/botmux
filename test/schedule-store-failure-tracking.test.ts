@@ -95,3 +95,36 @@ describe('markRun consecutive-failure tracking', () => {
     expect(r.crossedFailureThreshold).toBe(true);
   });
 });
+
+describe('nextFailureTracking (shared rule for JSON store and authority runtime)', () => {
+  it('advances the streak and crosses the alert threshold exactly once', async () => {
+    const { nextFailureTracking, SCHEDULE_FAILURE_ALERT_THRESHOLD } = await freshImport();
+    let current: { consecutiveFailures?: number; failureAlertSent?: boolean } = {};
+    for (let i = 1; i < SCHEDULE_FAILURE_ALERT_THRESHOLD; i += 1) {
+      current = nextFailureTracking(current, false);
+      expect(current.crossedFailureThreshold).toBe(false);
+      expect(current.consecutiveFailures).toBe(i);
+      expect(current.failureAlertSent).toBe(false);
+    }
+    current = nextFailureTracking(current, false);
+    expect(current.crossedFailureThreshold).toBe(true);
+    expect(current.failureAlertSent).toBe(true);
+    // 阈值之后继续失败不重复 crossed。
+    expect(nextFailureTracking(current, false).crossedFailureThreshold).toBe(false);
+  });
+
+  it('a success clears streak and watermark so the next streak can alert again', async () => {
+    const { nextFailureTracking } = await freshImport();
+    let current = nextFailureTracking(nextFailureTracking(nextFailureTracking({}, false), false), false);
+    expect(current.crossedFailureThreshold).toBe(true);
+    current = nextFailureTracking(current, true);
+    expect(current).toEqual({ consecutiveFailures: 0, failureAlertSent: false, crossedFailureThreshold: false });
+    expect(nextFailureTracking(nextFailureTracking(nextFailureTracking(current, false), false), false).crossedFailureThreshold)
+      .toBe(true);
+  });
+
+  it('treats undefined input (legacy task) as zero streak', async () => {
+    const { nextFailureTracking } = await freshImport();
+    expect(nextFailureTracking(undefined, false).consecutiveFailures).toBe(1);
+  });
+});

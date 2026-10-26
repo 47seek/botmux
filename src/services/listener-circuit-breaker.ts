@@ -1,24 +1,23 @@
 /**
  * ListenerCircuitBreaker —— 单个轮询目标（群/文档/订阅 key）的熔断状态机。
  *
- * 与 resilient-poller 配套：resilient-poller 是「通用周期任务运行时」
- * （退避/熔断/慢探测的完整引擎），event-dispatcher 的 message-listener 轮询
- * 已有自己的整轮看门狗+游标+全局 roster 循环，不适合整体替换；这里抽出一个
- * 零依赖的 per-key 熔断判定，供其在既有循环内调用。
+ * event-dispatcher 的 message-listener 轮询已有自己的整轮看门狗+游标+全局
+ * roster 循环，不适合整体替换；daemon 文档评论轮询同样在既有 5s 循环内接入。
+ * 这里提供零依赖的 per-key 熔断判定，供两条链路在既有循环内调用。
  *
  * 判定规则：
  *  - 永久错误连续 ≥ threshold 次 → 熔断（suspended），跳过正常轮询；
  *  - 熔断后仅在距上次探测 ≥ probeIntervalMs 时放行一次（慢探测）；
  *  - 任意一次成功 → 立即清除状态（bot 被重新拉回/权限恢复自动回岗）。
+ *
+ * 本类只管状态，不负责告警：「刚熔断」由 recordPermanent 的返回值告知调用方，
+ * 告警去重（避免应用级故障时逐目标告警风暴）由调用方按 app 维度处理。
  */
 
 export interface ListenerCircuitEntry {
   suspended: boolean;
   permanentStreak: number;
-  transientStreak: number;
   lastProbeAt: number;
-  /** 本暂停周期是否已告警（保证只告警一次）。 */
-  alerted: boolean;
 }
 
 export interface ListenerCircuitBreakerOptions {
@@ -42,7 +41,7 @@ export class ListenerCircuitBreaker {
   private entry(key: string): ListenerCircuitEntry {
     let e = this.states.get(key);
     if (!e) {
-      e = { suspended: false, permanentStreak: 0, transientStreak: 0, lastProbeAt: 0, alerted: false };
+      e = { suspended: false, permanentStreak: 0, lastProbeAt: 0 };
       this.states.set(key, e);
     }
     return e;
@@ -73,19 +72,12 @@ export class ListenerCircuitBreaker {
   recordPermanent(key: string): boolean {
     const e = this.entry(key);
     e.permanentStreak += 1;
-    e.transientStreak = 0;
     if (!e.suspended && e.permanentStreak >= this.threshold) {
       e.suspended = true;
       e.lastProbeAt = this.now();
       return true;
     }
     return false;
-  }
-
-  /** 登记一次瞬时错误（仅计数，不熔断；提供给需要观测的调用方）。 */
-  recordTransient(key: string): void {
-    const e = this.entry(key);
-    e.transientStreak += 1;
   }
 
   /**

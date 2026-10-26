@@ -29703,14 +29703,45 @@ async function pollWatchedDocComments(larkAppId: string): Promise<void> {
     docCommentPollCircuits.prune(liveKeys);
     for (const snapshot of subs) {
       const circuitKey = `${larkAppId}:${snapshot.fileToken}`;
+      // pending 重试阻塞中的文件本轮不会被处理，判断要放在 shouldPoll 之前，
+      // 否则每 5s 空耗一次熔断慢探测额度（探测间隔 10 分钟）。
+      if (pendingRetry.blockedFiles.has(snapshot.fileToken)) continue;
       if (!docCommentPollCircuits.shouldPoll(circuitKey)) continue;
+
+      // 第一段：只有「读评论列表」的可达性结果决定熔断。游标写入、评论投递等
+      // 处理阶段的错误与「文档是否永久不可达」无关（投递失败被收敛为游标不推进、
+      // 下轮重试），不能进熔断——历史上一个 try 包住整条链路，处理阶段抛出的
+      // 403/404 会把一篇可读文档推入熔断。
+      let comments;
       try {
-        if (pendingRetry.blockedFiles.has(snapshot.fileToken)) continue;
-        const comments = await listDocComments(larkAppId, {
+        comments = await listDocComments(larkAppId, {
           fileToken: snapshot.fileToken,
           fileType: snapshot.fileType,
         });
-        docCommentPollCircuits.recordSuccess(circuitKey); // 文档可达：若此前在熔断则自动恢复
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        logger.warn(`[doc-comment-poll] file=${snapshot.fileToken.slice(0, 12)} failed: ${message}`);
+        // 应用身份读不到这篇文档（权限撤销 / 文档被删 / 网络）——功能「配着」却从此
+        // 一条都不触发，是 owner 最需要在界面上看到的静默故障。
+        recordDocWatchActivity(config.session.dataDir, larkAppId, snapshot.fileToken, { outcome: 'poll-failed', error: message });
+        // 永久错误（真实形态：DocProviderRejectedError 的 httpStatus 403/404、
+        // UserTokenForbidden/DocSubscriptionPermission 的业务码 1069603）连续命中即
+        // 熔断，不再每 5s 空转；瞬时网络/限流错误不熔断，下一拍继续。
+        const classified = classifyLarkError(err);
+        if (classified.classification === 'permanent'
+          && docCommentPollCircuits.recordPermanent(circuitKey)) {
+          logger.warn(`[doc-comment-poll] circuit OPEN file=${snapshot.fileToken.slice(0, 12)} code=${classified.larkCode ?? classified.httpStatus ?? '?'}`);
+          recordDocWatchActivity(config.session.dataDir, larkAppId, snapshot.fileToken, {
+            outcome: 'poll-circuit-open',
+            error: `permanent ${classified.larkCode ?? classified.httpStatus ?? ''} ${message}`.slice(0, 300),
+          });
+        }
+        continue;
+      }
+      docCommentPollCircuits.recordSuccess(circuitKey); // 文档可达：若此前在熔断则自动恢复
+
+      // 第二段：游标/基线/评论投递。失败保留原有 poll-failed 观测，但不触碰熔断状态。
+      try {
         const latest = latestDocCommentPollCursor(comments);
         const current = getDocSubscription(config.session.dataDir, larkAppId, snapshot.fileToken);
         if (!current || current.managedBy !== 'watch-comment' || !isPollingDocTriggerMode(current.commentTriggerMode)) continue;
@@ -29806,22 +29837,10 @@ async function pollWatchedDocComments(larkAppId: string): Promise<void> {
           (reply) => { commitDocCommentPollCursor(config.session.dataDir, larkAppId, current.fileToken, reply); },
         );
       } catch (err) {
+        // 处理/投递阶段失败：保留可观测性，但不改变熔断状态（文档本身本拍可达）。
         const message = err instanceof Error ? err.message : String(err);
-        logger.warn(`[doc-comment-poll] file=${snapshot.fileToken.slice(0, 12)} failed: ${message}`);
-        // 应用身份读不到这篇文档（权限撤销 / 文档被删 / 网络）——功能「配着」却从此
-        // 一条都不触发，是 owner 最需要在界面上看到的静默故障。
+        logger.warn(`[doc-comment-poll] file=${snapshot.fileToken.slice(0, 12)} processing failed: ${message}`);
         recordDocWatchActivity(config.session.dataDir, larkAppId, snapshot.fileToken, { outcome: 'poll-failed', error: message });
-        // 永久错误（403 失权 / 文档 404 / 业务码 1254xxx）连续命中即熔断，
-        // 不再每 5s 空转；瞬时网络错误不熔断，下一拍继续。
-        const classified = classifyLarkError(err);
-        if (classified.classification === 'permanent'
-          && docCommentPollCircuits.recordPermanent(circuitKey)) {
-          logger.warn(`[doc-comment-poll] circuit OPEN file=${snapshot.fileToken.slice(0, 12)} code=${classified.larkCode ?? classified.httpStatus ?? '?'}`);
-          recordDocWatchActivity(config.session.dataDir, larkAppId, snapshot.fileToken, {
-            outcome: 'poll-circuit-open',
-            error: `permanent ${classified.larkCode ?? classified.httpStatus ?? ''} ${message}`.slice(0, 300),
-          });
-        }
       }
     }
   } finally {

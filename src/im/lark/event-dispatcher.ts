@@ -13,7 +13,7 @@ import { getBot, getAllBots, getBotOpenId, findOncallChat, getOwnerOpenId, loadB
 import { config, isVcMeetingAgentGloballyEnabled, vcMeetingAgentGlobalListenerBotAppId } from '../../config.js';
 import { getChatInfo, getChatMode, getChatModeStrict, getCachedChatMode, getChatName, getUserProfile, getMessageDetail, listChatMessagesUntil, resolveSiblingBotBySenderOpenId, resolveUnionIdFromOpenId, resolveUnionIdFromOpenIdStrict, replyMessage, sendUserMessage, isHumanOpenId, updateMessage } from './client.js';
 import { listChats, type ChatBrief } from '../../services/groups-store.js';
-import { classifyLarkError, type LarkApiError } from './error-classify.js';
+import { classifyLarkError } from './error-classify.js';
 import { ListenerCircuitBreaker } from '../../services/listener-circuit-breaker.js';
 import { logger } from '../../utils/logger.js';
 import { upsertBotInfoEntries } from '../../services/bots-info-store.js';
@@ -2930,10 +2930,19 @@ function runWithAbortDeadline<T>(
  */
 const LISTENER_PERMANENT_THRESHOLD = 3;
 const LISTENER_PROBE_INTERVAL_MS = 10 * 60_000;
+/**
+ * 管理员熔断私信按 app 去重的窗口。应用级故障（凭据/全站权限被撤）会让所有群
+ * 同时返回永久错误，逐群私信会形成告警风暴；同一 app 在窗口内只发第一条，
+ * 其余在日志里逐群记录，窗口过后新熔断的群允许再报一次。
+ */
+const LISTENER_ALERT_DEDUPE_MS = LISTENER_PROBE_INTERVAL_MS;
+let listenerNow: () => number = () => Date.now();
 const listenerCircuits = new ListenerCircuitBreaker({
   permanentThreshold: LISTENER_PERMANENT_THRESHOLD,
   probeIntervalMs: LISTENER_PROBE_INTERVAL_MS,
+  now: () => listenerNow(),
 });
+const lastListenerAlertAt = new Map<string, number>();
 
 function listenerCircuitKey(larkAppId: string, chatId: string): string {
   return `${larkAppId}:${chatId}`;
@@ -2941,6 +2950,14 @@ function listenerCircuitKey(larkAppId: string, chatId: string): string {
 
 export function __resetListenerCircuitsForTest(): void {
   listenerCircuits.clear();
+  lastListenerAlertAt.clear();
+  listenerNow = () => Date.now();
+}
+
+/** 测试用：注入熔断/告警共用的时钟（传 null/undefined 恢复真实时钟）。 */
+export function __setListenerClockForTest(now: (() => number) | null | undefined): void {
+  listenerNow = now ?? (() => Date.now());
+  lastListenerAlertAt.clear();
 }
 
 /**
@@ -2959,26 +2976,34 @@ async function listenerChatFailed(
   chatId: string,
   err: unknown,
 ): Promise<void> {
-  const classified = classifyLarkError(err) as LarkApiError;
+  const classified = classifyLarkError(err);
   if (classified.classification !== 'permanent') return; // 瞬时错误：本轮 warn，下轮继续，不退避
   const key = listenerCircuitKey(larkAppId, chatId);
   const justOpened = listenerCircuits.recordPermanent(key);
   if (!justOpened) return;
+  const codePart = classified.larkCode ? `（code ${classified.larkCode}）` : '';
+  logger.warn(`[message-listener:${larkAppId}] circuit OPEN for chat=${chatId.substring(0, 12)} code=${classified.larkCode ?? '?'}`);
+  // 应用级故障会同时熔断多个群：私信按 app 节流一个窗口，避免逐群告警风暴。
+  const now = listenerNow();
+  const lastAlertAt = lastListenerAlertAt.get(larkAppId) ?? 0;
+  if (now - lastAlertAt < LISTENER_ALERT_DEDUPE_MS) {
+    logger.warn(`[message-listener:${larkAppId}] circuit OPEN for chat=${chatId.substring(0, 12)} suppressed duplicate admin DM (app alerted ${now - lastAlertAt}ms ago)`);
+    return;
+  }
   const bot = getBot(larkAppId) as BotState | undefined;
   const adminOpenId = bot ? getAdminOpenId(bot) : undefined;
-  const codePart = classified.larkCode ? `（code ${classified.larkCode}）` : '';
+  if (!adminOpenId) return;
   const dm =
     `[botmux] 群消息监听已自动熔断：${chatId}\n` +
     `该群连续 ${LISTENER_PERMANENT_THRESHOLD} 次返回永久错误${codePart}（${classified.message.slice(0, 120)}），` +
-    `通常是 bot 被移出群或群已解散。已停止对该群的 30s 轮询并转为 10 分钟慢探测；` +
-    `bot 被重新拉回后会自动恢复。如不再需要该监听，可在工作台关闭对应群监听。`;
-  logger.warn(`[message-listener:${larkAppId}] circuit OPEN for chat=${chatId.substring(0, 12)} code=${classified.larkCode ?? '?'}`);
-  if (adminOpenId) {
-    try {
-      await dmAdmin(larkAppId, adminOpenId, dm, `listener circuit open ${chatId.substring(0, 12)}`);
-    } catch {
-      /* 私信失败保持熔断，不影响状态机 */
-    }
+    `通常是 bot 被移出群或群已解散。已停止对该群的高频轮询并转为 10 分钟慢探测；` +
+    `bot 被重新拉回后会自动恢复。如不再需要该监听，可在工作台关闭对应群监听。` +
+    `（同一应用其它群也在窗口内熔断时不重复私信，请以工作台监听状态为准。）`;
+  lastListenerAlertAt.set(larkAppId, now);
+  try {
+    await dmAdmin(larkAppId, adminOpenId, dm, `listener circuit open ${chatId.substring(0, 12)}`);
+  } catch {
+    /* 私信失败保持熔断，不影响状态机；水印已置位，避免失败重试造成消息轰炸 */
   }
 }
 
@@ -3484,9 +3509,13 @@ async function pollMessageListenersOnce(
   const bot = getBot(larkAppId);
   const configuredChatIds = enabledMessageListenerChatIds(bot);
   let chatIds = configuredChatIds;
+  // roster 拉取成功时本轮 chatIds 是权威全量，可顺手 prune 熔断表里消失的群；
+  // roster 失败回退到仅配置群时不能 prune（全局监听群只是暂时没列出来）。
+  let rosterFresh = !bot.config.globalMessageListener?.enabled;
   if (bot.config.globalMessageListener?.enabled) {
     try {
       chatIds = [...new Set([...(await listChats(larkAppId)).map(chat => chat.chatId), ...configuredChatIds])];
+      rosterFresh = true;
     } catch (error) {
       // A transient roster failure must not suppress custom/legacy listener
       // backfill for the whole 30s pass. Realtime delivery stays unaffected.
@@ -3515,6 +3544,9 @@ async function pollMessageListenersOnce(
   }
 
   const orderedChatIds = orderChatIdsFromCursor(larkAppId, chatIds);
+  if (rosterFresh) {
+    listenerCircuits.prune(new Set(orderedChatIds.map(chatId => listenerCircuitKey(larkAppId, chatId))));
+  }
   if (progress) progress.firstChatId = orderedChatIds[0];
   for (const chatId of orderedChatIds) {
     if (signal?.aborted) return;
