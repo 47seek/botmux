@@ -27,7 +27,7 @@ import { accessSync, chmodSync, mkdirSync, writeFileSync, unlinkSync, rmdirSync,
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { join, basename, dirname, delimiter, relative, extname } from 'node:path';
 import { resolveBotmuxWrapperBinDir, prependBotmuxBin } from './core/botmux-wrapper.js';
-import { sessionIdentityBinDir, prepareTriggerUserCliEnv, publishActiveTurn, GIT_ASKPASS_BASENAME } from './core/cli-identity.js';
+import { sessionIdentityBinDir, prepareTriggerUserCliEnv, publishActiveTurn, GIT_ASKPASS_BASENAME, applyTurnGitConfigEnv } from './core/cli-identity.js';
 import { prepareLarkToolEnv, usesLarkToolBinding, cleanupLarkToolBinding, larkToolBindingPath, resolveLarkToolDataDir, resolveIdentityStorageModel } from './core/lark-tool-binding.js';
 import { tokenStoreProtection } from './services/trigger-user-auth.js';
 import { installAidenCodexShim, writeAidenCodexShellConfigs } from './services/aiden-codex-shim.js';
@@ -22264,11 +22264,20 @@ async function spawnCli(
       ...(currentBotmuxTurnId ? { turnId: currentBotmuxTurnId } : {}),
     });
   }
-  prepareTriggerUserCliEnv(childEnv, process.env.SESSION_DATA_DIR, cfg.sessionId, identityPolicy, log,
+  // gitConfigPairs is the single authoritative git `-c` set for this turn. The
+  // pane-wrapped backends rebuild GIT_CONFIG_* from it via SpawnOpts; direct
+  // backends get the re-encoded block placed back into childEnv below.
+  const gitConfigPairs = prepareTriggerUserCliEnv(childEnv, process.env.SESSION_DATA_DIR, cfg.sessionId, identityPolicy, log,
     childIdentityModel,
     childIdentityModel === 'proven'
       ? { appId: cfg.larkAppId, ipcPort: parseDaemonIpcPort(process.env.BOTMUX_DAEMON_IPC_PORT) }
       : undefined);
+  // Reset the inherited git-config channel to exactly the turn-authored set.
+  // This keeps the direct-exec backends (PTY, env -i strict panes), which
+  // inherit childEnv wholesale, as clean as the shell-wrappered panes: ambient
+  // COUNT/high-index/gapped pairs (nested CLIs and hooks share GIT_CONFIG_COUNT
+  // as an accumulator) cannot ride along.
+  applyTurnGitConfigEnv(childEnv, gitConfigPairs);
   if (boundLark) prepareLarkToolEnv({ env: childEnv, effectivePath: perBotInjectEnv.PATH ?? childEnv.PATH, dataDir: process.env.SESSION_DATA_DIR!,
     sessionId: cfg.sessionId, appId: cfg.larkAppId, brand: cfg.brand });
   if (cfg.triggerUserAuth?.enabled && process.env.SESSION_DATA_DIR) {
@@ -24018,6 +24027,7 @@ async function spawnCli(
       cwd: spawnCwd,
       env: childEnv,
       injectEnv: perBotInjectKeys.length ? perBotInjectEnv : undefined,
+      gitConfigPairs,
     });
   } catch (err: any) {
     capturedSpawnCommand = null;
@@ -24098,6 +24108,7 @@ async function spawnCli(
       rows: PTY_ROWS,
       env: childEnv as Record<string, string>,
       injectEnv: perBotInjectKeys.length ? perBotInjectEnv : undefined,
+      gitConfigPairs,
       // Already removed from childEnv; shell-wrapped backends also `env -u`
       // them after the pane's rcfile / terminal-server env (session env overlay).
       unsetEnv: cfg.envUnset?.length ? cfg.envUnset : undefined,

@@ -38,6 +38,8 @@ import {
   renderGitAskpassScript,
   installGitAskpass,
   gitIdentityConfigEnv,
+  gitIdentityConfigPairs,
+  applyTurnGitConfigEnv,
 } from '../src/core/cli-identity.js';
 
 let dir: string;
@@ -237,13 +239,103 @@ describe('tmux env passthrough covers the identity vars', () => {
     }
   });
 
-  // The numbered git-config keys are listed literally, so the list has to match
-  // however many entries gitIdentityConfigEnv actually emits.
-  it('forwards every numbered git-config key that is actually emitted', async () => {
-    const { BOTMUX_INJECTED_ENV_KEYS } = await import('../src/utils/child-env.js');
-    const emitted = Object.keys(gitIdentityConfigEnv('/tmp/askpass', 'git.example.com'));
-    for (const key of emitted) {
-      expect(BOTMUX_INJECTED_ENV_KEYS).toContain(key);
+  // The numbered git-config keys are no longer a static pane allowlist: the
+  // pane transport rebuilds them from the turn-authored pair carrier
+  // (SpawnOpts.gitConfigPairs), so the contract is that every pair
+  // gitIdentityConfigPairs emits reaches a pane via buildBotmuxEnvAssignments
+  // with COUNT equal to the pair count.
+  it('forwards every emitted git-config pair through the pane carrier', async () => {
+    const { buildBotmuxEnvAssignments } = await import('../src/adapters/backend/tmux-backend.js');
+    const pairs = gitIdentityConfigPairs('/tmp/askpass', 'git.example.com');
+    const assignments = buildBotmuxEnvAssignments(
+      // Even a poisoned ambient block (pushed-up COUNT, high-index pairs) must
+      // not influence the carrier-derived output.
+      { GIT_CONFIG_COUNT: '14', GIT_CONFIG_KEY_14: 'core.hooksPath', GIT_CONFIG_VALUE_14: '/tmp/evil' },
+      undefined,
+      undefined,
+      pairs,
+    );
+    expect(assignments).toContain(`GIT_CONFIG_COUNT=${pairs.length}`);
+    expect(assignments).not.toContain(expect.stringMatching(/GIT_CONFIG_KEY_(?:[3-9]|\d{2})/));
+    expect(assignments).not.toContain('GIT_CONFIG_KEY_14=core.hooksPath');
+    pairs.forEach(([key, value], i) => {
+      expect(assignments).toContain(`GIT_CONFIG_KEY_${i}=${key}`);
+      expect(assignments).toContain(`GIT_CONFIG_VALUE_${i}=${value}`);
+    });
+  });
+
+  it('zeroes an ambient GIT_CONFIG_COUNT when no pair carrier is forwarded', async () => {
+    const { buildBotmuxEnvAssignments } = await import('../src/adapters/backend/tmux-backend.js');
+    const assignments = buildBotmuxEnvAssignments({ GIT_CONFIG_COUNT: '14' });
+    expect(assignments).toContain('GIT_CONFIG_COUNT=0');
+    expect(assignments.filter(a => a.startsWith('GIT_CONFIG_KEY_'))).toEqual([]);
+  });
+});
+
+describe('applyTurnGitConfigEnv resets the direct-exec channel', () => {
+  it('wipes an inherited pushed-up count and high-index pairs, then writes only the authored block', () => {
+    const env: NodeJS.ProcessEnv = {
+      ...process.env,
+      GIT_CONFIG_COUNT: '14',
+      GIT_CONFIG_KEY_0: 'stale.k0', GIT_CONFIG_VALUE_0: 'stale-v0',
+      GIT_CONFIG_KEY_2: 'stale.k2', GIT_CONFIG_VALUE_2: 'stale-v2',
+      GIT_CONFIG_KEY_14: 'core.hooksPath', GIT_CONFIG_VALUE_14: '/tmp/evil',
+      UNRELATED: 'keep',
+    };
+    applyTurnGitConfigEnv(env, gitIdentityConfigPairs('/tmp/askpass', 'git.example.com'));
+    expect(env.GIT_CONFIG_COUNT).toBe('3');
+    expect(env.GIT_CONFIG_KEY_0).toBe('credential.https://git.example.com.helper');
+    expect(env.GIT_CONFIG_KEY_2).toBe('url.https://git.example.com/.insteadOf');
+    expect(env.GIT_CONFIG_KEY_14).toBeUndefined();
+    expect(env.GIT_CONFIG_VALUE_14).toBeUndefined();
+    expect(env.GIT_CONFIG_KEY_3).toBeUndefined();
+    expect(env.UNRELATED).toBe('keep');
+  });
+
+  it('leaves no GIT_CONFIG_* trace with zero authored pairs even under ambient COUNT=14', () => {
+    const env: NodeJS.ProcessEnv = {
+      GIT_CONFIG_COUNT: '14', GIT_CONFIG_KEY_0: 'k', GIT_CONFIG_VALUE_0: 'v', UNRELATED: 'keep',
+    };
+    applyTurnGitConfigEnv(env, []);
+    expect(env.GIT_CONFIG_COUNT).toBeUndefined();
+    expect(env.GIT_CONFIG_KEY_0).toBeUndefined();
+    expect(env.GIT_CONFIG_VALUE_0).toBeUndefined();
+    expect(env.UNRELATED).toBe('keep');
+  });
+});
+
+describe('prepareTriggerUserCliEnv returns the turn git-config carrier', () => {
+  it('returns the host-scoped attribution pairs for an installed bytedcli wrapper', () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'pr2203-prepare-data-'));
+    const binDir = mkdtempSync(join(tmpdir(), 'pr2203-prepare-bin-'));
+    const bytedcli = join(binDir, 'bytedcli');
+    writeFileSync(bytedcli, '#!/bin/sh\nexit 0\n');
+    chmodSync(bytedcli, 0o755);
+    const env: NodeJS.ProcessEnv = { PATH: binDir };
+    const policy = {
+      enabled: true,
+      tools: ['bytedcli'],
+      fallback: 'bot-identity',
+      gitHost: 'git.example.com',
+    };
+    try {
+      const pairs = prepareTriggerUserCliEnv(
+        env, dataDir, 'sess-carrier', policy as never, () => {}, 'single',
+      );
+      expect(pairs).toHaveLength(3);
+      expect(pairs.map(([key]) => key)).toEqual([
+        'credential.https://git.example.com.helper',
+        'url.https://git.example.com/.insteadOf',
+        'url.https://git.example.com/.insteadOf',
+      ]);
+      expect(pairs[1][1]).toBe('ssh://git@git.example.com/');
+      expect(pairs[2][1]).toBe('git@git.example.com:');
+      expect(env.GIT_ASKPASS).toBeDefined();
+      expect(existsSync(env.GIT_ASKPASS as string)).toBe(true);
+      expect(pairs[0][1]).toContain(env.GIT_ASKPASS as string);
+    } finally {
+      rmSync(dataDir, { recursive: true, force: true });
+      rmSync(binDir, { recursive: true, force: true });
     }
   });
 });
