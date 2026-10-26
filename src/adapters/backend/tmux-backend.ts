@@ -336,6 +336,13 @@ export class TmuxBackend {
         env: tmuxEnv(),
         timeout: 3000,
       });
+      // `has-session` answers 0 for a session whose pane is a KEPT CORPSE
+      // (`remain-on-exit failed`, set by TmuxPipeBackend): the CLI is gone but
+      // the session object survives. Reporting that as `exists` would make a
+      // launch decision choose 'reattach' and attach the next generation to a
+      // dead pane. Ask the pane itself; only an explicit dead flag turns
+      // 'exists' into 'missing', so the normal path is a bare extra probe.
+      if (TmuxBackend.isSessionPaneDead(name, socketName)) return 'missing';
       return 'exists';
     } catch (e: any) {
       // Deadline first: a timed-out client can surface a clean numeric exit
@@ -363,6 +370,23 @@ export class TmuxBackend {
         return 'missing';
       }
       return 'unknown';
+    }
+  }
+
+  /** True only when the session's pane is a kept corpse. Any inconclusive
+   *  answer (probe error, timeout, an option this tmux does not report) is
+   *  `false` — a liveness probe must never invent a death it cannot see. */
+  private static isSessionPaneDead(name: string, socketName?: string): boolean {
+    try {
+      const out = String(
+        execFileSync(
+          'tmux', [...tmuxSocketArgs(socketName), 'display-message', '-p', '-t', name, '#{pane_dead}'],
+          { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'], env: tmuxEnv(), timeout: 2000 },
+        ) ?? '',
+      ).trim();
+      return out === '1';
+    } catch {
+      return false;
     }
   }
 

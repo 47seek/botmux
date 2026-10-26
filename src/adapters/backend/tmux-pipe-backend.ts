@@ -768,6 +768,23 @@ export class TmuxPipeBackend implements SessionBackend {
     }
   }
 
+  /** True only when tmux explicitly flags this pane dead. Any inconclusive
+   *  answer (probe error, timeout, an option this tmux does not report) is
+   *  `false` — a liveness probe must never invent a death it cannot see. */
+  private isPaneDead(): boolean {
+    try {
+      const out = String(
+        execFileSync(
+          'tmux', [...this.tmuxArgs, 'display-message', '-p', '-t', this.paneTarget, '#{pane_dead}'],
+          { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'], timeout: PANE_DEATH_PROBE_TIMEOUT_MS, env: tmuxEnv() },
+        ) ?? '',
+      ).trim();
+      return out === '1';
+    } catch {
+      return false;
+    }
+  }
+
   private exitCopyModeIfNeeded(): void {
     if (this.exited) return;
 
@@ -950,11 +967,20 @@ export class TmuxPipeBackend implements SessionBackend {
    */
   private probePaneAddressability(timeoutMs: number): { state: SessionProbe; reason?: string; serverLevel?: boolean } {
     try {
+      // `#{pane_id}` alone is NOT a liveness verdict once `remain-on-exit failed`
+      // (applySessionOptions) is in play: a crashed CLI leaves a DEAD pane in
+      // place, and a dead pane still answers a pane_id — the probe would then
+      // report `exists` forever and the session would never emit its exit. So a
+      // hit on pane_id is confirmed against `#{pane_dead}` in a second, cheap
+      // round-trip. Only an explicit `1` counts as death; an unreadable flag
+      // keeps the historic `exists` answer (never invent a death).
       const paneId = execFileSync(
         'tmux', [...this.tmuxArgs, 'display-message', '-p', '-t', this.paneTarget, '#{pane_id}'],
         { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], timeout: timeoutMs, env: tmuxEnv() },
       ).trim();
-      return { state: paneId.length > 0 ? 'exists' : 'missing', reason: paneId.length > 0 ? undefined : 'empty pane id' };
+      if (paneId.length === 0) return { state: 'missing', reason: 'empty pane id' };
+      if (this.isPaneDead()) return { state: 'missing', reason: 'pane is dead (remain-on-exit remnant)' };
+      return { state: 'exists' };
     } catch (err: any) {
       // Deadline first: a timed-out probe can carry a clean numeric exit when
       // the client's completion races the kill (isExecTimeoutError). That is
@@ -1197,8 +1223,72 @@ export class TmuxPipeBackend implements SessionBackend {
       } catch { /* pane may already be gone — benign */ }
       this.pipeAttached = false;
     }
+    // Read the real exit status BEFORE tearing the fifo down / killing the
+    // remnant: `remain-on-exit failed` keeps exactly this pane addressable
+    // while it is dead, and `#{pane_dead_status}` is the only carrier of
+    // 77/127 through tmux. Order matters — after the kill below there is no
+    // pane left to ask.
+    const death = this.readPaneDeath();
     this.teardownFifoReader();
-    this.fireExit(1, null);
+    // `remain-on-exit failed` means a non-zero exit leaves a dead pane (and
+    // with it the whole session) behind. Nothing else owns it: the worker
+    // replaces this backend, so without this the shell would outlive the
+    // session row and every crash would leak one. Gate on `dead`, NOT on a
+    // readable status: a signal-killed CLI is dead with an EMPTY
+    // `pane_dead_status` (verified on tmux 3.3a: `kill -9` leaves `1:`), so
+    // keying the cleanup on the status alone leaked exactly those sessions.
+    if (death.dead) this.killDeadPaneRemnant();
+    // The pane's real status, when we could read it. `null` keeps the historic
+    // sentinel (1) so callers that only care about "it exited" and the
+    // crash-restart policy's transient branch behave exactly as before.
+    this.fireExit(death.status ?? 1, null);
+  }
+
+  /**
+   * Whether the pane is a kept corpse, and the status the CLI returned if tmux
+   * recorded one.
+   *
+   * `#{pane_dead}` tells us the pane is dead rather than live;`#{pane_dead_status}`
+   * carries the status the CLI actually returned. Both are only populated
+   * because applySessionOptions() sets `remain-on-exit failed` per session.
+   * A SIGNAL death leaves the status empty (tmux has no exit code to report),
+   * so `dead` and `status` are deliberately separate signals. An inconclusive
+   * probe (server down, timeout, pane already gone) returns `{dead: false}` —
+   * the caller then keeps the historic behaviour instead of inventing a code.
+   *
+   * Deliberately does NOT consult `#{pane_id}` for liveness: a dead-but-kept
+   * pane still answers a pane_id, which is exactly the trap that would make a
+   * liveness probe report `exists` forever (see probePaneAddressability).
+   */
+  private readPaneDeath(): { dead: boolean; status: number | null } {
+    let out: string;
+    try {
+      out = String(
+        execFileSync(
+          'tmux',
+          [...this.tmuxArgs, 'display-message', '-p', '-t', this.paneTarget, '#{pane_dead}:#{pane_dead_status}'],
+          { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'], timeout: PANE_DEATH_PROBE_TIMEOUT_MS, env: tmuxEnv() },
+        ) ?? '',
+      ).trim();
+    } catch {
+      return { dead: false, status: null };
+    }
+    const [dead, status] = out.split(':');
+    if (dead !== '1') return { dead: false, status: null };
+    const parsed = Number.parseInt((status ?? '').trim(), 10);
+    return { dead: true, status: Number.isInteger(parsed) ? parsed : null };
+  }
+
+  /** Take down the corpse `remain-on-exit failed` left behind (and its session).
+   *  Best-effort and bounded: the pane is already dead, so failing here only
+   *  leaves a stale session that the orphan reaper owns. */
+  private killDeadPaneRemnant(): void {
+    if (!this.ownsSession) return;
+    try {
+      execFileSync('tmux', [...this.tmuxArgs, 'kill-session', '-t', this.paneTarget], {
+        stdio: 'ignore', timeout: 3000, env: tmuxEnv(),
+      });
+    } catch { /* already gone or another teardown won the race */ }
   }
 
   private createDetachedSession(bin: string, args: string[], opts: SpawnOpts): void {
@@ -1399,6 +1489,14 @@ export class TmuxPipeBackend implements SessionBackend {
       if (version === null || tmuxVersionAtLeast(version, 3, 1)) {
         execSync(`${this.tmuxCmd} set-option -t ${t} window-size largest`, { stdio: 'ignore', env, timeout: 5000 });
       }
+      // `remain-on-exit failed` — ONLY failed (non-zero) exits keep a dead
+      // pane around; a clean exit 0 removes the session exactly as before, so
+      // nothing about the normal lifecycle changes. What it buys: the CLI's
+      // real exit status survives on the pane (#{pane_dead_status}), which is
+      // the only channel that carries 77/127 through the tmux backend. See
+      // readPaneDeadStatus(). Set PER SESSION (-t), never -g: this server is
+      // shared with the user's own sessions.
+      execSync(`${this.tmuxCmd} set-option -t ${t} remain-on-exit failed`, { stdio: 'ignore', env, timeout: 5000 });
     } catch { /* session may not be ready yet — benign */ }
   }
 

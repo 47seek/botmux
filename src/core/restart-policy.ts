@@ -10,8 +10,18 @@
  *  2. 身份/凭证类失败（exit 77）重试本身无意义且会反复触发受管工具调用，
  *     应当更快停止，而不是和普通抖动一样等满 3 次。
  *
- * 把判定抽成纯函数：连续失败按「同一失败原因」累计，时间窗只用于重置
- * 瞬时抖动；已知永久退出码不被时间窗豁免、且阈值更低。
+ * 把判定抽成纯函数：连续失败累计，已知永久退出码不被时间窗豁免、且阈值更低。
+ *
+ * 两个必须守住的边界（评审实测出来的）：
+ *  - **性质切换不清零**：崩溃码在「永久 / 普通」之间来回跳（77,1,77,1…）时，
+ *    两套计数各自从 1 起算会把限流整个绕过去（实测 20 次崩溃停止 0 次）。因此
+ *    两个计数（总次数 `count`、永久次数 `permanentCount`）都只增不减，永久通道
+ *    用自己的累计值判闸，而不是本次退出码。
+ *  - **恢复健康即清零**：计数只在「连续失败」里才有意义。CLI 一旦报告 ready
+ *    （prompt_ready），说明它真的跑起来了；此前那次历史性 127 不该让这条会话
+ *    此后任何一次 127 都立即不重启（实测隔 90 天仍如此）。清零由调用方在 ready
+ *    时做（worker-pool 的 prompt_ready 分支 delete 掉该 session 的计数）。
+ *    本模块因此不缓存任何跨会话状态，重置语义天然成立。
  */
 
 export const RESTART_WINDOW_MS = 60_000;
@@ -30,10 +40,13 @@ export function isPermanentCliExitCode(code: number | null | undefined): boolean
 }
 
 export interface RestartCounter {
+  /** 连续失败总次数（跨性质累计；CLI ready 后由调用方清掉整条记录）。 */
   count: number;
   lastAt: number;
-  /** 上一次崩溃的退出码，用于识别「同一确定性原因」的连续失败。 */
+  /** 上一次崩溃的退出码，用于日志与性质判断。 */
   lastCode?: number | null;
+  /** 本轮连续失败里命中永久退出码的次数（跨性质累计）。 */
+  permanentCount?: number;
 }
 
 export interface RestartDecisionInput {
@@ -60,25 +73,50 @@ export function decideAutoRestart(input: RestartDecisionInput): RestartDecision 
   const fatalMax = input.fatalMax ?? FATAL_MAX_RESTARTS;
   const permanent = isPermanentCliExitCode(input.code);
 
-  // 连续失败计数的归零规则：
-  //  - 距上次崩溃超过窗口，且本次是普通（非永久）退出 → 视为新的一轮抖动，重置；
-  //  - 永久退出码即使间隔很久也不豁免（同一确定性原因在反复发生）；
-  //  - 退出码在两个永久码之间变化也算永久失败（都属「重试无意义」类），保持累计。
-  let count = input.prev?.count ?? 0;
   const withinWindow = input.prev !== undefined && input.now - input.prev.lastAt <= windowMs;
   const prevPermanent = input.prev !== undefined && isPermanentCliExitCode(input.prev.lastCode);
-  if (permanent && prevPermanent) {
-    count += 1;
-  } else if (!permanent && !prevPermanent && withinWindow) {
-    count += 1;
-  } else {
+  const prevCount = input.prev?.count ?? 0;
+  const prevPermanentCount = input.prev?.permanentCount
+    // 兼容老记录（引入 permanentCount 前写入的项）：按上一次退出码补算。
+    ?? (prevPermanent ? prevCount : 0);
+
+  // 计数只增不减 —— 性质切换（永久↔普通）**不**重置，否则来回横跳即可无限续命。
+  // 唯一的重置入口是「恢复健康」（调用方在 prompt_ready 时删除计数）。
+  // 时间窗只用来判断「这次普通崩溃是否属于同一轮抖动」。
+  let count: number;
+  if (input.prev === undefined) {
     count = 1;
+  } else if (permanent && prevPermanent) {
+    // 同一类确定性失败反复发生：跨窗也累计（本 PR 主治的慢启动必崩场景）。
+    count = prevCount + 1;
+  } else if (!permanent && !prevPermanent) {
+    // 都是普通退出：窗口内累计，超窗视为新的一轮抖动（与旧实现边界等价）。
+    count = withinWindow ? prevCount + 1 : 1;
+  } else {
+    // 性质切换：不清零，在上一轮基础上继续往上数。
+    count = prevCount + 1;
   }
 
-  const next: RestartCounter = { count, lastAt: input.now, lastCode: input.code ?? null };
-  const max = permanent ? fatalMax : defaultMax;
-  if (count > max) {
-    return { next, shouldRestart: false, reason: permanent ? 'permanent_exit' : 'window_budget' };
+  const permanentCount = prevPermanentCount + (permanent ? 1 : 0);
+  const next: RestartCounter = {
+    count,
+    lastAt: input.now,
+    lastCode: input.code ?? null,
+    permanentCount,
+  };
+
+  // 永久通道用自己的累计值判闸：首次永久失败给一次重启，第二次（无论中间是否
+  // 夹了普通崩溃）即停。不看 count，否则一笔陈年普通崩溃会吞掉这唯一的机会。
+  if (permanent && permanentCount > fatalMax) {
+    return { next, shouldRestart: false, reason: 'permanent_exit' };
+  }
+  // 普通通道：窗口内预算耗尽。permanentCount 一旦超限，普通退出也不再放行
+  // ——否则「永久失败→普通失败」交替就能让限流整体失效。
+  if (!permanent && permanentCount > fatalMax) {
+    return { next, shouldRestart: false, reason: 'permanent_exit' };
+  }
+  if (!permanent && count > defaultMax) {
+    return { next, shouldRestart: false, reason: 'window_budget' };
   }
   return { next, shouldRestart: true, reason: 'ok' };
 }

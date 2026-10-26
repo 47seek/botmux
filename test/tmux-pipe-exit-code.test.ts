@@ -1,0 +1,212 @@
+/**
+ * tmux 后端的真实退出码通道。
+ *
+ * 事故背景（评审阻断 1）：`TmuxPipeBackend` 只从两个出口 `fireExit(1, null)`，
+ * 于是 daemon 在所有默认（tmux）会话上永远只看到 code=1——崩溃重启策略里
+ * 77/127 的永久退出通道在生产路径上结构不可达，`restart-policy` 那半边等于
+ * 没接上。
+ *
+ * 这里钉的是行为，不是实现：用一个真 tmux（私有 socket）+ 真 TmuxPipeBackend
+ * 起一个 CLI，让它以各种方式退出，断言 `onExit` 拿到的退出码。
+ *
+ * 同时钉 N3：`remain-on-exit failed` 会让崩溃的 pane 尸体留在原地，而尸体仍会
+ * 回答 `#{pane_id}`、`has-session` 也返回 0——存活探针与后端闸口必须把它判成
+ * missing，否则会话永远报不出退出、还会把下一代 attach 到尸体上。
+ */
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { execFileSync, spawnSync } from 'node:child_process';
+import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { TmuxPipeBackend } from '../src/adapters/backend/tmux-pipe-backend.js';
+import { TmuxBackend } from '../src/adapters/backend/tmux-backend.js';
+import { rmSandboxScratch } from './helpers/rm-sandbox-scratch.js';
+
+let realTmux: string | undefined;
+try { realTmux = execFileSync('which', ['tmux'], { encoding: 'utf8' }).trim(); } catch { /* optional */ }
+
+/**
+ * Backend 退出检测依赖它自己的生命周期轮询（1s 起步、缺会话要连续 3 次才
+ * 判定），单例最坏 ~14s。给足余量且不靠固定 sleep。
+ */
+const EXIT_TIMEOUT_MS = 45_000;
+
+describe.skipIf(!realTmux)('tmux backend reports the pane pid\'s real exit code', () => {
+  let dir: string;
+  let socket: string;
+  const saved: Record<string, string | undefined> = {};
+  let seq = 0;
+
+  const tmux = (...args: string[]) => spawnSync(realTmux!, ['-S', socket, ...args], { encoding: 'utf8' });
+
+  /** One backend launch; resolves with the (code, signal) onExit reported. */
+  const runToExit = async (script: string): Promise<{ code: number | null; signal: string | null }> => {
+    const name = `bmx-exit${++seq}`;
+    const backend = new TmuxPipeBackend(name, { createSession: true, ownsSession: true, socketName: socket });
+    const workdir = mkdtempSync(join(tmpdir(), 'tmux-exit-cwd-'));
+    try {
+      return await new Promise((resolve, reject) => {
+        const timer = setTimeout(
+          () => reject(new Error(`${name} never reported an exit within ${EXIT_TIMEOUT_MS}ms`)),
+          EXIT_TIMEOUT_MS,
+        );
+        backend.onExit((code, signal) => {
+          clearTimeout(timer);
+          resolve({ code, signal });
+        });
+        backend.spawn('/bin/sh', ['-c', script], {
+          cwd: workdir,
+          cols: 100,
+          rows: 30,
+          env: { ...process.env } as Record<string, string>,
+          paneLaunchDir: workdir,
+        });
+      });
+    } finally {
+      rmSandboxScratch(workdir);
+    }
+  };
+
+  /** Sessions this file's backend left behind (the corpse must be reaped). */
+  const leftoverExitSessions = (): string[] => {
+    const listed = tmux('list-sessions', '-F', '#{session_name}');
+    if (listed.status !== 0) return []; // no server at all ⇒ nothing left behind
+    return String(listed.stdout).split('\n').map(l => l.trim()).filter(l => l.startsWith('bmx-exit'));
+  };
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'tmux-exit-'));
+    socket = join(dir, 'socket');
+    const bin = join(dir, 'bin');
+    mkdirSync(bin);
+    writeFileSync(join(bin, 'tmux'), `#!/bin/sh\nexec '${realTmux}' -S '${socket}' "$@"\n`, { mode: 0o755 });
+    for (const key of ['PATH', 'SHELL', 'TMUX', 'TMUX_PANE']) saved[key] = process.env[key];
+    process.env.PATH = `${bin}:${process.env.PATH}`;
+    process.env.SHELL = '/bin/sh';
+    delete process.env.TMUX;
+    delete process.env.TMUX_PANE;
+  });
+
+  afterEach(() => {
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    tmux('kill-server');
+    rmSandboxScratch(dir);
+  });
+
+  // 这两条是 PR 的全部意义所在：默认 tmux 后端必须能把「重试无意义」的退出码
+  // 交给 daemon，否则 restart-policy 的永久通道在生产上是死代码。
+  it('forwards 77 (identity/credential failure) instead of the historic sentinel 1', async () => {
+    expect(await runToExit('sleep 1.5; exit 77')).toEqual({ code: 77, signal: null });
+  });
+
+  it('forwards 127 (missing executable, the shape /usr/bin/env produces) instead of 1', async () => {
+    expect(await runToExit('sleep 1.5; exec /usr/bin/env /nonexistent-cli-xyz')).toEqual({ code: 127, signal: null });
+  });
+
+  // 普通非零退出同样要如实上报：熔断策略对 1 与 127 的处理不同，把 127 抖成 1
+  // 会掩盖「命令没装」。
+  it('forwards an ordinary non-zero code unchanged', async () => {
+    expect(await runToExit('sleep 1.5; exit 3')).toEqual({ code: 3, signal: null });
+  });
+
+  // 信号死亡没有 tmux 可报的退出码（实测 `pane_dead_status` 为空）。这里钉的是
+  // 「不得把信号死亡误归为永久失败」：它必须落回普通通道，而不是被当成 77/127
+  // 那样一次就熔断的确定性错误。
+  it('does not classify a signal death as a permanent exit', async () => {
+    const { code } = await runToExit('sleep 1.5; kill -9 $$');
+    expect(code === 77 || code === 127).toBe(false);
+  });
+
+  // `remain-on-exit failed` 会为一具崩溃的尸体留下整条 session；谁都不清理的话
+  // 每次崩溃都漏一条。这里断言没漏（也包括信号死亡：它的 status 为空，只按
+  // status 判清理会正好漏掉这一类）。
+  it('reaps the dead-pane remnant it kept for status reporting', async () => {
+    await runToExit('sleep 1.5; exit 77');
+    await runToExit('sleep 1.5; kill -9 $$');
+    // Backend 的 kill 是 best-effort 且与退出判定同一轮，给服务器一拍时间。
+    const deadline = Date.now() + 5_000;
+    let leftover = leftoverExitSessions();
+    while (leftover.length > 0 && Date.now() < deadline) {
+      await new Promise(r => setTimeout(r, 100));
+      leftover = leftoverExitSessions();
+    }
+    expect(leftover).toEqual([]);
+  });
+});
+
+/**
+ * N3：死 pane 在 tmux 眼里仍是「存在的会话」。任何拿会话存在性当存活证据的
+ * 地方都必须先排除它，否则会话永远不报退出、且下一次启动会把尸体当活会话
+ * attach。这两条钉的是 probe 层，也就是所有调用方共用的那一个判断。
+ */
+describe.skipIf(!realTmux)('tmux liveness probes treat a kept corpse as missing', () => {
+  let dir: string;
+  let socket: string;
+  const saved: Record<string, string | undefined> = {};
+  const tmux = (...args: string[]) => spawnSync(realTmux!, ['-S', socket, ...args], { encoding: 'utf8' });
+
+  beforeEach(async () => {
+    dir = mkdtempSync(join(tmpdir(), 'tmux-corpse-'));
+    socket = join(dir, 'socket');
+    const bin = join(dir, 'bin');
+    mkdirSync(bin);
+    writeFileSync(join(bin, 'tmux'), `#!/bin/sh\nexec '${realTmux}' -S '${socket}' "$@"\n`, { mode: 0o755 });
+    for (const key of ['PATH', 'SHELL']) saved[key] = process.env[key];
+    process.env.PATH = `${bin}:${process.env.PATH}`;
+    process.env.SHELL = '/bin/sh';
+    // One live session keeps the server up; the corpse is a second session that
+    // opted into remain-on-exit the same way applySessionOptions does.
+    // The option is per SESSION and must be set on the corpse itself — setting
+    // it on the neighbour leaves the corpse session to vanish on exit, and then
+    // this whole block tests nothing.
+    tmux('new-session', '-d', '-s', 'bmx-live-one', 'sleep 60');
+    tmux('new-session', '-d', '-s', 'bmx-corpse', 'sh -c "sleep 0.3; exit 77"');
+    tmux('set-option', '-t', 'bmx-corpse', 'remain-on-exit', 'failed');
+    const deadStatus = await waitForDeadPane('bmx-corpse');
+    expect(deadStatus.dead).toBe(true);
+    expect(deadStatus.status).toBe('77');
+  });
+
+  afterEach(() => {
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    tmux('kill-server');
+    rmSandboxScratch(dir);
+  });
+
+  const waitForDeadPane = async (name: string): Promise<{ dead: boolean; status: string }> => {
+    const deadline = Date.now() + 10_000;
+    for (;;) {
+      const out = tmux('display-message', '-p', '-t', name, '#{pane_dead}:#{pane_dead_status}');
+      const text = String(out.stdout ?? '').trim();
+      const [dead, status] = text.split(':');
+      if (dead === '1') return { dead: true, status: status ?? '' };
+      if (Date.now() > deadline) return { dead: false, status: '' };
+      await new Promise(r => setTimeout(r, 50));
+    }
+  };
+
+  // 前提本身也要钉住，否则下面两条断言可能因为尸体早被回收而假绿。
+  it('the raw tmux answers still say the corpse session exists', () => {
+    expect(tmux('has-session', '-t', 'bmx-corpse').status).toBe(0);
+    const paneId = tmux('display-message', '-p', '-t', 'bmx-corpse', '#{pane_id}');
+    expect(String(paneId.stdout).trim()).not.toBe('');
+  });
+
+  it('probeSession / hasSession report the corpse as missing', () => {
+    expect(TmuxBackend.probeSession('bmx-corpse', socket)).toBe('missing');
+    expect(TmuxBackend.hasSession('bmx-corpse', socket)).toBe(false);
+    // Launch selection must not choose "reattach" for a corpse.
+    expect(TmuxBackend.probeSessionForLaunch('bmx-corpse', socket)).toBe('missing');
+  });
+
+  it('leaves a genuinely live session reported as exists', () => {
+    expect(TmuxBackend.probeSession('bmx-live-one', socket)).toBe('exists');
+    expect(TmuxBackend.hasSession('bmx-live-one', socket)).toBe(true);
+  });
+});
