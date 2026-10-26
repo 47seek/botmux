@@ -1,5 +1,5 @@
 import { describe, expect, it, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, writeFileSync, existsSync, statSync, rmSync, closeSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readFileSync, existsSync, statSync, rmSync, closeSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { rotateLogIfNeeded, openRotatedAppendLog, DEFAULT_LOG_MAX_BYTES } from '../src/utils/log-rotate.js';
@@ -53,5 +53,43 @@ describe('rotateLogIfNeeded', () => {
 
   it('default limit is a finite positive size', () => {
     expect(DEFAULT_LOG_MAX_BYTES).toBeGreaterThan(0);
+  });
+});
+
+describe('openRotatedAppendLog', () => {
+  it('rolls an over-limit file to .1 and (re)opens a fresh writable file', () => {
+    const p = join(dir, 'daemon-0-out.log');
+    writeFileSync(p, 'x'.repeat(100));
+    const fd = openRotatedAppendLog(p, 50);
+    try {
+      // 旧内容已在 .1 归档里；新打开的 fd 写到轮转后新建的空文件。
+      expect(statSync(`${p}.1`).size).toBe(100);
+      writeFileSync(fd, 'fresh');
+    } finally {
+      closeSync(fd);
+    }
+    expect(statSync(p).size).toBe(5);
+  });
+
+  it('keeps rotating on every restart even when .1 already exists', () => {
+    // 归档 .1 已存在时再次轮转必须仍成功（rename 覆盖旧归档），
+    // 否则大小上限只在第一次启动生效，之后一直 append 超限文件。
+    const p = join(dir, 'daemon-1-err.log');
+    const fd1 = openRotatedAppendLog(p, 10);
+    closeSync(fd1);
+    writeFileSync(p, 'x'.repeat(40));
+    const fd2 = openRotatedAppendLog(p, 10);
+    closeSync(fd2);
+    expect(statSync(`${p}.1`).size).toBe(40);
+    expect(statSync(p).size).toBe(0); // 轮转后新建的空文件
+  });
+
+  it('appends to the existing file when below the limit', () => {
+    const nested = join(dir, 'daemon-0-out.log');
+    writeFileSync(nested, 'old');
+    const fd = openRotatedAppendLog(nested, 100);
+    try { writeFileSync(fd, '+new'); } finally { closeSync(fd); }
+    expect(readFileSync(nested, 'utf-8')).toBe('old+new');
+    expect(existsSync(`${nested}.1`)).toBe(false);
   });
 });
