@@ -387,6 +387,17 @@ describe('resolvePaneDeath waits for pane_dead_status without inventing one', ()
     expect(r).toEqual({ dead: true, status: 127 });
   });
 
+  // The discriminating case for "inconclusive never undoes a confirmed death":
+  // AFTER the transient error there is no further successful read at all. If an
+  // empty line were allowed to overwrite the confirmed death, this returns
+  // {dead:false} and the corpse would never be reaped (a real session leak).
+  it('keeps the confirmed death when every read AFTER the transient error is inconclusive', () => {
+    const lines = ['1:', '', '', ''];
+    let reads = 0;
+    const r = resolvePaneDeath('1:', () => lines[Math.min(reads++, lines.length - 1)]!, noSleep, OPTS);
+    expect(r).toEqual({ dead: true, status: null });
+  });
+
   it('respects the attempt bound when the status lands exactly on the last poll', () => {
     const lines = ['1:', '1:', '1:', '1:', '1:77'];
     let reads = 0;
