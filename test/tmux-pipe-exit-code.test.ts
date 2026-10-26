@@ -18,7 +18,7 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { TmuxPipeBackend } from '../src/adapters/backend/tmux-pipe-backend.js';
+import { TmuxPipeBackend, resolvePaneDeath } from '../src/adapters/backend/tmux-pipe-backend.js';
 import { TmuxBackend } from '../src/adapters/backend/tmux-backend.js';
 import { rmSandboxScratch } from './helpers/rm-sandbox-scratch.js';
 
@@ -336,5 +336,62 @@ describe.skipIf(!realTmux)('tmux liveness probes treat a kept corpse as missing'
       exists = tmux('has-session', '-t', 'bmx-corpse').status === 0;
     }
     expect(exists).toBe(false);
+  });
+});
+
+/**
+ * Pure race handling for `#{pane_dead}` flipping before `#{pane_dead_status}`
+ * is populated. Deterministic (no real tmux, injected read/sleep) — this is
+ * exactly the window that turned a real `exit 3` into the fallback code 1
+ * under CI load, so it must not rely on a timing-dependent end-to-end test.
+ */
+describe('resolvePaneDeath waits for pane_dead_status without inventing one', () => {
+  const noSleep = () => {};
+  const OPTS = { attempts: 5, intervalMs: 0 };
+
+  it('returns the status immediately when the first read already carries it (no re-read)', () => {
+    let reads = 0;
+    const r = resolvePaneDeath('1:77', () => { reads += 1; return '1:77'; }, noSleep, OPTS);
+    expect(r).toEqual({ dead: true, status: 77 });
+    expect(reads).toBe(0);
+  });
+
+  it('a live pane (dead=0) is not dead and never re-read', () => {
+    let reads = 0;
+    const r = resolvePaneDeath('0:', () => { reads += 1; return '0:'; }, noSleep, OPTS);
+    expect(r).toEqual({ dead: false, status: null });
+    expect(reads).toBe(0);
+  });
+
+  it('polls through the 1: → 1:<code> gap and returns the real code', () => {
+    const lines = ['1:', '1:3'];
+    let reads = 0;
+    const r = resolvePaneDeath('1:', () => lines[Math.min(reads++, lines.length - 1)]!, noSleep, OPTS);
+    expect(r).toEqual({ dead: true, status: 3 });
+    expect(reads).toBe(2);
+  });
+
+  it('accepts a permanently-empty status as null after the budget (signal death has no status)', () => {
+    let reads = 0;
+    const r = resolvePaneDeath('1:', () => { reads += 1; return '1:'; }, noSleep, OPTS);
+    expect(r).toEqual({ dead: true, status: null });
+    expect(reads).toBe(OPTS.attempts);
+  });
+
+  it('an inconclusive mid-poll read does not undo the already-confirmed death', () => {
+    // empty line = tmux error/timeout; the pane was already seen dead, so this
+    // contributes no status but must not flip the verdict back to alive.
+    const lines = ['1:', '', '1:127'];
+    let reads = 0;
+    const r = resolvePaneDeath('1:', () => lines[Math.min(reads++, lines.length - 1)]!, noSleep, OPTS);
+    expect(r).toEqual({ dead: true, status: 127 });
+  });
+
+  it('respects the attempt bound when the status lands exactly on the last poll', () => {
+    const lines = ['1:', '1:', '1:', '1:', '1:77'];
+    let reads = 0;
+    const r = resolvePaneDeath('1:', () => lines[Math.min(reads++, lines.length - 1)]!, noSleep, OPTS);
+    expect(r).toEqual({ dead: true, status: 77 });
+    expect(reads).toBe(5);
   });
 });

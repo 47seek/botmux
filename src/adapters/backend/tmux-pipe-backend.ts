@@ -107,6 +107,54 @@ export interface PipePaneDeathEvidence {
 
 const PANE_DEATH_PROBE_TIMEOUT_MS = 1000;
 const PANE_DEATH_SCREEN_TAIL_CHARS = 800;
+/** After #{pane_dead} flips, #{pane_dead_status} is populated a beat later
+ *  (`1:` → `1:77` observed on tmux 3.3a; the gap widens under a loaded server).
+ *  The teardown read polls that long at most for the real status. */
+const PANE_DEATH_STATUS_POLL_MS = 50;
+const PANE_DEATH_STATUS_MAX_POLLS = 20; // ≈1s wall budget, matching the empirically-validated fixture grace
+
+/**
+ * Resolve a dead pane's real exit status from the raw `#{pane_dead}:#{pane_dead_status}`
+ * line, accounting for tmux flipping the dead flag BEFORE the status is visible.
+ *
+ * Pure (the tmux read and the wait are injected) so the race handling is unit
+ * testable without forcing a timing-dependent real-tmux flake:
+ *  - the FIRST line must already confirm death (`dead === '1'`); otherwise the
+ *    pane is not dead and we report that;
+ *  - while it reads `1:` (dead, status not populated yet), re-read up to
+ *    `attempts` times; a read that fails to confirm death (a transient tmux
+ *    error / the pane racing away) is INCONCLUSIVE and does not undo the
+ *    already-confirmed death — it simply contributes no status;
+ *  - an empty status at the deadline is accepted as `null`: a signal death
+ *    legitimately has no exit status forever (we must not invent one).
+ */
+export function resolvePaneDeath(
+  firstLine: string,
+  readLine: () => string,
+  sleep: (ms: number) => void,
+  opts: { attempts: number; intervalMs: number } = {
+    attempts: PANE_DEATH_STATUS_MAX_POLLS,
+    intervalMs: PANE_DEATH_STATUS_POLL_MS,
+  },
+): { dead: boolean; status: number | null } {
+  // Returns: undefined = inconclusive read (cannot tell), null = confirmed
+  // dead with no status yet, string = confirmed dead with that status.
+  const statusOf = (line: string): string | null | undefined => {
+    const [dead, status] = String(line ?? '').trim().split(':');
+    if (dead !== '1') return undefined;
+    const s = (status ?? '').trim();
+    return s.length > 0 ? s : null;
+  };
+  let raw = statusOf(firstLine);
+  if (raw === undefined) return { dead: false, status: null };
+  for (let i = 0; i < opts.attempts && raw === null; i += 1) {
+    sleep(opts.intervalMs);
+    const r = statusOf(readLine());
+    if (r !== undefined) raw = r; // only a confirmed-dead line can advance
+  }
+  const parsed = raw === null ? NaN : Number.parseInt(raw, 10);
+  return { dead: true, status: Number.isInteger(parsed) ? parsed : null };
+}
 
 /** Build the readable startup error for a pane whose CLI process died
  *  immediately. Pure (no tmux calls) so the wording is unit-testable. */
@@ -1289,22 +1337,26 @@ export class TmuxPipeBackend implements SessionBackend {
    * liveness probe report `exists` forever (see probePaneAddressability).
    */
   private readPaneDeath(): { dead: boolean; status: number | null } {
-    let out: string;
-    try {
-      out = String(
-        execFileSync(
-          'tmux',
-          [...this.tmuxArgs, 'display-message', '-p', '-t', this.paneTarget, '#{pane_dead}:#{pane_dead_status}'],
-          { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'], timeout: PANE_DEATH_PROBE_TIMEOUT_MS, env: tmuxEnv() },
-        ) ?? '',
-      ).trim();
-    } catch {
-      return { dead: false, status: null };
-    }
-    const [dead, status] = out.split(':');
-    if (dead !== '1') return { dead: false, status: null };
-    const parsed = Number.parseInt((status ?? '').trim(), 10);
-    return { dead: true, status: Number.isInteger(parsed) ? parsed : null };
+    // One display-message round; an error is an inconclusive (empty) line.
+    const readLine = (): string => {
+      try {
+        return String(
+          execFileSync(
+            'tmux',
+            [...this.tmuxArgs, 'display-message', '-p', '-t', this.paneTarget, '#{pane_dead}:#{pane_dead_status}'],
+            { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'], timeout: PANE_DEATH_PROBE_TIMEOUT_MS, env: tmuxEnv() },
+          ) ?? '',
+        ).trim();
+      } catch {
+        return '';
+      }
+    };
+    // Poll for the status: tmux confirms death a beat before pane_dead_status
+    // is readable, and a single read under load turned a real exit 3/77/127
+    // into the fallback 1 (CI shard observed `{code:1}` for an `exit 3` CLI).
+    // resolvePaneDeath bounds the wait and accepts a permanently-empty status
+    // (signal death).
+    return resolvePaneDeath(readLine(), readLine, sleepSyncMs);
   }
 
   /** Take down the corpse `remain-on-exit failed` left behind (and its session).
