@@ -1238,6 +1238,34 @@ export function applyTurnGitConfigEnv(
 }
 
 /**
+ * The single wiring seam every CLI/engine spawn site must call to install the
+ * trigger-user identity: it prepares the wrapper env (PATH shim, askpass,
+ * wrappers) AND resets the git command-line config channel to the authored
+ * pair set in one step, returning that set so pane-style backends also carry
+ * it via SpawnOpts.gitConfigPairs.
+ *
+ * Keeping prepare + reset in ONE function is load-bearing: calling only
+ * prepareTriggerUserCliEnv leaves an inherited/pushed-up GIT_CONFIG_COUNT and
+ * ambient high-index pairs in the env (the field failure — git aborts or a
+ * foreign pair silently applies), which is what happened on the RPC
+ * app-server engineEnv path before it used this seam. Native-pane spawns,
+ * PTY, env -i strict panes and RPC app-servers all go through here.
+ */
+export function prepareTurnGitConfigEnv(
+  env: NodeJS.ProcessEnv,
+  sessionDataDir: string | undefined,
+  sessionId: string,
+  policy: TriggerUserAuthConfig | undefined,
+  log: (message: string) => void,
+  model: IdentityStorageModel,
+  execution?: { appId: string; ipcPort?: number },
+): Array<[string, string]> {
+  const pairs = prepareTriggerUserCliEnv(env, sessionDataDir, sessionId, policy, log, model, execution);
+  applyTurnGitConfigEnv(env, pairs);
+  return pairs;
+}
+
+/**
  * Locate the real tool binary, skipping any botmux wrapper.
  *
  * `which` would happily return our own wrapper once it is on PATH, producing a
