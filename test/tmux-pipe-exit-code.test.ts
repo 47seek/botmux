@@ -186,14 +186,21 @@ describe.skipIf(!realTmux)('tmux liveness probes treat a kept corpse as missing'
     for (const key of ['PATH', 'SHELL']) saved[key] = process.env[key];
     process.env.PATH = `${bin}:${process.env.PATH}`;
     process.env.SHELL = '/bin/sh';
-    // One live session keeps the server up; the corpse is a second session that
-    // opted into remain-on-exit the same way applySessionOptions does.
-    // The option is per SESSION and must be set on the corpse itself — setting
-    // it on the neighbour leaves the corpse session to vanish on exit, and then
-    // this whole block tests nothing.
+    // One live session keeps the server up; the corpse is a second session
+    // that opted into remain-on-exit.
+    // The option MUST be chained ATOMICALLY into new-session (`\; set-option`,
+    // one server queue, in order) — the same way createDetachedSession does
+    // it. A separate set-option after creation can land AFTER the short CLI
+    // exits under CI load: tmux then keeps a dead pane WITHOUT recording its
+    // status (`1:` forever), and the setup assertion raced (observed on a shard).
+    // The option is per session and must target the corpse itself, not the
+    // neighbour — otherwise the corpse just vanishes on exit and the block
+    // tests nothing.
     tmux('new-session', '-d', '-s', 'bmx-live-one', 'sleep 60');
-    tmux('new-session', '-d', '-s', 'bmx-corpse', 'sh -c "sleep 0.3; exit 77"');
-    tmux('set-option', '-t', 'bmx-corpse', 'remain-on-exit', 'failed');
+    tmux(
+      'new-session', '-d', '-s', 'bmx-corpse', 'sh -c "sleep 0.3; exit 77"',
+      ';', 'set-option', '-t', 'bmx-corpse', 'remain-on-exit', 'failed',
+    );
     const deadStatus = await waitForDeadPane('bmx-corpse');
     expect(deadStatus.dead).toBe(true);
     expect(deadStatus.status).toBe('77');
@@ -211,29 +218,22 @@ describe.skipIf(!realTmux)('tmux liveness probes treat a kept corpse as missing'
   /**
    * Wait until the pane is dead AND tmux has published its status.
    *
-   * `pane_dead` flips to 1 slightly BEFORE `pane_dead_status` is readable
-   * (observed on tmux 3.3a: `1:` then `1:77` a moment later). Returning on
-   * `dead === '1'` alone therefore raced the status publish and made this
-   * fixture flaky. Wait for the status too, but never block on an empty one
-   * forever: a SIGNAL death legitimately has no status at all.
+   * `#{pane_dead}` flips to 1 slightly BEFORE `#{pane_dead_status}` is readable
+   * (observed on tmux 3.3a: `1:` then `1:77` a moment later). This describe's
+   * setup corpse always exits 77, so a non-empty status MUST arrive — an empty
+   * one at the deadline is a corpse built too late (the setup race), which we
+   * want to fail loudly rather than accept. Signal death, which legitimately
+   * has no status, is covered by the other describe's `kill -9 $$` test.
    */
   const waitForDeadPane = async (name: string): Promise<{ dead: boolean; status: string }> => {
     const deadline = Date.now() + 10_000;
-    let sawDead = false;
-    let deadSince = 0;
     for (;;) {
       const out = tmux('display-message', '-p', '-t', name, '#{pane_dead}:#{pane_dead_status}');
       const text = String(out.stdout ?? '').trim();
       const [dead, status] = text.split(':');
-      if (dead === '1') {
-        const value = status ?? '';
-        if (value !== '') return { dead: true, status: value };
-        // A status that never arrives is legitimate for a signal death; give
-        // the publish window a moment, then accept the empty status.
-        if (sawDead && Date.now() - deadSince > 1_000) return { dead: true, status: value };
-        if (!sawDead) { sawDead = true; deadSince = Date.now(); }
-      }
-      if (Date.now() > deadline) return { dead: sawDead, status: '' };
+      const value = status ?? '';
+      if (dead === '1' && value !== '') return { dead: true, status: value };
+      if (Date.now() > deadline) return { dead: dead === '1', status: value };
       await new Promise(r => setTimeout(r, 25));
     }
   };
