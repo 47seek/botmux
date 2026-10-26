@@ -386,6 +386,15 @@ export class TmuxPipeBackend implements SessionBackend {
   private recentOutput = '';
   private static readonly RECENT_OUTPUT_MAX = 4096;
   private readonly exitCbs: Array<(code: number | null, signal: string | null) => void> = [];
+  /**
+   * Sticky exit state. `spawn()` can report an exit SYNCHRONOUSLY (reattach
+   * finds a kept corpse and returns early), but the worker wires `onExit` only
+   * AFTER `spawn()` returns — firing into an empty listener list there would
+   * lose the event forever (no watcher is started on that branch), silently
+   * stalling that session. An exit reported before any listener exists is
+   * replayed to the next `onExit` registration.
+   */
+  private pendingExit: { code: number | null; signal: string | null } | null = null;
   private lifecycleTimer: NodeJS.Timeout | null = null;
   private lastUnknownProbeLogAt = 0;
   /** Debounce authoritative pane-missing replies. Probe timeouts / EMFILE /
@@ -494,10 +503,14 @@ export class TmuxPipeBackend implements SessionBackend {
       // Refuse to "attach" to a kept corpse. applySessionOptions() above set
       // `remain-on-exit failed`, which preserves a crashed CLI's pane for
       // status reporting — but a corpse is not a session anyone can talk to.
-      // Reporting it as an exit (instead of pretending to reattach) is what
-      // keeps the daemon's crash-restart policy in charge of the next attempt.
-      if (this.isPaneDead()) {
-        this.fireExit(this.readPaneDeath().status ?? 1, null);
+      // Reap it (the next generation must be able to create this name
+      // afresh), then report its real exit so the crash-restart policy
+      // decides instead of pretending to reattach.
+      const corpseDeath = this.readPaneDeath();
+      if (corpseDeath.dead) {
+        this.exited = true;
+        this.killDeadPaneRemnant();
+        this.fireExit(corpseDeath.status ?? 1, null);
         return;
       }
     }
@@ -861,6 +874,12 @@ export class TmuxPipeBackend implements SessionBackend {
   }
 
   onExit(cb: (code: number | null, signal: string | null) => void): void {
+    // Replay an exit spawn() reported before any listener existed (see
+    // pendingExit) instead of silently dropping it.
+    if (this.pendingExit) {
+      try { cb(this.pendingExit.code, this.pendingExit.signal); } catch { /* listener crash is benign */ }
+      return;
+    }
     this.exitCbs.push(cb);
   }
 
@@ -1734,6 +1753,10 @@ export class TmuxPipeBackend implements SessionBackend {
   }
 
   private fireExit(code: number | null, signal: string | null): void {
+    // An exit is a one-shot sticky state: never deliver two different verdicts
+    // (e.g. an in-spawn corpse report racing the lifecycle watcher).
+    if (this.pendingExit) return;
+    this.pendingExit = { code, signal };
     for (const cb of this.exitCbs) {
       try { cb(code, signal); } catch { /* listener crash is benign */ }
     }

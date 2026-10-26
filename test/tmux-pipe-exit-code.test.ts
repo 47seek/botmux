@@ -247,4 +247,39 @@ describe.skipIf(!realTmux)('tmux liveness probes treat a kept corpse as missing'
     });
     expect(exited).toEqual({ code: 77 });
   });
+
+  // PRODUCTION ORDERING: worker.ts calls backend.spawn() first and only wires
+  // onExit afterwards (the main handler is registered after spawn returns).
+  // The corpse refusal fires SYNCHRONOUSLY inside spawn(), so a fire straight
+  // into an empty listener list would be lost — no watcher is started on that
+  // branch either, and the session would silently stall (regression found
+  // post-fix with a real-tmux probe). The exit must replay to the late
+  // registration.
+  it('delivers the synchronous corpse exit when onExit is wired only AFTER spawn', async () => {
+    const backend = new TmuxPipeBackend('bmx-corpse', { ownsSession: true, isReattach: true, socketName: socket });
+    backend.spawn('/bin/sh', ['-c', 'exit 0'], {
+      cwd: dir, cols: 100, rows: 30, env: { ...process.env } as Record<string, string>, paneLaunchDir: dir,
+    });
+    const exited = await new Promise<{ code: number | null } | 'no-exit'>((resolve) => {
+      const timer = setTimeout(() => resolve('no-exit'), 3_000);
+      backend.onExit((code) => { clearTimeout(timer); resolve({ code }); });
+    });
+    expect(exited).toEqual({ code: 77 });
+  });
+
+  // The refusal must also reap the corpse session: otherwise the next launch's
+  // new-session collides with the dead session of the same name.
+  it('reaps the corpse session when refusing to reattach', async () => {
+    const backend = new TmuxPipeBackend('bmx-corpse', { ownsSession: true, isReattach: true, socketName: socket });
+    backend.spawn('/bin/sh', ['-c', 'exit 0'], {
+      cwd: dir, cols: 100, rows: 30, env: { ...process.env } as Record<string, string>, paneLaunchDir: dir,
+    });
+    const deadline = Date.now() + 3_000;
+    let exists = tmux('has-session', '-t', 'bmx-corpse').status === 0;
+    while (exists && Date.now() < deadline) {
+      await new Promise(r => setTimeout(r, 50));
+      exists = tmux('has-session', '-t', 'bmx-corpse').status === 0;
+    }
+    expect(exists).toBe(false);
+  });
 });
