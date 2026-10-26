@@ -106,6 +106,23 @@ describe.skipIf(!realTmux)('tmux backend reports the pane pid\'s real exit code'
     expect(await runToExit('sleep 1.5; exec /usr/bin/env /nonexistent-cli-xyz')).toEqual({ code: 127, signal: null });
   });
 
+  // 秒崩（<100ms，127 的典型形态）走的是**启动失败**路径而非崩溃重启路径：
+  // spawn() 抛错，worker 把它当 "CLI 启动失败" 报给用户（卡片上带最后一屏，
+  // 明确写着「/usr/bin/env: ... No such file or directory」）。这条路径不需要
+  // 也不应该依赖崩溃熔断——用户已经被告知具体原因。这里钉住这个分工，免得
+  // 以后有人为了「让熔断也能收到秒崩」把它改成静默重启。
+  it('treats an instantly-dying CLI as a startup failure (spawn throws, with the reason)', async () => {
+    const backend = new TmuxPipeBackend(`bmx-instant${++seq}`, { createSession: true, ownsSession: true, socketName: socket });
+    const workdir = mkdtempSync(join(tmpdir(), 'tmux-instant-'));
+    try {
+      expect(() => backend.spawn('/bin/sh', ['-c', 'exec /usr/bin/env /nonexistent-cli-instant'], {
+        cwd: workdir, cols: 100, rows: 30, env: { ...process.env } as Record<string, string>, paneLaunchDir: workdir,
+      })).toThrow(/启动后立即退出|No such file or directory/);
+    } finally {
+      rmSandboxScratch(workdir);
+    }
+  });
+
   // 普通非零退出同样要如实上报：熔断策略对 1 与 127 的处理不同，把 127 抖成 1
   // 会掩盖「命令没装」。
   it('forwards an ordinary non-zero code unchanged', async () => {
@@ -198,15 +215,36 @@ describe.skipIf(!realTmux)('tmux liveness probes treat a kept corpse as missing'
     expect(String(paneId.stdout).trim()).not.toBe('');
   });
 
-  it('probeSession / hasSession report the corpse as missing', () => {
-    expect(TmuxBackend.probeSession('bmx-corpse', socket)).toBe('missing');
-    expect(TmuxBackend.hasSession('bmx-corpse', socket)).toBe(false);
-    // Launch selection must not choose "reattach" for a corpse.
-    expect(TmuxBackend.probeSessionForLaunch('bmx-corpse', socket)).toBe('missing');
+  // The backend's own liveness probe is what the lifecycle watcher and every
+  // guarded write consult, so THIS is where a corpse must read as missing.
+  it('the backend\'s own liveness probe reports the corpse as missing', () => {
+    const backend = new TmuxPipeBackend('bmx-corpse', { ownsSession: true, isReattach: true, socketName: socket });
+    expect(backend.isPaneAlive()).toBe(false);
   });
 
-  it('leaves a genuinely live session reported as exists', () => {
-    expect(TmuxBackend.probeSession('bmx-live-one', socket)).toBe('exists');
-    expect(TmuxBackend.hasSession('bmx-live-one', socket)).toBe(true);
+  // Launch selection must not choose "reattach" for a corpse: that probe is
+  // what the worker's backend gate consults before a spawn.
+  it('launch selection reports the corpse as missing, not as a reattachable session', () => {
+    expect(TmuxBackend.probeSessionForLaunch('bmx-corpse', socket)).toBe('missing');
+    expect(TmuxBackend.probeSessionForLaunch('bmx-live-one', socket)).toBe('exists');
+  });
+
+  it('leaves a genuinely live session reported as alive', () => {
+    const backend = new TmuxPipeBackend('bmx-live-one', { ownsSession: true, isReattach: true, socketName: socket });
+    expect(backend.isPaneAlive()).toBe(true);
+  });
+
+  // Reattaching a fresh generation onto a corpse would point every later write
+  // at a dead pane; report the exit instead so the restart policy decides.
+  it('refuses to reattach to a corpse and reports its exit status', async () => {
+    const backend = new TmuxPipeBackend('bmx-corpse', { ownsSession: true, isReattach: true, socketName: socket });
+    const exited = await new Promise<{ code: number | null } | 'no-exit'>((resolve) => {
+      const timer = setTimeout(() => resolve('no-exit'), 3_000);
+      backend.onExit((code) => { clearTimeout(timer); resolve({ code }); });
+      backend.spawn('/bin/sh', ['-c', 'exit 0'], {
+        cwd: dir, cols: 100, rows: 30, env: { ...process.env } as Record<string, string>, paneLaunchDir: dir,
+      });
+    });
+    expect(exited).toEqual({ code: 77 });
   });
 });

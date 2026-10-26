@@ -307,7 +307,16 @@ export class TmuxBackend {
    * verdict, only "nothing here can be attached to".
    */
   static probeSessionForLaunch(name: string, socketName?: string): SessionProbe {
-    return TmuxBackend.classifyHasSession(name, true, socketName);
+    const probe = TmuxBackend.classifyHasSession(name, true, socketName);
+    // A session whose pane is a KEPT CORPSE (`remain-on-exit failed`, set by
+    // TmuxPipeBackend for status reporting) answers has-session but has no live
+    // CLI. For LAUNCH selection — and only there — that must read 'missing', or
+    // the next generation would "reattach" to a dead pane. Deliberately not in
+    // classifyHasSession: that is the generic existence probe used by dozens of
+    // call sites (teardown verification, restore, read isolation), each of
+    // which wants a single cheap round-trip and its own verdict on a stall.
+    if (probe === 'exists' && TmuxBackend.isPaneDead(name, socketName)) return 'missing';
+    return probe;
   }
 
   /**
@@ -336,13 +345,6 @@ export class TmuxBackend {
         env: tmuxEnv(),
         timeout: 3000,
       });
-      // `has-session` answers 0 for a session whose pane is a KEPT CORPSE
-      // (`remain-on-exit failed`, set by TmuxPipeBackend): the CLI is gone but
-      // the session object survives. Reporting that as `exists` would make a
-      // launch decision choose 'reattach' and attach the next generation to a
-      // dead pane. Ask the pane itself; only an explicit dead flag turns
-      // 'exists' into 'missing', so the normal path is a bare extra probe.
-      if (TmuxBackend.isSessionPaneDead(name, socketName)) return 'missing';
       return 'exists';
     } catch (e: any) {
       // Deadline first: a timed-out client can surface a clean numeric exit
@@ -373,10 +375,10 @@ export class TmuxBackend {
     }
   }
 
-  /** True only when the session's pane is a kept corpse. Any inconclusive
-   *  answer (probe error, timeout, an option this tmux does not report) is
-   *  `false` — a liveness probe must never invent a death it cannot see. */
-  private static isSessionPaneDead(name: string, socketName?: string): boolean {
+  /** True only when tmux explicitly flags the target pane dead. Any
+   *  inconclusive answer (probe error, timeout, an option this tmux does not
+   *  report) is `false` — a liveness probe must never invent a death. */
+  static isPaneDead(name: string, socketName?: string): boolean {
     try {
       const out = String(
         execFileSync(

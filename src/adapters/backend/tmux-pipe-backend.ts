@@ -491,6 +491,15 @@ export class TmuxPipeBackend implements SessionBackend {
       // like set-clipboard / window-size largest are idempotent to re-apply.
       this.applySessionOptions();
       this.restoreDetachedOwnedSessionSize();
+      // Refuse to "attach" to a kept corpse. applySessionOptions() above set
+      // `remain-on-exit failed`, which preserves a crashed CLI's pane for
+      // status reporting — but a corpse is not a session anyone can talk to.
+      // Reporting it as an exit (instead of pretending to reattach) is what
+      // keeps the daemon's crash-restart policy in charge of the next attempt.
+      if (this.isPaneDead()) {
+        this.fireExit(this.readPaneDeath().status ?? 1, null);
+        return;
+      }
     }
 
     // Step 1: create the fifo. mkfifo is POSIX; linux/darwin both have it.
@@ -1336,6 +1345,16 @@ export class TmuxPipeBackend implements SessionBackend {
       ...(opts.strictEnv
         ? [shellSpec.shell, '-c', loader, '_', launchFile.path]
         : shellCommandArgv(shellSpec, loader, [launchFile.path])),
+      // `remain-on-exit failed` must be in effect BEFORE the CLI can exit, or a
+      // fast death (exit 127 from a missing binary is sub-100ms) takes the
+      // whole session with it and the exit status is gone forever. applySession
+      // Options() at the end of this method is far too late — measured: a
+      // `set-option` after the fact reports `: ` (no status) for exactly the
+      // crash shape this channel exists to report. Chaining it into the SAME
+      // tmux invocation (tmux runs `\;`-separated commands in one server queue,
+      // in order) makes it atomic with creation. `failed` keeps a pane only for
+      // a NON-zero exit, so a clean exit 0 still removes the session as before.
+      ';', 'set-option', '-t', this.paneTarget, 'remain-on-exit', 'failed',
     ];
     const commandBytes = tmuxCommandBytes(argv);
     // Every failure below ends here. The chat only ever sees `error` (tmux's
@@ -1489,13 +1508,11 @@ export class TmuxPipeBackend implements SessionBackend {
       if (version === null || tmuxVersionAtLeast(version, 3, 1)) {
         execSync(`${this.tmuxCmd} set-option -t ${t} window-size largest`, { stdio: 'ignore', env, timeout: 5000 });
       }
-      // `remain-on-exit failed` — ONLY failed (non-zero) exits keep a dead
-      // pane around; a clean exit 0 removes the session exactly as before, so
-      // nothing about the normal lifecycle changes. What it buys: the CLI's
-      // real exit status survives on the pane (#{pane_dead_status}), which is
-      // the only channel that carries 77/127 through the tmux backend. See
-      // readPaneDeadStatus(). Set PER SESSION (-t), never -g: this server is
-      // shared with the user's own sessions.
+      // `remain-on-exit failed` is set ATOMICALLY with new-session (see the
+      // `\;` chain in createDetachedSession) — a fast death would otherwise
+      // take the status with it. This re-apply is for a REATTACHED session:
+      // one created by an older build has no such option yet, and it must be
+      // in place before the CLI can die. Idempotent.
       execSync(`${this.tmuxCmd} set-option -t ${t} remain-on-exit failed`, { stdio: 'ignore', env, timeout: 5000 });
     } catch { /* session may not be ready yet — benign */ }
   }
