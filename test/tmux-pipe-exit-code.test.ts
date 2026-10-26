@@ -67,13 +67,6 @@ describe.skipIf(!realTmux)('tmux backend reports the pane pid\'s real exit code'
     }
   };
 
-  /** Sessions this file's backend left behind (the corpse must be reaped). */
-  const leftoverExitSessions = (): string[] => {
-    const listed = tmux('list-sessions', '-F', '#{session_name}');
-    if (listed.status !== 0) return []; // no server at all ⇒ nothing left behind
-    return String(listed.stdout).split('\n').map(l => l.trim()).filter(l => l.startsWith('bmx-exit'));
-  };
-
   beforeEach(() => {
     dir = mkdtempSync(join(tmpdir(), 'tmux-exit-'));
     socket = join(dir, 'socket');
@@ -140,17 +133,36 @@ describe.skipIf(!realTmux)('tmux backend reports the pane pid\'s real exit code'
   // `remain-on-exit failed` 会为一具崩溃的尸体留下整条 session；谁都不清理的话
   // 每次崩溃都漏一条。这里断言没漏（也包括信号死亡：它的 status 为空，只按
   // status 判清理会正好漏掉这一类）。
-  it('reaps the dead-pane remnant it kept for status reporting', async () => {
-    await runToExit('sleep 1.5; exit 77');
-    await runToExit('sleep 1.5; kill -9 $$');
-    // Backend 的 kill 是 best-effort 且与退出判定同一轮，给服务器一拍时间。
-    const deadline = Date.now() + 5_000;
-    let leftover = leftoverExitSessions();
-    while (leftover.length > 0 && Date.now() < deadline) {
-      await new Promise(r => setTimeout(r, 100));
-      leftover = leftoverExitSessions();
+  // The remnant carries an EMPTY status when the CLI was killed by a signal
+  // (`kill -9` has no exit code), so gating reaping on `pane_dead_status`
+  // leaked exactly those sessions. Assert the signal case: it is the one that
+  // proves reaping keys on `pane_dead`, not on a readable code.
+  it('reaps the dead-pane remnant even when the CLI was signal-killed (no status)', async () => {
+    const name = `bmx-reap${++seq}`;
+    const backend = new TmuxPipeBackend(name, { createSession: true, ownsSession: true, socketName: socket });
+    const workdir = mkdtempSync(join(tmpdir(), 'tmux-reap-'));
+    try {
+      const exited = await new Promise<{ code: number | null }>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error(`${name}: no exit reported`)), EXIT_TIMEOUT_MS);
+        backend.onExit((code) => { clearTimeout(timer); resolve({ code }); });
+        backend.spawn('/bin/sh', ['-c', 'sleep 1.5; kill -9 $$'], {
+          cwd: workdir, cols: 100, rows: 30, env: { ...process.env } as Record<string, string>, paneLaunchDir: workdir,
+        });
+      });
+      // Signal death has no tmux status; the backend keeps the historic
+      // sentinel (1) rather than inventing one. What matters here is that the
+      // remnant is still reaped — see the has-session check below.
+      expect(exited.code).toBe(1);
+      const deadline = Date.now() + 5_000;
+      let leftover = tmux('has-session', '-t', name).status === 0;
+      while (leftover && Date.now() < deadline) {
+        await new Promise(r => setTimeout(r, 100));
+        leftover = tmux('has-session', '-t', name).status === 0;
+      }
+      expect(leftover).toBe(false);
+    } finally {
+      rmSandboxScratch(workdir);
     }
-    expect(leftover).toEqual([]);
   });
 });
 
@@ -196,15 +208,33 @@ describe.skipIf(!realTmux)('tmux liveness probes treat a kept corpse as missing'
     rmSandboxScratch(dir);
   });
 
+  /**
+   * Wait until the pane is dead AND tmux has published its status.
+   *
+   * `pane_dead` flips to 1 slightly BEFORE `pane_dead_status` is readable
+   * (observed on tmux 3.3a: `1:` then `1:77` a moment later). Returning on
+   * `dead === '1'` alone therefore raced the status publish and made this
+   * fixture flaky. Wait for the status too, but never block on an empty one
+   * forever: a SIGNAL death legitimately has no status at all.
+   */
   const waitForDeadPane = async (name: string): Promise<{ dead: boolean; status: string }> => {
     const deadline = Date.now() + 10_000;
+    let sawDead = false;
+    let deadSince = 0;
     for (;;) {
       const out = tmux('display-message', '-p', '-t', name, '#{pane_dead}:#{pane_dead_status}');
       const text = String(out.stdout ?? '').trim();
       const [dead, status] = text.split(':');
-      if (dead === '1') return { dead: true, status: status ?? '' };
-      if (Date.now() > deadline) return { dead: false, status: '' };
-      await new Promise(r => setTimeout(r, 50));
+      if (dead === '1') {
+        const value = status ?? '';
+        if (value !== '') return { dead: true, status: value };
+        // A status that never arrives is legitimate for a signal death; give
+        // the publish window a moment, then accept the empty status.
+        if (sawDead && Date.now() - deadSince > 1_000) return { dead: true, status: value };
+        if (!sawDead) { sawDead = true; deadSince = Date.now(); }
+      }
+      if (Date.now() > deadline) return { dead: sawDead, status: '' };
+      await new Promise(r => setTimeout(r, 25));
     }
   };
 
@@ -265,6 +295,31 @@ describe.skipIf(!realTmux)('tmux liveness probes treat a kept corpse as missing'
       backend.onExit((code) => { clearTimeout(timer); resolve({ code }); });
     });
     expect(exited).toEqual({ code: 77 });
+  });
+
+  // An exit is a ONE-SHOT verdict. After the corpse branch reported 77, a later
+  // stop (kill(), a stale watcher tick) must not re-deliver a different code to
+  // listeners registered afterwards — that would hand the daemon two
+  // contradictory crash reasons for the same CLI lifetime (and could restart a
+  // session the policy had already decided to stop).
+  it('reports exactly one exit verdict per CLI lifetime', async () => {
+    const backend = new TmuxPipeBackend('bmx-corpse', { ownsSession: true, isReattach: true, socketName: socket });
+    const seen: Array<number | null> = [];
+    backend.spawn('/bin/sh', ['-c', 'exit 0'], {
+      cwd: dir, cols: 100, rows: 30, env: { ...process.env } as Record<string, string>, paneLaunchDir: dir,
+    });
+    backend.onExit(code => seen.push(code));
+    // A second teardown attempt after the verdict is already in.
+    backend.kill();
+    backend.kill();
+    await new Promise(r => setTimeout(r, 300));
+    // A listener registered later must still see the SAME first verdict.
+    const late = await new Promise<{ code: number | null } | 'no-exit'>((resolve) => {
+      const timer = setTimeout(() => resolve('no-exit'), 1_000);
+      backend.onExit(code => { clearTimeout(timer); resolve({ code }); });
+    });
+    expect(seen).toEqual([77]);
+    expect(late).toEqual({ code: 77 });
   });
 
   // The refusal must also reap the corpse session: otherwise the next launch's
