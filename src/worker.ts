@@ -538,7 +538,7 @@ import type {
   SessionProbe,
   SessionShutdownDetachResult,
 } from './adapters/backend/types.js';
-import { tmuxEnv, probeTmuxFunctionalWithRetry, getTmuxVersionCached, tmuxSupportsRemainOnExitFailed } from './setup/ensure-tmux.js';
+import { tmuxEnv, probeTmuxFunctionalWithRetry, resolveTmuxVersionAtSessionBoundary, tmuxSupportsRemainOnExitFailed } from './setup/ensure-tmux.js';
 import { probeZmxRuntime, zmxEnv } from './setup/ensure-zmx.js';
 import type { PersistentBackendTarget } from './adapters/backend/types.js';
 import { herdrConfigForSession } from './adapters/backend/types.js';
@@ -20405,18 +20405,23 @@ async function spawnCli(
       // unavailable, so new sessions run with the pre-#2164 default: they
       // always start, but the crash-restart policy cannot see 77/127 (it
       // degrades to a generic exit). Warn that the deterministic-failure
-      // circuit breaker is off, without gating anything.
-      {
-        const tmuxVersion = getTmuxVersionCached();
+      // circuit breaker is off, without gating anything. The whole resolve is
+      // inside the one-shot guard: a successful answer warms the process
+      // cache for the session creation that follows, and a tmux whose `-V`
+      // hangs does not pay the probe cost on every later spawnCli. The log
+      // reflects the boundary resolution at THIS moment; if its re-probe also
+      // fails and a later creation's re-probe succeeds, that creation runs
+      // with the breaker enabled regardless of this one-shot line (a window
+      // narrowed to two consecutive failed probes, not closed entirely).
+      if (!hasWarnedTmuxExitCodeDegradation) {
+        const tmuxVersion = resolveTmuxVersionAtSessionBoundary();
         const vlabel = tmuxVersion ? `${tmuxVersion.major}.${tmuxVersion.minor}` : 'unknown';
-        if (!hasWarnedTmuxExitCodeDegradation) {
-          if (tmuxSupportsRemainOnExitFailed(tmuxVersion)) {
-            log(`tmux backend: server version ${vlabel} — crash exit-code circuit breaker enabled (remain-on-exit failed supported)`);
-          } else {
-            log(`tmux backend: server version ${vlabel} (< 3.2 or unknown) — "remain-on-exit failed" unsupported; new sessions start normally, but deterministic crash exit codes (77/127) are not reported, so the crash-restart circuit breaker is degraded to generic-exit handling`);
-          }
-          hasWarnedTmuxExitCodeDegradation = true;
+        if (tmuxSupportsRemainOnExitFailed(tmuxVersion)) {
+          log(`tmux backend: server version ${vlabel} — crash exit-code circuit breaker enabled (remain-on-exit failed supported)`);
+        } else {
+          log(`tmux backend: server version ${vlabel} (< 3.2 or unknown) — "remain-on-exit failed" unsupported; new sessions start normally, but deterministic crash exit codes (77/127) are not reported, so the crash-restart circuit breaker is degraded to generic-exit handling`);
         }
+        hasWarnedTmuxExitCodeDegradation = true;
       }
     } else if (effectiveBackend === 'zellij') {
       // Like tmux, zellij's probe is a disposable background session, so a

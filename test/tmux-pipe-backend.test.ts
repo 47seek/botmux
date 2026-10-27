@@ -684,6 +684,37 @@ describe('TmuxPipeBackend remain-on-exit failed vs tmux version (v3.53.0 regress
       expect(hasFailedChain()).toBe(true);    // modern tmux → chain enabled
     } finally { be.kill(); }
   });
+
+  // createDetachedSession resolves the version once and applySessionOptions()
+  // runs at its end: the reapply MUST reuse that resolution. A second boundary
+  // resolve re-forces a `tmux -V` even inside the null TTL (the resolver
+  // refreshes on ANY null), so an unreadable tmux would pay the 3s probe
+  // timeout twice per session creation (~6s -> ~9s worst case) for a decision
+  // that is already known. One session = one boundary resolution.
+  it('resolves tmux -V exactly once per session creation when the probe stays unreadable', () => {
+    resetTmuxVersionCacheForTests();
+    let vCalls = 0;
+    mockedExecFileSync.mockImplementation(((_bin: unknown, args: string[]) => {
+      if (args[0] === '-V') {
+        vCalls += 1;
+        throw Object.assign(new Error('ETIMEDOUT'), { code: 'ETIMEDOUT' });
+      }
+      if (args[0] === 'new-session') return '1234 $7 5678';
+      return '';
+    }) as typeof execFileSync);
+    // Prime a recent null (the shape a failed gate/self-check leaves behind).
+    expect(getTmuxVersionCached()).toBeNull();
+    expect(vCalls).toBe(1);
+
+    const be = new TmuxPipeBackend('bmx-roe-create-unreadable', { createSession: true, ownsSession: true });
+    try {
+      expect(() => be.spawn('sleep', ['60'], spawnOpts())).not.toThrow();
+      // prime(1) + the single boundary resolve's forced re-probe(2); the
+      // end-of-creation option reapply must not resolve a third time.
+      expect(vCalls).toBe(2);
+      expect(hasFailedChain()).toBe(false);
+    } finally { be.kill(); }
+  });
 });
 
 describe('TmuxPipeBackend server selection (dedicated socket)', () => {
@@ -2206,5 +2237,58 @@ describe('TmuxPipeBackend tmux version gating', () => {
       Array.isArray(args) && (args[0] === 'resize-window' || args[0] === 'resize-pane')
     ));
     expect(resizeCalls).toEqual([]);
+  });
+});
+
+// The reattach reapply of `remain-on-exit failed` (#2164, backfilled onto
+// sessions an older build created) must follow the SAME tmux >= 3.2 gate as
+// the new-session chain (#2418 regression). A pre-3.2 tmux rejects the value,
+// and a gate in the opposite direction (never reapplying) would silently lose
+// the crash exit-code channel on supported hosts — so both directions need an
+// assertion. The reattach path never builds a new-session argv, which is why
+// these assert on the string-form execSync calls, not newSessionArgs().
+describe('reattach remain-on-exit reapply vs tmux version', () => {
+  const roeReapplyCalls = (): string[] => mockedExecSync.mock.calls
+    .map(c => String(c[0]))
+    .filter(cmd => cmd.includes('set-option') && cmd.includes('remain-on-exit'));
+
+  it('skips the reattach remain-on-exit reapply on tmux 3.1c', () => {
+    mockedExecFileSync.mockImplementation(((_bin: any, args: any) => {
+      if (Array.isArray(args) && args[0] === '-V') return 'tmux 3.1c\n' as any;
+      return '' as any;
+    }) as any);
+    const be = new TmuxPipeBackend('bmx-reattach-roe-old', { ownsSession: true, isReattach: true });
+    be.spawn('/bin/echo', [], spawnOpts());
+    expect(roeReapplyCalls()).toEqual([]);
+  });
+
+  it('reapplies remain-on-exit failed on a reattach when tmux supports it (3.3a)', () => {
+    mockedExecFileSync.mockImplementation(((_bin: any, args: any) => {
+      if (Array.isArray(args) && args[0] === '-V') return 'tmux 3.3a\n' as any;
+      return '' as any;
+    }) as any);
+    const be = new TmuxPipeBackend('bmx-reattach-roe-new', { ownsSession: true, isReattach: true });
+    be.spawn('/bin/echo', [], spawnOpts());
+    expect(roeReapplyCalls().length).toBe(1);
+  });
+
+  it('re-probes tmux -V once at the reattach boundary after a cached null, then reapplies', () => {
+    resetTmuxVersionCacheForTests();
+    let vCalls = 0;
+    mockedExecFileSync.mockImplementation(((_bin: any, args: any) => {
+      if (Array.isArray(args) && args[0] === '-V') {
+        vCalls += 1;
+        if (vCalls === 1) throw Object.assign(new Error('ETIMEDOUT'), { code: 'ETIMEDOUT' });
+        return 'tmux 3.3a\n' as any;
+      }
+      return '' as any;
+    }) as any);
+    // A failed gate probe left a null inside the short TTL.
+    expect(getTmuxVersionCached()).toBeNull();
+    expect(vCalls).toBe(1);
+    const be = new TmuxPipeBackend('bmx-reattach-roe-reprobe', { ownsSession: true, isReattach: true });
+    be.spawn('/bin/echo', [], spawnOpts());
+    expect(vCalls).toBe(2);
+    expect(roeReapplyCalls().length).toBe(1);
   });
 });
