@@ -10725,8 +10725,8 @@ function antigravityRecoveryAttachPath(path: string): string {
 }
 
 /** Ownership gate for binding a Codex bridge to a session id that came from the
- *  shared history. A live thread-id footer proves a daemon-backed TUI's
- *  exact thread for this backend generation; otherwise retain the legacy fd
+ *  shared history. A live thread-id footer or a correlated input receipt proves
+ *  the exact thread for this backend generation; otherwise retain the legacy fd
  *  membership gate below. Never consult the shared daemon's combined fd set.
  *
  *  Legacy ownership gate for a session id that came from the
@@ -10746,7 +10746,7 @@ function antigravityRecoveryAttachPath(path: string): string {
  *  AND the initial-attach guard) call this one wrapper — there is no parallel
  *  decision copy that could drift. */
 function codexHistorySidOwnedByCurrentPid(cliSessionId: string): boolean {
-  if (backend && codexTerminalSessionIsBound(backend, cliSessionId)) return true;
+  if (backend && codexTerminalSessionIsBound(adapterInputHandle(backend), cliSessionId)) return true;
   const pid = currentCodexObservedPid();
   const ownedRollouts = pid ? findCodexRolloutSetByPid(pid) : undefined;
   const owned = codexHistorySidIsOwned(cliSessionId, ownedRollouts);
@@ -18614,6 +18614,9 @@ async function flushPending(): Promise<void> {
               msg,
               {
                 turnId: item.turnId,
+                ...(lastInitConfig?.cliId === 'codex'
+                  && !lastInitConfig.adoptMode && lastInitConfig.promptInjection !== 'none'
+                  ? { correlateTranscript: true as const } : {}),
                 ...(item.trustedCaller ? { trustedCaller: item.trustedCaller } : {}),
                 ...(item.codexAppSteerable ? { codexAppSteerable: true } : {}),
               },
