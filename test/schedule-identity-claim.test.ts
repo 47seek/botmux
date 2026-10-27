@@ -301,6 +301,27 @@ describe('claim card on a fire without identity', () => {
     expect(store.getClaimCard(APP, 'a1b2c3d4')?.messageId).toBe('om_card_2');
   });
 
+  it('reports a broken card store as a rejection, never by throwing into the turn being prepared', async () => {
+    const h = harness();
+    addTask({ ownerOpenId: ALICE.open, ownerUnionId: ALICE.union });
+    h.deps.getCard = () => { throw new Error('database is not open'); };
+    const task = authorityTask();
+    let restored!: Promise<void>;
+    let gap!: Promise<void>;
+    expect(() => {
+      restored = h.claims.noteIdentityRestored({
+        appId: APP, task, turnId: 'schedule:a1b2c3d4:00000001-0000-4000-8000-000000000000',
+        identity: { ok: true, openId: ALICE.open, unionId: ALICE.union, source: 'creator' },
+      });
+      gap = h.claims.noteIdentityGap({
+        appId: APP, task, turnId: 'schedule:a1b2c3d4:00000002-0000-4000-8000-000000000000', fireChatId: CHAT,
+        location: { kind: 'chat', chatId: CHAT }, gap: { ok: false, reason: 'no_creator' },
+      });
+    }).not.toThrow();
+    await expect(restored).rejects.toThrow('database is not open');
+    await expect(gap).rejects.toThrow('database is not open');
+  });
+
   it('keeps one card per task across a daemon restart', async () => {
     const h = harness();
     addTask();
@@ -536,6 +557,25 @@ describe('claim card buttons', () => {
     expect(buttons(result.card.data).map(b => b.value.action))
       .toEqual(['schedule_identity_reclaim', 'schedule_identity_rerun']);
     expect(store.getClaimCard(APP, 'a1b2c3d4')).toMatchObject({ messageId: lapsed.messageId, status: 'claimed' });
+  });
+
+  it('a click on an older copy of the card does not move the record of the current one', async () => {
+    const h = harness();
+    const first = await pending(h);
+    await h.click('schedule_identity_claim', first.card, ALICE, first.messageId);
+    h.allowed.delete(ALICE.open);
+    h.tick();
+    await h.fire();
+    expect(store.getClaimCard(APP, 'a1b2c3d4')).toMatchObject({ messageId: 'om_card_2', status: 'pending' });
+    h.allowed.add(ALICE.open);
+    // Someone still looking at the very first (unclaimed) copy clicks it.
+    const stale = await h.click('schedule_identity_claim', first.card, BOB, first.messageId);
+    expect(stale.toast.content).toContain('已刷新');
+    expect(store.getClaimCard(APP, 'a1b2c3d4')).toMatchObject({ messageId: 'om_card_2', status: 'pending' });
+    // So the next fire still settles the card everyone sees now.
+    h.tick();
+    await h.fire();
+    expect(h.updates.map(u => u.messageId)).toEqual(['om_card_2']);
   });
 
   it('settles the pending card at the next fire once the claimant can act again', async () => {
