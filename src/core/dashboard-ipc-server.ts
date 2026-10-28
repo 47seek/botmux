@@ -485,7 +485,8 @@ import {
   type SessionRow,
 } from './dashboard-rows.js';
 import { getBotBrand, getBot, getBotClient, getBotOpenId, getOwnerOpenId, loadBotConfigs, readBotSkillPolicy, getBotTuiSlashAllow, updateBotNativeSubagentRuntime, MAX_TURN_TIMEOUT_MS, normalizeDshProfile, type BotConfig, type NativeSubagentRuntimeConfigState, type UsageDisplayMode, type MessageListenerConfig } from '../bot-registry.js';
-import { generateAuthUrl, tryHandleCallbackUrl, getFeedGroupAuthStatus, listAuthorizedUsers, FEED_GROUP_OAUTH_SCOPES, requestUserAuthorization } from '../utils/user-token.js';
+import { generateAuthUrl, tryHandleCallbackUrl, getFeedGroupAuthStatus, isUsableOpenId, listAuthorizedUsers, FEED_GROUP_OAUTH_SCOPES, requestUserAuthorization } from '../utils/user-token.js';
+import { queryTriggerUserAuthStatus } from '../services/trigger-user-auth-status.js';
 import { tokenStoreProtection, triggerUserAuthApplies, credentialSourceOf, type TriggerUserAuthConfig } from '../services/trigger-user-auth.js';
 import { platformCredentialsUrl } from '../platform/credential-grant-client.js';
 import { scanCredentialBearingMcpServers, credentialBearingMcpAdvisory } from '../services/credential-bearing-mcp.js';
@@ -10073,11 +10074,32 @@ botConfigPutRoute<{ enabled?: unknown; larkToolBinding?: unknown }>('/api/bot-la
 // GET /api/bot-trigger-user-auth-status — 当前策略 + 已授权人数 + 两条如实的
 // 边界提示（token 存储保护程度、自带凭证的 MCP server）。
 // 只回人数不回名单：谁授权过是成员关系，dashboard 没有理由把它摊给所有能登录的人。
-ipcRoute('GET', '/api/bot-trigger-user-auth-status', requireBoundBot(async (_req, res) => {
+//
+// `?openId=` 是给已经知道 open_id 的集成方（例如管共享机器的 device daemon）
+// 按人查询的入口。不带这个参数时响应与以前完全一致。带了且格式合法时，在同一
+// 份聚合字段之外追加 `user`：
+//   • `coverage` 恒为 `local-stores`。平台签发的授权（credentialSource 为
+//     platform / auto）不在 `tools` 里；这里的 needs-login 不等于 turn 会被拒。
+//   • `tools.bytedcli.basis=provider-probe`：实时 `bytedcli auth status`。
+//   • `tools['lark-cli']`：有设备登录文件则为 authorized / file-present（不读
+//     密文、不轮询进行中的 device flow）；否则若该人 legacy user-token 仍可用
+//     （access 有效或还可刷新）则为 authorized / expiry-check，与 turn 的
+//     lark-cli 回落一致。两者都没有才是 needs-login。
+//   • `tools['user-token'].basis=expiry-check`：只看该人自己的 token 文件。
+// 已知过期时间才带 expiresAt / refreshExpiresAt。不回 token 内容，也不因为
+// 查询一个人而列出其他人。非法 open_id 直接 400，避免拼进文件路径。
+ipcRoute('GET', '/api/bot-trigger-user-auth-status', requireBoundBot(async (req, res) => {
   try {
+    const openIdRaw = new URL(req.url ?? '/', 'http://localhost').searchParams.get('openId');
+    const openId = openIdRaw?.trim() ?? '';
+    if (openId && !isUsableOpenId(openId)) {
+      jsonRes(res, 400, { ok: false, error: 'invalid_open_id' });
+      return;
+    }
     const cfg = getBot(cachedLarkAppId).config;
     const policy = cfg.triggerUserAuth ?? null;
-    const authorizedCount = listAuthorizedUsers(cfg.larkAppId, normalizeBrand(cfg.brand)).length;
+    const brand = normalizeBrand(cfg.brand);
+    const authorizedCount = listAuthorizedUsers(cfg.larkAppId, brand).length;
     // Oncall (legacy true) provides the OS-enforced credential boundary that
     // makes other people's token files unreadable. scratch is NOT counted here:
     // it is write-integrity COW, not a read/credential boundary, so the agent
@@ -10087,6 +10109,9 @@ ipcRoute('GET', '/api/bot-trigger-user-auth-status', requireBoundBot(async (_req
     // Platform-backed source: tell the UI whether this machine is bound so the
     // picker can say what `auto` / `platform` will actually do here.
     const platformUrl = platformCredentialsUrl();
+    const user = openId
+      ? await queryTriggerUserAuthStatus({ appId: cfg.larkAppId, brand, openId })
+      : undefined;
     jsonRes(res, 200, {
       ok: true,
       policy,
@@ -10097,6 +10122,7 @@ ipcRoute('GET', '/api/bot-trigger-user-auth-status', requireBoundBot(async (_req
       tokenStoreEnforced: protection.enforced,
       ...(protection.advisory ? { tokenStoreAdvisory: protection.advisory } : {}),
       ...(mcpAdvisory ? { mcpAdvisory } : {}),
+      ...(user ? { user } : {}),
     });
   } catch (e: any) {
     jsonRes(res, 500, { ok: false, error: e?.message ?? String(e) });
