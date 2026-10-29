@@ -390,6 +390,7 @@ import type {
   VcMeetingImTurnOrigin,
 } from './types.js';
 import { normalizeCodexAppCotMarker } from './services/codex-app-cot.js';
+import { normalizeDshCotMarker } from './services/dsh-cot.js';
 import { t, setDefaultLocale } from './i18n/index.js';
 import { registerPromptOverrideResolver } from './skills/effective-builtins.js';
 import { TerminalRenderer } from './utils/terminal-renderer.js';
@@ -15353,6 +15354,22 @@ async function handleTrustedCodexAppMarker(
     }
     observeCotEntries(marker.entries, turn);
     return true;
+  }
+
+  if (kind === 'cot') {
+    // Keep runtime gating in the pure normalizer: dsh-tui also has cliId 'dsh'.
+    const entries = normalizeDshCotMarker(lastInitConfig?.cliId, lastInitConfig?.dshRuntime, payload);
+    if (entries) {
+      // Cosmetic only: attributed like dsh's final reply; dropped without an active turn.
+      if (currentBotmuxTurnId) {
+        observeCotEntries(entries, { turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt });
+      }
+      return true;
+    }
+    if (lastInitConfig?.cliId === 'dsh') {
+      log(`${cliName()} dropped untrusted or malformed cot control marker`);
+      return true;
+    }
   }
 
   // master added lifecycle/steer markers. In the merged world codex-app reaches
